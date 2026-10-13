@@ -1,0 +1,9 @@
+/target/
+/.cache/
+/artifacts/
+/dist/
+*.p12
+*.pfx
+*.key
+*.keychain-db
+.DS_Store

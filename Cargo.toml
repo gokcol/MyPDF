@@ -1,0 +1,64 @@
+[package]
+name = "mypdf-milestone0"
+version = "0.6.0"
+edition = "2024"
+default-run = "mypdf"
+
+[[bin]]
+name = "mypdf"
+path = "src/bin/mypdf.rs"
+
+[[bin]]
+name = "mypdf-milestone0"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hayro = "0.8"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+lopdf = { version = "0.45", features = ["font_embedding"] }
+p12-keystore = "0.4"
+rcgen = "0.14"
+rpassword = "7"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+time = "0.3"
+tokio = { version = "1", features = ["rt", "macros"] }
+underskrift = { version = "0.1.4", default-features = false, features = ["visual", "verify", "blocking", "tsp"] }
+zeroize = "1"
+rand = "0.8"
+rsa = "0.9"
+p256 = { version = "0.13", features = ["pkcs8"] }
+p384 = { version = "0.13", features = ["pkcs8"] }
+x509-parser = "0.18"
+ttf-parser = "0.25"
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "wgpu", "accesskit", "x11", "wayland"] }
+rfd = "0.17.2"
+wgpu = { version = "27", default-features = false, features = ["metal", "dx12", "wgsl"] }
+base64 = "0.22"
+resvg = "0.45.1"
+zip = { version = "9.0.2", default-features = false, features = ["deflate"] }
+quick-xml = "0.41"
+svg2pdf = "0.13"
+
+[profile.dev.package.hayro]
+opt-level = 2
+[profile.dev.package.hayro-interpret]
+opt-level = 2
+[profile.dev.package.vello_cpu]
+opt-level = 2
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+security-framework = "3.7"
+security-framework-sys = "2.17"
+muda = "0.17"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+
+[patch.crates-io]
+underskrift = { path = "vendor/underskrift" }

@@ -1,0 +1,2495 @@
+mod content;
+mod digital;
+mod editing;
+mod home;
+pub mod icon;
+mod menu;
+mod organize;
+#[cfg(test)]
+mod preview;
+mod recovery;
+mod ui;
+use ui::{ActionButton, Icon};
+
+use eframe::egui::{self, Color32, FontId, Rect, RichText, Stroke, TextureHandle, pos2, vec2};
+use mypdf_milestone0::viewer::{self, Event, PageSize, PageText, RasterKey, SearchHit, Worker};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, mpsc};
+
+const INK: Color32 = Color32::from_rgb(46, 48, 54);
+const ACCENT: Color32 = Color32::from_rgb(39, 126, 216);
+const MUTED: Color32 = Color32::from_rgb(103, 108, 120);
+const PAPER: Color32 = Color32::from_rgb(245, 245, 247);
+const CANVAS: Color32 = Color32::from_rgb(226, 228, 233);
+const CACHE_BUDGET: usize = 128 * 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Zoom {
+    Width,
+    Page,
+    Scale(f32),
+}
+// Preserve the PDF point under the gesture while page gaps and centering stay fixed.
+fn pinch_scroll_offset(
+    pages: &[PageSize],
+    old: f32,
+    new: f32,
+    old_width: f32,
+    new_width: f32,
+    offset: egui::Vec2,
+    pointer: egui::Vec2,
+) -> egui::Vec2 {
+    let content = offset + pointer;
+    let mut old_top = 24.;
+    let mut new_top = 24.;
+    for (index, page) in pages.iter().enumerate() {
+        if content.y <= old_top + page.height * old + 12. || index + 1 == pages.len() {
+            let x = (content.x - (old_width - page.width * old) / 2.) / old;
+            let y = (content.y - old_top) / old;
+            return vec2(
+                ((new_width - page.width * new) / 2. + x * new - pointer.x).max(0.),
+                (new_top + y * new - pointer.y).max(0.),
+            );
+        }
+        old_top += page.height * old + 24.;
+        new_top += page.height * new + 24.;
+    }
+    offset
+}
+
+struct Raster {
+    texture: TextureHandle,
+    bytes: usize,
+    used: u64,
+}
+struct Tab {
+    id: u64,
+    path: PathBuf,
+    worker: Worker,
+    bytes: Option<Arc<[u8]>>,
+    pages: Vec<PageSize>,
+    signed: bool,
+    unsaved_on_load: bool,
+    remember_open: bool,
+    session: Option<mypdf_milestone0::annotations::Session>,
+    capabilities: Option<mypdf_milestone0::annotations::Capabilities>,
+    editing_warning: Option<String>,
+    selected_annotation: Option<String>,
+    error: Option<String>,
+    page: usize,
+    page_input: String,
+    zoom: Zoom,
+    scale: f32,
+    jump: Option<(usize, Option<f32>)>,
+    document_view: Option<(Rect, egui::Vec2, f32)>,
+    last_pinch: Option<std::time::Instant>,
+    text: Vec<Option<Arc<PageText>>>,
+    search_worker: viewer::SearchWorker,
+    search_at: Option<std::time::Instant>,
+    searching: bool,
+    jump_to_first_hit: bool,
+    query: String,
+    hits: Vec<SearchHit>,
+    hit: usize,
+    indexed: usize,
+    index_done: bool,
+    search_limited: bool,
+    search_dirty: bool,
+    rasters: HashMap<RasterKey, Raster>,
+    pending: HashSet<RasterKey>,
+    render_errors: HashMap<usize, String>,
+}
+impl Tab {
+    fn name(&self) -> String {
+        self.path
+            .file_name()
+            .unwrap_or(self.path.as_os_str())
+            .to_string_lossy()
+            .into_owned()
+    }
+    fn jump(&mut self, page: usize) {
+        if !self.pages.is_empty() {
+            self.page = page.min(self.pages.len() - 1);
+            self.page_input = (self.page + 1).to_string();
+            self.jump = Some((self.page, None));
+        }
+    }
+    fn select_hit(&mut self, hit: usize) {
+        if self.hits.is_empty() {
+            return;
+        }
+        self.hit = hit % self.hits.len();
+        let found = &self.hits[self.hit];
+        let y = found.rects.first().map(|r| r[1]);
+        self.page = found.page;
+        self.page_input = (self.page + 1).to_string();
+        self.jump = Some((self.page, y));
+    }
+    fn request(&mut self, key: RasterKey) {
+        if !self.pending.contains(&key)
+            && !self.rasters.contains_key(&key)
+            && !self.render_errors.contains_key(&key.page)
+            && self.worker.request(key)
+        {
+            self.pending.insert(key);
+        }
+    }
+    fn search(&mut self, ctx: &egui::Context) {
+        let results: Vec<_> = self.search_worker.results.try_iter().collect();
+        for (generation, hits) in results {
+            if generation != self.search_worker.generation() {
+                continue;
+            }
+            self.hits = hits;
+            self.hit = self.hit.min(self.hits.len().saturating_sub(1));
+            self.searching = false;
+            if self.jump_to_first_hit && !self.hits.is_empty() {
+                self.select_hit(0);
+                self.jump_to_first_hit = false;
+            }
+        }
+        if !self.search_dirty {
+            return;
+        }
+        if self.query.trim().is_empty() {
+            self.hits.clear();
+            self.search_dirty = false;
+            self.searching = false;
+            return;
+        }
+        let at = self.search_at.get_or_insert_with(std::time::Instant::now);
+        if at.elapsed() >= std::time::Duration::from_millis(150)
+            && self
+                .search_worker
+                .request(self.text.clone(), self.query.clone())
+        {
+            self.search_dirty = false;
+            self.search_at = None;
+            self.searching = true;
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+        }
+    }
+}
+
+pub struct Viewer {
+    home: home::Home,
+    content: content::ContentState,
+    organizer: organize::Organizer,
+    editor: editing::EditorState,
+    digital: digital::DigitalState,
+    tabs: Vec<Tab>,
+    active: usize,
+    next_id: u64,
+    tick: u64,
+    sidebar: bool,
+    inspector: bool,
+    accessible_text: bool,
+    recovery: recovery::Recovery,
+    search: bool,
+    focus_search: bool,
+    status: Option<(String, bool)>,
+    saving: bool,
+    save_events: mpsc::Receiver<Result<(PathBuf, u64, u64), String>>,
+    save_tx: mpsc::Sender<Result<(PathBuf, u64, u64), String>>,
+    close_intent: Option<Option<u64>>,
+    close_after_save: Option<Option<u64>>,
+    exit_approved: bool,
+    _native_menu: Option<menu::NativeMenu>,
+    menu_events: mpsc::Receiver<String>,
+}
+impl Viewer {
+    pub fn new(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> Self {
+        editing::install_annotation_font(&cc.egui_ctx);
+        ui::install_theme(&cc.egui_ctx);
+        let (native_menu, menu_events) = menu::install(cc.egui_ctx.clone());
+        let (save_tx, save_events) = mpsc::channel();
+        let mut app = Self {
+            home: home::Home::new(&cc.egui_ctx),
+            content: content::ContentState::new(),
+            organizer: organize::Organizer::new(),
+            editor: editing::EditorState::new(),
+            digital: digital::DigitalState::new(),
+            tabs: vec![],
+            active: 0,
+            next_id: 0,
+            tick: 0,
+            sidebar: true,
+            inspector: true,
+            accessible_text: false,
+            recovery: recovery::Recovery::new(&cc.egui_ctx),
+            search: false,
+            focus_search: false,
+            status: None,
+            saving: false,
+            save_events,
+            save_tx,
+            close_intent: None,
+            close_after_save: None,
+            exit_approved: false,
+            _native_menu: native_menu,
+            menu_events,
+        };
+        for path in paths {
+            app.open(path, &cc.egui_ctx);
+        }
+        app
+    }
+    fn open(&mut self, path: PathBuf, ctx: &egui::Context) {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
+            self.active = i;
+            self.home.visible = false;
+            if self.tabs[i].bytes.is_some() && self.tabs[i].path.is_file() {
+                self.home.remember(&self.tabs[i].path);
+            }
+            return;
+        }
+        if self.tabs.len() >= 16 {
+            self.status = Some((
+                "Close a tab before opening another PDF (16-tab limit).".into(),
+                true,
+            ));
+            return;
+        }
+        self.next_id += 1;
+        let wake = ctx.clone();
+        let worker = Worker::open(path.clone(), move || wake.request_repaint());
+        let wake = ctx.clone();
+        let search_worker = viewer::SearchWorker::new(move || wake.request_repaint());
+        self.tabs.push(Tab {
+            id: self.next_id,
+            path,
+            worker,
+            bytes: None,
+            pages: vec![],
+            signed: false,
+            unsaved_on_load: false,
+            remember_open: true,
+            session: None,
+            capabilities: None,
+            editing_warning: None,
+            selected_annotation: None,
+            error: None,
+            page: 0,
+            page_input: "1".into(),
+            document_view: None,
+            last_pinch: None,
+            zoom: Zoom::Width,
+            scale: 1.0,
+            jump: Some((0, None)),
+            text: vec![],
+            search_worker,
+            search_at: None,
+            searching: false,
+            jump_to_first_hit: false,
+            query: String::new(),
+            hits: vec![],
+            hit: 0,
+            indexed: 0,
+            index_done: false,
+            search_limited: false,
+            search_dirty: false,
+            rasters: HashMap::new(),
+            pending: HashSet::new(),
+            render_errors: HashMap::new(),
+        });
+        self.active = self.tabs.len() - 1;
+        self.home.visible = false;
+        self.status = None;
+    }
+    fn native_pick(&self, dialog: rfd::FileDialog) -> Option<PathBuf> {
+        menu::with_file_dialog(self._native_menu.as_ref(), || dialog.pick_file())
+    }
+    fn native_picks(&self, dialog: rfd::FileDialog) -> Option<Vec<PathBuf>> {
+        menu::with_file_dialog(self._native_menu.as_ref(), || dialog.pick_files())
+    }
+    fn native_save(&self, dialog: rfd::FileDialog) -> Option<PathBuf> {
+        menu::with_file_dialog(self._native_menu.as_ref(), || dialog.save_file())
+    }
+    fn text_command(ctx: &egui::Context, key: egui::Key, shift: bool) {
+        let modifiers = egui::Modifiers {
+            shift,
+            ..egui::Modifiers::COMMAND
+        };
+        ctx.input_mut(|i| {
+            i.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            })
+        });
+    }
+    fn open_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(paths) = self.native_picks(
+            rfd::FileDialog::new()
+                .set_title("Open PDF")
+                .add_filter("PDF documents", &["pdf"]),
+        ) {
+            for path in paths {
+                self.open(path, ctx);
+            }
+        }
+    }
+    fn save_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(id) = self
+            .content
+            .pending_text()
+            .filter(|id| self.tabs.get(self.active).is_some_and(|t| t.id == *id))
+            && !self.content.busy
+        {
+            self.content.after_text = Some(content::AfterText::Save(id));
+            self.content.new_commit = true;
+            self.finish_new_text(ctx);
+            return;
+        }
+        if self.unfinished_edit(self.tabs.get(self.active).map(|t| t.id)) {
+            return;
+        }
+        if self.content.busy || self.organizer.busy {
+            self.status = Some((
+                "Wait for the current operation before saving.".into(),
+                false,
+            ));
+            return;
+        }
+        if !self.apply_pending_annotation() {
+            return;
+        }
+        if self.saving {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Some(bytes) = tab
+            .session
+            .as_ref()
+            .map(|s| s.source.clone())
+            .or_else(|| tab.bytes.clone())
+        else {
+            return;
+        };
+        let tab_id = tab.id;
+        let revision = tab.session.as_ref().map_or(0, |s| s.revision());
+        let annotations = tab
+            .session
+            .as_ref()
+            .map(|s| s.annotations.clone())
+            .unwrap_or_default();
+        let stem = tab.path.file_stem().unwrap_or_default().to_string_lossy();
+        let dialog = rfd::FileDialog::new()
+            .set_title("Save a Copy • choose a new filename")
+            .add_filter("PDF document", &["pdf"])
+            .set_file_name(format!("{stem}-copy.pdf"))
+            .set_directory(tab.path.parent().unwrap_or(std::path::Path::new(".")));
+        let Some(destination) = self.native_save(dialog) else {
+            self.close_after_save = None;
+            return;
+        };
+        self.saving = true;
+        self.status = Some(("Saving a complete copy…".into(), false));
+        let tx = self.save_tx.clone();
+        let wake = ctx.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<_> {
+                let bytes = if revision == 0 {
+                    bytes.to_vec()
+                } else {
+                    mypdf_milestone0::annotations::export(&bytes, &annotations)?
+                };
+                viewer::save_copy(&destination, &bytes)?;
+                Ok((destination, tab_id, revision))
+            })()
+            .map_err(|e| format!("Could not save: {e:#}. Existing files are preserved."));
+            let _ = tx.send(result);
+            wake.request_repaint();
+        });
+    }
+    fn close(&mut self, index: usize) {
+        if index < self.tabs.len() {
+            self.recovery.clear(self.tabs[index].id);
+            self.tabs.remove(index);
+            if self.active > index {
+                self.active -= 1;
+            }
+            self.active = self.active.min(self.tabs.len().saturating_sub(1));
+            if self.tabs.is_empty() {
+                self.home.visible = true;
+            }
+        }
+    }
+    fn action(&mut self, action: &str, ctx: &egui::Context) {
+        if self.home.visible
+            && matches!(
+                action,
+                "save"
+                    | "close"
+                    | "undo"
+                    | "redo"
+                    | "zoom_in"
+                    | "zoom_out"
+                    | "actual"
+                    | "fit_width"
+                    | "fit_page"
+            )
+        {
+            return;
+        }
+        match action {
+            "home" => self.show_home(),
+            "new" => self.new_blank(ctx),
+            "open" => self.open_dialog(ctx),
+            "save" => self.save_dialog(ctx),
+            "close" => self.request_close(self.tabs.get(self.active).map(|t| t.id), ctx),
+            "quit" => self.request_close(None, ctx),
+            "identities" => {
+                self.digital.open = true;
+                self.digital.panel = digital::Panel::Identities;
+            }
+            "sign" => {
+                self.digital.open = true;
+                self.digital.panel = digital::Panel::Sign;
+                self.digital.use_document(self.tabs.get(self.active));
+            }
+            "validate" => {
+                self.digital.open = true;
+                self.digital.panel = digital::Panel::Validate;
+            }
+            "cut" => ctx.send_viewport_cmd(egui::ViewportCommand::RequestCut),
+            "copy" => ctx.send_viewport_cmd(egui::ViewportCommand::RequestCopy),
+            "paste" => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+            "select_all" => Self::text_command(ctx, egui::Key::A, false),
+            "edit_undo" | "edit_redo" => {
+                if ctx.wants_keyboard_input() {
+                    Self::text_command(ctx, egui::Key::Z, action == "edit_redo");
+                } else if !self.home.visible {
+                    self.editor_undo(action == "edit_redo");
+                }
+            }
+            "undo" => self.editor_undo(false),
+            "redo" => self.editor_undo(true),
+            "find" if self.home.visible => self.home.focus_search = true,
+            "find" => {
+                self.editor.annotation_sidebar = false;
+                self.search = true;
+                self.sidebar = true;
+                self.focus_search = true;
+            }
+            "sidebar" => self.sidebar = !self.sidebar,
+            "inspector" => self.inspector = !self.inspector,
+            "recovery" => self.recovery.open = true,
+            "page_text" => self.accessible_text = !self.accessible_text,
+            "zoom_in" | "zoom_out" | "actual" | "fit_width" | "fit_page" => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.zoom = match action {
+                        "actual" => Zoom::Scale(1.0),
+                        "fit_width" => Zoom::Width,
+                        "fit_page" => Zoom::Page,
+                        "zoom_in" => Zoom::Scale((tab.scale * 1.2).min(6.0)),
+                        _ => Zoom::Scale((tab.scale / 1.2).max(0.1)),
+                    };
+                    tab.jump = Some((tab.page, None));
+                }
+            }
+            _ => {}
+        }
+    }
+    fn events(&mut self, ctx: &egui::Context) {
+        for tab in &mut self.tabs {
+            for event in tab.worker.events.try_iter().take(16).collect::<Vec<_>>() {
+                match event {
+                    Event::Loaded {
+                        bytes,
+                        pages,
+                        signed,
+                        annotations,
+                        capabilities,
+                        editing_warning,
+                    } => {
+                        if std::mem::take(&mut tab.remember_open) && !tab.unsaved_on_load {
+                            self.home.remember(&tab.path);
+                        }
+                        tab.text.resize_with(pages.len(), || None);
+                        tab.pages = pages;
+                        if tab.session.is_none() {
+                            tab.session = Some(mypdf_milestone0::annotations::Session::new(
+                                bytes.clone(),
+                                annotations,
+                                !capabilities.signed
+                                    && !capabilities.certified
+                                    && !capabilities.encrypted
+                                    && editing_warning.is_none(),
+                            ));
+                        }
+                        if tab.unsaved_on_load {
+                            if let Some(s) = &mut tab.session {
+                                s.mark_unsaved();
+                            }
+                            tab.unsaved_on_load = false;
+                        }
+                        tab.jump(tab.page.min(tab.pages.len().saturating_sub(1)));
+                        tab.bytes = Some(bytes);
+                        if let Some(session) = &mut tab.session {
+                            session.editable = !capabilities.signed
+                                && !capabilities.certified
+                                && !capabilities.encrypted
+                                && editing_warning.is_none();
+                        }
+                        tab.capabilities = Some(capabilities);
+                        tab.editing_warning = editing_warning;
+                        tab.signed = signed;
+                    }
+                    Event::Indexed { page, text } => {
+                        tab.text[page] = Some(Arc::new(text));
+                        tab.indexed += 1;
+                        tab.search_dirty = true;
+                    }
+                    Event::IndexFinished { limited } => {
+                        tab.index_done = true;
+                        tab.search_limited = limited;
+                    }
+                    Event::Raster { key, size, rgba } => {
+                        tab.pending.remove(&key);
+                        let bytes = rgba.len();
+                        let image = egui::ColorImage::from_rgba_premultiplied(size, &rgba);
+                        let texture = ctx.load_texture(
+                            format!("{}-{}-{}-{}", tab.id, key.page, key.scale, key.thumbnail),
+                            image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        tab.rasters.insert(
+                            key,
+                            Raster {
+                                texture,
+                                bytes,
+                                used: self.tick,
+                            },
+                        );
+                    }
+                    Event::RasterFailed { key, error } => {
+                        tab.pending.remove(&key);
+                        tab.render_errors.insert(key.page, error);
+                    }
+                    Event::Failed(error) => {
+                        tab.pending.clear();
+                        tab.error = Some(error);
+                    }
+                }
+            }
+            tab.search(ctx);
+            if tab.error.is_none()
+                && (!tab.pending.is_empty()
+                    || tab.bytes.is_none() && tab.error.is_none()
+                    || !tab.index_done)
+            {
+                ctx.request_repaint_after(std::time::Duration::from_millis(80));
+            }
+        }
+        let saved: Vec<_> = self.save_events.try_iter().collect();
+        for saved in saved {
+            self.saving = false;
+            self.status = Some(match saved {
+                Ok((path, id, revision)) => {
+                    self.home.remember(&path);
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+                        if let Some(session) = &mut tab.session {
+                            session.mark_saved(revision);
+                        } else {
+                            tab.unsaved_on_load = false;
+                        }
+                        if !tab.unsaved_on_load && tab.session.as_ref().is_none_or(|s| !s.dirty()) {
+                            self.recovery.clear(id);
+                        }
+                    }
+                    if let Some(intent) = self.close_after_save.take() {
+                        self.request_close(intent, ctx);
+                    }
+                    (
+                        format!("Saved {} • source file preserved", path.display()),
+                        false,
+                    )
+                }
+                Err(e) => {
+                    self.close_after_save = None;
+                    (e, true)
+                }
+            });
+        }
+        let actions: Vec<_> = self.menu_events.try_iter().collect();
+        for action in actions {
+            self.action(&action, ctx);
+        }
+        let dropped = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect::<Vec<_>>()
+        });
+        for path in dropped {
+            self.open(path, ctx);
+        }
+    }
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        if !self.home.visible
+            && !ctx.wants_keyboard_input()
+            && !self.editor.text_editing
+            && !self.digital.open
+            && !self.editor.signature_open
+            && !self.editor.library_open
+        {
+            if ctx.input_mut(|i| {
+                i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::Z,
+                )
+            }) {
+                self.editor_undo(true);
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
+                self.editor_undo(false);
+            }
+            if matches!(
+                self.editor.mode,
+                editing::Mode::Annotate | editing::Mode::Draw
+            ) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+            {
+                self.editor_delete();
+            }
+        }
+        // macOS menu accelerators own these shortcuts to prevent duplicate dialogs.
+        if !cfg!(target_os = "macos") || self._native_menu.is_none() {
+            for (key, action) in [
+                (egui::Key::N, "new"),
+                (egui::Key::O, "open"),
+                (egui::Key::S, "save"),
+                (egui::Key::W, "close"),
+                (egui::Key::F, "find"),
+                (egui::Key::Equals, "zoom_in"),
+                (egui::Key::Minus, "zoom_out"),
+                (egui::Key::Num0, "actual"),
+            ] {
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, key)) {
+                    self.action(action, ctx);
+                }
+            }
+        }
+        for (key, action) in [
+            (egui::Key::L, "sidebar"),
+            (egui::Key::R, "inspector"),
+            (egui::Key::H, "home"),
+        ] {
+            if ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, key)
+            }) {
+                self.action(action, ctx);
+            }
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab))
+            && !self.tabs.is_empty()
+        {
+            self.active = (self.active + 1) % self.tabs.len();
+            self.home.visible = false;
+        }
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::Tab,
+            )
+        }) && !self.tabs.is_empty()
+        {
+            self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+            self.home.visible = false;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.search = false;
+        }
+        if !self.home.visible
+            && !ctx.wants_keyboard_input()
+            && let Some(tab) = self.tabs.get_mut(self.active)
+        {
+            if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) {
+                tab.jump(tab.page + 1);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::PageUp)) {
+                tab.jump(tab.page.saturating_sub(1));
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
+                tab.jump(0);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::End)) {
+                tab.jump(tab.pages.len().saturating_sub(1));
+            }
+        }
+    }
+    fn toolbar(&mut self, ctx: &egui::Context) {
+        let mut action = None;
+        let mut close = None;
+        egui::TopBottomPanel::top("document_tabs")
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(29, 30, 34))
+                    .inner_margin(egui::Margin::symmetric(12, 5)),
+            )
+            .show(ctx, |ui| {
+                *ui.visuals_mut() = egui::Visuals::dark();
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        #[cfg(target_os = "macos")]
+                        ui.add_space(70.0);
+                        ui.label(
+                            RichText::new("MyPDF")
+                                .color(Color32::from_rgb(210, 215, 223))
+                                .strong(),
+                        );
+                        ui.add_space(14.0);
+                        if ui
+                            .add(ActionButton::new(Icon::Home, "Home").selected(self.home.visible))
+                            .on_hover_text("Home · ⇧⌘H")
+                            .clicked()
+                        {
+                            action = Some("home");
+                        }
+                        for (i, tab) in self.tabs.iter().enumerate() {
+                            ui.push_id(tab.id, |ui| {
+                                egui::Frame::new()
+                                    .fill(if i == self.active && !self.home.visible {
+                                        Color32::from_rgb(67, 69, 75)
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    })
+                                    .corner_radius(4.0)
+                                    .inner_margin(egui::Margin::symmetric(12, 4))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            let mut name = tab.name();
+                                            if name.chars().count() > 28 {
+                                                name = format!(
+                                                    "{}…",
+                                                    name.chars().take(27).collect::<String>()
+                                                );
+                                            }
+                                            if tab.session.as_ref().is_some_and(|s| s.dirty()) {
+                                                name.push_str(" •");
+                                            }
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        RichText::new(name)
+                                                            .color(Color32::from_gray(238)),
+                                                    )
+                                                    .frame(false),
+                                                )
+                                                .on_hover_text(tab.path.display().to_string())
+                                                .clicked()
+                                            {
+                                                self.active = i;
+                                                self.home.visible = false;
+                                            }
+                                            if ui
+                                                .add(egui::Button::new("×").frame(false))
+                                                .on_hover_text("Close tab")
+                                                .clicked()
+                                            {
+                                                close = Some(i);
+                                            }
+                                        })
+                                    });
+                            });
+                        }
+                        if ui
+                            .add(ActionButton::new(Icon::Plus, "Open PDF").compact())
+                            .clicked()
+                        {
+                            action = Some("open");
+                        }
+                        let drag = ui.allocate_response(
+                            vec2(ui.available_width().max(1.0), 30.0),
+                            egui::Sense::drag(),
+                        );
+                        if drag.drag_started() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
+                    })
+                });
+            });
+        if let Some(index) = close.take() {
+            self.request_close(self.tabs.get(index).map(|t| t.id), ctx);
+        }
+        if let Some(a) = action.take() {
+            self.action(a, ctx);
+        }
+        if self.home.visible {
+            return;
+        }
+        egui::TopBottomPanel::top("main_toolbar")
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(39, 40, 46))
+                    .inner_margin(egui::Margin::symmetric(12, 0)),
+            )
+            .show(ctx, |ui| {
+                *ui.visuals_mut() = egui::Visuals::dark();
+                ui.spacing_mut().item_spacing.x = 5.;
+                let compact = ui.available_width() < 1100.;
+                ui.horizontal(|ui| {
+                    for (icon, label, key) in [
+                        (Icon::Plus, "New blank PDF", "new"),
+                        (Icon::Open, "Open…", "open"),
+                        (Icon::Save, "Save a Copy…", "save"),
+                    ] {
+                        let enabled = key != "save"
+                            || (!self.saving
+                                && self
+                                    .tabs
+                                    .get(self.active)
+                                    .is_some_and(|t| t.bytes.is_some()));
+                        if ui
+                            .add_enabled(enabled, ActionButton::new(icon, label).compact())
+                            .clicked()
+                        {
+                            action = Some(key);
+                        }
+                    }
+                    ui.add_space(12.);
+                    for (mode, icon, label) in [
+                        (editing::Mode::Read, Icon::Read, "Read"),
+                        (editing::Mode::Annotate, Icon::Pen, "Annotate"),
+                        (editing::Mode::Edit, Icon::Text, "Edit"),
+                        (editing::Mode::Draw, Icon::Shapes, "Draw"),
+                        (editing::Mode::Forms, Icon::Form, "Forms"),
+                        (editing::Mode::Sign, Icon::Shield, "Sign"),
+                        (editing::Mode::Pages, Icon::Library, "Pages"),
+                        (editing::Mode::Convert, Icon::Extract, "Export"),
+                    ] {
+                        if mode == editing::Mode::Sign {
+                            self.sign_menu(ui, compact, true);
+                            continue;
+                        }
+                        let button = ActionButton::new(icon, label)
+                            .tab()
+                            .selected(self.editor.mode == mode);
+                        if ui
+                            .add(if compact { button.compact() } else { button })
+                            .clicked()
+                            && self.apply_pending_annotation()
+                        {
+                            self.editor.mode = mode;
+                            self.editor.library_open = false;
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                ActionButton::new(Icon::Inspector, "Toggle right panel")
+                                    .compact()
+                                    .selected(self.inspector),
+                            )
+                            .clicked()
+                        {
+                            self.inspector = !self.inspector;
+                        }
+                        if ui
+                            .add(
+                                ActionButton::new(Icon::Sidebar, "Toggle left panel")
+                                    .compact()
+                                    .selected(self.sidebar),
+                            )
+                            .clicked()
+                        {
+                            self.sidebar = !self.sidebar;
+                        }
+                        if ui
+                            .add(ActionButton::new(Icon::Search, "Find").compact())
+                            .clicked()
+                        {
+                            action = Some("find");
+                        }
+                    });
+                });
+            });
+        egui::TopBottomPanel::bottom("document_navigation")
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(249, 250, 252))
+                    .inner_margin(egui::Margin::symmetric(12, 3)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 5.;
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        if ui
+                            .add(ActionButton::new(Icon::Minus, "Zoom out").compact())
+                            .clicked()
+                        {
+                            action = Some("zoom_out");
+                        }
+                        egui::ComboBox::from_id_salt("zoom")
+                            .width(82.0)
+                            .selected_text(match tab.zoom {
+                                Zoom::Width => "Fit width".into(),
+                                Zoom::Page => "Fit page".into(),
+                                Zoom::Scale(s) => format!("{}%", (s * 100.0).round() as i32),
+                            })
+                            .show_ui(ui, |ui| {
+                                for (label, mode) in [
+                                    ("Fit width", Zoom::Width),
+                                    ("Fit page", Zoom::Page),
+                                    ("50%", Zoom::Scale(0.5)),
+                                    ("75%", Zoom::Scale(0.75)),
+                                    ("100%", Zoom::Scale(1.0)),
+                                    ("150%", Zoom::Scale(1.5)),
+                                    ("200%", Zoom::Scale(2.0)),
+                                    ("400%", Zoom::Scale(4.0)),
+                                ] {
+                                    if ui.selectable_value(&mut tab.zoom, mode, label).clicked() {
+                                        tab.jump = Some((tab.page, None));
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        if ui
+                            .add(ActionButton::new(Icon::Plus, "Zoom in").compact())
+                            .clicked()
+                        {
+                            action = Some("zoom_in");
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                tab.page > 0,
+                                ActionButton::new(Icon::Left, "Previous page").compact(),
+                            )
+                            .clicked()
+                        {
+                            tab.jump(tab.page.saturating_sub(1));
+                        }
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut tab.page_input)
+                                .desired_width(30.0)
+                                .horizontal_align(egui::Align::Center),
+                        );
+                        r.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::TextEdit,
+                                true,
+                                "Page number",
+                            )
+                        });
+                        self.editor.text_editing |= r.has_focus();
+                        if r.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            && let Ok(n) = tab.page_input.parse::<usize>()
+                        {
+                            tab.jump(n.saturating_sub(1));
+                        }
+                        ui.label(format!("/ {}", tab.pages.len()));
+                        if ui
+                            .add_enabled(
+                                tab.page + 1 < tab.pages.len(),
+                                ActionButton::new(Icon::Right, "Next page").compact(),
+                            )
+                            .clicked()
+                        {
+                            tab.jump(tab.page + 1);
+                        }
+                    }
+
+                    ui.separator();
+                    let session = self.tabs.get(self.active).and_then(|t| t.session.as_ref());
+                    if ui
+                        .add_enabled(
+                            session.is_some_and(|s| s.can_undo()),
+                            ActionButton::new(Icon::Undo, "Undo").compact(),
+                        )
+                        .clicked()
+                    {
+                        action = Some("undo");
+                    }
+                    if ui
+                        .add_enabled(
+                            session.is_some_and(|s| s.can_redo()),
+                            ActionButton::new(Icon::Redo, "Redo").compact(),
+                        )
+                        .clicked()
+                    {
+                        action = Some("redo");
+                    }
+                    if let Some(tab) = self.tabs.get(self.active)
+                        && let Some(s) = &tab.session
+                        && s.dirty()
+                    {
+                        ui.label(
+                            RichText::new(self.recovery.label(tab.id, s.revision()))
+                                .size(11.)
+                                .color(MUTED),
+                        );
+                    }
+                    if let Some(tab) = self.tabs.get(self.active) {
+                        if tab.signed {
+                            ui.label(RichText::new("Signed PDF").size(11.).color(MUTED)).on_hover_text("Existing digital signatures are preserved. Ordinary editing is disabled.");
+                        } else if let Some(warning) = &tab.editing_warning {
+                            ui.label(RichText::new("Read-only").size(11.).color(MUTED)).on_hover_text(warning);
+                        }
+                    }
+                    if let Some(e) = &self.recovery.error {
+                        if ui.small_button("Autosave issue").on_hover_text(e).clicked() {
+                            self.recovery.open = true;
+                        }
+                    } else if ui.available_width() > 220. {
+                        let message =
+                            self.status
+                                .as_ref()
+                                .map(|(s, _)| s.clone())
+                                .unwrap_or_else(|| {
+                                    self.tabs
+                                        .get(self.active)
+                                        .map(|t| t.name())
+                                        .unwrap_or_else(|| "Local files · Native Rust".into())
+                                });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(&message).size(11.).color(MUTED))
+                                    .truncate(),
+                            )
+                            .on_hover_text(message);
+                        });
+                    }
+                });
+            });
+        if let Some(index) = close {
+            self.request_close(self.tabs.get(index).map(|t| t.id), ctx);
+        }
+        if let Some(action) = action {
+            self.action(action, ctx);
+        }
+    }
+    fn sidebar(&mut self, ctx: &egui::Context) {
+        if !self.sidebar || self.tabs.is_empty() {
+            return;
+        }
+        if self.editor.annotation_sidebar {
+            egui::SidePanel::left("sidebar")
+                .resizable(true)
+                .default_width(240.0)
+                .width_range(190.0..=360.0)
+                .frame(egui::Frame::new().fill(PAPER).inner_margin(12.0))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Pages").clicked() {
+                            self.editor.annotation_sidebar = false;
+                            self.search = false;
+                        }
+                        if ui.button("Search").clicked() {
+                            self.editor.annotation_sidebar = false;
+                            self.search = true;
+                            self.focus_search = true;
+                        }
+                        ui.label("Marks");
+                    });
+                    ui.separator();
+                    self.annotation_list(ui);
+                });
+            return;
+        }
+        let tab = &mut self.tabs[self.active];
+        let tick = self.tick;
+        egui::SidePanel::left("sidebar").resizable(true).default_width(220.0).width_range(190.0..=360.0).frame(egui::Frame::new().fill(PAPER).inner_margin(12.0)).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.selectable_label(!self.search, "Pages").clicked() { self.search = false; }
+                if ui.selectable_label(self.search, "Search").clicked() { self.search = true; self.focus_search = true; }
+                if ui.small_button("Marks").clicked() { self.editor.annotation_sidebar = true; }
+            });
+            ui.separator();
+            if self.search {
+                let response = ui.add(egui::TextEdit::singleline(&mut tab.query).hint_text("Find in document…").desired_width(f32::INFINITY));
+                self.editor.text_editing |= response.has_focus();
+                if self.focus_search { response.request_focus(); self.focus_search = false; }
+                if response.changed() { tab.search_worker.invalidate(); tab.search_dirty = true; tab.search_at = Some(std::time::Instant::now()); tab.hits.clear(); tab.hit = 0; tab.jump_to_first_hit = true; tab.search(ctx); }
+                if (response.has_focus() || response.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter)) { let next = if ui.input(|i| i.modifiers.shift) { tab.hit + tab.hits.len().saturating_sub(1) } else { tab.hit + 1 }; tab.select_hit(next); response.request_focus(); }
+                ui.horizontal(|ui| {
+                    let message = if tab.hits.is_empty() { "0 matches".into() } else { format!("{} of {}", tab.hit + 1, tab.hits.len()) };
+                    ui.label(RichText::new(message).color(MUTED).size(12.0));
+                    if ui.add_enabled(!tab.hits.is_empty(), ActionButton::new(Icon::Left, "Previous page").compact()).on_hover_text("Previous match • Shift+Enter").clicked() { tab.select_hit(tab.hit + tab.hits.len().saturating_sub(1)); }
+                    if ui.add_enabled(!tab.hits.is_empty(), ActionButton::new(Icon::Right, "Next page").compact()).on_hover_text("Next match • Enter").clicked() { tab.select_hit(tab.hit + 1); }
+                });
+                if !tab.index_done { ui.label(RichText::new(format!("Indexing {}/{} pages…", tab.indexed, tab.pages.len())).color(MUTED).size(11.0)); }
+                if tab.searching || tab.search_dirty && !tab.query.is_empty() { ui.label(RichText::new("Searching…").color(MUTED).size(11.0)); }
+                if tab.search_limited { ui.label(RichText::new("Search is partial: this document reached the text index limit.").color(MUTED).size(12.0)); }
+                if !tab.query.is_empty() && tab.hits.is_empty() && tab.index_done && !tab.search_limited && !tab.searching && !tab.search_dirty { ui.label(RichText::new("No searchable matches. Scanned pages need OCR, which comes in a later milestone.").color(MUTED).size(12.0)); }
+                let mut chosen = None;
+                egui::ScrollArea::vertical().id_salt((tab.id, "search_results")).show(ui, |ui| {
+                    for (i, hit) in tab.hits.iter().enumerate().take(1000) { let selected = i == tab.hit; egui::Frame::new().fill(if selected { Color32::from_rgb(221, 235, 220) } else { Color32::TRANSPARENT }).corner_radius(5.0).inner_margin(8.0).show(ui, |ui| {
+                        ui.label(RichText::new(format!("Page {}", hit.page + 1)).size(11.0).strong().color(ACCENT));
+                        if ui.add(egui::Button::new(&hit.snippet).wrap().frame(false)).clicked() { chosen = Some(i); }
+                    }); }
+                });
+                if let Some(index) = chosen { tab.select_hit(index); }
+            } else {
+                ui.label(RichText::new(format!("{} pages", tab.pages.len())).color(MUTED).size(12.0));
+                egui::ScrollArea::vertical().id_salt((tab.id, "thumbnails")).show_rows(ui, 176.0, tab.pages.len(), |ui, range| {
+                    for page in range { let size = tab.pages[page]; let factor = (132.0 / size.width).min(146.0 / size.height); let display = vec2(size.width * factor, size.height * factor); let key = viewer::raster_key(page, size, factor * ctx.pixels_per_point(), true); tab.request(key);
+                        let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 176.0), egui::Sense::click());
+                        response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, page == tab.page, format!("Go to page {}", page + 1)));
+                        let image = Rect::from_center_size(pos2(rect.center().x, rect.top() + 77.0), display);
+                        ui.painter().rect_filled(image.expand(3.0), 2.0, if page == tab.page { ACCENT } else { Color32::from_rgb(210, 216, 207) });
+                        ui.painter().rect_filled(image, 0.0, Color32::WHITE);
+                        if let Some(raster) = tab.rasters.get_mut(&key) { raster.used = tick; ui.painter().image(raster.texture.id(), image, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE); }
+                        if let Some(session) = &tab.session && session.editable {
+                            for a in session.annotations.iter().filter(|a| a.page == page) {
+                                editing::paint_annotation(&mut self.editor, ctx, ui.painter(), image, factor, a);
+                            }
+                        }
+                        ui.painter().text(pos2(rect.center().x, rect.bottom() - 12.0), egui::Align2::CENTER_CENTER, (page + 1).to_string(), FontId::proportional(12.0), if page == tab.page { ACCENT } else { MUTED });
+                        if response.on_hover_text(format!("Go to page {}", page + 1)).clicked() { tab.jump(page); }
+                    }
+                });
+            }
+        });
+    }
+    fn document(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(CANVAS))
+            .show(ctx, |ui| {
+                let Some(tab) = self.tabs.get_mut(self.active) else {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space((ui.available_height() * 0.24).max(30.0));
+                        ui.label(RichText::new("Welcome to MyPDF").size(36.0).color(INK));
+                        ui.add_space(14.0);
+                        ui.label(
+                            RichText::new(
+                                "Read, edit, annotate and sign. Your documents stay on your desktop.",
+                            )
+                            .size(16.0)
+                            .color(MUTED),
+                        );
+                        ui.add_space(20.0);
+                        if ui.add(ActionButton::new(Icon::Plus,"New Blank PDF")).clicked() { self.new_blank(ctx); }
+                        if ui
+                            .add(ActionButton::new(Icon::Open, "Open PDF…").primary())
+                            .clicked()
+                        {
+                            self.open_dialog(ctx);
+                        }
+                        ui.add_space(20.0);
+                        ui.label(
+                            RichText::new("Drop files here  •  ⌘O on Mac  /  Ctrl+O on Windows")
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                    });
+                    return;
+                };
+                if let Some(error) = &tab.error {
+                    ui.centered_and_justified(|ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.heading("Could not open this PDF");
+                            ui.label(error);
+                            ui.label(
+                                RichText::new(tab.path.display().to_string())
+                                    .small()
+                                    .color(MUTED),
+                            );
+                        });
+                    });
+                    return;
+                }
+                if tab.pages.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        ui.spinner();
+                        ui.label("Opening PDF…");
+                    });
+                    return;
+                }
+                let available = ui.available_size();
+                let widest = tab.pages.iter().map(|p| p.width).fold(1.0, f32::max);
+                let tallest = tab.pages.iter().map(|p| p.height).fold(1.0, f32::max);
+                let mut pinch_offset = None;
+                let delta = ctx.input(|i| i.zoom_delta());
+                if delta.is_finite() && (delta - 1.).abs() > 0.0001
+                    && let Some((view, offset, old_width)) = tab.document_view
+                    && let Some(pointer) = ctx.pointer_hover_pos()
+                    && view.contains(pointer) && ctx.layer_id_at(pointer) == Some(ui.layer_id())
+                {
+                    let next = (tab.scale * delta).clamp(0.1, 6.);
+                    let new_width = (widest * next).max(available.x - 16.) + 32.;
+                    pinch_offset = Some(pinch_scroll_offset(&tab.pages, tab.scale, next, old_width, new_width, offset, pointer - view.min));
+                    tab.zoom = Zoom::Scale(next);
+                    tab.last_pinch=Some(std::time::Instant::now());
+                    tab.jump = None;
+                }
+                let next_scale = match tab.zoom {
+                    Zoom::Width => (available.x - 64.0) / widest,
+                    Zoom::Page => {
+                        ((available.x - 64.0) / widest).min((available.y - 48.0) / tallest)
+                    }
+                    Zoom::Scale(s) => s,
+                }
+                .clamp(0.1, 6.0);
+                if (tab.scale - next_scale).abs() > 0.005 {
+                    tab.scale = next_scale;
+                    if tab.jump.is_none() && pinch_offset.is_none() {
+                        tab.jump = Some((tab.page, None));
+                    }
+                }
+                let scale = tab.scale;
+                let max_width = tab
+                    .pages
+                    .iter()
+                    .map(|p| p.width * scale)
+                    .fold(available.x - 16.0, f32::max)
+                    + 32.0;
+                let mut tops = Vec::with_capacity(tab.pages.len());
+                let mut height = 24.0;
+                for page in &tab.pages {
+                    tops.push(height);
+                    height += page.height * scale + 24.0;
+                }
+                let mut scroll = egui::ScrollArea::both()
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        drag: self.editor.mode == editing::Mode::Read,
+                        ..Default::default()
+                    })
+                    .id_salt((tab.id, "document"))
+                    .auto_shrink([false, false]);
+                if let Some(offset) = pinch_offset {
+                    scroll = scroll.scroll_offset(offset);
+                }
+                if let Some((page, y)) = tab.jump.take() {
+                    scroll = scroll.vertical_scroll_offset(
+                        (tops[page] + y.unwrap_or(0.0) * scale - 24.0).max(0.0),
+                    );
+                }
+                let mut visible_page = tab.page;
+                let output = scroll.show_viewport(ui, |ui, viewport| {
+                    let (canvas, canvas_response) =
+                        ui.allocate_exact_size(vec2(max_width, height), egui::Sense::click());
+                    if canvas_response.clicked()
+                        && matches!(self.editor.mode, editing::Mode::Read | editing::Mode::Draw | editing::Mode::Annotate)
+                        && let Some(pointer) = canvas_response.interact_pointer_pos()
+                        && !tab.pages.iter().enumerate().any(|(page, size)| {
+                            Rect::from_min_size(canvas.min + vec2((max_width - size.width * scale) / 2., tops[page]), vec2(size.width * scale, size.height * scale)).contains(pointer)
+                        })
+                    {
+                        tab.selected_annotation = None;
+                        self.editor.draft = None;
+                    }
+                    let center = viewport.center().y;
+                    for (page, size) in tab.pages.iter().copied().enumerate() {
+                        let top = tops[page];
+                        let bottom = top + size.height * scale;
+                        if top <= center && bottom + 24.0 >= center {
+                            visible_page = page;
+                        }
+                    }
+                    for (page, top) in tops.iter().copied().enumerate() {
+                        let size = tab.pages[page];
+                        let bottom = top + size.height * scale;
+                        if bottom < viewport.min.y - 300.0 || top > viewport.max.y + 300.0 {
+                            continue;
+                        }
+                        let page_rect = Rect::from_min_size(
+                            canvas.min + vec2((max_width - size.width * scale) / 2.0, top),
+                            vec2(size.width * scale, size.height * scale),
+                        );
+                        ui.painter().rect_filled(
+                            page_rect.translate(vec2(0.0, 3.0)).expand(2.0),
+                            1.0,
+                            Color32::from_black_alpha(16),
+                        );
+                        ui.painter().rect_filled(page_rect, 0.0, Color32::WHITE);
+                        let key =
+                            viewer::raster_key(page, size, scale * ctx.pixels_per_point(), false);
+                        let fallback = tab
+                            .rasters
+                            .keys()
+                            .filter(|k| k.page == page && !k.thumbnail)
+                            .min_by_key(|k| k.scale.abs_diff(key.scale))
+                            .copied();
+                        let settling=tab.last_pinch.is_some_and(|t|t.elapsed()<std::time::Duration::from_millis(120));
+                        if !settling || (fallback.is_none() && !tab.pending.iter().any(|k|k.page==page && !k.thumbnail)) { tab.request(key); }
+                        if settling { ctx.request_repaint_after(std::time::Duration::from_millis(120)); }
+                        if let Some(raster) = tab.rasters.get_mut(&key) {
+                            raster.used = self.tick;
+                            ui.painter().image(
+                                raster.texture.id(),
+                                page_rect,
+                                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        } else if let Some(fallback) = fallback {
+                            if let Some(raster) = tab.rasters.get_mut(&fallback) {
+                                raster.used = self.tick;
+                                ui.painter().image(
+                                    raster.texture.id(),
+                                    page_rect,
+                                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                                    Color32::WHITE,
+                                );
+                            }
+                        } else {
+                            ui.painter().text(
+                                page_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                tab.render_errors
+                                    .get(&page)
+                                    .map(String::as_str)
+                                    .unwrap_or("Rendering page…"),
+                                FontId::proportional(14.0),
+                                MUTED,
+                            );
+                        }
+                        if self.search && !tab.query.is_empty() {
+                            for (index, hit) in
+                                tab.hits.iter().enumerate().filter(|(_, h)| h.page == page)
+                            {
+                                for r in &hit.rects {
+                                    let highlight = Rect::from_min_max(
+                                        page_rect.min + vec2(r[0], r[1]) * scale,
+                                        page_rect.min + vec2(r[2], r[3]) * scale,
+                                    )
+                                    .expand(1.5)
+                                    .intersect(page_rect);
+                                    ui.painter().rect_filled(
+                                        highlight,
+                                        1.0,
+                                        if index == tab.hit {
+                                            Color32::from_rgba_unmultiplied(244, 151, 29, 115)
+                                        } else {
+                                            Color32::from_rgba_unmultiplied(248, 213, 70, 85)
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        editing::page_interaction(
+                            &mut self.editor,
+                            tab,
+                            ui,
+                            page,
+                            page_rect,
+                            scale,
+                            &mut self.status,
+                        );
+                        content::overlay(&mut self.content,self.editor.mode,tab,ui,page,page_rect,scale);
+                        ui.painter().rect_stroke(
+                            page_rect,
+                            0.0,
+                            Stroke::new(1.0, Color32::from_black_alpha(12)),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                });
+                tab.document_view = Some((output.inner_rect, output.state.offset, max_width));
+                if visible_page != tab.page {
+                    tab.page = visible_page;
+                    tab.page_input = (visible_page + 1).to_string();
+                }
+            });
+    }
+    fn trim_cache(&mut self) {
+        let mut total: usize = self
+            .tabs
+            .iter()
+            .flat_map(|t| t.rasters.values())
+            .map(|r| r.bytes)
+            .sum();
+        if total <= CACHE_BUDGET {
+            return;
+        }
+        let mut candidates: Vec<_> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .flat_map(|(i, t)| t.rasters.iter().map(move |(k, r)| (r.used, i, *k, r.bytes)))
+            .collect();
+        candidates.sort_by_key(|r| r.0);
+        for (_, tab, key, bytes) in candidates {
+            if total <= CACHE_BUDGET {
+                break;
+            }
+            self.tabs[tab].rasters.remove(&key);
+            total -= bytes;
+        }
+    }
+}
+
+impl eframe::App for Viewer {
+    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.tick += 1;
+        self.content_events(ctx);
+        self.page_events(ctx);
+        self.events(ctx);
+        self.editor_events();
+        self.digital_events(ctx);
+        self.shortcuts(ctx);
+        self.editor.text_editing = false;
+        self.toolbar(ctx);
+        if !self.home.visible {
+            self.editor_tools(ctx);
+            self.page_tools(ctx);
+            self.content_tools(ctx);
+        }
+        if let Some((status, true)) = &self.status {
+            let status = status.clone();
+            let mut dismiss = false;
+            egui::TopBottomPanel::bottom("status")
+                .frame(
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(255, 244, 240))
+                        .inner_margin(egui::Margin::symmetric(16, 4)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(status)
+                                .size(12.)
+                                .color(Color32::from_rgb(155, 47, 39)),
+                        );
+                        dismiss = ui.small_button("Dismiss").clicked();
+                    });
+                });
+            if dismiss {
+                self.status = None;
+            }
+        }
+        if self.home.visible {
+            self.home_screen(ctx);
+        } else if self.editor.mode == editing::Mode::Pages {
+            if self.inspector {
+                self.organizer_panel(ctx);
+            }
+            self.page_overview(ctx);
+        } else {
+            self.sidebar(ctx);
+            if self.inspector {
+                if matches!(
+                    self.editor.mode,
+                    editing::Mode::Edit | editing::Mode::Forms | editing::Mode::Convert
+                ) {
+                    self.content_panel(ctx);
+                } else {
+                    self.asset_panel(ctx);
+                    if !self.editor.library_open {
+                        self.annotation_inspector(ctx);
+                    }
+                }
+            }
+            self.document(ctx);
+        }
+        self.finish_new_text(ctx);
+        self.page_dialogs(ctx);
+        self.digital_events(ctx);
+        self.editor_windows(ctx);
+        self.digital_window(ctx);
+        self.close_dialog(ctx);
+        if self.exit_approved {
+            for tab in &self.tabs {
+                self.recovery.clear(tab.id);
+            }
+        } else {
+            self.recovery_tick(ctx);
+        }
+        self.recovery_window(ctx);
+        if self.accessible_text {
+            egui::Window::new("Accessible page text")
+                .open(&mut self.accessible_text)
+                .default_size(vec2(520., 420.))
+                .show(ctx, |ui| {
+                    if let Some(tab) = self.tabs.get(self.active) {
+                        ui.label(format!("{} · Page {}", tab.name(), tab.page + 1));
+                        if let Some(text) = tab.text.get(tab.page).and_then(Option::as_ref) {
+                            if text.text.trim().is_empty() {
+                                ui.label("This page contains no extractable text.");
+                            }
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                let mut value = text.text.as_str();
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut value)
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(18),
+                                )
+                                .widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::WidgetType::TextEdit,
+                                        true,
+                                        "Page text",
+                                    )
+                                });
+                            });
+                        } else {
+                            ui.label("Page text is being indexed…");
+                        }
+                    }
+                });
+        }
+        self.trim_cache();
+        if !ctx.input(|i| i.raw.hovered_files.is_empty()) {
+            let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop"));
+            let painter = ctx.layer_painter(layer);
+            let rect = ctx.content_rect();
+            painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(28, 109, 89, 180));
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop PDFs to open",
+                FontId::proportional(30.0),
+                Color32::WHITE,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::App;
+    use std::time::{Duration, Instant};
+
+    fn frame(app: &mut Viewer, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let modifiers = events
+            .iter()
+            .find_map(|event| {
+                if let egui::Event::Key { modifiers, .. } = event {
+                    Some(*modifiers)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1100.0, 760.0))),
+            events,
+            modifiers,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            app.update(ctx, &mut eframe::Frame::_new_kittest())
+        });
+    }
+    fn key(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            },
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers,
+            },
+        ]
+    }
+    fn until(app: &mut Viewer, ctx: &egui::Context, ready: impl Fn(&Viewer) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !ready(app) {
+            assert!(
+                Instant::now() < deadline,
+                "Desktop event loop did not reach the expected state"
+            );
+            frame(app, ctx, vec![]);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn clicks_select_drawings_and_clear_on_empty_page_or_surrounding_canvas() {
+        use mypdf_milestone0::annotations::{Annotation, Kind, Style};
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        until(&mut app, &ctx, |a| a.tabs[0].session.is_some());
+        app.editor.mode = editing::Mode::Draw;
+        app.inspector = true;
+        let line = Annotation::new(
+            0,
+            [100., 100., 280., 260.],
+            Kind::Line {
+                start: [0., 1.],
+                end: [1., 0.],
+                arrow: false,
+            },
+            Style::default(),
+        );
+        let ellipse = Annotation::new(0, [310., 100., 430., 220.], Kind::Ellipse, Style::default());
+        app.tabs[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .commit(vec![line.clone(), ellipse.clone()])
+            .unwrap();
+        let revision = app.tabs[0].session.as_ref().unwrap().revision();
+        app.tabs[0].selected_annotation = Some(line.id.clone());
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let page = |app: &Viewer| {
+            ctx.read_response(egui::Id::new((app.tabs[0].id, 0_usize, "page_actions")))
+                .unwrap()
+                .rect
+        };
+        let click = |app: &mut Viewer, p: egui::Pos2| {
+            for pressed in [true, false] {
+                frame(
+                    app,
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(p),
+                        egui::Event::PointerButton {
+                            pos: p,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+        };
+        for tool in [
+            editing::Tool::Line,
+            editing::Tool::Arrow,
+            editing::Tool::Rectangle,
+            editing::Tool::Pen,
+            editing::Tool::Select,
+        ] {
+            app.editor.select_tool(tool);
+            let rect = page(&app);
+            let scale = app.tabs[0].scale;
+            click(&mut app, rect.min + vec2(110., 110.) * scale);
+            assert!(
+                app.tabs[0].selected_annotation.is_none(),
+                "empty space inside a diagonal line's bounding box must deselect"
+            );
+            assert!(app.editor.draft.is_none());
+            frame(&mut app, &ctx, vec![]);
+            assert!(
+                (page(&app).width() - rect.width()).abs() < 1.,
+                "deselection must not resize the page"
+            );
+            click(&mut app, rect.min + vec2(190., 180.) * scale);
+            assert_eq!(
+                app.tabs[0].selected_annotation.as_deref(),
+                Some(line.id.as_str())
+            );
+            let gray = rect.min + vec2(-16., 70.);
+            click(&mut app, gray);
+            assert!(
+                app.tabs[0].selected_annotation.is_none(),
+                "gray page surround clears selection too"
+            );
+            let rect = page(&app);
+            click(&mut app, rect.min + vec2(370., 160.) * scale);
+            assert_eq!(
+                app.tabs[0].selected_annotation.as_deref(),
+                Some(ellipse.id.as_str())
+            );
+            click(&mut app, rect.min + vec2(312., 102.) * scale);
+            assert!(
+                app.tabs[0].selected_annotation.is_none(),
+                "ellipse bounding-box corners are outside the shape"
+            );
+        }
+        assert_eq!(
+            app.tabs[0].session.as_ref().unwrap().revision(),
+            revision,
+            "selection never edits document contents"
+        );
+    }
+
+    #[test]
+    fn drawing_inspector_updates_on_each_frame_and_groups_slider_undo() {
+        use mypdf_milestone0::annotations::{Annotation, Kind, StrokeStyle, Style};
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        until(&mut app, &ctx, |a| a.tabs[0].session.is_some());
+        app.editor.mode = editing::Mode::Draw;
+        app.inspector = true;
+        let kinds = [
+            Kind::Rectangle,
+            Kind::Ellipse,
+            Kind::Line {
+                start: [0., 0.],
+                end: [1., 1.],
+                arrow: true,
+            },
+            Kind::DoubleArrow {
+                start: [0., 0.],
+                end: [1., 1.],
+            },
+            Kind::Polygon {
+                points: vec![[0., 0.], [1., 0.], [0.5, 1.]],
+                closed: true,
+            },
+            Kind::Ink {
+                strokes: vec![vec![[0., 0.], [1., 1.]]],
+            },
+            Kind::Svg {
+                source: mypdf_milestone0::svg::DEFAULT.into(),
+                tint: false,
+            },
+        ];
+        let bounds = |app: &mut Viewer, label: &str, last: bool| {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1100., 760.))),
+                    ..Default::default()
+                },
+                |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+            );
+            let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+            assert!(
+                !nodes
+                    .iter()
+                    .any(|(_, n)| matches!(n.label(), Some("Apply" | "Reset")))
+            );
+            let matches: Vec<_> = nodes
+                .iter()
+                .filter(|(_, n)| n.label() == Some(label))
+                .collect();
+            let node = if last {
+                matches.last()
+            } else {
+                matches.first()
+            }
+            .unwrap_or_else(|| panic!("missing {label}"));
+            let r = node.1.bounds().unwrap();
+            Rect::from_min_max(
+                pos2(r.x0 as f32, r.y0 as f32),
+                pos2(r.x1 as f32, r.y1 as f32),
+            )
+        };
+        let pointer = |p, pressed| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let click = |app: &mut Viewer, p| {
+            for pressed in [true, false] {
+                frame(
+                    app,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(p), pointer(p, pressed)],
+                );
+            }
+        };
+        for kind in kinds {
+            let mark = Annotation::new(0, [100., 100., 250., 200.], kind, Style::default());
+            app.tabs[0]
+                .session
+                .as_mut()
+                .unwrap()
+                .commit(vec![mark.clone()])
+                .unwrap();
+            app.tabs[0].selected_annotation = Some(mark.id.clone());
+            app.editor.draft = None;
+            for _ in 0..3 {
+                frame(&mut app, &ctx, vec![]);
+            }
+            let blue = bounds(&mut app, "Blue color", false).center();
+            click(&mut app, blue);
+            assert_eq!(
+                app.tabs[0].session.as_ref().unwrap().annotations[0]
+                    .style
+                    .color,
+                [0.15, 0.49, 0.85]
+            );
+            if !matches!(mark.kind, Kind::Svg { .. }) {
+                for style in StrokeStyle::ALL {
+                    let button =
+                        bounds(&mut app, &format!("{} stroke style", style.label()), false)
+                            .center();
+                    click(&mut app, button);
+                    assert_eq!(
+                        app.tabs[0].session.as_ref().unwrap().annotations[0]
+                            .style
+                            .stroke,
+                        style
+                    );
+                }
+            }
+            let before = app.tabs[0].session.as_ref().unwrap().annotations[0].clone();
+            let slider = bounds(&mut app, "Opacity", true);
+            let at =
+                |fraction: f32| pos2(slider.left() + slider.width() * fraction, slider.center().y);
+            frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(at(0.85)), pointer(at(0.85), true)],
+            );
+            let mut last_opacity = 1.;
+            for fraction in [0.7, 0.5, 0.3] {
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(at(fraction))],
+                );
+                let s = app.tabs[0].session.as_ref().unwrap();
+                assert!(
+                    s.annotations[0].style.opacity < last_opacity,
+                    "opacity must change before mouse release"
+                );
+                last_opacity = s.annotations[0].style.opacity;
+                assert!(s.dirty());
+            }
+            frame(&mut app, &ctx, vec![pointer(at(0.3), false)]);
+            let after = app.tabs[0].session.as_ref().unwrap().annotations[0].clone();
+            app.editor_undo(false);
+            assert_eq!(
+                app.tabs[0].session.as_ref().unwrap().annotations[0],
+                before,
+                "one Undo reverses the entire slider gesture"
+            );
+            app.editor_undo(true);
+            assert_eq!(app.tabs[0].session.as_ref().unwrap().annotations[0], after);
+            let saved = app.tabs[0]
+                .session
+                .as_ref()
+                .unwrap()
+                .snapshot_bytes()
+                .unwrap();
+            assert_eq!(
+                mypdf_milestone0::annotations::load(&lopdf::Document::load_mem(&saved).unwrap()),
+                vec![after]
+            );
+        }
+    }
+
+    #[test]
+    fn sign_ribbon_menu_routes_visual_and_certificate_signatures() {
+        for (main_ribbon, digital) in [(true, false), (true, true), (false, false), (false, true)] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+            app.new_blank(&ctx);
+            until(&mut app, &ctx, |a| a.tabs[0].session.is_some());
+            app.editor.mode = editing::Mode::Draw;
+            let bounds = |app: &mut Viewer, label: &str, last: bool| {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1100., 760.))),
+                        ..Default::default()
+                    },
+                    |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+                );
+                let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+                let matches: Vec<_> = nodes
+                    .iter()
+                    .filter(|(_, n)| n.label() == Some(label))
+                    .collect();
+                let n = if last {
+                    matches.last()
+                } else {
+                    matches.first()
+                }
+                .unwrap_or_else(|| panic!("missing {label}"));
+                let r = n.1.bounds().unwrap();
+                pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32)
+            };
+            let click = |app: &mut Viewer, p| {
+                for pressed in [true, false] {
+                    frame(
+                        app,
+                        &ctx,
+                        vec![
+                            egui::Event::PointerMoved(p),
+                            egui::Event::PointerButton {
+                                pos: p,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                }
+            };
+            for _ in 0..3 {
+                frame(&mut app, &ctx, vec![]);
+            }
+            let sign = bounds(&mut app, "Sign", !main_ribbon);
+            click(&mut app, sign);
+            for _ in 0..3 {
+                frame(&mut app, &ctx, vec![]);
+            }
+            let visual = bounds(&mut app, "Signature", false);
+            let certificate = bounds(&mut app, "Digital Signature", false);
+            assert!(
+                certificate.y > visual.y,
+                "menu order is Signature, then Digital Signature"
+            );
+            click(&mut app, if digital { certificate } else { visual });
+            assert_eq!(app.digital.open, digital);
+            assert_eq!(app.editor.signature_open, !digital);
+            if digital {
+                assert!(app.digital.panel == digital::Panel::Sign);
+                assert!(app.editor.mode == editing::Mode::Sign);
+            } else {
+                assert!(app.editor.mode == editing::Mode::Annotate);
+            }
+            assert_eq!(
+                app.tabs[0].session.as_ref().unwrap().revision(),
+                0,
+                "opening a menu never signs or changes the document"
+            );
+        }
+    }
+    #[test]
+    fn home_to_add_text_types_in_place_and_reopens_saved_pdf() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        until(&mut app, &ctx, |a| a.tabs[0].session.is_some());
+        app.editor.mode = editing::Mode::Edit;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1100., 760.))),
+                ..Default::default()
+            },
+            |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+        );
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let r = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Add text"))
+            .unwrap()
+            .1
+            .bounds()
+            .unwrap();
+        let button = pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32);
+        let click = |app: &mut Viewer, p| {
+            for pressed in [true, false] {
+                frame(
+                    app,
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(p),
+                        egui::Event::PointerButton {
+                            pos: p,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+        };
+        click(&mut app, button);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let page = ctx
+            .read_response(egui::Id::new((
+                app.tabs[0].id,
+                0_usize,
+                "add_text_position",
+            )))
+            .unwrap()
+            .rect;
+        let point = page.min + vec2(80., 100.);
+        click(&mut app, point);
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Text("Typed in place on this page".into())],
+        );
+        let text_id = egui::Id::new((app.tabs[0].id, 0_usize, "inline_new_text"));
+        assert!(
+            ctx.memory(|m| m.has_focus(text_id)),
+            "Typing must focus the on-page editor"
+        );
+        let text_box = ctx.read_response(text_id).unwrap().rect;
+        assert!(
+            text_box.min.distance(point) < 1.,
+            "Text must start at the clicked point"
+        );
+        app.show_home();
+        assert!(app.home.visible && app.tabs.len() == 1);
+        frame(&mut app, &ctx, vec![]);
+        app.home.visible = false;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        frame(
+            &mut app,
+            &ctx,
+            key(egui::Key::Enter, egui::Modifiers::COMMAND),
+        );
+        until(&mut app, &ctx, |a| {
+            !a.content.busy && a.tabs[0].session.as_ref().unwrap().revision() > 0
+        });
+        let saved = app.tabs[0]
+            .session
+            .as_ref()
+            .unwrap()
+            .snapshot_bytes()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("In-place text.pdf");
+        viewer::save_copy(&path, &saved).unwrap();
+        app.open(path, &ctx);
+        until(&mut app, &ctx, |a| a.tabs[1].index_done);
+        assert!(
+            app.tabs[1].text[0]
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("Typed in place on this page")
+        );
+        assert!(!app.tabs[1].session.as_ref().unwrap().dirty());
+    }
+
+    #[test]
+    fn pinch_zoom_is_anchored_and_only_changes_the_document() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        until(&mut app, &ctx, |a| a.tabs[0].session.is_some());
+        app.action("actual", &ctx);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let (view, offset, width) = app.tabs[0].document_view.unwrap();
+        let pointer = view.center();
+        let page = app.tabs[0].pages[0];
+        let before = vec2(
+            offset.x + pointer.x - view.min.x - (width - page.width) / 2.,
+            offset.y + pointer.y - view.min.y - 24.,
+        );
+        let ui_zoom = ctx.zoom_factor();
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(pointer), egui::Event::Zoom(1.5)],
+        );
+        assert_eq!(app.tabs[0].scale, 1.5);
+        assert_eq!(ctx.zoom_factor(), ui_zoom);
+        let (after_view, after_offset, after_width) = app.tabs[0].document_view.unwrap();
+        let after = vec2(
+            (after_offset.x + pointer.x - after_view.min.x - (after_width - page.width * 1.5) / 2.)
+                / 1.5,
+            (after_offset.y + pointer.y - after_view.min.y - 24.) / 1.5,
+        );
+        assert!(
+            (before - after).length() < 1.,
+            "anchor moved: {before:?} -> {after:?}"
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(pos2(10., 10.)),
+                egui::Event::Zoom(2.),
+            ],
+        );
+        assert_eq!(app.tabs[0].scale, 1.5);
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(pointer), egui::Event::Zoom(0.5)],
+        );
+        assert_eq!(app.tabs[0].scale, 0.75);
+    }
+
+    #[test]
+    fn desktop_event_loop_search_navigation_tabs_and_error_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("original.pdf");
+        let second = temp.path().join("edited.pdf");
+        let bytes = mypdf_milestone0::document::fixture(
+            &mypdf_milestone0::document::default_font().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&first, &bytes).unwrap();
+        std::fs::write(&second, &bytes).unwrap();
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = Viewer::new(&cc, vec![first.clone(), second]);
+        until(&mut app, &ctx, |a| {
+            a.tabs.iter().all(|t| t.index_done) && !a.tabs[1].rasters.is_empty()
+        });
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active, 1);
+        app.action("actual", &ctx);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.tabs[1].scale, 1.0);
+        app.action("find", &ctx);
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![egui::Event::Text("sözleşme".into())]);
+        until(&mut app, &ctx, |a| a.tabs[1].hits.len() == 2);
+        let (menu_tx, menu_rx) = mpsc::channel();
+        app.menu_events = menu_rx;
+        menu_tx.send("select_all".into()).unwrap();
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![egui::Event::Text("sözleşme".into())]);
+        assert_eq!(
+            app.tabs[1].query, "sözleşme",
+            "Native Select All must reach egui text fields"
+        );
+        assert_eq!(app.tabs[1].query, "sözleşme");
+        until(&mut app, &ctx, |a| {
+            !a.tabs[1].search_dirty && !a.tabs[1].searching && a.tabs[1].hits.len() == 2
+        });
+        assert_eq!(app.tabs[1].hit, 0);
+        frame(&mut app, &ctx, key(egui::Key::Enter, egui::Modifiers::NONE));
+        assert_eq!(
+            app.tabs[1].hit, 1,
+            "Enter must navigate even when TextEdit surrenders focus"
+        );
+        assert_eq!(app.tabs[1].page, 1);
+        frame(
+            &mut app,
+            &ctx,
+            key(egui::Key::Enter, egui::Modifiers::SHIFT),
+        );
+        assert_eq!(app.tabs[1].hit, 0);
+        frame(&mut app, &ctx, key(egui::Key::Tab, egui::Modifiers::CTRL));
+        assert_eq!(app.active, 0);
+        assert_eq!(app.tabs[0].query, "");
+        assert!(app.tabs[0].zoom == Zoom::Width);
+        frame(&mut app, &ctx, key(egui::Key::Tab, egui::Modifiers::CTRL));
+        assert_eq!(app.active, 1);
+        assert_eq!(app.tabs[1].query, "sözleşme");
+        assert_eq!(app.tabs[1].scale, 1.0);
+        app.open(first, &ctx);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active, 0);
+        let invalid = temp.path().join("invalid.pdf");
+        std::fs::write(&invalid, b"invalid PDF").unwrap();
+        app.open(invalid, &ctx);
+        until(&mut app, &ctx, |a| a.tabs[2].error.is_some());
+        assert!(app.tabs[0].bytes.is_some() && app.tabs[1].bytes.is_some());
+        app.close(2);
+        assert_eq!(app.tabs.len(), 2);
+    }
+    #[test]
+    fn editing_canvas_keeps_drag_gestures_when_the_page_overflows_the_scroll_viewport() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("scroll-canvas.pdf");
+        std::fs::write(
+            &path,
+            mypdf_milestone0::document::fixture(
+                &mypdf_milestone0::document::default_font().unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = Viewer::new(&cc, vec![path]);
+        until(&mut app, &ctx, |a| a.tabs[0].index_done);
+        app.action("actual", &ctx);
+        app.editor.mode = editing::Mode::Annotate;
+        app.editor.select_tool(editing::Tool::Rectangle);
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let rect = ctx
+            .read_response(egui::Id::new((app.tabs[0].id, 0_usize, "page_actions")))
+            .unwrap()
+            .rect;
+        let start = rect.min + vec2(150.0, 250.0);
+        let end = rect.min + vec2(300.0, 320.0);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(start + vec2(20.0, 20.0))],
+        );
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(end)]);
+        frame(&mut app, &ctx, vec![button(end, false)]);
+        let session = app.tabs[0].session.as_ref().unwrap();
+        assert_eq!(
+            session.annotations.len(),
+            1,
+            "The viewer scroll area must not capture annotation drags"
+        );
+        assert_eq!(session.revision(), 1, "A gesture must commit once");
+        assert_eq!(session.annotations[0].rect, [150.0, 250.0, 300.0, 320.0]);
+    }
+    #[test]
+    fn organizer_drag_transactions_reload_search_and_share_annotation_undo() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pages.pdf");
+        let original = mypdf_milestone0::document::fixture(
+            &mypdf_milestone0::document::default_font().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = Viewer::new(&cc, vec![path.clone()]);
+        until(&mut app, &ctx, |a| a.tabs[0].index_done);
+        let annotation = mypdf_milestone0::annotations::Annotation::new(
+            0,
+            [60.0, 70.0, 180.0, 100.0],
+            mypdf_milestone0::annotations::Kind::Rectangle,
+            Default::default(),
+        );
+        app.tabs[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .commit(vec![annotation])
+            .unwrap();
+        app.editor.mode = editing::Mode::Pages;
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let first = ctx
+            .read_response(egui::Id::new((app.tabs[0].id, 0_usize, "organizer_page")))
+            .unwrap()
+            .rect;
+        let second = ctx
+            .read_response(egui::Id::new((app.tabs[0].id, 1_usize, "organizer_page")))
+            .unwrap()
+            .rect;
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            pressed,
+            button: egui::PointerButton::Primary,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let target = second.center() + vec2(20.0, 0.0);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(first.center()),
+                button(first.center(), true),
+                egui::Event::PointerMoved(target),
+                button(target, false),
+            ],
+        );
+        until(&mut app, &ctx, |a| {
+            !a.organizer.busy
+                && a.tabs[0].index_done
+                && a.tabs[0].session.as_ref().unwrap().revision() == 2
+        });
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().annotations[0].page, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        app.editor_undo(false);
+        frame(&mut app, &ctx, vec![]);
+        until(&mut app, &ctx, |a| a.tabs[0].index_done);
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().annotations[0].page, 0);
+        app.editor_undo(true);
+        frame(&mut app, &ctx, vec![]);
+        until(&mut app, &ctx, |a| a.tabs[0].index_done);
+        app.page_change(
+            &ctx,
+            mypdf_milestone0::pages::Operation::Crop {
+                pages: vec![1],
+                margins: [18.0; 4],
+            },
+        );
+        until(&mut app, &ctx, |a| {
+            !a.organizer.busy
+                && a.tabs[0].index_done
+                && a.tabs[0].session.as_ref().unwrap().revision() == 3
+        });
+        let result = app.tabs[0]
+            .session
+            .as_ref()
+            .unwrap()
+            .snapshot_bytes()
+            .unwrap();
+        let output = temp.path().join("organized.pdf");
+        mypdf_milestone0::write_new(&output, &result).unwrap();
+        app.open(output, &ctx);
+        until(&mut app, &ctx, |a| a.tabs[1].index_done);
+        assert_eq!(app.tabs[1].session.as_ref().unwrap().annotations[0].page, 1);
+        assert!(!app.tabs[1].session.as_ref().unwrap().dirty());
+        assert_eq!(app.tabs[0].pages[1].width, app.tabs[1].pages[1].width);
+    }
+    #[test]
+    fn content_transactions_refresh_search_undo_and_safe_copy() {
+        use mypdf_milestone0::{content as core, document};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.pdf");
+        let original = document::fixture(&document::default_font().unwrap()).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(
+            &eframe::CreationContext::_new_kittest(ctx.clone()),
+            vec![path.clone()],
+        );
+        until(&mut app, &ctx, |a| a.tabs[0].index_done);
+        app.editor.mode = editing::Mode::Edit;
+        let (ordinal, run) = document::text_runs(&original, 1)
+            .unwrap()
+            .into_iter()
+            .enumerate()
+            .find(|(_, r)| r.text == document::ORIGINAL)
+            .unwrap();
+        app.content_change(
+            &ctx,
+            content::Edit::Text {
+                page: 1,
+                ordinal,
+                original: run.text,
+                replacement: document::REPLACEMENT.into(),
+            },
+        );
+        until(&mut app, &ctx, |a| {
+            !a.content.busy
+                && a.tabs[0].index_done
+                && a.tabs[0].session.as_ref().unwrap().revision() == 1
+        });
+        assert!(
+            app.tabs[0].text[0]
+                .as_ref()
+                .unwrap()
+                .text
+                .contains(document::REPLACEMENT)
+        );
+        let source = app.tabs[0].session.as_ref().unwrap().source.clone();
+        let image = core::images(&source, 1).unwrap()[0].clone();
+        app.content_change(
+            &ctx,
+            content::Edit::Image {
+                page: 1,
+                index: image.index,
+                edit: core::ImageEdit::Delete,
+            },
+        );
+        until(&mut app, &ctx, |a| {
+            !a.content.busy
+                && a.tabs[0].index_done
+                && a.tabs[0].session.as_ref().unwrap().revision() == 2
+        });
+        assert!(
+            core::images(&app.tabs[0].session.as_ref().unwrap().source, 1)
+                .unwrap()
+                .is_empty()
+        );
+        app.editor_undo(false);
+        frame(&mut app, &ctx, vec![]);
+        until(&mut app, &ctx, |a| a.tabs[0].index_done);
+        assert_eq!(
+            core::images(&app.tabs[0].session.as_ref().unwrap().source, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        let output = temp.path().join("edited.pdf");
+        mypdf_milestone0::write_new(
+            &output,
+            &app.tabs[0]
+                .session
+                .as_ref()
+                .unwrap()
+                .snapshot_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        app.open(output, &ctx);
+        until(&mut app, &ctx, |a| a.tabs[1].index_done);
+        assert!(
+            app.tabs[1].text[0]
+                .as_ref()
+                .unwrap()
+                .text
+                .contains(document::REPLACEMENT)
+        );
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+    #[test]
+    fn blank_document_is_unsaved_and_blank_page_is_undoable() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        until(&mut app, &ctx, |a| a.tabs[0].index_done);
+        assert!(app.tabs[0].session.as_ref().unwrap().dirty());
+        app.page_change(
+            &ctx,
+            mypdf_milestone0::pages::Operation::InsertBlank {
+                at: 1,
+                width: 595.,
+                height: 842.,
+            },
+        );
+        until(&mut app, &ctx, |a| {
+            !a.organizer.busy && a.tabs[0].pages.len() == 2 && a.tabs[0].index_done
+        });
+        app.editor_undo(false);
+        frame(&mut app, &ctx, vec![]);
+        until(&mut app, &ctx, |a| {
+            a.tabs[0].pages.len() == 1 && a.tabs[0].index_done
+        });
+    }
+
+    #[test]
+    fn responsive_mode_controls_have_accessible_labels_and_stay_in_bounds() {
+        for width in [720., 1200.] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+            app.home.visible = false;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(width, 820.))),
+                    ..Default::default()
+                },
+                |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+            );
+            let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+            let mut previous = 0.;
+            for label in [
+                "Read", "Annotate", "Edit", "Draw", "Forms", "Sign", "Pages", "Export",
+            ] {
+                let node = &nodes
+                    .iter()
+                    .find(|(_, n)| n.label() == Some(label))
+                    .unwrap()
+                    .1;
+                let r = node.bounds().unwrap();
+                assert!(
+                    r.x0 >= previous && r.x1 <= width as f64,
+                    "{label} is clipped or overlaps at width {width}: {r:?}"
+                );
+                previous = r.x1;
+            }
+            for label in ["Toggle left panel", "Toggle right panel", "Find"] {
+                let r = nodes
+                    .iter()
+                    .find(|(_, n)| n.label() == Some(label))
+                    .unwrap()
+                    .1
+                    .bounds()
+                    .unwrap();
+                assert!(
+                    r.x0 >= previous && r.x1 <= width as f64,
+                    "{label} is clipped"
+                );
+            }
+            app.action("sidebar", &ctx);
+            assert!(!app.sidebar && app.inspector);
+            app.action("inspector", &ctx);
+            assert!(!app.sidebar && !app.inspector);
+            app.action("sidebar", &ctx);
+            assert!(app.sidebar && !app.inspector);
+        }
+    }
+}

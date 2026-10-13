@@ -1,0 +1,286 @@
+//! Manual visual QA of the actual egui layout, without a window server.
+//! Run with MYPDF_PREVIEW_DIR and `cargo test --bin mypdf native_visual_preview -- --ignored`.
+use super::*;
+use eframe::App;
+
+#[derive(Default)]
+struct Preview {
+    textures: HashMap<egui::TextureId, egui::ColorImage>,
+}
+impl Preview {
+    fn capture(&mut self, app: &mut Viewer, ctx: &egui::Context) -> egui::FullOutput {
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 820.0))),
+                max_texture_side: Some(8192),
+                ..Default::default()
+            },
+            |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+        );
+        for (id, delta) in &output.textures_delta.set {
+            let egui::ImageData::Color(image) = &delta.image;
+            if let Some([x, y]) = delta.pos {
+                let target = self.textures.get_mut(id).unwrap();
+                for row in 0..image.size[1] {
+                    let offset = (y + row) * target.size[0] + x;
+                    target.pixels[offset..offset + image.size[0]].copy_from_slice(
+                        &image.pixels[row * image.size[0]..(row + 1) * image.size[0]],
+                    );
+                }
+            } else {
+                self.textures.insert(*id, (**image).clone());
+            }
+        }
+        output
+    }
+    fn save(&self, ctx: &egui::Context, output: egui::FullOutput, path: &std::path::Path) {
+        let scale = output.pixels_per_point;
+        let (w, h) = ((1200.0 * scale) as u32, (820.0 * scale) as u32);
+        let mut canvas = image::RgbaImage::from_pixel(w, h, image::Rgba([232, 237, 245, 255]));
+        let cross = |a: egui::Vec2, b: egui::Vec2| a.x * b.y - a.y * b.x;
+        for primitive in ctx.tessellate(output.shapes, scale) {
+            let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive else {
+                continue;
+            };
+            let Some(texture) = self.textures.get(&mesh.texture_id) else {
+                continue;
+            };
+            for triangle in mesh.indices.chunks_exact(3) {
+                let v = triangle.map_vertices(&mesh.vertices);
+                let points = v.map(|vertex| vertex.pos.to_vec2() * scale);
+                let area = cross(points[1] - points[0], points[2] - points[0]);
+                if area.abs() < 0.0001 {
+                    continue;
+                }
+                let minimum = points
+                    .iter()
+                    .fold(primitive.clip_rect.min.to_vec2() * scale, |a, p| {
+                        a.max(p.min(points[0]).min(points[1]).min(points[2]))
+                    });
+                let maximum = points
+                    .iter()
+                    .fold(primitive.clip_rect.max.to_vec2() * scale, |a, p| {
+                        a.min(p.max(points[0]).max(points[1]).max(points[2]))
+                    });
+                for y in (minimum.y.floor().max(0.0) as u32)
+                    ..(maximum.y.ceil().min(h as f32).max(0.0) as u32)
+                {
+                    for x in (minimum.x.floor().max(0.0) as u32)
+                        ..(maximum.x.ceil().min(w as f32).max(0.0) as u32)
+                    {
+                        let p = vec2(x as f32 + 0.5, y as f32 + 0.5);
+                        let weights = [
+                            cross(points[1] - p, points[2] - p) / area,
+                            cross(points[2] - p, points[0] - p) / area,
+                            cross(points[0] - p, points[1] - p) / area,
+                        ];
+                        if weights.iter().any(|v| *v < -0.0001) {
+                            continue;
+                        }
+                        let uv = (0..3).fold(egui::Vec2::ZERO, |sum, i| {
+                            sum + v[i].uv.to_vec2() * weights[i]
+                        });
+                        let tx = (uv.x * texture.size[0] as f32)
+                            .floor()
+                            .clamp(0.0, (texture.size[0] - 1) as f32)
+                            as usize;
+                        let ty = (uv.y * texture.size[1] as f32)
+                            .floor()
+                            .clamp(0.0, (texture.size[1] - 1) as f32)
+                            as usize;
+                        let sampled = texture.pixels[ty * texture.size[0] + tx].to_array();
+                        let mut src = [0.0; 4];
+                        for c in 0..4 {
+                            src[c] = (0..3)
+                                .map(|i| v[i].color.to_array()[c] as f32 * weights[i])
+                                .sum::<f32>()
+                                * sampled[c] as f32
+                                / 255.0;
+                        }
+                        let dst = canvas.get_pixel_mut(x, y);
+                        for c in 0..3 {
+                            dst[c] = (src[c] + dst[c] as f32 * (1.0 - src[3] / 255.0))
+                                .clamp(0.0, 255.0) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        canvas.save(path).unwrap();
+    }
+}
+trait TriangleVertices {
+    fn map_vertices(&self, vertices: &[egui::epaint::Vertex]) -> [egui::epaint::Vertex; 3];
+}
+impl TriangleVertices for [u32] {
+    fn map_vertices(&self, vertices: &[egui::epaint::Vertex]) -> [egui::epaint::Vertex; 3] {
+        [
+            vertices[self[0] as usize],
+            vertices[self[1] as usize],
+            vertices[self[2] as usize],
+        ]
+    }
+}
+
+#[test]
+#[ignore = "Manual visual QA; writes only to the explicitly selected preview directory"]
+fn native_visual_preview() {
+    let root = PathBuf::from(std::env::var_os("MYPDF_PREVIEW_DIR").expect("Set MYPDF_PREVIEW_DIR"));
+    std::fs::create_dir_all(&root).unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let pdf = fixture.path().join("Document.pdf");
+    let source =
+        mypdf_milestone0::document::fixture(&mypdf_milestone0::document::default_font().unwrap())
+            .unwrap();
+    let source = if std::env::var("MYPDF_PREVIEW_ONLY").as_deref() == Ok("AddText") {
+        mypdf_milestone0::convert::blank(595., 842.).unwrap()
+    } else {
+        source
+    };
+    std::fs::write(&pdf, source).unwrap();
+    let ctx = egui::Context::default();
+    ctx.set_pixels_per_point(2.0);
+    let mut app = Viewer::new(
+        &eframe::CreationContext::_new_kittest(ctx.clone()),
+        vec![pdf],
+    );
+    app.editor.mode = editing::Mode::Annotate;
+    app.tabs[0].zoom = Zoom::Page;
+    let mut preview = Preview::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !app.tabs[0].index_done || !app.tabs[0].rasters.keys().any(|key| !key.thumbnail) {
+        assert!(std::time::Instant::now() < deadline);
+        preview.capture(&mut app, &ctx);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    for collection in [
+        "Home",
+        "HomeEmpty",
+        "Viewer",
+        "Arrows",
+        "Symbols",
+        "Stamps",
+        "Pages",
+        "Crop",
+        "Edit",
+        "InlineText",
+        "BlockText",
+        "Images",
+        "Convert",
+        "Draw",
+        "Inspector",
+        "AddText",
+        "Prompt",
+        "Confirmation",
+    ] {
+        if let Ok(only) = std::env::var("MYPDF_PREVIEW_ONLY")
+            && !only.split(',').any(|v| v.eq_ignore_ascii_case(collection))
+        {
+            continue;
+        }
+        app.home.visible = matches!(collection, "Home" | "HomeEmpty");
+        if collection == "Home" {
+            for (i, name) in [
+                "Getting started",
+                "Project notes",
+                "Research paper",
+                "Design review",
+                "Meeting minutes",
+                "Reading list",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let path = fixture.path().join(format!("{name}.pdf"));
+                let bytes = mypdf_milestone0::convert::text_to_pdf(&format!("# {name}\n\nMyPDF workspace\n\nA place for your documents and ideas.\n\n## Notes\n\nOpen a PDF to read, annotate, edit, or sign.\n\nKeep your important files in Favorites."), true).unwrap();
+                std::fs::write(&path, bytes).unwrap();
+                app.home.remember(&path);
+                if i == 0 || i == 2 {
+                    app.home.preview_favorite(&path);
+                }
+            }
+        }
+        if collection == "HomeEmpty" {
+            app.home.preview_clear();
+        }
+        app.editor.mode = if matches!(collection, "Pages" | "Crop") {
+            editing::Mode::Pages
+        } else {
+            editing::Mode::Annotate
+        };
+        if matches!(collection, "Edit" | "Images" | "InlineText" | "BlockText") {
+            app.editor.mode = editing::Mode::Edit;
+            app.content.image_mode = collection == "Images";
+        }
+        if collection == "Convert" {
+            app.editor.mode = editing::Mode::Convert;
+        }
+        if matches!(collection, "Draw" | "Inspector" | "Prompt") {
+            app.editor.mode = editing::Mode::Draw;
+        }
+        if collection == "Inspector" {
+            let a = mypdf_milestone0::annotations::Annotation::new(
+                0,
+                [250., 340., 430., 480.],
+                mypdf_milestone0::annotations::Kind::Ellipse,
+                mypdf_milestone0::annotations::Style {
+                    fill: Some([0.11, 0.43, 0.35]),
+                    opacity: 0.5,
+                    ..Default::default()
+                },
+            );
+            app.tabs[0].selected_annotation = Some(a.id.clone());
+            app.tabs[0]
+                .session
+                .as_mut()
+                .unwrap()
+                .commit(vec![a])
+                .unwrap();
+        }
+        if collection == "AddText" {
+            app.editor.mode = editing::Mode::Edit;
+            app.content.text_preview(app.tabs[0].id);
+        }
+        if collection == "Prompt" {
+            app.editor.create_stamp_prompt();
+        }
+        if collection == "Confirmation" {
+            app.editor.svg_preview_close();
+            app.tabs[0].session.as_mut().unwrap().mark_unsaved();
+            app.close_intent = Some(Some(app.tabs[0].id));
+        }
+        app.organizer.crop = collection == "Crop";
+        app.editor.library_open = matches!(collection, "Arrows" | "Symbols" | "Stamps");
+        app.editor.library_tab = collection.into();
+        for _ in 0..16 {
+            preview.capture(&mut app, &ctx);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !app.tabs[0].pending.is_empty()
+            || app.content.loading
+            || (app.home.visible && app.home.preview_pending())
+        {
+            assert!(std::time::Instant::now() < deadline);
+            preview.capture(&mut app, &ctx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if collection == "InlineText" {
+            app.content.existing_preview(app.tabs[0].id);
+            for _ in 0..3 {
+                preview.capture(&mut app, &ctx);
+            }
+        }
+        if collection == "BlockText" {
+            app.content.block_preview(app.tabs[0].id);
+            for _ in 0..3 {
+                preview.capture(&mut app, &ctx);
+            }
+        }
+        let output = preview.capture(&mut app, &ctx);
+        preview.save(
+            &ctx,
+            output,
+            &root.join(format!("{}.png", collection.to_lowercase())),
+        );
+    }
+}
