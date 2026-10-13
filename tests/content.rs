@@ -484,10 +484,12 @@ fn added_text_embeds_selected_styles_and_preserves_alignment() {
             .unwrap()
             .as_stream()
             .unwrap();
-        assert_eq!(
-            font.get_plain_content().unwrap(),
-            std::fs::read(&face.path).unwrap()
-        );
+        // Only the glyphs used are embedded, as a tagged subset of the chosen face.
+        let program = font.get_plain_content().unwrap();
+        assert!(program.len() * 4 < std::fs::read(&face.path).unwrap().len());
+        assert!(ttf_parser::Face::parse(&program, 0).is_ok());
+        let name = descriptor.get(b"FontName").unwrap().as_name().unwrap();
+        assert_eq!(name[6], b'+', "subset fonts carry a six-letter tag");
     }
     assert_eq!(xs[0], 50.);
     assert!(xs[1] > xs[0] && xs[2] > xs[1]);

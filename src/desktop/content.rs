@@ -41,7 +41,8 @@ struct Inspection {
     images: Result<Vec<content::ImageObject>, String>,
     fields: Result<Vec<forms::Field>, String>,
 }
-type Change = Result<(u64, u64, Vec<u8>), String>;
+/// Tab, base revision, new bytes, and an optional note for the status bar.
+type Change = Result<(u64, u64, Vec<u8>, Option<String>), String>;
 type Output = Result<(String, Option<PathBuf>), String>;
 #[derive(Clone)]
 pub(super) enum Edit {
@@ -273,7 +274,7 @@ impl Viewer {
         for result in changes {
             self.content.busy = false;
             match result {
-                Ok((id, revision, bytes)) => {
+                Ok((id, revision, bytes, note)) => {
                     if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id)
                         && let Some(s) = &mut tab.session
                     {
@@ -322,7 +323,13 @@ impl Viewer {
                                 } else {
                                     self.content.add_target = None;
                                 }
-                                self.status=Some(("Changes applied • Undo is available • Save a Copy to keep them".into(),false));
+                                self.status = Some((
+                                    note.unwrap_or_else(|| {
+                                        "Changes applied • Undo is available • Save a Copy to keep them"
+                                            .into()
+                                    }),
+                                    false,
+                                ));
                             }
                             Err(e) => {
                                 self.content.inserting_text = false;
@@ -419,6 +426,7 @@ impl Viewer {
                     } else {
                         mypdf_milestone0::annotations::export(&source, &annotations)?
                     };
+                    let mut note = None;
                     let result = match edit {
                         Edit::AddText {
                             page,
@@ -440,13 +448,20 @@ impl Viewer {
                             let run = runs
                                 .get(ordinal)
                                 .ok_or_else(|| anyhow::anyhow!("Text object no longer exists"))?;
-                            document::replace_text_object(
+                            let (bytes, families) = document::replace_text_object_reporting(
                                 &bytes,
                                 page,
                                 run.operator_index,
                                 &original,
                                 &replacement,
-                            )?
+                            )?;
+                            if !families.is_empty() {
+                                note = Some(format!(
+                                    "This PDF’s font lacks some of these characters, so the text now uses {}.",
+                                    families.join(", ")
+                                ));
+                            }
+                            bytes
                         }
                         Edit::Image { page, index, edit } => {
                             content::edit_image(&bytes, page, index, &edit)?
@@ -454,7 +469,7 @@ impl Viewer {
                         Edit::Field { id, value } => forms::fill(&bytes, id, &value)?,
                         Edit::Block { page, block } => text_block::replace(&bytes, page, &block)?,
                     };
-                    Ok((id, revision, result))
+                    Ok((id, revision, result, note))
                 }))
                 .map_err(|_| "The PDF could not be edited. Your document is unchanged.".into())
                 .and_then(|r| r.map_err(|e| format!("{e:#}")));
@@ -532,16 +547,16 @@ impl Viewer {
         let page = self.tabs.get(self.active).map_or(0, |t| t.page);
         let mut change = None;
         let mut replace = None;
-        egui::SidePanel::right("content_inspector").exact_width(310.).resizable(false).frame(egui::Frame::new().fill(PAPER).inner_margin(18.)).show(ctx,|ui|{
-            ui.heading(if mode==editing::Mode::Forms{"Fill forms"}else{"Edit PDF"});ui.label(RichText::new(format!("Page {}",page+1)).small().color(MUTED));ui.add_space(12.);
+        egui::SidePanel::right("content_inspector").exact_width(310.).resizable(false).frame(egui::Frame::new().fill(theme::paper()).inner_margin(18.)).show(ctx,|ui|{
+            ui.heading(if mode==editing::Mode::Forms{"Fill forms"}else{"Edit PDF"});ui.label(RichText::new(format!("Page {}",page+1)).small().color(theme::muted()));ui.add_space(12.);
             if self.content.loading{ui.spinner();ui.label("Inspecting page…");return;}
             let Some(info)=&self.content.inspection else{ui.label("Open a PDF to begin.");return};
-            if !editable{ui.label(RichText::new(if self.content.busy{"Applying changes…"}else{"This document is read-only."}).color(MUTED));}
+            if !editable{ui.label(RichText::new(if self.content.busy{"Applying changes…"}else{"This document is read-only."}).color(theme::muted()));}
             if mode==editing::Mode::Edit{
                 ui.horizontal(|ui|{if ui.selectable_value(&mut self.content.image_mode,false,"Text").changed()|ui.selectable_value(&mut self.content.image_mode,true,"Images").changed(){self.content.selected=None;}});ui.add_space(8.);
                 if self.content.image_mode{
                     match &info.images{Err(e)=>{ui.label(e);},Ok(images)=>{
-                        ui.label(RichText::new("Select an image here or on the page.").small().color(MUTED));
+                        ui.label(RichText::new("Select an image here or on the page.").small().color(theme::muted()));
                         egui::ScrollArea::vertical().id_salt("image_objects").max_height(205.).show(ui,|ui|{for (i,image) in images.iter().enumerate(){if ui.selectable_label(self.content.selected==Some(i),format!("{}  ·  {} × {} px",image.name,image.pixels[0],image.pixels[1])).clicked(){self.content.selected=Some(i);self.content.rect=[image.rect[0],image.rect[1],image.rect[2]-image.rect[0],image.rect[3]-image.rect[1]];}}});
                         if images.is_empty(){ui.label("No directly editable image objects on this page.");}
                         if let Some(image)=self.content.selected.and_then(|i|images.get(i)){
@@ -552,7 +567,7 @@ impl Viewer {
                                 if ui.add(ActionButton::new(Icon::Trash,"Delete image")).clicked(){change=Some(Edit::Image{page:page as u32+1,index:image.index,edit:content::ImageEdit::Delete});}
                             });
                         }
-                        ui.add_space(12.);ui.label(RichText::new("Page-level images only. Existing clipping paths remain in effect.").small().color(MUTED));
+                        ui.add_space(12.);ui.label(RichText::new("Page-level images only. Existing clipping paths remain in effect.").small().color(theme::muted()));
                     }}
                 }else{
                     ui.label("Click text on the page to edit it.");
@@ -563,11 +578,11 @@ impl Viewer {
                     if visible.is_empty(){ui.label("No fillable fields on this page. Open a PDF containing a standard AcroForm.");}
                     egui::ScrollArea::vertical().id_salt("form_fields").max_height(240.).show(ui,|ui|{for f in visible{if ui.selectable_label(self.content.field==Some(f.id),format!("{}{}",f.name,if f.required{" *"}else{""})).clicked(){self.content.field=Some(f.id);self.content.value=f.value.clone();}}});
                     if let Some(f)=fields.iter().find(|f|Some(f.id)==self.content.field){
-                        ui.separator();ui.label(RichText::new(&f.name).strong());
+                        ui.separator();ui.label(RichText::new(&f.name).family(ui::semibold()));
                         if let Some(reason)=&f.reason{ui.label(reason);return;}
                         ui.add_enabled_ui(editable,|ui|{
                             match &f.kind{
-                                FieldKind::Text{multiline,max}=>{let edit=if *multiline{egui::TextEdit::multiline(&mut self.content.value).desired_rows(5)}else{egui::TextEdit::singleline(&mut self.content.value)};let r=ui.add(edit.desired_width(f32::INFINITY).char_limit(max.unwrap_or(32768)));self.editor.text_editing|=r.has_focus();}
+                                FieldKind::Text{multiline,max}=>{let edit=if *multiline{egui::TextEdit::multiline(&mut self.content.value).margin(ui::FIELD_MARGIN).desired_rows(5)}else{egui::TextEdit::singleline(&mut self.content.value).margin(ui::FIELD_MARGIN)};let r=ui.add(edit.desired_width(f32::INFINITY).char_limit(max.unwrap_or(32768)));self.editor.text_editing|=r.has_focus();}
                                 FieldKind::Choice{options,editable}=>{egui::ComboBox::from_id_salt("field_choice").selected_text(options.iter().find(|(v,_)|*v==self.content.value).map(|(_,l)|l.as_str()).unwrap_or(&self.content.value)).width(264.).show_ui(ui,|ui|{ui.selectable_value(&mut self.content.value,String::new(),"(empty)");for(v,label)in options{ui.selectable_value(&mut self.content.value,v.clone(),label);}});if *editable{let r=ui.text_edit_singleline(&mut self.content.value);self.editor.text_editing|=r.has_focus();}}
                                 FieldKind::Button{radio,states}=>{if !*radio&&states.len()==1{let mut checked=self.content.value==states[0];if ui.checkbox(&mut checked,"Checked").changed(){self.content.value=if checked{states[0].clone()}else{"Off".into()};}}else{for state in states{ui.radio_value(&mut self.content.value,state.clone(),state);}ui.radio_value(&mut self.content.value,"Off".into(),"Clear selection");}}
                                 FieldKind::Unsupported=>{}
@@ -575,7 +590,7 @@ impl Viewer {
                             ui.add_space(10.);if ui.add_enabled(self.content.value!=f.value,ActionButton::new(Icon::Save,"Apply field value").primary()).clicked(){change=Some(Edit::Field{id:f.id,value:self.content.value.clone()});}
                         });
                     }
-                    ui.add_space(12.);ui.label(RichText::new("Values and widget appearances are saved together. Apply each field, then Save a Copy.").small().color(MUTED));
+                    ui.add_space(12.);ui.label(RichText::new("Values and widget appearances are saved together. Apply each field, then Save a Copy.").small().color(theme::muted()));
                 }}
             }
         });
@@ -647,7 +662,7 @@ impl Viewer {
         egui::TopBottomPanel::top("edit_ribbon")
             .frame(
                 egui::Frame::new()
-                    .fill(PAPER)
+                    .fill(theme::surface())
                     .inner_margin(egui::Margin::symmetric(16, 7)),
             )
             .show(ctx, |ui| {
@@ -749,11 +764,11 @@ impl Viewer {
                 .tabs
                 .get(self.active)
                 .is_some_and(|t| t.session.as_ref().is_some_and(|s| s.editable));
-        egui::SidePanel::right("new_text_panel").default_width(270.).width_range(250.0..=340.0).resizable(true).frame(egui::Frame::new().fill(PAPER).inner_margin(16.)).show(ctx,|ui| {
+        egui::SidePanel::right("new_text_panel").default_width(270.).width_range(250.0..=340.0).resizable(true).frame(egui::Frame::new().fill(theme::paper()).inner_margin(16.)).show(ctx,|ui| {
             ui.spacing_mut().item_spacing=vec2(8.,10.);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Text").size(18.).strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| { if ui.small_button("×").on_hover_text("Hide text panel").clicked() { self.inspector=false; } });
+                ui.label(RichText::new("Text").size(17.).family(ui::semibold()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| { if ui.add(ActionButton::new(Icon::Close, "Hide text panel").compact()).clicked() { self.inspector=false; } });
             });
             ui.add_space(8.);
             let (sample,_) = ui.allocate_exact_size(vec2(ui.available_width(),96.),egui::Sense::hover());
@@ -764,7 +779,7 @@ impl Viewer {
             ui.painter().text(sample.center(),egui::Align2::CENTER_CENTER,"Sample",self.content.text_font(self.content.new_size.clamp(18.,32.)),color);
             ui.add_space(10.);
             ui.add_enabled_ui(editable,|ui| {
-                ui.label(RichText::new("FONT").size(10.).color(MUTED));
+                ui::caption(ui, "Font");
                 if let Some(current)=fonts.get(self.content.new_font) {
                     egui::ComboBox::from_id_salt("text_font_family").width(ui.available_width()).selected_text(&current.family).show_ui(ui,|ui| {
                         for (index,font) in fonts.iter().enumerate().filter(|(_,f)|!f.bold&&!f.italic) {
@@ -793,7 +808,7 @@ impl Viewer {
                         if ui.add(ActionButton::new(icon,label).compact().selected(self.content.new_alignment==value)).clicked() { self.content.new_alignment=value; }
                     }
                 });
-                ui.add_space(8.); ui.label(RichText::new("COLOR").size(10.).color(MUTED));
+                ui.add_space(8.); ui::caption(ui, "Color");
                 editing::color_palette(ui,&mut self.content.new_color);
                 ui.add_space(8.);
                 if self.content.new_placed {
@@ -805,13 +820,13 @@ impl Viewer {
                         });
                     });
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(!self.content.new_text.trim().is_empty(),ActionButton::new(Icon::Save,"Done").primary()).clicked() { self.content.new_commit=true; }
+                        if ui.add_enabled(!self.content.new_text.trim().is_empty(),ActionButton::new(Icon::Check,"Done").primary()).clicked() { self.content.new_commit=true; }
                         if ui.add(ActionButton::new(Icon::Left,"Cancel")).clicked() { self.content.new_text.clear(); self.content.new_placed=false; self.content.next_text=None; }
                     });
                 }
             });
             ui.add_space(8.);
-            ui.label(RichText::new(if self.content.new_placed { "Type on the page. Drag the top handle to move; drag the circles to resize. Click elsewhere on the page or press ⌘Return to finish." } else { "Click anywhere on a page and start typing." }).size(12.).color(MUTED));
+            ui.label(RichText::new(if self.content.new_placed { "Type on the page. Drag the top handle to move; drag the circles to resize. Click elsewhere on the page or press ⌘Return to finish." } else { "Click anywhere on a page and start typing." }).size(12.).color(theme::muted()));
         });
     }
     pub(super) fn finish_new_text(&mut self, ctx: &egui::Context) {
@@ -860,12 +875,12 @@ impl Viewer {
             .tabs
             .get(self.active)
             .is_some_and(|t| !t.pages.is_empty());
-        egui::SidePanel::right("conversion_panel").exact_width(310.).resizable(false).frame(egui::Frame::new().fill(PAPER).inner_margin(18.)).show(ctx,|ui|{
-            ui.heading("Convert");ui.label(RichText::new("Local files. Fresh output copies.").small().color(MUTED));ui.add_space(16.);
+        egui::SidePanel::right("conversion_panel").exact_width(310.).resizable(false).frame(egui::Frame::new().fill(theme::paper()).inner_margin(18.)).show(ctx,|ui|{
+            ui.heading("Convert");ui.label(RichText::new("Local files. Fresh output copies.").small().color(theme::muted()));ui.add_space(16.);
             ui.add_enabled_ui(!self.content.busy,|ui|{
-                ui.label(RichText::new("Create a PDF").strong());
+                ui.label(RichText::new("Create a PDF").family(ui::semibold()));
                 for(icon,label,key)in[(Icon::Plus,"New blank PDF","blank"),(Icon::Import,"Images to PDF…","images"),(Icon::Text,"Markdown / Word to PDF…","document")]{if ui.add(ActionButton::new(icon,label)).clicked(){action=key;}}
-                ui.add_space(18.);ui.separator();ui.add_space(12.);ui.label(RichText::new("Export this PDF").strong());
+                ui.add_space(18.);ui.separator();ui.add_space(12.);ui.label(RichText::new("Export this PDF").family(ui::semibold()));
                 ui.add_enabled_ui(ready,|ui|{
                     egui::ComboBox::from_id_salt("conversion_format").selected_text(match self.content.format{Format::Png=>"PNG images",Format::Jpeg=>"JPEG images",Format::Text=>"Plain text (.txt)",Format::Markdown=>"Markdown (.md)",Format::Word=>"Word (.docx)"}).width(270.).show_ui(ui,|ui|{for(f,label)in[(Format::Png,"PNG images"),(Format::Jpeg,"JPEG images"),(Format::Text,"Plain text (.txt)"),(Format::Markdown,"Markdown (.md)"),(Format::Word,"Word (.docx)")]{ui.selectable_value(&mut self.content.format,f,label);}});
                     ui.add_space(10.);ui.label("Pages · e.g. 1, 3-5");let r=ui.text_edit_singleline(&mut self.content.range);self.editor.text_editing|=r.has_focus();
@@ -873,7 +888,7 @@ impl Viewer {
                     if matches!(self.content.format,Format::Png|Format::Jpeg){ui.horizontal(|ui|{ui.label("Resolution");ui.add(egui::DragValue::new(&mut self.content.dpi).range(72.0..=300.0).suffix(" DPI"));});}
                     ui.add_space(12.);if ui.add(ActionButton::new(Icon::Extract,"Export…").primary()).clicked(){action="export";}
                 });
-                ui.add_space(16.);ui.label(RichText::new("Word and Markdown conversions use document text and basic paragraphs. Fonts, columns, tables, headers and page layout are not reconstructed. Word import accepts text documents; drawings are reported. No OCR yet.").small().color(MUTED));
+                ui.add_space(16.);ui.label(RichText::new("Word and Markdown conversions use document text and basic paragraphs. Fonts, columns, tables, headers and page layout are not reconstructed. Word import accepts text documents; drawings are reported. No OCR yet.").small().color(theme::muted()));
             });if self.content.busy{ui.spinner();ui.label("Converting…");}
         });
         match action {
@@ -1139,7 +1154,7 @@ impl Viewer {
                                     a.style.font_size,
                                     egui::FontFamily::Name("annotation".into()),
                                 ),
-                                INK,
+                                theme::ink(),
                                 (a.rect[2] - a.rect[0] - 8.).max(1.),
                             )
                         });
@@ -1186,15 +1201,15 @@ impl Viewer {
     fn existing_text_panel(&mut self, ctx: &egui::Context) {
         let current = self.tabs.get(self.active).map(|t| (t.id, t.page));
         egui::SidePanel::right("content_inspector").exact_width(290.).resizable(false)
-            .frame(egui::Frame::new().fill(PAPER).inner_margin(18.))
+            .frame(egui::Frame::new().fill(theme::paper()).inner_margin(18.))
             .show(ctx, |ui| {
                 ui.heading("Text");
                 ui.add_space(16.);
                 if let Some(draft) = &mut self.content.existing && current == Some((draft.key.0, draft.key.2)) {
-                    ui.label(RichText::new("Editing on the page").strong());
+                    ui.label(RichText::new("Editing on the page").family(ui::semibold()));
                     ui.add_space(10.);
                     if let InlineTarget::Block(block) = &mut draft.target {
-                        ui.label(RichText::new(format!("{} text objects selected", block.selection.runs.len()+block.selection.annotations.len())).color(MUTED));
+                        ui.label(RichText::new(format!("{} text objects selected", block.selection.runs.len()+block.selection.annotations.len())).color(theme::muted()));
                         ui.add_space(10.);
                         ui.add_enabled_ui(!self.content.busy, |ui| {
                             let fonts = text_style::fonts();
@@ -1207,15 +1222,15 @@ impl Viewer {
                             ui.add(egui::DragValue::new(&mut draft.size).range(4.0..=144.0).suffix(" pt")).on_hover_text("Block font size");
                             editing::color_palette(ui, &mut draft.color);
                             ui.add_space(8.);
-                            ui.label(RichText::new("The selection becomes one block with this font and color. Drag the corner to resize.").small().color(MUTED));
+                            ui.label(RichText::new("The selection becomes one block with this font and color. Drag the corner to resize.").small().color(theme::muted()));
                         });
                     } else {
-                        ui.label(RichText::new(&draft.font).color(MUTED));
-                        ui.label(RichText::new(format!("{:.1} pt", draft.size)).color(MUTED));
+                        ui.label(RichText::new(&draft.font).color(theme::muted()));
+                        ui.label(RichText::new(format!("{:.1} pt", draft.size)).color(theme::muted()));
                     }
                     ui.add_space(18.);
                     ui.add_enabled_ui(!self.content.busy, |ui| {
-                        if ui.add(ActionButton::new(Icon::Text,"Done").primary()).clicked() { self.content.new_commit = true; }
+                        if ui.add(ActionButton::new(Icon::Check,"Done").primary()).clicked() { self.content.new_commit = true; }
                         if ui.add(ActionButton::new(Icon::Left,"Cancel")).clicked() {
                             self.content.existing = None;
                             self.content.next_existing = None;
@@ -1224,15 +1239,15 @@ impl Viewer {
                         }
                     });
                     ui.add_space(14.);
-                    ui.label(RichText::new("Type directly in the text area on the page. Click outside or press ⌘Return to finish. Esc cancels.").size(13.).color(MUTED));
+                    ui.label(RichText::new("Type directly in the text area on the page. Click outside or press ⌘Return to finish. Esc cancels.").size(13.).color(theme::muted()));
                 } else {
-                    ui.label(RichText::new(if self.content.area_mode { "Drag a rectangle around the text you want to edit together." } else { "Click text on the page to edit it." }).size(15.).color(INK));
+                    ui.label(RichText::new(if self.content.area_mode { "Drag a rectangle around the text you want to edit together." } else { "Click text on the page to edit it." }).size(15.).color(theme::ink()));
                     ui.add_space(12.);
-                    ui.label(RichText::new(if self.content.area_mode { "Included text highlights as you drag. Release to open a multiline text area. Esc cancels." } else { "Use Select area to edit several lines together, or Add text for a new block." }).color(MUTED));
-                    if let Some(hint) = &self.content.selection_hint { ui.add_space(12.); ui.label(RichText::new(hint).color(MUTED)); }
+                    ui.label(RichText::new(if self.content.area_mode { "Included text highlights as you drag. Release to open a multiline text area. Esc cancels." } else { "Use Select area to edit several lines together, or Add text for a new block." }).color(theme::muted()));
+                    if let Some(hint) = &self.content.selection_hint { ui.add_space(12.); ui.label(RichText::new(hint).color(theme::muted())); }
                     if self.content.loading { ui.add_space(12.); ui.spinner(); }
                     if let Some(info) = &self.content.inspection && let Err(e) = &info.text {
-                        ui.add_space(12.); ui.label(RichText::new(e).small().color(MUTED));
+                        ui.add_space(12.); ui.label(RichText::new(e).small().color(theme::muted()));
                     }
                 }
                 if self.content.busy { ui.spinner(); ui.label("Applying text…"); }
@@ -1447,8 +1462,13 @@ fn existing_overlay(
             && let Some(end) = ui.input(|i| i.pointer.interact_pos())
         {
             let r = Rect::from_two_pos(start, end).intersect(page_rect);
-            painter.rect_filled(r, 2., ACCENT.gamma_multiply(0.08));
-            painter.rect_stroke(r, 2., Stroke::new(1., ACCENT), egui::StrokeKind::Inside);
+            painter.rect_filled(r, 2., theme::accent().gamma_multiply(0.08));
+            painter.rect_stroke(
+                r,
+                2.,
+                Stroke::new(1., theme::accent()),
+                egui::StrokeKind::Inside,
+            );
             let selected: Vec<_> = candidates
                 .into_iter()
                 .filter(|d| r.contains(screen(d.rect).center()))
@@ -1457,7 +1477,7 @@ fn existing_overlay(
                 painter.rect_filled(
                     screen(item.rect).expand(2.),
                     1.,
-                    ACCENT.gamma_multiply(0.17),
+                    theme::accent().gamma_multiply(0.17),
                 );
             }
             if background.drag_stopped() {
@@ -1521,7 +1541,12 @@ fn existing_overlay(
             )
         });
         if response.hovered() {
-            painter.rect_stroke(r, 2., Stroke::new(1., ACCENT), egui::StrokeKind::Outside);
+            painter.rect_stroke(
+                r,
+                2.,
+                Stroke::new(1., theme::accent()),
+                egui::StrokeKind::Outside,
+            );
         }
         if response.clicked() && !state.busy {
             clicked = Some(draft);
@@ -1562,34 +1587,6 @@ fn existing_overlay(
     let original = screen(draft.rect);
     let annotation = matches!(draft.target, InlineTarget::Annotation(_));
     let block = matches!(draft.target, InlineTarget::Block(_));
-    let origin = original.min
-        + if annotation {
-            vec2(4., 4.) * scale
-        } else if block {
-            vec2(0., 0.)
-        } else {
-            vec2(0., -draft.size * 0.2) * scale
-        };
-    let width = original
-        .width()
-        .max(if block { 10. } else { 200. * scale })
-        .min((page_rect.right() - origin.x).max(10.));
-    let rect = Rect::from_min_size(
-        origin,
-        vec2(width, original.height().max(draft.size * 1.5 * scale)),
-    );
-    if let InlineTarget::Block(block) = &draft.target {
-        for mask in &block.masks {
-            painter.rect_filled(screen(*mask).expand(2.), 0., Color32::WHITE);
-        }
-    }
-    painter.rect_filled(original.union(rect).expand(3.), 2., Color32::WHITE);
-    painter.rect_stroke(
-        rect.expand(3.),
-        2.,
-        Stroke::new(1., ACCENT),
-        egui::StrokeKind::Outside,
-    );
     let family = if let InlineTarget::Block(block) = &draft.target {
         text_style::fonts()
             .get(block.font)
@@ -1605,6 +1602,45 @@ fn existing_overlay(
         (draft.color[1] * 255.) as u8,
         (draft.color[2] * 255.) as u8,
     );
+    let origin = original.min
+        + if annotation {
+            vec2(4., 4.) * scale
+        } else if block {
+            vec2(0., 0.)
+        } else {
+            vec2(0., -draft.size * 0.2) * scale
+        };
+    // A single run grows with its text, like the PDF it will become.
+    let text_width = if annotation || block {
+        original.width()
+    } else {
+        let font = FontId::new((draft.size * scale).clamp(4., 800.), family.clone());
+        ui.fonts_mut(|f| f.layout_no_wrap(draft.text.clone(), font, color).size().x) + 2.
+    };
+    let width = original
+        .width()
+        .max(text_width)
+        .max(10.)
+        .min((page_rect.right() - origin.x).max(10.));
+    let rect = Rect::from_min_size(
+        origin,
+        vec2(width, original.height().max(draft.size * 1.25 * scale)),
+    );
+    // Hide only the words being replaced; the page around them stays visible.
+    if let InlineTarget::Block(block) = &draft.target {
+        for mask in &block.masks {
+            painter.rect_filled(screen(*mask).expand(2.), 0., Color32::WHITE);
+        }
+    }
+    painter.rect_filled(original.expand(1.5), 0., Color32::WHITE);
+    let outline = rect.expand2(vec2(5., 3.));
+    ui::dashed_rect(&painter, outline, theme::accent());
+    if !block {
+        for center in [outline.left_center(), outline.right_center()] {
+            painter.circle_filled(center, 4.5, Color32::WHITE);
+            painter.circle_stroke(center, 4.5, Stroke::new(1.5, theme::accent()));
+        }
+    }
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
         ui.set_clip_rect(page_rect.intersect(ui.clip_rect()));
         ui.add_enabled_ui(!state.busy, |ui| {
@@ -1624,9 +1660,9 @@ fn existing_overlay(
                 ui.fonts_mut(|f| f.layout_job(job))
             };
             let edit = if annotation || block {
-                egui::TextEdit::multiline(&mut draft.text)
+                egui::TextEdit::multiline(&mut draft.text).margin(ui::FIELD_MARGIN)
             } else {
-                egui::TextEdit::singleline(&mut draft.text)
+                egui::TextEdit::singleline(&mut draft.text).margin(ui::FIELD_MARGIN)
             };
             let output = edit
                 .id(egui::Id::new((tab.id, page, "inline_existing_text")))
@@ -1661,7 +1697,7 @@ fn existing_overlay(
     if block && !state.busy {
         let handle = Rect::from_center_size(rect.max, vec2(16., 16.));
         painter.circle_filled(rect.max, 5., Color32::WHITE);
-        painter.circle_stroke(rect.max, 5., Stroke::new(1.5, ACCENT));
+        painter.circle_stroke(rect.max, 5., Stroke::new(1.5, theme::accent()));
         let response = ui
             .interact(
                 handle,
@@ -1736,15 +1772,21 @@ pub(super) fn overlay(
             let painter = ui
                 .painter()
                 .with_clip_rect(page_rect.intersect(ui.clip_rect()));
-            painter.rect_stroke(r, 0., Stroke::new(1., ACCENT), egui::StrokeKind::Outside);
-            let move_rect = Rect::from_center_size(r.center_top() - vec2(0., 7.), vec2(46., 14.));
-            painter.rect_filled(move_rect, 6., Color32::from_rgb(222, 234, 250));
+            ui::dashed_rect(&painter, r.expand(2.), theme::accent());
+            let move_rect = Rect::from_center_size(r.center_top() - vec2(0., 9.), vec2(40., 12.));
+            painter.rect_filled(move_rect, 6., Color32::WHITE);
+            painter.rect_stroke(
+                move_rect,
+                6.,
+                Stroke::new(1., theme::accent()),
+                egui::StrokeKind::Inside,
+            );
             painter.line_segment(
                 [
                     move_rect.center() - vec2(10., 0.),
                     move_rect.center() + vec2(10., 0.),
                 ],
-                Stroke::new(2., ACCENT),
+                Stroke::new(2., theme::accent()),
             );
             let moving = ui
                 .interact(
@@ -1796,6 +1838,7 @@ pub(super) fn overlay(
             ui.scope_builder(egui::UiBuilder::new().max_rect(r), |ui| {
                 ui.set_clip_rect(r.intersect(page_rect).intersect(ui.clip_rect()));
                 let edit = egui::TextEdit::multiline(&mut state.new_text)
+                    .margin(ui::FIELD_MARGIN)
                     .id(egui::Id::new((tab.id, page, "inline_new_text")))
                     .text_color(color)
                     .frame(false)
@@ -1824,7 +1867,7 @@ pub(super) fn overlay(
             ] {
                 let handle = Rect::from_center_size(center, vec2(12., 12.));
                 painter.circle_filled(center, 5., Color32::WHITE);
-                painter.circle_stroke(center, 5., Stroke::new(1.5, ACCENT));
+                painter.circle_stroke(center, 5., Stroke::new(1.5, theme::accent()));
                 let resize = ui
                     .interact(
                         handle,
@@ -1918,7 +1961,7 @@ pub(super) fn overlay(
             Stroke::new(
                 if selected { 2. } else { 1. },
                 if selected {
-                    ACCENT
+                    theme::accent()
                 } else {
                     Color32::from_rgb(147, 183, 220)
                 },

@@ -36,9 +36,8 @@ fn read(bytes: &[u8]) -> Result<Document> {
         "PDF exceeds 256 MB"
     );
     let doc = Document::load_mem(bytes).context("Could not read PDF pages")?;
-    let caps = annotations::inspect(&doc);
     ensure!(
-        !caps.signed && !caps.certified && !caps.encrypted,
+        annotations::inspect(&doc).rewritable(),
         "Page changes require an unsigned, unencrypted PDF. Signed originals are preserved."
     );
     let count = doc.get_pages().len();

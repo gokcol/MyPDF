@@ -97,11 +97,24 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             &item("find", "Find…", Code::KeyF, Modifiers::empty()),
         ],
     );
+    let appearance = Submenu::with_items(
+        "Appearance",
+        true,
+        &[
+            &MenuItem::with_id("theme_system", "Match System", true, None),
+            &MenuItem::with_id("theme_light", "Light", true, None),
+            &MenuItem::with_id("theme_dark", "Dark", true, None),
+        ],
+    );
+    let Ok(appearance) = appearance else {
+        return (None, rx);
+    };
     let view = Submenu::with_items(
         "View",
         true,
         &[
             &MenuItem::with_id("home", "Home (⇧⌘H)", true, None),
+            &appearance,
             &P::separator(),
             &item("zoom_in", "Zoom In", Code::Equal, Modifiers::empty()),
             &item("zoom_out", "Zoom Out", Code::Minus, Modifiers::empty()),
@@ -119,8 +132,10 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
         "Sign",
         true,
         &[
+            &MenuItem::with_id("quick_sign", "Quick Sign", true, None),
+            &MenuItem::with_id("appearance", "Signature Appearance…", true, None),
             &MenuItem::with_id("identities", "Digital IDs…", true, None),
-            &MenuItem::with_id("sign", "Digitally Sign…", true, None),
+            &MenuItem::with_id("sign", "Sign with Options…", true, None),
             &MenuItem::with_id("validate", "Validate Signatures…", true, None),
         ],
     );

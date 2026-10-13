@@ -177,6 +177,23 @@ pub fn replace_text_object(
     expected: &str,
     replacement: &str,
 ) -> Result<Vec<u8>> {
+    replace_text_object_reporting(bytes, page, index, expected, replacement).map(|(b, _)| b)
+}
+
+/// Like [`replace_text_object`], also returning the installed font families that
+/// set the text when the PDF's own font cannot draw it (empty otherwise).
+///
+/// The run keeps its font when that font's program really contains every glyph.
+/// Otherwise it is re-set with [`crate::unicode_text`]: the closest installed
+/// match to the original font, falling back per character across installed
+/// fonts, shaped and embedded as a subset, so any Unicode text can be written.
+pub fn replace_text_object_reporting(
+    bytes: &[u8],
+    page: u32,
+    index: usize,
+    expected: &str,
+    replacement: &str,
+) -> Result<(Vec<u8>, Vec<String>)> {
     ensure!(
         replacement.len() <= 32_768 && !replacement.contains(['\n', '\r']),
         "Use a single text run of at most 32 KB; paragraph reflow is not supported"
@@ -196,47 +213,47 @@ pub fn replace_text_object(
         selected.text == expected,
         "The text changed; select it again before editing"
     );
-    let mut replacement_font = None;
-    let encoded = {
+    let seen: std::collections::HashSet<char> = runs
+        .iter()
+        .filter(|r| r.font == selected.font)
+        .flat_map(|r| r.text.chars())
+        .collect();
+    let own = {
         let fonts = doc.get_page_fonts(page_id)?;
         let font = fonts
             .get(selected.font.as_bytes())
             .context("font disappeared")?;
         let encoding = font.get_font_encoding(&doc)?;
         let encoded = encoding.string_to_bytes(replacement);
-        if encoding.bytes_to_string(&encoded)? == replacement {
-            encoded
-        } else {
-            ensure!(
-                selected.font.starts_with("MyPDFText"),
-                "replacement contains glyphs unavailable in the existing font/CMap"
-            );
-            // MyPDF embeds the complete TrueType face with a per-block CMap. Extend
-            // this block using the same embedded face, without touching other blocks.
-            let descendant = font
-                .get(b"DescendantFonts")?
-                .as_array()?
-                .first()
-                .context("Missing font")?;
-            let descendant = doc.dereference(descendant)?.1.as_dict()?;
-            let descriptor = doc
-                .dereference(descendant.get(b"FontDescriptor")?)?
-                .1
-                .as_dict()?;
-            let stream = doc
-                .dereference(descriptor.get(b"FontFile2")?)?
-                .1
-                .as_stream()?;
-            let bytes = stream
-                .decompressed_content()
-                .unwrap_or_else(|_| stream.content.clone());
-            let font = crate::pdf_font::PdfFont::embed_bytes(&mut doc, replacement, bytes)?;
-            let encoded = font.hex(replacement)?;
-            let encoded = encoded
-                .as_bytes()
-                .chunks_exact(2)
-                .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
-                .collect();
+        (encoding.bytes_to_string(&encoded)? == replacement
+            && crate::unicode_text::missing_glyphs(
+                &doc,
+                font,
+                &selected.base_font,
+                &seen,
+                replacement,
+            )
+            .is_empty())
+        .then_some(encoded)
+    };
+    let first = selected.operator_index;
+    let mut families = vec![];
+    let inserted = match own {
+        Some(encoded) => {
+            let op = &mut content.operations[first];
+            let value = Object::String(encoded, StringFormat::Hexadecimal);
+            match op.operator.as_str() {
+                "TJ" => op.operands = vec![Object::Array(vec![value])],
+                "\"" => op.operands[2] = value,
+                _ => op.operands[0] = value,
+            }
+            1
+        }
+        None => {
+            use crate::unicode_text::{Preferred, Writer};
+            let mut writer = Writer::new(&Preferred::LikePdfFont(selected.base_font.clone()))?;
+            let line = writer.shape(replacement)?;
+            let ids = writer.embed(&mut doc)?;
             let mut resources = crate::content::resources(&doc, page_id)?;
             let mut fonts = doc
                 .dereference(resources.get(b"Font")?)?
@@ -244,53 +261,79 @@ pub fn replace_text_object(
                 .as_dict()?
                 .clone();
             let mut suffix = doc.max_id;
-            while fonts.has(format!("MyPDFText{suffix}").as_bytes()) {
-                suffix += 1;
-            }
-            let name = format!("MyPDFText{suffix}");
-            fonts.set(name.as_str(), font.id);
+            let names: Vec<Option<String>> = ids
+                .iter()
+                .map(|id| {
+                    id.map(|id| {
+                        while fonts.has(format!("MyPDFText{suffix}").as_bytes()) {
+                            suffix += 1;
+                        }
+                        let name = format!("MyPDFText{suffix}");
+                        fonts.set(name.as_str(), id);
+                        name
+                    })
+                })
+                .collect();
             resources.set("Font", fonts);
             doc.get_dictionary_mut(page_id)?.set("Resources", resources);
-            replacement_font = Some(name);
-            encoded
-        }
-    };
-    let op = &mut content.operations[selected.operator_index];
-    let value = Object::String(encoded, StringFormat::Hexadecimal);
-    match op.operator.as_str() {
-        "TJ" => op.operands = vec![Object::Array(vec![value])],
-        "\"" => op.operands[2] = value,
-        _ => op.operands[0] = value,
-    }
-    if let Some(font) = replacement_font {
-        content.operations.insert(
-            selected.operator_index + 1,
-            Operation::new(
+            let rise = content.operations[..first]
+                .iter()
+                .rev()
+                .find(|op| op.operator == "Ts")
+                .and_then(|op| op.operands.first()?.as_float().ok())
+                .unwrap_or(0.);
+            let op = &content.operations[first];
+            // Quote operators move to the next line (and set spacing) before showing.
+            let mut ops = match op.operator.as_str() {
+                "'" => vec![Operation::new("T*", vec![])],
+                "\"" => vec![
+                    Operation::new("Tw", vec![op.operands[0].clone()]),
+                    Operation::new("Tc", vec![op.operands[1].clone()]),
+                    Operation::new("T*", vec![]),
+                ],
+                _ => vec![],
+            };
+            ops.extend(writer.operations(&line, &names, selected.size, 0., rise)?);
+            ops.push(Operation::new(
                 "Tf",
                 vec![
                     Object::Name(selected.font.as_bytes().to_vec()),
                     selected.size.into(),
                 ],
-            ),
-        );
-        content.operations.insert(
-            selected.operator_index,
-            Operation::new(
-                "Tf",
-                vec![Object::Name(font.into_bytes()), selected.size.into()],
-            ),
-        );
-    }
+            ));
+            let count = ops.len();
+            content.operations.splice(first..first + 1, ops);
+            families = writer.families();
+            count
+        }
+    };
     let stream = doc.add_object(Stream::new(Dictionary::new(), content.encode()?));
     doc.get_dictionary_mut(page_id)?.set("Contents", stream);
     let output = crate::content::serialize(&mut doc)?;
+    // Read the new text back. Right-to-left and complex scripts extract in visual
+    // or cluster order, so for those every character must be present instead.
+    let shown: String = text_runs(&output, page)?
+        .iter()
+        .filter(|r| (first..first + inserted).contains(&r.operator_index))
+        .map(|r| r.text.as_str())
+        .collect();
+    let written = crate::unicode_text::visible(replacement);
+    let sorted = |text: &str| {
+        // Glyphs inside reordered clusters may have no Unicode value of their own.
+        let mut chars: Vec<char> = text
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '\u{FFFD}')
+            .collect();
+        chars.sort_unstable();
+        chars.dedup();
+        chars
+    };
     ensure!(
-        text_runs(&output, page)?
-            .iter()
-            .any(|r| r.text == replacement),
+        shown == written
+            || crate::unicode_text::complex(replacement) && sorted(&shown) == sorted(&written),
         "saved replacement failed verification"
     );
-    Ok(output)
+    Ok((output, families))
 }
 
 #[derive(Debug, Serialize)]

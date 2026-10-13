@@ -12,12 +12,14 @@ pub mod pages;
 pub mod pdf_font;
 pub mod proof;
 pub mod recovery;
+pub mod signature_edit;
 pub mod signing;
 pub mod stroke;
 pub mod svg;
 pub mod text_block;
 pub mod text_geometry;
 pub mod text_style;
+pub mod unicode_text;
 pub mod viewer;
 #[cfg(target_os = "windows")]
 pub mod windows_store;

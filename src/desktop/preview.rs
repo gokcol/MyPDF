@@ -9,10 +9,19 @@ struct Preview {
 }
 impl Preview {
     fn capture(&mut self, app: &mut Viewer, ctx: &egui::Context) -> egui::FullOutput {
+        self.capture_with(app, ctx, vec![])
+    }
+    fn capture_with(
+        &mut self,
+        app: &mut Viewer,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
         let output = ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 820.0))),
                 max_texture_side: Some(8192),
+                events,
                 ..Default::default()
             },
             |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
@@ -142,8 +151,11 @@ fn native_visual_preview() {
     ctx.set_pixels_per_point(2.0);
     let mut app = Viewer::new(
         &eframe::CreationContext::_new_kittest(ctx.clone()),
-        vec![pdf],
+        vec![pdf.clone()],
     );
+    if std::env::var("MYPDF_PREVIEW_THEME").as_deref() == Ok("dark") {
+        ctx.set_theme(egui::Theme::Dark);
+    }
     app.editor.mode = editing::Mode::Annotate;
     app.tabs[0].zoom = Zoom::Page;
     let mut preview = Preview::default();
@@ -172,6 +184,14 @@ fn native_visual_preview() {
         "AddText",
         "Prompt",
         "Confirmation",
+        "Group",
+        "Lasso",
+        "DigitalIds",
+        "Appearance",
+        "SignDocument",
+        "QuickPrompt",
+        "QuickSign",
+        "Signatures",
     ] {
         if let Ok(only) = std::env::var("MYPDF_PREVIEW_ONLY")
             && !only.split(',').any(|v| v.eq_ignore_ascii_case(collection))
@@ -237,6 +257,141 @@ fn native_visual_preview() {
                 .commit(vec![a])
                 .unwrap();
         }
+        if matches!(collection, "Group" | "Lasso") {
+            use mypdf_milestone0::annotations::{Annotation, Kind, Style};
+            app.editor.mode = editing::Mode::Draw;
+            let style = |rgb: [f32; 3]| Style {
+                color: rgb,
+                width: 3.,
+                ..Default::default()
+            };
+            let marks = vec![
+                Annotation::new(
+                    0,
+                    [90., 590., 230., 690.],
+                    Kind::Rectangle,
+                    style([0.16, 0.41, 0.96]),
+                ),
+                Annotation::new(
+                    0,
+                    [260., 580., 360., 690.],
+                    Kind::Ellipse,
+                    style([0.9, 0.29, 0.29]),
+                ),
+                Annotation::new(
+                    0,
+                    [380., 600., 520., 680.],
+                    Kind::Line {
+                        start: [0., 1.],
+                        end: [1., 0.],
+                        arrow: true,
+                    },
+                    style([0.95, 0.68, 0.15]),
+                ),
+            ];
+            let ids = marks.iter().map(|a| a.id.clone()).collect::<Vec<_>>();
+            app.tabs[0].session.as_mut().unwrap().commit(marks).unwrap();
+            if collection == "Group" {
+                selection::set(&mut app.tabs[0], &mut app.editor, ids);
+            } else {
+                selection::set(&mut app.tabs[0], &mut app.editor, vec![]);
+                app.editor.select_tool(editing::Tool::Lasso);
+            }
+        }
+        app.digital.open = false;
+        if collection == "DigitalIds" {
+            app.digital.preview_identities(digital::Panel::Identities);
+        }
+        if collection == "Appearance" {
+            app.digital.preview_identities(digital::Panel::Appearance);
+            use mypdf_milestone0::annotations::{Kind, Style};
+            let strokes = vec![
+                (0..=60)
+                    .map(|i| {
+                        let t = i as f32 / 60.;
+                        [t, 0.55 - (t * 18.).sin() * 0.3 * (1. - t * 0.5)]
+                    })
+                    .collect(),
+                vec![[0.15, 0.85], [0.95, 0.78]],
+            ];
+            let library = app.editor.library.as_mut().unwrap();
+            let mut ids = vec![];
+            for (name, kind, aspect) in [
+                (
+                    "Check mark",
+                    Kind::Symbol(mypdf_milestone0::annotations::Symbol::Check),
+                    1.,
+                ),
+                (
+                    "Initials",
+                    Kind::Text {
+                        text: "J.A.".into(),
+                    },
+                    2.,
+                ),
+                ("My signature", Kind::Ink { strokes }, 3.),
+            ] {
+                let asset = mypdf_milestone0::assets::Asset::new(
+                    name,
+                    kind,
+                    Style {
+                        color: [0.08, 0.18, 0.55],
+                        width: 2.4,
+                        font_size: 24.,
+                        ..Default::default()
+                    },
+                    aspect,
+                );
+                ids.push(asset.id.clone());
+                library.put(asset).unwrap();
+            }
+            app.digital.preview_appearance(
+                ids.pop().unwrap(),
+                mypdf_milestone0::signing::AppearanceLayout::ImageOnly,
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !app.digital.appearance_ready() {
+                assert!(std::time::Instant::now() < deadline);
+                preview.capture(&mut app, &ctx);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        if collection == "SignDocument" {
+            app.digital.preview_identities(digital::Panel::Sign);
+            app.digital.use_document(app.tabs.first());
+        }
+        if collection == "QuickPrompt" {
+            app.digital.preview_quick_prompt();
+        }
+        if collection == "QuickSign" {
+            app.digital.preview_identities(digital::Panel::Sign);
+            app.quick_sign();
+        }
+        // The last scene swaps in a signed copy of the document.
+        if collection == "Signatures" {
+            let signed = fixture.path().join("Signed contract.pdf");
+            let bytes = std::fs::read(&pdf).unwrap();
+            std::fs::write(
+                &signed,
+                signatures::signed_fixture(&bytes, "Jane Appleseed"),
+            )
+            .unwrap();
+            app.digital.open = false;
+            app.close(0);
+            app.open(signed, &ctx);
+            app.editor.mode = editing::Mode::Read;
+            app.tabs[0].zoom = Zoom::Page;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while app.tabs[0].signatures.views.is_none()
+                || !app.tabs[0].rasters.keys().any(|key| !key.thumbnail)
+            {
+                assert!(std::time::Instant::now() < deadline);
+                preview.capture(&mut app, &ctx);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            app.tabs[0].signatures.panel = true;
+            app.tabs[0].signatures.selected = Some("Approval".into());
+        }
         if collection == "AddText" {
             app.editor.mode = editing::Mode::Edit;
             app.content.text_preview(app.tabs[0].id);
@@ -276,7 +431,32 @@ fn native_visual_preview() {
                 preview.capture(&mut app, &ctx);
             }
         }
-        let output = preview.capture(&mut app, &ctx);
+        // A lasso is drawn only while the mouse button is held, here on the gray canvas.
+        let events = if collection == "Lasso" {
+            let lasso = (0..=40)
+                .map(|i| {
+                    let a = i as f32 / 40. * std::f32::consts::TAU * 0.92 + 2.6;
+                    [
+                        300. + a.cos() * 230. + (a * 3.).sin() * 14.,
+                        640. + a.sin() * 95.,
+                    ]
+                })
+                .collect();
+            selection::preview_lasso(&mut app.editor, app.tabs[0].id, lasso);
+            let p = pos2(240., 420.);
+            vec![
+                egui::Event::PointerMoved(p),
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        } else {
+            vec![]
+        };
+        let output = preview.capture_with(&mut app, &ctx, events);
         preview.save(
             &ctx,
             output,
