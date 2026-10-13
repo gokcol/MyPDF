@@ -501,11 +501,7 @@ impl Session {
     pub fn commit_document(&mut self, bytes: Vec<u8>) -> Result<()> {
         ensure!(self.editable, "This document is read-only");
         let doc = Document::load_mem(&bytes)?;
-        let caps = inspect(&doc);
-        ensure!(
-            !caps.signed && !caps.certified && !caps.encrypted,
-            "Page result is not editable"
-        );
+        ensure!(inspect(&doc).rewritable(), "Page result is not editable");
         let annotations = load(&doc);
         self.past.push(Snapshot {
             source: self.source.clone(),
@@ -569,9 +565,19 @@ pub struct Capabilities {
     pub certified: bool,
     pub encrypted: bool,
     pub needs_signing_preparation: bool,
+    /// The user unlocked every signature for editing (see [`crate::signature_edit`]).
+    pub unlocked: bool,
+}
+impl Capabilities {
+    /// Whether this document may be rewritten: unsigned and unencrypted, or a
+    /// signed document the user unlocked (saved as an incremental update).
+    pub fn rewritable(&self) -> bool {
+        !self.encrypted && (!(self.signed || self.certified) || self.unlocked)
+    }
 }
 pub fn inspect(doc: &Document) -> Capabilities {
     Capabilities {
+        unlocked: crate::signature_edit::is_unlocked(doc),
         signed: crate::document::has_signatures(doc),
         certified: doc.catalog().is_ok_and(|d| d.get(b"Perms").is_ok()),
         encrypted: doc.is_encrypted(),
@@ -686,7 +692,7 @@ fn remove_managed(doc: &mut Document) -> Result<()> {
     Ok(())
 }
 pub fn clean_render_copy(bytes: &[u8], doc: &mut Document) -> Result<Vec<u8>> {
-    if load(doc).is_empty() || inspect(doc).signed {
+    if load(doc).is_empty() || !inspect(doc).rewritable() {
         return Ok(bytes.to_vec());
     }
     remove_managed(doc)?;
@@ -1236,9 +1242,8 @@ pub fn appearance(
 pub fn export(bytes: &[u8], annotations: &[Annotation]) -> Result<Vec<u8>> {
     ensure!(annotations.len() <= 5000, "Too many annotations");
     let mut doc = Document::load_mem(bytes)?;
-    let caps = inspect(&doc);
     ensure!(
-        !caps.signed && !caps.certified && !caps.encrypted,
+        inspect(&doc).rewritable(),
         "Signed, certified, or encrypted PDFs cannot be rewritten for annotations"
     );
     let geometry = page_geometry(bytes)?;

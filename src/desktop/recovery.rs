@@ -14,6 +14,8 @@ enum Command {
         page: usize,
         source: Arc<[u8]>,
         annotations: Vec<annotations::Annotation>,
+        /// The signed file that edits of an unlocked signed PDF are appended to.
+        original: Option<Arc<[u8]>>,
     },
     Clear(u64),
     Restore(Entry),
@@ -81,14 +83,20 @@ impl Recovery {
                         page,
                         source,
                         annotations,
+                        original,
                     } => {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                             || -> anyhow::Result<()> {
-                                let bytes = if revision == 0 {
+                                let mut bytes = if revision == 0 {
                                     source.to_vec()
                                 } else {
                                     annotations::export(&source, &annotations)?
                                 };
+                                if let Some(original) = original {
+                                    bytes = mypdf_milestone0::signature_edit::incremental_update(
+                                        &original, &bytes,
+                                    )?;
+                                }
                                 store.write(id, path, revision, page, &bytes)
                             },
                         ))
@@ -275,6 +283,7 @@ impl Viewer {
                             page: tab.page,
                             source: s.source.clone(),
                             annotations: s.annotations.clone(),
+                            original: tab.signed_original.clone(),
                         })
                         .is_ok();
                     if !self.recovery.busy {
@@ -295,19 +304,28 @@ impl Viewer {
         egui::Window::new("Document recovery")
             .open(&mut open)
             .default_width(460.)
+            .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new("Pick up where you left off")
-                        .size(20.)
-                        .strong(),
-                );
-                ui.label(
-                    "These local copies contain unsaved changes. Original PDFs are unchanged.",
-                );
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(44., 44.), egui::Sense::hover());
+                    ui::badge(ui.painter(), r, Icon::Reload, ui::Fill::Brand, Color32::WHITE);
+                    ui.add_space(4.);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.;
+                        ui::title(ui, "Pick up where you left off", 18.);
+                        ui.label(
+                            RichText::new(
+                                "These local copies contain unsaved changes. Original PDFs are unchanged.",
+                            )
+                            .size(12.5)
+                            .color(theme::muted()),
+                        );
+                    });
+                });
                 ui.add_space(12.);
                 if let Some(e) = &self.recovery.error {
-                    ui.colored_label(Color32::DARK_RED, e);
+                    ui.colored_label(theme::danger(), e);
                 }
                 if self.recovery.entries.is_empty() {
                     ui.label("No recovery copies are waiting.");
@@ -318,10 +336,12 @@ impl Viewer {
                         for entry in &self.recovery.entries {
                             ui.push_id(&entry.file, |ui| {
                                 egui::Frame::new()
-                                    .fill(Color32::WHITE)
-                                    .corner_radius(10.)
+                                    .fill(theme::paper())
+                                    .stroke(Stroke::new(1., theme::line()))
+                                    .corner_radius(12.)
                                     .inner_margin(12.)
                                     .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
                                         ui.label(
                                             RichText::new(
                                                 entry
@@ -331,7 +351,7 @@ impl Viewer {
                                                     .unwrap_or_default()
                                                     .to_string_lossy(),
                                             )
-                                            .strong(),
+                                            .family(ui::semibold()),
                                         );
                                         let time = time::OffsetDateTime::from_unix_timestamp(
                                             entry.metadata.updated as i64,
@@ -347,7 +367,7 @@ impl Viewer {
                                             )
                                         })
                                         .unwrap_or_default();
-                                        ui.label(RichText::new(time).small().color(MUTED));
+                                        ui.label(RichText::new(time).small().color(theme::muted()));
                                         ui.add_enabled_ui(!self.recovery.busy, |ui| {
                                             ui.horizontal(|ui| {
                                                 if ui
@@ -380,7 +400,7 @@ impl Viewer {
                         "Close this window to decide later. View → Document Recovery reopens it.",
                     )
                     .small()
-                    .color(MUTED),
+                    .color(theme::muted()),
                 );
             });
         self.recovery.open = open;

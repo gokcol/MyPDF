@@ -43,6 +43,10 @@ resvg = "0.45.1"
 zip = { version = "9.0.2", default-features = false, features = ["deflate"] }
 quick-xml = "0.41"
 svg2pdf = "0.13"
+fontdb = "0.23"
+rustybuzz = "0.20"
+unicode-bidi = "0.3"
+subsetter = "0.2"
 
 [profile.dev.package.hayro]
 opt-level = 2

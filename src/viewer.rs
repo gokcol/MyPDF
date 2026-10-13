@@ -406,7 +406,7 @@ fn run_worker(
             Ok(mut doc) => {
                 let caps = crate::annotations::inspect(&doc);
                 let annotations = crate::annotations::load(&doc);
-                let rendering = if !caps.signed && !caps.certified && !caps.encrypted {
+                let rendering = if caps.rewritable() {
                     crate::annotations::clean_render_copy(&bytes, &mut doc)?
                 } else {
                     bytes.to_vec()
@@ -420,6 +420,7 @@ fn run_worker(
                     certified: true,
                     encrypted: false,
                     needs_signing_preparation: false,
+                    unlocked: false,
                 },
                 bytes.to_vec(),
                 Some(format!("Editing is unavailable for this PDF: {e}")),

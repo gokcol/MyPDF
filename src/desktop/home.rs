@@ -3,8 +3,6 @@ use super::*;
 use mypdf_milestone0::home::{Entry, History};
 use std::path::Path;
 
-const BLUE: Color32 = Color32::from_rgb(0, 119, 250);
-const SOFT_BLUE: Color32 = Color32::from_rgb(239, 246, 255);
 type PreviewResult = (PathBuf, Result<egui::ColorImage, String>);
 struct Thumbnail {
     image: Option<TextureHandle>,
@@ -194,16 +192,19 @@ impl Viewer {
     pub(super) fn home_screen(&mut self, ctx: &egui::Context) {
         self.home.poll(ctx, self.tick);
         let mut action = None;
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::WHITE)).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::paper())).show(ctx, |ui| {
             ui.spacing_mut().item_spacing.y = 5.;
-            for font in ui.style_mut().text_styles.values_mut() { *font = home_font(font.size, false); }
             egui::ScrollArea::vertical().id_salt("home_scroll").auto_shrink([false, false]).show(ui, |ui| {
                 let margin = ((ui.available_width() - 1140.) / 2.).max(28.);
                 egui::Frame::new().inner_margin(egui::Margin { left: margin as i8, right: margin as i8, top: 26, bottom: 32 }).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Home").font(home_font(34., true)).color(INK));
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.;
+                            ui.label(RichText::new("Home").font(home_font(ui, 32., true)).color(theme::ink()));
+                            ui.label(RichText::new("Read, edit, annotate and sign. Everything stays on your device.").size(13.5).color(theme::muted()));
+                        });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let response = ui.add(egui::TextEdit::singleline(&mut self.home.query).hint_text("Search recents & favorites").desired_width(205.).margin(vec2(12., 9.)));
+                            let response = ui.add(egui::TextEdit::singleline(&mut self.home.query).margin(ui::FIELD_MARGIN).hint_text("Search recents & favorites").desired_width(230.).margin(vec2(12., 8.)));
                             response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Search recents and favorites"));
                             if self.home.focus_search { response.request_focus(); self.home.focus_search = false; }
                         });
@@ -217,23 +218,23 @@ impl Viewer {
                     section_title(ui, "Tools for You");
                     ui.add_space(12.);
                     let tools = [
-                        (Icon::Text, "Edit PDF", BLUE, HomeAction::Mode(editing::Mode::Edit)),
-                        (Icon::Highlight, "Annotate", Color32::from_rgb(208, 147, 0), HomeAction::Mode(editing::Mode::Annotate)),
-                        (Icon::Library, "Manage Pages", Color32::from_rgb(69, 154, 244), HomeAction::Mode(editing::Mode::Pages)),
-                        (Icon::Import, "Files to PDF", Color32::from_rgb(232, 74, 89), HomeAction::Import),
-                        (Icon::Sign, "Sign PDF", Color32::from_rgb(108, 91, 203), HomeAction::Mode(editing::Mode::Sign)),
-                        (Icon::Blank, "New Blank PDF", BLUE, HomeAction::Blank),
+                        (Icon::Text, "Edit PDF", "Text & images", theme::accent(), HomeAction::Mode(editing::Mode::Edit)),
+                        (Icon::Highlight, "Annotate", "Highlight & comment", Color32::from_rgb(250, 160, 20), HomeAction::Mode(editing::Mode::Annotate)),
+                        (Icon::Library, "Manage Pages", "Reorder, rotate, crop", Color32::from_rgb(18, 172, 150), HomeAction::Mode(editing::Mode::Pages)),
+                        (Icon::Import, "Files to PDF", "Images, Word, Markdown", Color32::from_rgb(244, 84, 84), HomeAction::Import),
+                        (Icon::Sign, "Sign PDF", "Signatures & certificates", Color32::from_rgb(132, 88, 246), HomeAction::Mode(editing::Mode::Sign)),
+                        (Icon::Blank, "New Blank PDF", "Start from scratch", Color32::from_rgb(14, 150, 230), HomeAction::Blank),
                     ];
                     let columns = if ui.available_width() >= 960. { 6 } else { 3 };
-                    let width = (ui.available_width() - 12. * (columns - 1) as f32) / columns as f32;
+                    let width = (ui.available_width() - 14. * (columns - 1) as f32) / columns as f32;
                     for row in tools.chunks(columns) {
                         ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 12.;
-                            for (icon, label, color, target) in row {
-                                if tool_card(ui, *icon, label, *color, width).clicked() { action = Some(target.clone()); }
+                            ui.spacing_mut().item_spacing.x = 14.;
+                            for (icon, label, detail, color, target) in row {
+                                if tool_card(ui, *icon, label, detail, *color, width).clicked() { action = Some(target.clone()); }
                             }
                         });
-                        ui.add_space(6.);
+                        ui.add_space(8.);
                     }
                     ui.add_space(18.);
                     for favorite in [false, true] {
@@ -249,13 +250,14 @@ impl Viewer {
                         });
                         ui.add_space(12.);
                         if entries.is_empty() {
-                            egui::Frame::new().fill(Color32::from_rgb(248, 249, 251)).corner_radius(14.).inner_margin(18.).show(ui, |ui| {
+                            egui::Frame::new().fill(theme::surface()).stroke(Stroke::new(1., theme::line())).corner_radius(16.).inner_margin(16.).show(ui, |ui| {
                                 ui.set_min_width(ui.available_width());
                                 ui.horizontal(|ui| {
-                                    let (r, _) = ui.allocate_exact_size(vec2(24., 24.), egui::Sense::hover());
-                                    ui::draw_icon(ui.painter(), r, if favorite { Icon::Star } else { Icon::Read }, Color32::from_gray(163));
+                                    let (r, _) = ui.allocate_exact_size(vec2(34., 34.), egui::Sense::hover());
+                                    ui.painter().rect_filled(r, 10, if favorite { theme::warning().gamma_multiply(0.16) } else { theme::accent_soft() });
+                                    ui::draw_icon(ui.painter(), r.shrink(8.), if favorite { Icon::Star } else { Icon::Document }, if favorite { Color32::from_rgb(235, 150, 20) } else { theme::accent() });
                                     ui.add_space(6.);
-                                    ui.label(RichText::new(if !self.home.query.is_empty() { "No matching documents." } else if favorite { "Keep a document close. Click its star to add it here." } else { "Your recently opened and saved PDFs will appear here." }).color(MUTED).size(13.));
+                                    ui.label(RichText::new(if !self.home.query.is_empty() { "No matching documents." } else if favorite { "Keep a document close. Click its star to add it here." } else { "Your recently opened and saved PDFs will appear here." }).color(theme::muted()).size(13.));
                                 });
                             });
                         } else {
@@ -277,7 +279,7 @@ impl Viewer {
                         ui.add_space(26.);
                     }
                     if let Some(error) = &self.home.error {
-                        ui.colored_label(Color32::from_rgb(165, 57, 43), format!("Home history: {error}"));
+                        ui.colored_label(theme::danger(), format!("Home history: {error}"));
                         if ui.link("Reload history").clicked() { self.home.reload(); }
                     }
                 });
@@ -332,48 +334,62 @@ impl Viewer {
         }
         let mut choice = None;
         let modal = egui::Modal::new(egui::Id::new("home_import"))
-            .frame(
-                egui::Frame::popup(&ctx.style())
-                    .corner_radius(22.)
-                    .inner_margin(26.),
-            )
+            .backdrop_color(Color32::from_black_alpha(64))
+            .frame(ui::modal_frame())
             .show(ctx, |ui| {
-                ui.set_width(370.);
-                ui.label(RichText::new("Create a PDF").size(23.).strong());
-                ui.add_space(8.);
-                ui.label(
-                    RichText::new("Choose the type of file you want to convert.").color(MUTED),
-                );
-                ui.add_space(18.);
-                for (images, icon, label, detail) in [
-                    (
-                        true,
+                ui.set_width(380.);
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(44., 44.), egui::Sense::hover());
+                    ui::badge(
+                        ui.painter(),
+                        r,
                         Icon::Import,
-                        "Images to PDF",
-                        "PNG or JPEG · one image per page",
-                    ),
-                    (
-                        false,
-                        Icon::Text,
-                        "Word or Markdown to PDF",
-                        "DOCX, MD or TXT · text and basic paragraphs",
-                    ),
-                ] {
-                    if ui
-                        .add_enabled(!self.content.busy, ActionButton::new(icon, label))
-                        .clicked()
-                    {
-                        choice = Some(images);
+                        ui::Fill::Brand,
+                        Color32::WHITE,
+                    );
+                    ui.add_space(4.);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.;
+                        ui::title(ui, "Create a PDF", 18.);
+                        ui.label(
+                            RichText::new("Choose the kind of file to convert.")
+                                .size(13.)
+                                .color(theme::muted()),
+                        );
+                    });
+                });
+                ui.add_space(16.);
+                ui.add_enabled_ui(!self.content.busy, |ui| {
+                    for (images, icon, color, label, detail) in [
+                        (
+                            true,
+                            Icon::Import,
+                            Color32::from_rgb(244, 84, 84),
+                            "Images to PDF",
+                            "PNG or JPEG · one image per page",
+                        ),
+                        (
+                            false,
+                            Icon::Text,
+                            theme::accent(),
+                            "Word or Markdown to PDF",
+                            "DOCX, MD or TXT · text and basic paragraphs",
+                        ),
+                    ] {
+                        if option_row(ui, icon, color, label, detail).clicked() {
+                            choice = Some(images);
+                        }
+                        ui.add_space(4.);
                     }
-                    ui.label(RichText::new(detail).small().color(MUTED));
-                    ui.add_space(12.);
-                }
+                });
                 if self.content.busy {
-                    ui.spinner();
-                    ui.label("Creating your PDF…");
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Creating your PDF…").color(theme::muted()));
+                    });
                 }
-                ui.separator();
-                if ui.button("Cancel").clicked() {
+                ui.add_space(12.);
+                if ui::dialog_button(ui, "Cancel", ui::DialogTone::Secondary).clicked() {
                     self.home.import_open = false;
                 }
             });
@@ -386,151 +402,288 @@ impl Viewer {
         }
     }
 }
-fn home_font(size: f32, bold: bool) -> FontId {
-    let face = mypdf_milestone0::text_style::fonts().iter().find(|face| {
-        matches!(face.family.as_str(), "Arial" | "DejaVuSans") && face.bold == bold && !face.italic
-    });
-    face.map_or_else(
-        || FontId::proportional(size),
-        |f| FontId::new(size, egui::FontFamily::Name(f.ui_name().into())),
-    )
+fn home_font(ui: &egui::Ui, size: f32, bold: bool) -> FontId {
+    if bold {
+        ui::bold(ui, size)
+    } else {
+        FontId::proportional(size)
+    }
 }
 fn section_title(ui: &mut egui::Ui, label: &str) {
-    ui.label(RichText::new(label).font(home_font(21., true)).color(INK));
+    ui::title(ui, label, 19.);
 }
 fn button_info(response: &egui::Response, label: &str) {
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
 }
+/// A selectable dialog row: colored icon tile, title, detail and a chevron.
+fn option_row(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    color: Color32,
+    label: &str,
+    detail: &str,
+) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(ui.available_width(), 62.), egui::Sense::click());
+    button_info(&response, label);
+    let enabled = ui.is_enabled();
+    let hovered = enabled && response.hovered();
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        12,
+        if hovered {
+            theme::accent_soft()
+        } else {
+            theme::surface()
+        },
+        Stroke::new(
+            1.,
+            if hovered {
+                theme::accent_line()
+            } else {
+                theme::line()
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    if response.has_focus() {
+        painter.rect_stroke(
+            rect,
+            12,
+            Stroke::new(2.5, theme::accent()),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let tile = Rect::from_center_size(pos2(rect.left() + 32., rect.center().y), vec2(36., 36.));
+    ui::badge(
+        painter,
+        tile,
+        icon,
+        ui::Fill::Sheen,
+        if enabled {
+            color
+        } else {
+            Color32::from_gray(190)
+        },
+    );
+    painter.text(
+        pos2(rect.left() + 60., rect.center().y - 9.),
+        egui::Align2::LEFT_CENTER,
+        label,
+        ui::strong(ui, 14.),
+        if enabled {
+            theme::ink()
+        } else {
+            theme::muted()
+        },
+    );
+    painter.text(
+        pos2(rect.left() + 60., rect.center().y + 10.),
+        egui::Align2::LEFT_CENTER,
+        detail,
+        FontId::proportional(12.),
+        theme::muted(),
+    );
+    ui::draw_icon(
+        painter,
+        Rect::from_center_size(pos2(rect.right() - 20., rect.center().y), vec2(14., 14.)),
+        Icon::Right,
+        if hovered {
+            theme::accent()
+        } else {
+            theme::muted()
+        },
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+/// A dashed rounded-rectangle outline, used for drop zones.
+pub(super) fn dashed_outline(painter: &egui::Painter, rect: Rect, r: f32, stroke: Stroke) {
+    let mut border = Vec::new();
+    for (center, start) in [
+        (rect.right_top() + vec2(-r, r), -90.),
+        (rect.right_bottom() + vec2(-r, -r), 0.),
+        (rect.left_bottom() + vec2(r, -r), 90.),
+        (rect.left_top() + vec2(r, r), 180.),
+    ] {
+        for step in 0..=8 {
+            let a = (start + step as f32 * 90. / 8.).to_radians();
+            border.push(center + vec2(a.cos(), a.sin()) * r);
+        }
+    }
+    border.push(border[0]);
+    painter.extend(egui::Shape::dashed_line(&border, stroke, 9., 7.));
+}
 fn open_banner(ui: &mut egui::Ui) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(vec2(ui.available_width(), 190.), egui::Sense::click());
+        ui.allocate_exact_size(vec2(ui.available_width(), 196.), egui::Sense::click());
     button_info(&response, "Open Files");
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        painter.rect_filled(
+        let hovered = response.hovered();
+        // A faint brand wash: the gradient texture at low opacity over white.
+        painter.rect_filled(rect, 22, theme::surface());
+        ui::gradient_rect(
+            painter,
             rect,
-            20.,
-            if response.hovered() {
-                Color32::from_rgb(231, 242, 255)
-            } else {
-                SOFT_BLUE
-            },
+            22,
+            ui::Fill::Brand,
+            Color32::from_white_alpha(if hovered { 46 } else { 32 }),
         );
-        let inset = rect.shrink(8.);
-        let r = 12.;
-        let mut border = Vec::new();
-        for (center, start) in [
-            (inset.right_top() + vec2(-r, r), -90.),
-            (inset.right_bottom() + vec2(-r, -r), 0.),
-            (inset.left_bottom() + vec2(r, -r), 90.),
-            (inset.left_top() + vec2(r, r), 180.),
-        ] {
-            for step in 0..=8 {
-                let a = (start + step as f32 * 90. / 8.).to_radians();
-                border.push(center + vec2(a.cos(), a.sin()) * r);
-            }
-        }
-        border.push(border[0]);
-        painter.extend(egui::Shape::dashed_line(
-            &border,
-            Stroke::new(1.4, Color32::from_rgb(176, 208, 250)),
-            10.,
-            8.,
-        ));
+        dashed_outline(
+            painter,
+            rect.shrink(8.),
+            15.,
+            Stroke::new(
+                1.5,
+                theme::accent().gamma_multiply(if hovered { 0.6 } else { 0.38 }),
+            ),
+        );
         if response.has_focus() {
-            painter.rect_stroke(rect, 20., Stroke::new(2., BLUE), egui::StrokeKind::Inside);
-        }
-        let center = rect.center_top() + vec2(0., 60.);
-        for (x, y) in [(-16., 5.), (16., 5.), (0., 0.)] {
-            let page = Rect::from_center_size(center + vec2(x, y), vec2(42., 56.));
-            painter.rect_filled(
-                page.translate(vec2(0., 3.)),
-                4.,
-                Color32::from_rgb(210, 226, 249),
-            );
-            painter.rect(
-                page,
-                4.,
-                Color32::WHITE,
-                Stroke::new(1., Color32::from_rgb(186, 215, 255)),
+            painter.rect_stroke(
+                rect,
+                22,
+                Stroke::new(2.5, theme::accent()),
                 egui::StrokeKind::Inside,
             );
+        }
+        let center = rect.center_top() + vec2(0., 62.);
+        for (x, y, angle) in [(-24., 6., -0.16), (24., 6., 0.16), (0., 0., 0.)] {
+            let page = Rect::from_center_size(center + vec2(x, y), vec2(44., 58.));
+            let rot = egui::emath::Rot2::from_angle(angle);
+            let corners = [
+                page.left_top(),
+                page.right_top(),
+                page.right_bottom(),
+                page.left_bottom(),
+            ]
+            .map(|c| center + vec2(x, y) + rot * (c - page.center()));
+            painter.add(egui::Shape::convex_polygon(
+                corners.iter().map(|c| *c + vec2(0., 3.)).collect(),
+                Color32::from_black_alpha(18),
+                Stroke::NONE,
+            ));
+            painter.add(egui::Shape::convex_polygon(
+                corners.to_vec(),
+                Color32::WHITE,
+                Stroke::new(1., Color32::from_rgb(214, 222, 245)),
+            ));
             if x == 0. {
-                painter.text(
-                    page.center_bottom() - vec2(0., 15.),
-                    egui::Align2::CENTER_CENTER,
-                    "PDF",
-                    home_font(15., true),
-                    Color32::from_rgb(116, 179, 253),
-                );
-                for y in [12., 18.] {
+                for (i, w) in [26., 20., 24.].iter().enumerate() {
+                    let y = page.top() + 11. + i as f32 * 7.;
                     painter.line_segment(
-                        [page.min + vec2(9., y), page.min + vec2(33., y)],
-                        Stroke::new(1., Color32::from_rgb(181, 212, 251)),
+                        [pos2(page.left() + 9., y), pos2(page.left() + 9. + w, y)],
+                        Stroke::new(1.6, Color32::from_rgb(206, 216, 240)),
                     );
                 }
+                let tag =
+                    Rect::from_center_size(page.center_bottom() - vec2(0., 13.), vec2(32., 15.));
+                painter.rect_filled(tag, 4, theme::danger());
+                painter.text(
+                    tag.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "PDF",
+                    home_font(ui, 10.5, true),
+                    Color32::WHITE,
+                );
             }
         }
-        let pill = Rect::from_center_size(rect.center_top() + vec2(0., 131.), vec2(142., 38.));
-        painter.rect_filled(pill, 19., BLUE);
-        painter.text(
-            pill.center(),
-            egui::Align2::CENTER_CENTER,
-            "Open Files",
-            home_font(16., true),
+        let pill = Rect::from_center_size(rect.center_top() + vec2(0., 136.), vec2(150., 40.));
+        ui::shadow(painter, pill, 20, 2);
+        ui::gradient_rect(
+            painter,
+            pill,
+            20,
+            ui::Fill::Brand,
+            if hovered {
+                Color32::from_gray(232)
+            } else {
+                Color32::WHITE
+            },
+        );
+        let label = Rect::from_center_size(pill.center(), vec2(112., 20.));
+        ui::draw_icon(
+            painter,
+            Rect::from_center_size(pos2(label.left() + 8., label.center().y), vec2(16., 16.)),
+            Icon::Open,
             Color32::WHITE,
         );
         painter.text(
-            rect.center_top() + vec2(0., 173.),
+            pos2(label.left() + 24., label.center().y),
+            egui::Align2::LEFT_CENTER,
+            "Open Files",
+            home_font(ui, 15., true),
+            Color32::WHITE,
+        );
+        painter.text(
+            rect.center_top() + vec2(0., 176.),
             egui::Align2::CENTER_CENTER,
-            "or drop PDFs here",
-            home_font(14., false),
-            Color32::from_rgb(90, 151, 230),
+            "or drop PDFs anywhere in this window",
+            home_font(ui, 12.5, false),
+            theme::muted(),
         );
     }
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+/// A white card with a hairline border that lifts on hover.
+fn card(painter: &egui::Painter, rect: Rect, hovered: bool, focused: bool) {
+    ui::shadow(painter, rect, 16, if hovered { 3 } else { 1 });
+    painter.rect(
+        rect,
+        16,
+        theme::surface(),
+        Stroke::new(
+            1.,
+            if hovered {
+                theme::accent_line()
+            } else {
+                theme::line()
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    if focused {
+        painter.rect_stroke(
+            rect,
+            16,
+            Stroke::new(2.5, theme::accent()),
+            egui::StrokeKind::Inside,
+        );
+    }
 }
 fn tool_card(
     ui: &mut egui::Ui,
     icon: Icon,
     label: &str,
+    detail: &str,
     color: Color32,
     width: f32,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 116.), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 128.), egui::Sense::click());
     button_info(&response, label);
     if ui.is_rect_visible(rect) {
-        let blank = matches!(icon, Icon::Blank);
-        ui.painter().rect_filled(
-            rect,
-            17.,
-            if response.hovered() {
-                Color32::from_rgb(230, 240, 253)
-            } else if blank {
-                SOFT_BLUE
-            } else {
-                Color32::from_rgb(247, 248, 250)
-            },
-        );
-        if response.has_focus() {
-            ui.painter()
-                .rect_stroke(rect, 17., Stroke::new(2., BLUE), egui::StrokeKind::Inside);
-        }
-        let center = rect.center_top() + vec2(0., 40.);
-        ui.painter()
-            .circle_filled(center, 23., color.gamma_multiply(0.09));
-        ui::draw_icon(
-            ui.painter(),
-            Rect::from_center_size(center, vec2(32., 32.)),
-            icon,
-            color,
-        );
+        let hovered = response.hovered();
+        let rect = if hovered {
+            rect.translate(vec2(0., -2.))
+        } else {
+            rect
+        };
+        card(ui.painter(), rect, hovered, response.has_focus());
+        let tile = Rect::from_center_size(rect.center_top() + vec2(0., 40.), vec2(46., 46.));
+        ui::badge(ui.painter(), tile, icon, ui::Fill::Sheen, color);
         ui.painter().text(
             rect.center_top() + vec2(0., 86.),
             egui::Align2::CENTER_CENTER,
             label,
-            home_font(14., false),
-            INK,
+            ui::strong(ui, 14.),
+            theme::ink(),
+        );
+        ui.painter().text(
+            rect.center_top() + vec2(0., 106.),
+            egui::Align2::CENTER_CENTER,
+            detail,
+            home_font(ui, 11.5, false),
+            theme::muted(),
         );
     }
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -557,11 +710,11 @@ fn document_card(
             let painter = ui.painter();
             painter.rect_filled(
                 rect,
-                12.,
+                14,
                 if response.hovered() {
-                    SOFT_BLUE
+                    theme::accent_soft()
                 } else {
-                    Color32::from_rgb(248, 249, 251)
+                    theme::control()
                 },
             );
             let preview = home.previews.get_mut(&entry.path);
@@ -579,13 +732,14 @@ fn document_card(
                 let s = t.size_vec2();
                 s * (space.width() / s.x).min(space.height() / s.y)
             });
-            let paper = Rect::from_center_size(rect.center(), size);
-            painter.rect_filled(paper.translate(vec2(0., 2.)), 3., Color32::from_gray(219));
+            let lift = if response.hovered() { -3. } else { 0. };
+            let paper = Rect::from_center_size(rect.center() + vec2(0., lift), size);
+            ui::shadow(painter, paper, 3, if response.hovered() { 3 } else { 1 });
             painter.rect(
                 paper,
                 3.,
                 Color32::WHITE,
-                Stroke::new(0.7, Color32::from_gray(223)),
+                Stroke::new(0.7, Color32::from_gray(226)),
                 egui::StrokeKind::Inside,
             );
             if let Some(image) = image {
@@ -599,12 +753,17 @@ fn document_card(
                 ui::draw_icon(
                     painter,
                     Rect::from_center_size(paper.center(), vec2(30., 30.)),
-                    Icon::Read,
-                    Color32::from_rgb(184, 199, 219),
+                    Icon::Document,
+                    Color32::from_rgb(190, 198, 222),
                 );
             }
             if response.has_focus() {
-                painter.rect_stroke(rect, 12., Stroke::new(2., BLUE), egui::StrokeKind::Inside);
+                painter.rect_stroke(
+                    rect,
+                    14,
+                    Stroke::new(2.5, theme::accent()),
+                    egui::StrokeKind::Inside,
+                );
             }
         }
         if response.clicked() {
@@ -645,20 +804,40 @@ fn document_card(
                 r.shrink(3.),
                 Icon::Star,
                 if entry.favorite {
-                    Color32::from_rgb(227, 164, 20)
+                    Color32::from_rgb(245, 166, 35)
+                } else if favorite.hovered() {
+                    Color32::from_rgb(245, 166, 35).gamma_multiply(0.7)
                 } else {
-                    Color32::from_gray(169)
+                    theme::muted()
                 },
             );
+            if entry.favorite {
+                ui.painter().circle_filled(
+                    r.center() + vec2(0., 0.6),
+                    2.6,
+                    Color32::from_rgb(245, 166, 35),
+                );
+            }
             if favorite.has_focus() {
-                ui.painter()
-                    .rect_stroke(r, 4., Stroke::new(1., BLUE), egui::StrokeKind::Inside);
+                ui.painter().rect_stroke(
+                    r,
+                    4.,
+                    Stroke::new(1.5, theme::accent()),
+                    egui::StrokeKind::Inside,
+                );
             }
             if favorite.on_hover_text(label).clicked() {
                 action = Some(HomeAction::Favorite(entry.path.clone(), !entry.favorite));
             }
-            ui.add(egui::Label::new(RichText::new(entry.name()).size(13.).color(INK)).truncate())
-                .on_hover_text(entry.name());
+            ui.add(
+                egui::Label::new(
+                    RichText::new(entry.name())
+                        .font(ui::strong(ui, 13.))
+                        .color(theme::ink()),
+                )
+                .truncate(),
+            )
+            .on_hover_text(entry.name());
         });
         ui.label(
             RichText::new(if entry.opened > 0 {
@@ -667,7 +846,7 @@ fn document_card(
                 "Favorite".into()
             })
             .size(11.)
-            .color(MUTED),
+            .color(theme::muted()),
         );
     });
     action

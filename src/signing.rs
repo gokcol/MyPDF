@@ -24,16 +24,25 @@ pub struct SignatureEvidence {
     pub revocation: String,
     pub timestamp: Option<String>,
     pub certificate_binding_valid: bool,
+    /// The signer's certificate, for display, export and session trust.
+    #[serde(skip)]
+    pub signer_der: Option<Vec<u8>>,
 }
 
 pub fn verify(bytes: &[u8], trusted_cert: Option<&[u8]>) -> Result<Vec<SignatureEvidence>> {
+    verify_trusting(bytes, &trusted_cert.into_iter().collect::<Vec<_>>())
+}
+/// Verify against several explicitly trusted certificates.
+pub fn verify_trusting(bytes: &[u8], trusted: &[&[u8]]) -> Result<Vec<SignatureEvidence>> {
     if underskrift::verify::extractor::extract_signatures(bytes)?.is_empty() {
         return Ok(Vec::new());
     }
     let mut stores = TrustStoreSet::new();
-    if let Some(cert) = trusted_cert {
+    if !trusted.is_empty() {
         let mut trust = TrustStore::new();
-        trust.add_der_certificate(cert)?;
+        for cert in trusted {
+            trust.add_der_certificate(cert)?;
+        }
         stores = stores.with_sig_store(trust);
     }
     let report = SignatureVerifier::new(&stores)
@@ -59,6 +68,7 @@ pub fn verify(bytes: &[u8], trusted_cert: Option<&[u8]>) -> Result<Vec<Signature
             revocation: "not checked (offline validation)".into(),
             timestamp: s.timestamp_time.clone(),
             certificate_binding_valid: s.ess_cert_id_match == Some(true),
+            signer_der: s.signer_cert_der.clone(),
         })
         .collect())
 }
@@ -183,6 +193,27 @@ fn checked_input(
     Ok(before)
 }
 
+/// How a visible signature box is composed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub enum AppearanceLayout {
+    /// Artwork beside "Digitally signed by", the date and any reason or location.
+    #[default]
+    ImageAndDetails,
+    /// Only the artwork, such as a handwritten signature, on a transparent background.
+    ImageOnly,
+    /// Only the signing details, in a bordered box.
+    DetailsOnly,
+}
+impl AppearanceLayout {
+    /// The smallest signature box, in points, that keeps the appearance legible.
+    pub fn minimum_size(self) -> (f32, f32) {
+        match self {
+            Self::ImageOnly => (24.0, 12.0),
+            _ => (120.0, 48.0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DesktopSigningRequest {
     pub field: String,
@@ -192,6 +223,7 @@ pub struct DesktopSigningRequest {
     pub reason: String,
     pub location: String,
     pub artwork: Option<crate::assets::Asset>,
+    pub layout: AppearanceLayout,
 }
 impl Default for DesktopSigningRequest {
     fn default() -> Self {
@@ -203,6 +235,7 @@ impl Default for DesktopSigningRequest {
             reason: String::new(),
             location: String::new(),
             artwork: None,
+            layout: AppearanceLayout::default(),
         }
     }
 }
@@ -214,12 +247,13 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
         .rect
         .context("An invisible signature has no appearance")?;
     let (w, h) = (rect[2] - rect[0], rect[3] - rect[1]);
+    let (min_w, min_h) = request.layout.minimum_size();
     ensure!(
         w.is_finite()
             && h.is_finite()
-            && (120.0..=1500.0).contains(&w)
-            && (48.0..=600.0).contains(&h),
-        "Draw a signature rectangle at least 120 × 48 points, up to 1500 × 600"
+            && (min_w..=1500.0).contains(&w)
+            && (min_h..=600.0).contains(&h),
+        "Draw a signature rectangle at least {min_w} × {min_h} points, up to 1500 × 600"
     );
     ensure!(
         request.name.len() <= 200 && request.reason.len() <= 1000 && request.location.len() <= 300,
@@ -239,6 +273,46 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
     doc.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceTable;
     let mut base = vec![];
     doc.save_to(&mut base)?;
+    let render = |bytes: Vec<u8>, transparent: bool| -> Result<Vec<u8>> {
+        let pdf = hayro::hayro_syntax::Pdf::new(bytes)
+            .map_err(|e| anyhow::anyhow!("Signature appearance: {e:?}"))?;
+        let raster = hayro::render(
+            &pdf.pages()[0],
+            &hayro::RenderCache::new(),
+            &hayro::hayro_interpret::InterpreterSettings::default(),
+            &hayro::RenderSettings::default(),
+            &hayro::PixmapSettings {
+                x_scale: 2.0,
+                y_scale: 2.0,
+                bg_color: if transparent {
+                    hayro::vello_cpu::color::palette::css::TRANSPARENT
+                } else {
+                    hayro::vello_cpu::color::palette::css::WHITE
+                },
+            },
+        );
+        Ok(raster.into_png()?)
+    };
+    if request.layout == AppearanceLayout::ImageOnly {
+        let artwork = request
+            .artwork
+            .as_ref()
+            .context("Choose a signature image for an image-only appearance")?;
+        artwork.validate()?;
+        // Fit the artwork inside the box, keeping its proportions.
+        let (aw, ah) = if (w - 4.0) / (h - 4.0) > artwork.aspect {
+            ((h - 4.0) * artwork.aspect, h - 4.0)
+        } else {
+            (w - 4.0, (w - 4.0) / artwork.aspect)
+        };
+        let (x, y) = ((w - aw) / 2.0, (h - ah) / 2.0);
+        let mut style = artwork.style.clone();
+        if matches!(artwork.kind, Kind::Text { .. } | Kind::Stamp { .. }) {
+            style.font_size = style.font_size.min((ah - 4.0) / 1.25).max(6.0);
+        }
+        let mark = Annotation::new(0, [x, y, x + aw, y + ah], artwork.kind.clone(), style);
+        return render(crate::annotations::export(&base, &[mark])?, true);
+    }
     let mut annotations = vec![Annotation::new(
         0,
         [1.0, 1.0, w - 1.0, h - 1.0],
@@ -248,7 +322,11 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
             ..Default::default()
         },
     )];
-    let left = if let Some(artwork) = &request.artwork {
+    let artwork = request
+        .artwork
+        .as_ref()
+        .filter(|_| request.layout == AppearanceLayout::ImageAndDetails);
+    let left = if let Some(artwork) = artwork {
         artwork.validate()?;
         let aw = (w * 0.34 - 8.0).min((h - 16.0) * artwork.aspect);
         let ah = aw / artwork.aspect;
@@ -298,22 +376,7 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
             },
         ));
         match crate::annotations::export(&base, &current) {
-            Ok(bytes) => {
-                let pdf = hayro::hayro_syntax::Pdf::new(bytes)
-                    .map_err(|e| anyhow::anyhow!("Signature appearance: {e:?}"))?;
-                let raster = hayro::render(
-                    &pdf.pages()[0],
-                    &hayro::RenderCache::new(),
-                    &hayro::hayro_interpret::InterpreterSettings::default(),
-                    &hayro::RenderSettings::default(),
-                    &hayro::PixmapSettings {
-                        x_scale: 2.0,
-                        y_scale: 2.0,
-                        bg_color: hayro::vello_cpu::color::palette::css::WHITE,
-                    },
-                );
-                return Ok(raster.into_png()?);
-            }
+            Ok(bytes) => return render(bytes, false),
             Err(e) => last = Some(e),
         }
     }

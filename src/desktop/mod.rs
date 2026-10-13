@@ -8,6 +8,9 @@ mod organize;
 #[cfg(test)]
 mod preview;
 mod recovery;
+mod selection;
+mod signatures;
+mod theme;
 mod ui;
 use ui::{ActionButton, Icon};
 
@@ -17,11 +20,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 
-const INK: Color32 = Color32::from_rgb(46, 48, 54);
-const ACCENT: Color32 = Color32::from_rgb(39, 126, 216);
-const MUTED: Color32 = Color32::from_rgb(103, 108, 120);
-const PAPER: Color32 = Color32::from_rgb(245, 245, 247);
-const CANVAS: Color32 = Color32::from_rgb(226, 228, 233);
 const CACHE_BUDGET: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -70,12 +68,17 @@ struct Tab {
     bytes: Option<Arc<[u8]>>,
     pages: Vec<PageSize>,
     signed: bool,
+    /// The signed file that edits are appended to, once editing is unlocked.
+    signed_original: Option<Arc<[u8]>>,
+    signatures: signatures::TabSignatures,
     unsaved_on_load: bool,
     remember_open: bool,
     session: Option<mypdf_milestone0::annotations::Session>,
     capabilities: Option<mypdf_milestone0::annotations::Capabilities>,
     editing_warning: Option<String>,
     selected_annotation: Option<String>,
+    /// A multi-object selection on one page; empty unless at least two marks are chosen.
+    group: Vec<String>,
     error: Option<String>,
     page: usize,
     page_input: String,
@@ -173,6 +176,91 @@ impl Tab {
     }
 }
 
+/// A small rounded status label tinted with `color`.
+fn pill(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.12))
+        .corner_radius(9)
+        .inner_margin(egui::Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).size(11.).color(color))
+        })
+        .inner
+}
+enum TabClick {
+    Select,
+    Close,
+}
+/// A document tab chip: PDF glyph, name, unsaved dot and a close button on hover.
+fn document_tab(ui: &mut egui::Ui, tab: &Tab, active: bool, dirty: bool) -> Option<TabClick> {
+    let mut name = tab.name();
+    if name.chars().count() > 28 {
+        name = format!("{}…", name.chars().take(27).collect::<String>());
+    }
+    let font = FontId::proportional(13.);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(name.clone(), font, theme::ink());
+    let size = vec2(galley.size().x + 74., 30.);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, true, active, name.as_str())
+    });
+    let close_rect =
+        Rect::from_center_size(pos2(rect.right() - 16., rect.center().y), vec2(20., 20.));
+    let close = ui.interact(
+        close_rect,
+        ui.id().with(("close_tab", tab.id)),
+        egui::Sense::click(),
+    );
+    close.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Close tab"));
+    let painter = ui.painter();
+    if active {
+        ui::shadow(painter, rect, 8, 1);
+        painter.rect_filled(rect, 8, theme::surface());
+    } else if response.hovered() || close.hovered() {
+        painter.rect_filled(rect, 8, theme::hover());
+    }
+    let glyph = Rect::from_center_size(pos2(rect.left() + 18., rect.center().y), vec2(16., 16.));
+    ui::draw_icon(
+        painter,
+        glyph,
+        Icon::Document,
+        if active {
+            theme::danger()
+        } else {
+            theme::muted()
+        },
+    );
+    painter.galley_with_override_text_color(
+        pos2(rect.left() + 32., rect.center().y - galley.size().y / 2.),
+        galley,
+        if active { theme::ink() } else { theme::muted() },
+    );
+    if close.hovered() {
+        painter.rect_filled(close_rect, 5, theme::pressed());
+    }
+    if active || response.hovered() || close.hovered() {
+        ui::draw_icon(painter, close_rect.shrink(5.), Icon::Close, theme::muted());
+    } else if dirty {
+        painter.circle_filled(close_rect.center(), 3.5, theme::accent());
+    }
+    if dirty && (active || response.hovered() || close.hovered()) {
+        painter.circle_filled(
+            pos2(close_rect.left() - 6., rect.center().y),
+            3.,
+            theme::accent(),
+        );
+    }
+    if close.on_hover_text("Close tab").clicked() {
+        return Some(TabClick::Close);
+    }
+    response
+        .on_hover_text(tab.path.display().to_string())
+        .clicked()
+        .then_some(TabClick::Select)
+}
+
 pub struct Viewer {
     home: home::Home,
     content: content::ContentState,
@@ -198,6 +286,12 @@ pub struct Viewer {
     exit_approved: bool,
     _native_menu: Option<menu::NativeMenu>,
     menu_events: mpsc::Receiver<String>,
+    /// Certificates trusted until the app quits.
+    trusted: Vec<Vec<u8>>,
+    signature_prompt: Option<signatures::Prompt>,
+    signature_busy: bool,
+    signature_tx: mpsc::Sender<signatures::SignatureJob>,
+    signature_rx: mpsc::Receiver<signatures::SignatureJob>,
 }
 impl Viewer {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> Self {
@@ -205,6 +299,7 @@ impl Viewer {
         ui::install_theme(&cc.egui_ctx);
         let (native_menu, menu_events) = menu::install(cc.egui_ctx.clone());
         let (save_tx, save_events) = mpsc::channel();
+        let (signature_tx, signature_rx) = mpsc::channel();
         let mut app = Self {
             home: home::Home::new(&cc.egui_ctx),
             content: content::ContentState::new(),
@@ -230,6 +325,11 @@ impl Viewer {
             exit_approved: false,
             _native_menu: native_menu,
             menu_events,
+            trusted: vec![],
+            signature_prompt: None,
+            signature_busy: false,
+            signature_tx,
+            signature_rx,
         };
         for path in paths {
             app.open(path, &cc.egui_ctx);
@@ -265,12 +365,15 @@ impl Viewer {
             bytes: None,
             pages: vec![],
             signed: false,
+            signed_original: None,
+            signatures: Default::default(),
             unsaved_on_load: false,
             remember_open: true,
             session: None,
             capabilities: None,
             editing_warning: None,
             selected_annotation: None,
+            group: vec![],
             error: None,
             page: 0,
             page_input: "1".into(),
@@ -380,6 +483,7 @@ impl Viewer {
             .as_ref()
             .map(|s| s.annotations.clone())
             .unwrap_or_default();
+        let signed_original = tab.signed_original.clone();
         let stem = tab.path.file_stem().unwrap_or_default().to_string_lossy();
         let dialog = rfd::FileDialog::new()
             .set_title("Save a Copy • choose a new filename")
@@ -400,6 +504,13 @@ impl Viewer {
                     bytes.to_vec()
                 } else {
                     mypdf_milestone0::annotations::export(&bytes, &annotations)?
+                };
+                // Signed bytes stay untouched: edits are appended as a new revision.
+                let bytes = match signed_original {
+                    Some(original) => {
+                        mypdf_milestone0::signature_edit::incremental_update(&original, &bytes)?
+                    }
+                    None => bytes,
                 };
                 viewer::save_copy(&destination, &bytes)?;
                 Ok((destination, tab_id, revision))
@@ -449,6 +560,14 @@ impl Viewer {
             "identities" => {
                 self.digital.open = true;
                 self.digital.panel = digital::Panel::Identities;
+            }
+            "quick_sign" => self.quick_sign(),
+            "theme_system" => ui::set_theme_preference(ctx, egui::ThemePreference::System),
+            "theme_light" => ui::set_theme_preference(ctx, egui::ThemePreference::Light),
+            "theme_dark" => ui::set_theme_preference(ctx, egui::ThemePreference::Dark),
+            "appearance" => {
+                self.digital.open = true;
+                self.digital.panel = digital::Panel::Appearance;
             }
             "sign" => {
                 self.digital.open = true;
@@ -519,10 +638,7 @@ impl Viewer {
                             tab.session = Some(mypdf_milestone0::annotations::Session::new(
                                 bytes.clone(),
                                 annotations,
-                                !capabilities.signed
-                                    && !capabilities.certified
-                                    && !capabilities.encrypted
-                                    && editing_warning.is_none(),
+                                capabilities.rewritable() && editing_warning.is_none(),
                             ));
                         }
                         if tab.unsaved_on_load {
@@ -534,10 +650,8 @@ impl Viewer {
                         tab.jump(tab.page.min(tab.pages.len().saturating_sub(1)));
                         tab.bytes = Some(bytes);
                         if let Some(session) = &mut tab.session {
-                            session.editable = !capabilities.signed
-                                && !capabilities.certified
-                                && !capabilities.encrypted
-                                && editing_warning.is_none();
+                            session.editable =
+                                capabilities.rewritable() && editing_warning.is_none();
                         }
                         tab.capabilities = Some(capabilities);
                         tab.editing_warning = editing_warning;
@@ -655,9 +769,8 @@ impl Viewer {
             if matches!(
                 self.editor.mode,
                 editing::Mode::Annotate | editing::Mode::Draw
-            ) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
-            {
-                self.editor_delete();
+            ) {
+                self.selection_keys(ctx);
             }
         }
         // macOS menu accelerators own these shortcuts to prevent duplicate dialogs.
@@ -731,74 +844,47 @@ impl Viewer {
         egui::TopBottomPanel::top("document_tabs")
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(29, 30, 34))
-                    .inner_margin(egui::Margin::symmetric(12, 5)),
+                    .fill(theme::chrome())
+                    .inner_margin(egui::Margin::symmetric(12, 6)),
             )
             .show(ctx, |ui| {
-                *ui.visuals_mut() = egui::Visuals::dark();
                 egui::ScrollArea::horizontal().show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.;
                         #[cfg(target_os = "macos")]
                         ui.add_space(70.0);
+                        let (mark, _) =
+                            ui.allocate_exact_size(vec2(22., 22.), egui::Sense::hover());
+                        ui::logo(ui.painter(), mark);
+                        ui.add_space(3.);
                         ui.label(
                             RichText::new("MyPDF")
-                                .color(Color32::from_rgb(210, 215, 223))
-                                .strong(),
+                                .font(ui::bold(ui, 14.))
+                                .color(theme::ink()),
                         );
-                        ui.add_space(14.0);
+                        ui.add_space(12.0);
                         if ui
-                            .add(ActionButton::new(Icon::Home, "Home").selected(self.home.visible))
+                            .add(
+                                ActionButton::new(Icon::Home, "Home")
+                                    .tab()
+                                    .selected(self.home.visible),
+                            )
                             .on_hover_text("Home · ⇧⌘H")
                             .clicked()
                         {
                             action = Some("home");
                         }
                         for (i, tab) in self.tabs.iter().enumerate() {
-                            ui.push_id(tab.id, |ui| {
-                                egui::Frame::new()
-                                    .fill(if i == self.active && !self.home.visible {
-                                        Color32::from_rgb(67, 69, 75)
-                                    } else {
-                                        Color32::TRANSPARENT
-                                    })
-                                    .corner_radius(4.0)
-                                    .inner_margin(egui::Margin::symmetric(12, 4))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            let mut name = tab.name();
-                                            if name.chars().count() > 28 {
-                                                name = format!(
-                                                    "{}…",
-                                                    name.chars().take(27).collect::<String>()
-                                                );
-                                            }
-                                            if tab.session.as_ref().is_some_and(|s| s.dirty()) {
-                                                name.push_str(" •");
-                                            }
-                                            if ui
-                                                .add(
-                                                    egui::Button::new(
-                                                        RichText::new(name)
-                                                            .color(Color32::from_gray(238)),
-                                                    )
-                                                    .frame(false),
-                                                )
-                                                .on_hover_text(tab.path.display().to_string())
-                                                .clicked()
-                                            {
-                                                self.active = i;
-                                                self.home.visible = false;
-                                            }
-                                            if ui
-                                                .add(egui::Button::new("×").frame(false))
-                                                .on_hover_text("Close tab")
-                                                .clicked()
-                                            {
-                                                close = Some(i);
-                                            }
-                                        })
-                                    });
-                            });
+                            let active = i == self.active && !self.home.visible;
+                            let dirty = tab.session.as_ref().is_some_and(|s| s.dirty());
+                            match document_tab(ui, tab, active, dirty) {
+                                Some(TabClick::Select) => {
+                                    self.active = i;
+                                    self.home.visible = false;
+                                }
+                                Some(TabClick::Close) => close = Some(i),
+                                None => {}
+                            }
                         }
                         if ui
                             .add(ActionButton::new(Icon::Plus, "Open PDF").compact())
@@ -807,11 +893,14 @@ impl Viewer {
                             action = Some("open");
                         }
                         let drag = ui.allocate_response(
-                            vec2(ui.available_width().max(1.0), 30.0),
+                            vec2((ui.available_width() - 40.).max(1.0), 30.0),
                             egui::Sense::drag(),
                         );
                         if drag.drag_started() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
+                        if let Some(choice) = ui::theme_menu(ui) {
+                            action = Some(choice);
                         }
                     })
                 });
@@ -828,16 +917,44 @@ impl Viewer {
         egui::TopBottomPanel::top("main_toolbar")
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(39, 40, 46))
-                    .inner_margin(egui::Margin::symmetric(12, 0)),
+                    .fill(theme::toolbar())
+                    .inner_margin(egui::Margin::symmetric(12, 6)),
             )
             .show(ctx, |ui| {
-                *ui.visuals_mut() = egui::Visuals::dark();
-                ui.spacing_mut().item_spacing.x = 5.;
-                let compact = ui.available_width() < 1100.;
+                ui.spacing_mut().item_spacing.x = 4.;
+                const MODES: [(editing::Mode, Icon, &str); 8] = [
+                    (editing::Mode::Read, Icon::Read, "Read"),
+                    (editing::Mode::Annotate, Icon::Pen, "Annotate"),
+                    (editing::Mode::Edit, Icon::Text, "Edit"),
+                    (editing::Mode::Draw, Icon::Shapes, "Draw"),
+                    (editing::Mode::Forms, Icon::Form, "Forms"),
+                    (editing::Mode::Sign, Icon::Sign, "Sign"),
+                    (editing::Mode::Pages, Icon::Library, "Pages"),
+                    (editing::Mode::Convert, Icon::Export, "Export"),
+                ];
+                let track_width = |ui: &egui::Ui, compact: bool| {
+                    MODES
+                        .iter()
+                        .map(|(mode, icon, label)| {
+                            let mut b = ActionButton::new(*icon, label).tab();
+                            if compact {
+                                b = b.compact();
+                            }
+                            if *mode == editing::Mode::Sign {
+                                b = b.dropdown();
+                            }
+                            b.width(ui)
+                        })
+                        .sum::<f32>()
+                        + 2. * (MODES.len() - 1) as f32
+                        + 6.
+                };
+                let full = ui.available_width();
+                // File actions (left) and panel toggles (right) need about 230 points.
+                let compact = full < track_width(ui, false) + 260.;
                 ui.horizontal(|ui| {
                     for (icon, label, key) in [
-                        (Icon::Plus, "New blank PDF", "new"),
+                        (Icon::Blank, "New blank PDF", "new"),
                         (Icon::Open, "Open…", "open"),
                         (Icon::Save, "Save a Copy…", "save"),
                     ] {
@@ -854,33 +971,30 @@ impl Viewer {
                             action = Some(key);
                         }
                     }
-                    ui.add_space(12.);
-                    for (mode, icon, label) in [
-                        (editing::Mode::Read, Icon::Read, "Read"),
-                        (editing::Mode::Annotate, Icon::Pen, "Annotate"),
-                        (editing::Mode::Edit, Icon::Text, "Edit"),
-                        (editing::Mode::Draw, Icon::Shapes, "Draw"),
-                        (editing::Mode::Forms, Icon::Form, "Forms"),
-                        (editing::Mode::Sign, Icon::Shield, "Sign"),
-                        (editing::Mode::Pages, Icon::Library, "Pages"),
-                        (editing::Mode::Convert, Icon::Extract, "Export"),
-                    ] {
-                        if mode == editing::Mode::Sign {
-                            self.sign_menu(ui, compact, true);
-                            continue;
+                    let used = ui.min_rect().width();
+                    let track = track_width(ui, compact);
+                    let centered = (full - track) / 2. - used;
+                    let room = full - track - used - 118.;
+                    ui.add_space(centered.min(room).max(8.));
+                    ui::segment_track(ui, |ui| {
+                        for (mode, icon, label) in MODES {
+                            if mode == editing::Mode::Sign {
+                                self.sign_menu(ui, compact, true);
+                                continue;
+                            }
+                            let button = ActionButton::new(icon, label)
+                                .tab()
+                                .selected(self.editor.mode == mode);
+                            if ui
+                                .add(if compact { button.compact() } else { button })
+                                .clicked()
+                                && self.apply_pending_annotation()
+                            {
+                                self.editor.mode = mode;
+                                self.editor.library_open = false;
+                            }
                         }
-                        let button = ActionButton::new(icon, label)
-                            .tab()
-                            .selected(self.editor.mode == mode);
-                        if ui
-                            .add(if compact { button.compact() } else { button })
-                            .clicked()
-                            && self.apply_pending_annotation()
-                        {
-                            self.editor.mode = mode;
-                            self.editor.library_open = false;
-                        }
-                    }
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add(
@@ -914,8 +1028,8 @@ impl Viewer {
         egui::TopBottomPanel::bottom("document_navigation")
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(249, 250, 252))
-                    .inner_margin(egui::Margin::symmetric(12, 3)),
+                    .fill(theme::toolbar())
+                    .inner_margin(egui::Margin::symmetric(12, 4)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -968,7 +1082,7 @@ impl Viewer {
                             tab.jump(tab.page.saturating_sub(1));
                         }
                         let r = ui.add(
-                            egui::TextEdit::singleline(&mut tab.page_input)
+                            egui::TextEdit::singleline(&mut tab.page_input).margin(ui::FIELD_MARGIN)
                                 .desired_width(30.0)
                                 .horizontal_align(egui::Align::Center),
                         );
@@ -1022,17 +1136,34 @@ impl Viewer {
                         && let Some(s) = &tab.session
                         && s.dirty()
                     {
-                        ui.label(
-                            RichText::new(self.recovery.label(tab.id, s.revision()))
-                                .size(11.)
-                                .color(MUTED),
+                        let label = self.recovery.label(tab.id, s.revision());
+                        let (dot, _) = ui.allocate_exact_size(vec2(8., 8.), egui::Sense::hover());
+                        ui.painter().circle_filled(
+                            dot.center(),
+                            3.5,
+                            if label.contains("up to date") {
+                                theme::success()
+                            } else {
+                                theme::warning()
+                            },
                         );
+                        ui.label(RichText::new(label).size(11.5).color(theme::muted()));
                     }
-                    if let Some(tab) = self.tabs.get(self.active) {
-                        if tab.signed {
-                            ui.label(RichText::new("Signed PDF").size(11.).color(MUTED)).on_hover_text("Existing digital signatures are preserved. Ordinary editing is disabled.");
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        if tab.signed_original.is_some() {
+                            let pill = pill(ui, "Signed · editing", theme::warning())
+                                .on_hover_text("Edits are saved after the signed version, so signatures stay valid for what they signed. Click for signature details.");
+                            if pill.interact(egui::Sense::click()).clicked() {
+                                tab.signatures.panel = true;
+                            }
+                        } else if tab.signed {
+                            let pill = pill(ui, "Signed PDF", theme::success())
+                                .on_hover_text("Existing digital signatures are preserved. Use “Edit anyway…” in the signature bar to edit. Click for signature details.");
+                            if pill.interact(egui::Sense::click()).clicked() {
+                                tab.signatures.panel = true;
+                            }
                         } else if let Some(warning) = &tab.editing_warning {
-                            ui.label(RichText::new("Read-only").size(11.).color(MUTED)).on_hover_text(warning);
+                            pill(ui, "Read-only", theme::muted()).on_hover_text(warning);
                         }
                     }
                     if let Some(e) = &self.recovery.error {
@@ -1052,7 +1183,7 @@ impl Viewer {
                                 });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add(
-                                egui::Label::new(RichText::new(&message).size(11.).color(MUTED))
+                                egui::Label::new(RichText::new(&message).size(11.5).color(theme::muted()))
                                     .truncate(),
                             )
                             .on_hover_text(message);
@@ -1076,74 +1207,85 @@ impl Viewer {
                 .resizable(true)
                 .default_width(240.0)
                 .width_range(190.0..=360.0)
-                .frame(egui::Frame::new().fill(PAPER).inner_margin(12.0))
+                .frame(egui::Frame::new().fill(theme::paper()).inner_margin(12.0))
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("Pages").clicked() {
+                    match ui::segmented(ui, &["Pages", "Search", "Marks"], 2) {
+                        Some(0) => {
                             self.editor.annotation_sidebar = false;
                             self.search = false;
                         }
-                        if ui.button("Search").clicked() {
+                        Some(1) => {
                             self.editor.annotation_sidebar = false;
                             self.search = true;
                             self.focus_search = true;
                         }
-                        ui.label("Marks");
-                    });
-                    ui.separator();
+                        _ => {}
+                    }
+                    ui.add_space(4.);
                     self.annotation_list(ui);
                 });
             return;
         }
         let tab = &mut self.tabs[self.active];
         let tick = self.tick;
-        egui::SidePanel::left("sidebar").resizable(true).default_width(220.0).width_range(190.0..=360.0).frame(egui::Frame::new().fill(PAPER).inner_margin(12.0)).show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.selectable_label(!self.search, "Pages").clicked() { self.search = false; }
-                if ui.selectable_label(self.search, "Search").clicked() { self.search = true; self.focus_search = true; }
-                if ui.small_button("Marks").clicked() { self.editor.annotation_sidebar = true; }
-            });
-            ui.separator();
+        egui::SidePanel::left("sidebar").resizable(true).default_width(220.0).width_range(190.0..=360.0).frame(egui::Frame::new().fill(theme::paper()).inner_margin(12.0)).show(ctx, |ui| {
+            match ui::segmented(ui, &["Pages", "Search", "Marks"], usize::from(self.search)) {
+                Some(0) => self.search = false,
+                Some(1) => { self.search = true; self.focus_search = true; }
+                Some(_) => self.editor.annotation_sidebar = true,
+                None => {}
+            }
+            ui.add_space(4.);
             if self.search {
-                let response = ui.add(egui::TextEdit::singleline(&mut tab.query).hint_text("Find in document…").desired_width(f32::INFINITY));
+                let response = ui.add(egui::TextEdit::singleline(&mut tab.query).margin(ui::FIELD_MARGIN).hint_text("Find in document…").margin(vec2(10., 7.)).desired_width(f32::INFINITY));
                 self.editor.text_editing |= response.has_focus();
                 if self.focus_search { response.request_focus(); self.focus_search = false; }
                 if response.changed() { tab.search_worker.invalidate(); tab.search_dirty = true; tab.search_at = Some(std::time::Instant::now()); tab.hits.clear(); tab.hit = 0; tab.jump_to_first_hit = true; tab.search(ctx); }
                 if (response.has_focus() || response.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter)) { let next = if ui.input(|i| i.modifiers.shift) { tab.hit + tab.hits.len().saturating_sub(1) } else { tab.hit + 1 }; tab.select_hit(next); response.request_focus(); }
                 ui.horizontal(|ui| {
                     let message = if tab.hits.is_empty() { "0 matches".into() } else { format!("{} of {}", tab.hit + 1, tab.hits.len()) };
-                    ui.label(RichText::new(message).color(MUTED).size(12.0));
+                    ui.label(RichText::new(message).color(theme::muted()).size(12.0));
                     if ui.add_enabled(!tab.hits.is_empty(), ActionButton::new(Icon::Left, "Previous page").compact()).on_hover_text("Previous match • Shift+Enter").clicked() { tab.select_hit(tab.hit + tab.hits.len().saturating_sub(1)); }
                     if ui.add_enabled(!tab.hits.is_empty(), ActionButton::new(Icon::Right, "Next page").compact()).on_hover_text("Next match • Enter").clicked() { tab.select_hit(tab.hit + 1); }
                 });
-                if !tab.index_done { ui.label(RichText::new(format!("Indexing {}/{} pages…", tab.indexed, tab.pages.len())).color(MUTED).size(11.0)); }
-                if tab.searching || tab.search_dirty && !tab.query.is_empty() { ui.label(RichText::new("Searching…").color(MUTED).size(11.0)); }
-                if tab.search_limited { ui.label(RichText::new("Search is partial: this document reached the text index limit.").color(MUTED).size(12.0)); }
-                if !tab.query.is_empty() && tab.hits.is_empty() && tab.index_done && !tab.search_limited && !tab.searching && !tab.search_dirty { ui.label(RichText::new("No searchable matches. Scanned pages need OCR, which comes in a later milestone.").color(MUTED).size(12.0)); }
+                if !tab.index_done { ui.label(RichText::new(format!("Indexing {}/{} pages…", tab.indexed, tab.pages.len())).color(theme::muted()).size(11.0)); }
+                if tab.searching || tab.search_dirty && !tab.query.is_empty() { ui.label(RichText::new("Searching…").color(theme::muted()).size(11.0)); }
+                if tab.search_limited { ui.label(RichText::new("Search is partial: this document reached the text index limit.").color(theme::muted()).size(12.0)); }
+                if !tab.query.is_empty() && tab.hits.is_empty() && tab.index_done && !tab.search_limited && !tab.searching && !tab.search_dirty { ui.label(RichText::new("No searchable matches. Scanned pages need OCR, which comes in a later milestone.").color(theme::muted()).size(12.0)); }
                 let mut chosen = None;
                 egui::ScrollArea::vertical().id_salt((tab.id, "search_results")).show(ui, |ui| {
-                    for (i, hit) in tab.hits.iter().enumerate().take(1000) { let selected = i == tab.hit; egui::Frame::new().fill(if selected { Color32::from_rgb(221, 235, 220) } else { Color32::TRANSPARENT }).corner_radius(5.0).inner_margin(8.0).show(ui, |ui| {
-                        ui.label(RichText::new(format!("Page {}", hit.page + 1)).size(11.0).strong().color(ACCENT));
+                    for (i, hit) in tab.hits.iter().enumerate().take(1000) { let selected = i == tab.hit; egui::Frame::new().fill(if selected { theme::accent_soft() } else { Color32::TRANSPARENT }).stroke(Stroke::new(1., if selected { theme::accent_line() } else { Color32::TRANSPARENT })).corner_radius(8.0).inner_margin(8.0).show(ui, |ui| {
+                        ui.label(RichText::new(format!("Page {}", hit.page + 1)).size(11.0).family(ui::semibold()).color(theme::accent()));
                         if ui.add(egui::Button::new(&hit.snippet).wrap().frame(false)).clicked() { chosen = Some(i); }
                     }); }
                 });
                 if let Some(index) = chosen { tab.select_hit(index); }
             } else {
-                ui.label(RichText::new(format!("{} pages", tab.pages.len())).color(MUTED).size(12.0));
+                ui.label(RichText::new(format!("{} pages", tab.pages.len())).color(theme::muted()).size(11.5));
                 egui::ScrollArea::vertical().id_salt((tab.id, "thumbnails")).show_rows(ui, 176.0, tab.pages.len(), |ui, range| {
                     for page in range { let size = tab.pages[page]; let factor = (132.0 / size.width).min(146.0 / size.height); let display = vec2(size.width * factor, size.height * factor); let key = viewer::raster_key(page, size, factor * ctx.pixels_per_point(), true); tab.request(key);
                         let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 176.0), egui::Sense::click());
                         response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, page == tab.page, format!("Go to page {}", page + 1)));
                         let image = Rect::from_center_size(pos2(rect.center().x, rect.top() + 77.0), display);
-                        ui.painter().rect_filled(image.expand(3.0), 2.0, if page == tab.page { ACCENT } else { Color32::from_rgb(210, 216, 207) });
-                        ui.painter().rect_filled(image, 0.0, Color32::WHITE);
+                        let current = page == tab.page;
+                        ui::shadow(ui.painter(), image, 2, 1);
+                        if current {
+                            ui.painter().rect_stroke(image.expand(4.0), 6, Stroke::new(2.5, theme::accent()), egui::StrokeKind::Middle);
+                        } else if response.hovered() {
+                            ui.painter().rect_stroke(image.expand(4.0), 6, Stroke::new(2.0, theme::accent_line()), egui::StrokeKind::Middle);
+                        }
+                        ui.painter().rect_filled(image, 2.0, Color32::WHITE);
                         if let Some(raster) = tab.rasters.get_mut(&key) { raster.used = tick; ui.painter().image(raster.texture.id(), image, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE); }
                         if let Some(session) = &tab.session && session.editable {
                             for a in session.annotations.iter().filter(|a| a.page == page) {
                                 editing::paint_annotation(&mut self.editor, ctx, ui.painter(), image, factor, a);
                             }
                         }
-                        ui.painter().text(pos2(rect.center().x, rect.bottom() - 12.0), egui::Align2::CENTER_CENTER, (page + 1).to_string(), FontId::proportional(12.0), if page == tab.page { ACCENT } else { MUTED });
+                        let number = pos2(rect.center().x, rect.bottom() - 11.0);
+                        if current {
+                            ui.painter().rect_filled(Rect::from_center_size(number, vec2(26. + 6. * (page + 1).to_string().len() as f32, 18.)), 9, theme::accent());
+                        }
+                        ui.painter().text(number, egui::Align2::CENTER_CENTER, (page + 1).to_string(), ui::strong(ui, 11.5), if current { Color32::WHITE } else { theme::muted() });
                         if response.on_hover_text(format!("Go to page {}", page + 1)).clicked() { tab.jump(page); }
                     }
                 });
@@ -1152,19 +1294,23 @@ impl Viewer {
     }
     fn document(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(CANVAS))
+            .frame(egui::Frame::new().fill(theme::canvas()))
             .show(ctx, |ui| {
                 let Some(tab) = self.tabs.get_mut(self.active) else {
                     ui.vertical_centered(|ui| {
-                        ui.add_space((ui.available_height() * 0.24).max(30.0));
-                        ui.label(RichText::new("Welcome to MyPDF").size(36.0).color(INK));
-                        ui.add_space(14.0);
+                        ui.add_space((ui.available_height() * 0.2).max(30.0));
+                        let (mark, _) = ui.allocate_exact_size(vec2(72., 72.), egui::Sense::hover());
+                        ui::shadow(ui.painter(), mark, 18, 2);
+                        ui::logo(ui.painter(), mark);
+                        ui.add_space(18.0);
+                        ui.label(RichText::new("Welcome to MyPDF").font(ui::bold(ui, 32.)).color(theme::ink()));
+                        ui.add_space(10.0);
                         ui.label(
                             RichText::new(
                                 "Read, edit, annotate and sign. Your documents stay on your desktop.",
                             )
                             .size(16.0)
-                            .color(MUTED),
+                            .color(theme::muted()),
                         );
                         ui.add_space(20.0);
                         if ui.add(ActionButton::new(Icon::Plus,"New Blank PDF")).clicked() { self.new_blank(ctx); }
@@ -1178,7 +1324,7 @@ impl Viewer {
                         ui.label(
                             RichText::new("Drop files here  •  ⌘O on Mac  /  Ctrl+O on Windows")
                                 .size(12.0)
-                                .color(MUTED),
+                                .color(theme::muted()),
                         );
                     });
                     return;
@@ -1191,7 +1337,7 @@ impl Viewer {
                             ui.label(
                                 RichText::new(tab.path.display().to_string())
                                     .small()
-                                    .color(MUTED),
+                                    .color(theme::muted()),
                             );
                         });
                     });
@@ -1275,6 +1421,7 @@ impl Viewer {
                         })
                     {
                         tab.selected_annotation = None;
+                        tab.group.clear();
                         self.editor.draft = None;
                     }
                     let center = viewport.center().y;
@@ -1295,11 +1442,7 @@ impl Viewer {
                             canvas.min + vec2((max_width - size.width * scale) / 2.0, top),
                             vec2(size.width * scale, size.height * scale),
                         );
-                        ui.painter().rect_filled(
-                            page_rect.translate(vec2(0.0, 3.0)).expand(2.0),
-                            1.0,
-                            Color32::from_black_alpha(16),
-                        );
+                        ui::shadow(ui.painter(), page_rect, 1, 2);
                         ui.painter().rect_filled(page_rect, 0.0, Color32::WHITE);
                         let key =
                             viewer::raster_key(page, size, scale * ctx.pixels_per_point(), false);
@@ -1339,7 +1482,7 @@ impl Viewer {
                                     .map(String::as_str)
                                     .unwrap_or("Rendering page…"),
                                 FontId::proportional(14.0),
-                                MUTED,
+                                theme::muted(),
                             );
                         }
                         if self.search && !tab.query.is_empty() {
@@ -1375,6 +1518,11 @@ impl Viewer {
                             &mut self.status,
                         );
                         content::overlay(&mut self.content,self.editor.mode,tab,ui,page,page_rect,scale);
+                        if matches!(self.editor.mode, editing::Mode::Read | editing::Mode::Sign)
+                            || tab.signed_original.is_none()
+                        {
+                            signatures::page_overlay(tab, ui, page, page_rect, scale);
+                        }
                         ui.painter().rect_stroke(
                             page_rect,
                             0.0,
@@ -1419,12 +1567,14 @@ impl Viewer {
 
 impl eframe::App for Viewer {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        theme::sync(ctx.theme());
         self.tick += 1;
         self.content_events(ctx);
         self.page_events(ctx);
         self.events(ctx);
         self.editor_events();
         self.digital_events(ctx);
+        self.signature_events(ctx);
         self.shortcuts(ctx);
         self.editor.text_editing = false;
         self.toolbar(ctx);
@@ -1432,6 +1582,7 @@ impl eframe::App for Viewer {
             self.editor_tools(ctx);
             self.page_tools(ctx);
             self.content_tools(ctx);
+            self.signature_bar(ctx);
         }
         if let Some((status, true)) = &self.status {
             let status = status.clone();
@@ -1439,18 +1590,11 @@ impl eframe::App for Viewer {
             egui::TopBottomPanel::bottom("status")
                 .frame(
                     egui::Frame::new()
-                        .fill(Color32::from_rgb(255, 244, 240))
-                        .inner_margin(egui::Margin::symmetric(16, 4)),
+                        .fill(theme::danger_soft())
+                        .inner_margin(egui::Margin::symmetric(14, 3)),
                 )
                 .show(ctx, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new(status)
-                                .size(12.)
-                                .color(Color32::from_rgb(155, 47, 39)),
-                        );
-                        dismiss = ui.small_button("Dismiss").clicked();
-                    });
+                    dismiss = ui::notice(ui, &status);
                 });
             if dismiss {
                 self.status = None;
@@ -1465,7 +1609,9 @@ impl eframe::App for Viewer {
             self.page_overview(ctx);
         } else {
             self.sidebar(ctx);
-            if self.inspector {
+            if self.signature_panel_open() {
+                self.signature_panel(ctx);
+            } else if self.inspector {
                 if matches!(
                     self.editor.mode,
                     editing::Mode::Edit | editing::Mode::Forms | editing::Mode::Convert
@@ -1485,6 +1631,7 @@ impl eframe::App for Viewer {
         self.digital_events(ctx);
         self.editor_windows(ctx);
         self.digital_window(ctx);
+        self.signature_dialogs(ctx);
         self.close_dialog(ctx);
         if self.exit_approved {
             for tab in &self.tabs {
@@ -1497,6 +1644,7 @@ impl eframe::App for Viewer {
         if self.accessible_text {
             egui::Window::new("Accessible page text")
                 .open(&mut self.accessible_text)
+                .collapsible(false)
                 .default_size(vec2(520., 420.))
                 .show(ctx, |ui| {
                     if let Some(tab) = self.tabs.get(self.active) {
@@ -1509,6 +1657,7 @@ impl eframe::App for Viewer {
                                 let mut value = text.text.as_str();
                                 ui.add(
                                     egui::TextEdit::multiline(&mut value)
+                                        .margin(ui::FIELD_MARGIN)
                                         .desired_width(f32::INFINITY)
                                         .desired_rows(18),
                                 )
@@ -1531,13 +1680,36 @@ impl eframe::App for Viewer {
             let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop"));
             let painter = ctx.layer_painter(layer);
             let rect = ctx.content_rect();
-            painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(28, 109, 89, 180));
+            painter.rect_filled(rect, 0.0, theme::paper().gamma_multiply(0.9));
+            let zone = rect.shrink(24.);
+            painter.rect_filled(zone, 22, theme::accent().gamma_multiply(0.06));
+            home::dashed_outline(
+                &painter,
+                zone,
+                22.,
+                Stroke::new(2., theme::accent().gamma_multiply(0.7)),
+            );
+            let tile = Rect::from_center_size(zone.center() - vec2(0., 36.), vec2(72., 72.));
+            ui::badge(
+                &painter,
+                tile,
+                Icon::Import,
+                ui::Fill::Brand,
+                Color32::WHITE,
+            );
             painter.text(
-                rect.center(),
+                zone.center() + vec2(0., 34.),
                 egui::Align2::CENTER_CENTER,
                 "Drop PDFs to open",
-                FontId::proportional(30.0),
-                Color32::WHITE,
+                ui::font(ctx, ui::STRONG, 22.),
+                theme::ink(),
+            );
+            painter.text(
+                zone.center() + vec2(0., 62.),
+                egui::Align2::CENTER_CENTER,
+                "Each file opens in its own tab",
+                FontId::proportional(13.5),
+                theme::muted(),
             );
         }
     }

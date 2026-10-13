@@ -14,9 +14,8 @@ pub fn editable(bytes: &[u8]) -> Result<Document> {
         "PDF exceeds 256 MB"
     );
     let doc = Document::load_mem(bytes)?;
-    let caps = crate::annotations::inspect(&doc);
     ensure!(
-        !caps.signed && !caps.certified && !caps.encrypted,
+        crate::annotations::inspect(&doc).rewritable(),
         "Editing requires an unsigned, unencrypted PDF. The original is preserved."
     );
     Ok(doc)
@@ -123,20 +122,34 @@ pub fn add_text_styled(
     );
     let normalized = text.replace("\r\n", "\n").replace('\t', "    ");
     let text = normalized.as_str();
-    let font = if let Some(path) = &format.font {
-        crate::pdf_font::PdfFont::embed_file(&mut doc, text, path)?
-    } else {
-        crate::pdf_font::PdfFont::embed(&mut doc, text)?
+    // Any script: the chosen face first, installed fonts for the rest, shaped.
+    let preferred = match &format.font {
+        Some(path) => crate::unicode_text::Preferred::File(path.clone()),
+        None => crate::unicode_text::Preferred::File(crate::document::default_font()?),
     };
-    let lines = font.wrap_preserving(text, size, w);
+    let mut writer = crate::unicode_text::Writer::new(&preferred)?;
+    let wrapped = writer.wrap(text, size, w)?;
     ensure!(
-        lines.len() as f32 * size * 1.3 <= h,
+        wrapped.len() as f32 * size * 1.3 <= h,
         "Text does not fit. Enlarge the block or use a smaller font."
     );
+    let lines = wrapped
+        .iter()
+        .map(|(line, end)| {
+            Ok((
+                writer.shape(line)?,
+                line.chars().filter(|c| *c == ' ').count(),
+                *end,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     ensure!(
-        lines.iter().all(|line| font.width(line, size) <= w),
-        "A word is too wide. Enlarge the block or add a line break."
+        lines
+            .iter()
+            .all(|(line, _, _)| line.width(size) <= w + 0.01),
+        "A character is too wide. Enlarge the block."
     );
+    let ids = writer.embed(&mut doc)?;
     let mut resources = resources(&doc, id)?;
     let mut fonts = resources
         .get(b"Font")
@@ -147,11 +160,19 @@ pub fn add_text_styled(
         .transpose()?
         .unwrap_or_default();
     let mut suffix = doc.max_id;
-    while fonts.has(format!("MyPDFText{suffix}").as_bytes()) {
-        suffix += 1;
-    }
-    let name = format!("MyPDFText{suffix}");
-    fonts.set(name.as_str(), font.id);
+    let names: Vec<Option<String>> = ids
+        .iter()
+        .map(|id| {
+            id.map(|id| {
+                while fonts.has(format!("MyPDFText{suffix}").as_bytes()) {
+                    suffix += 1;
+                }
+                let name = format!("MyPDFText{suffix}");
+                fonts.set(name.as_str(), id);
+                name
+            })
+        })
+        .collect();
     resources.set("Font", fonts);
     // Isolate even an unbalanced original CTM/text state by requiring balanced
     // q/Q and text objects, then wrapping original content in a fresh q/Q pair.
@@ -187,22 +208,12 @@ pub fn add_text_styled(
     ));
     operations.push(Operation::new("BT", vec![]));
     operations.push(Operation::new(
-        "Tf",
-        vec![Object::Name(name.into_bytes()), size.into()],
-    ));
-    operations.push(Operation::new(
         "rg",
         color.iter().map(|v| Object::Real(*v)).collect(),
     ));
-    let paragraph_ends: HashSet<_> = text
-        .split('\n')
-        .scan(0_usize, |end, p| {
-            *end += font.wrap_preserving(p, size, w).len();
-            Some(*end - 1)
-        })
-        .collect();
     // Display coordinates have y down; flip glyphs back to an upright baseline.
-    for (index, line) in lines.iter().enumerate() {
+    for (index, (line, spaces, ends_paragraph)) in lines.iter().enumerate() {
+        let width = line.width(size);
         operations.push(Operation::new(
             "Tm",
             vec![
@@ -211,44 +222,23 @@ pub fn add_text_styled(
                 0.into(),
                 (-1).into(),
                 (x + match format.alignment {
-                    crate::text_style::Alignment::Center => (w - font.width(line, size)) / 2.,
-                    crate::text_style::Alignment::Right => w - font.width(line, size),
+                    crate::text_style::Alignment::Center => (w - width) / 2.,
+                    crate::text_style::Alignment::Right => w - width,
                     _ => 0.,
                 })
                 .into(),
                 (y + size + index as f32 * size * 1.3).into(),
             ],
         ));
-        let hex = font.hex(line)?;
-        let encoded = hex
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
-            .collect::<Vec<_>>();
-        let spaces = line.chars().filter(|c| *c == ' ').count();
-        let ends_paragraph = paragraph_ends.contains(&index);
-        if format.alignment == crate::text_style::Alignment::Justified
+        let gap = if format.alignment == crate::text_style::Alignment::Justified
             && !ends_paragraph
-            && spaces > 0
+            && *spaces > 0
         {
-            let gap = (w - font.width(line, size)) / spaces as f32 * 1000. / size;
-            let mut parts = vec![];
-            for (ch, cid) in line.chars().zip(encoded.chunks_exact(2)) {
-                parts.push(Object::String(
-                    cid.to_vec(),
-                    lopdf::StringFormat::Hexadecimal,
-                ));
-                if ch == ' ' {
-                    parts.push(Object::Real(-gap));
-                }
-            }
-            operations.push(Operation::new("TJ", vec![Object::Array(parts)]));
+            (w - width) / *spaces as f32
         } else {
-            operations.push(Operation::new(
-                "Tj",
-                vec![Object::String(encoded, lopdf::StringFormat::Hexadecimal)],
-            ));
-        }
+            0.
+        };
+        operations.extend(writer.operations(line, &names, size, gap, 0.)?);
     }
     operations.push(Operation::new("ET", vec![]));
     operations.push(Operation::new("Q", vec![]));

@@ -155,13 +155,20 @@ pub fn extract_signatures_from_doc(doc: &Document) -> Result<Vec<ExtractedSignat
 
         // Extract Contents (the CMS/PKCS#7 bytes)
         // lopdf parses the hex string into raw bytes for us.
-        // We strip trailing zero padding to get the actual DER.
+        // MyPDF patch: the DER header gives the exact length. Trimming every
+        // trailing zero also cut a final 0x00 from about one signature in 256,
+        // turning a valid signature invalid. Padding is only trimmed when the
+        // header cannot be read (for example BER indefinite length).
         let cms_bytes = match sig_dict.get(b"Contents").and_then(Object::as_str) {
             Ok(bytes) => {
                 let mut data = bytes.to_vec();
-                // Trim trailing zeros (padding from the hex placeholder)
-                while data.last() == Some(&0) {
-                    data.pop();
+                match der_element_length(&data).filter(|n| *n <= data.len()) {
+                    Some(length) => data.truncate(length),
+                    None => {
+                        while data.last() == Some(&0) {
+                            data.pop();
+                        }
+                    }
                 }
                 data
             }
@@ -262,4 +269,22 @@ mod tests {
         let sigs = extract_signatures(&pdf_data).expect("extraction failed");
         assert!(sigs.is_empty(), "unsigned PDF should have no signatures");
     }
+}
+
+/// Total length (tag, length and contents) of the definite-length DER element
+/// at the start of `data`, or `None` if its header cannot be read.
+fn der_element_length(data: &[u8]) -> Option<usize> {
+    let first = *data.get(1)?;
+    if first < 0x80 {
+        return Some(2 + first as usize);
+    }
+    let count = (first & 0x7f) as usize;
+    if count == 0 || count > 4 {
+        return None;
+    }
+    let mut length = 0usize;
+    for &byte in data.get(2..2 + count)? {
+        length = length.checked_mul(256)?.checked_add(byte as usize)?;
+    }
+    (2 + count).checked_add(length)
 }

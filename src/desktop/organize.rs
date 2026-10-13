@@ -44,7 +44,7 @@ impl Organizer {
 }
 impl Tab {
     /// Rebuild rendering/search only when an undo or page edit changes the PDF source.
-    fn refresh_document(&mut self, ctx: &egui::Context) {
+    pub(super) fn refresh_document(&mut self, ctx: &egui::Context) {
         let Some(source) = self.session.as_ref().map(|s| s.source.clone()) else {
             return;
         };
@@ -65,6 +65,7 @@ impl Tab {
         self.search_dirty = true;
         self.searching = false;
         self.selected_annotation = None;
+        self.group.clear();
         self.error = None;
         if let Some(session) = &mut self.session {
             session.editable = false;
@@ -183,7 +184,7 @@ impl Viewer {
         egui::TopBottomPanel::top("page_tools")
             .frame(
                 egui::Frame::new()
-                    .fill(PAPER)
+                    .fill(theme::surface())
                     .inner_margin(egui::Margin::symmetric(14, 6)),
             )
             .show(ctx, |ui| {
@@ -224,11 +225,12 @@ impl Viewer {
                             count,
                             self.organizer.selected.len()
                         ))
-                        .color(MUTED)
+                        .color(theme::muted())
                         .small(),
                     );
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut self.organizer.range)
+                            .margin(ui::FIELD_MARGIN)
                             .hint_text("1, 3-5")
                             .desired_width(95.0),
                     );
@@ -258,7 +260,7 @@ impl Viewer {
                             "Drag to reorder · ⌘/Ctrl-click to select · double-click to read",
                         )
                         .small()
-                        .color(MUTED),
+                        .color(theme::muted()),
                     );
                 });
             });
@@ -377,7 +379,7 @@ impl Viewer {
             ui.add_space(10.0);
             if ui.add(ActionButton::new(Icon::Plus,"Blank page · same size")).clicked(){action="blank";}
             if ui.add(ActionButton::new(Icon::Import,"Pages from PDF…")).clicked(){action="pdf";}
-            ui.label(RichText::new("Imported pages keep their contents and annotations.\nDocument-level bookmarks are not merged.").small().color(MUTED));
+            ui.label(RichText::new("Imported pages keep their contents and annotations.\nDocument-level bookmarks are not merged.").small().color(theme::muted()));
         });
         if !action.is_empty() {
             open = false;
@@ -496,24 +498,23 @@ impl Viewer {
     }
     pub(super) fn organizer_panel(&mut self, ctx: &egui::Context) {
         let mut action = "";
-        egui::SidePanel::right("page_properties").exact_width(248.0).frame(egui::Frame::new().fill(PAPER).inner_margin(18.0)).show(ctx,|ui|{
+        egui::SidePanel::right("page_properties").exact_width(248.0).frame(egui::Frame::new().fill(theme::paper()).inner_margin(18.0)).show(ctx,|ui|{
             ui.heading(if self.organizer.crop {"Crop pages"}else{"Page tools"});ui.add_space(16.0);
             if self.organizer.crop {
-                ui.label(RichText::new("MARGINS · POINTS").small().color(MUTED));
+                ui.label(RichText::new("MARGINS · POINTS").small().color(theme::muted()));
                 for (label,value) in ["Left","Top","Right","Bottom"].into_iter().zip(&mut self.organizer.margins) {
                     ui.horizontal(|ui|{ui.label(label);let r=ui.add(egui::DragValue::new(value).range(0.0..=100_000.0).speed(1.0).suffix(" pt"));self.editor.text_editing|=r.has_focus();});
                 }
                 ui.add_space(12.0);
                 if ui.add_enabled(!self.organizer.busy,ActionButton::new(Icon::Crop,"Apply crop").primary()).clicked(){action="crop";}
                 if ui.add_enabled(!self.organizer.busy,ActionButton::new(Icon::Undo,"Reset to full page")).clicked(){action="reset";}
-                ui.add_space(10.0);ui.label(RichText::new("The shaded area will be hidden. Cropping keeps the original content; it is not redaction.").small().color(MUTED));
+                ui.add_space(10.0);ui.label(RichText::new("The shaded area will be hidden. Cropping keeps the original content; it is not redaction.").small().color(theme::muted()));
             } else {
-                ui.label(RichText::new("SPLIT DOCUMENT").small().color(MUTED));
+                ui::caption(ui, "Split document");
                 ui.horizontal(|ui|{ui.label("Every");let r=ui.add(egui::DragValue::new(&mut self.organizer.split_every).range(1..=10_000));self.editor.text_editing|=r.has_focus();ui.label("pages");});
-                ui.label(RichText::new("Split saves the whole document into a new folder. Extract saves just the selected pages.").small().color(MUTED));
-                ui.add_space(24.0);ui.separator();ui.add_space(12.0);
-                ui.label(RichText::new("Your original stays intact").strong());
-                ui.label(RichText::new("Reorder, rotate, crop and delete are undoable. Use Save a Copy when you are ready.").small().color(MUTED));
+                ui.label(RichText::new("Split saves the whole document into a new folder. Extract saves just the selected pages.").small().color(theme::muted()));
+                ui.add_space(20.0);
+                ui::tip(ui, "Your original stays intact", "Reorder, rotate, crop and delete are undoable. Use Save a Copy when you are ready.");
             }
         });
         let pages = self.organizer.selected.iter().copied().collect();
@@ -545,7 +546,7 @@ impl Viewer {
         let pointer = ctx.input(|i| i.pointer.interact_pos());
         let released = ctx.input(|i| i.pointer.any_released());
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(CANVAS).inner_margin(24.0))
+            .frame(egui::Frame::new().fill(theme::canvas()).inner_margin(24.0))
             .show(ctx, |ui| {
                 let Some(tab) = self.tabs.get_mut(self.active) else {
                     ui.label("Open a PDF to organize its pages.");
@@ -589,10 +590,11 @@ impl Viewer {
                                         vec2(size.width, size.height) * scale,
                                     );
                                     let selected = self.organizer.selected.contains(&i);
-                                    ui.painter().rect_filled(
-                                        rect.translate(vec2(0.0, 2.0)).expand(1.0),
-                                        2.0,
-                                        Color32::from_black_alpha(24),
+                                    ui::shadow(
+                                        ui.painter(),
+                                        rect,
+                                        2,
+                                        if response.hovered() { 3 } else { 1 },
                                     );
                                     ui.painter().rect_filled(rect, 1.0, Color32::WHITE);
                                     let key = viewer::raster_key(
@@ -659,31 +661,35 @@ impl Viewer {
                                         ui.painter().rect_stroke(
                                             crop,
                                             0.0,
-                                            Stroke::new(1.5, ACCENT),
+                                            Stroke::new(1.5, theme::accent()),
                                             egui::StrokeKind::Inside,
                                         );
                                     }
                                     if selected {
                                         ui.painter().rect_stroke(
                                             rect.expand(4.0),
-                                            4.0,
-                                            Stroke::new(2.0, ACCENT),
+                                            6.0,
+                                            Stroke::new(2.5, theme::accent()),
                                             egui::StrokeKind::Outside,
                                         );
                                     }
                                     let badge = Rect::from_center_size(
                                         pos2(area.center().x, area.bottom() - 12.0),
-                                        vec2(34.0, 24.0),
+                                        vec2(30.0 + 6.0 * (i + 1).to_string().len() as f32, 20.0),
                                     );
                                     if selected {
-                                        ui.painter().rect_filled(badge, 5.0, ACCENT);
+                                        ui.painter().rect_filled(badge, 10.0, theme::accent());
                                     }
                                     ui.painter().text(
                                         badge.center(),
                                         egui::Align2::CENTER_CENTER,
                                         (i + 1).to_string(),
-                                        FontId::proportional(13.0),
-                                        if selected { Color32::WHITE } else { INK },
+                                        ui::strong(ui, 12.0),
+                                        if selected {
+                                            Color32::WHITE
+                                        } else {
+                                            theme::muted()
+                                        },
                                     );
                                     if response.clicked() {
                                         let modifiers = ui.input(|i| i.modifiers);
@@ -733,7 +739,7 @@ impl Viewer {
                                             };
                                             ui.painter().line_segment(
                                                 [pos2(x, area.top()), pos2(x, area.bottom())],
-                                                Stroke::new(3.0, ACCENT),
+                                                Stroke::new(3.0, theme::accent()),
                                             );
                                         }
                                     }

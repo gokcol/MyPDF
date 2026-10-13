@@ -20,6 +20,7 @@ pub(super) enum Mode {
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Tool {
     Select,
+    Lasso,
     Pen,
     Highlight,
     Underline,
@@ -40,6 +41,7 @@ impl Tool {
     fn label(self) -> &'static str {
         match self {
             Self::Select => "Select",
+            Self::Lasso => "Lasso select",
             Self::Pen => "Pen",
             Self::Highlight => "Highlight",
             Self::Underline => "Underline",
@@ -62,6 +64,7 @@ impl Tool {
     fn icon(self) -> Icon {
         match self {
             Self::Select => Icon::Select,
+            Self::Lasso => Icon::Lasso,
             Self::Pen => Icon::Pen,
             Self::Highlight => Icon::Highlight,
             Self::Underline => Icon::Underline,
@@ -132,7 +135,7 @@ impl Default for SvgEditor {
 pub(super) struct EditorState {
     svg: SvgEditor,
     pub mode: Mode,
-    tool: Tool,
+    pub(super) tool: Tool,
     style: Style,
     pub text_editing: bool,
     pub library_open: bool,
@@ -143,7 +146,13 @@ pub(super) struct EditorState {
     placed: Option<Asset>,
     pub(super) draft: Option<Annotation>,
     // Document, annotation, last committed revision, and focused property field.
-    property_edit: Option<(u64, String, u64, Option<egui::Id>)>,
+    pub(super) property_edit: Option<(u64, String, u64, Option<egui::Id>)>,
+    pub(super) marquee: Option<selection::Marquee>,
+    pub(super) group_gesture: Option<selection::GroupGesture>,
+    /// Tab and last revision of a continuous group property edit or nudge.
+    pub(super) group_edit: Option<(u64, u64)>,
+    /// The asset most recently added to the library, for "use as my signature".
+    pub(super) last_added: Option<String>,
     gesture: Option<Gesture>,
     vertices: Option<VertexPath>,
     pressed: Option<(u64, usize, [f32; 2])>,
@@ -192,6 +201,10 @@ impl EditorState {
             placed: None,
             draft: None,
             property_edit: None,
+            marquee: None,
+            group_gesture: None,
+            group_edit: None,
+            last_added: None,
             gesture: None,
             vertices: None,
             pressed: None,
@@ -236,7 +249,9 @@ impl EditorState {
                 .unwrap_or_else(|| "Library is unavailable".into())
         })?;
         let stamp = asset.stamp;
+        let id = asset.id.clone();
         library.put(asset).map_err(|e| format!("{e:#}"))?;
+        self.last_added = Some(id);
         self.library_tab = if stamp { "Stamps" } else { "Saved" }.into();
         Ok(())
     }
@@ -246,13 +261,13 @@ impl EditorState {
         self.gesture = None;
         self.pressed = None;
         if tool == Tool::Highlight {
-            self.style.color = [1.0, 0.8, 0.05];
+            self.style.color = HIGHLIGHT;
             self.style.opacity = 0.35;
             self.style.fill = None;
         } else {
             self.style.opacity = 1.0;
-            if self.style.color == [1.0, 0.8, 0.05] {
-                self.style.color = [0.11, 0.43, 0.35];
+            if self.style.color == HIGHLIGHT {
+                self.style.color = DEFAULT_INK;
             }
         }
     }
@@ -371,6 +386,9 @@ impl EditorState {
     }
 }
 
+const HIGHLIGHT: [f32; 3] = [1.0, 0.8, 0.05];
+const DEFAULT_INK: [f32; 3] = [0.11, 0.43, 0.35];
+
 pub(super) fn color_palette(ui: &mut egui::Ui, current: &mut [f32; 3]) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -382,12 +400,24 @@ pub(super) fn color_palette(ui: &mut egui::Ui, current: &mut [f32; 3]) -> bool {
             ("Coral", [0.9, 0.29, 0.29]),
             ("Gold", [0.95, 0.68, 0.15]),
         ] {
-            let (r, response) = ui.allocate_exact_size(vec2(23., 27.), egui::Sense::click());
+            let (r, response) = ui.allocate_exact_size(vec2(24., 28.), egui::Sense::click());
             let selected = *current == rgb;
-            ui.painter().circle_filled(r.center(), 8.5, color(rgb, 1.));
+            let swatch = color(rgb, 1.);
+            ui.painter().circle_filled(
+                r.center(),
+                if response.hovered() && !selected {
+                    9.5
+                } else {
+                    8.5
+                },
+                swatch,
+            );
+            // A hairline keeps dark ink visible on the dark theme's panels.
+            ui.painter()
+                .circle_stroke(r.center(), 8.5, Stroke::new(1., theme::line()));
             if selected {
                 ui.painter()
-                    .circle_stroke(r.center(), 11., Stroke::new(1.4, ACCENT));
+                    .circle_stroke(r.center(), 11.5, Stroke::new(2., swatch));
             }
             response.widget_info(|| {
                 egui::WidgetInfo::selected(
@@ -404,15 +434,7 @@ pub(super) fn color_palette(ui: &mut egui::Ui, current: &mut [f32; 3]) -> bool {
         }
         // The picker converts RGB through HSV even without user input. Only accept
         // an actual edit, avoiding floating-point drift and phantom undo revisions.
-        let mut custom = *current;
-        if ui
-            .color_edit_button_rgb(&mut custom)
-            .on_hover_text("Custom color")
-            .changed()
-        {
-            *current = custom;
-            changed = true;
-        }
+        changed |= ui::color_swatch(ui, current, "Custom color");
     });
     changed
 }
@@ -426,7 +448,7 @@ fn property_slider(
     let mut focus = None;
     ui.push_id(label, |ui| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(label).size(12.).color(MUTED));
+            ui.label(RichText::new(label).size(12.).color(theme::muted()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let r = ui.add(
                     egui::DragValue::new(value)
@@ -463,9 +485,9 @@ fn property_slider(
 
 fn stroke_styles(ui: &mut egui::Ui, current: &mut StrokeStyle) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Style").size(12.).color(MUTED));
+        ui.label(RichText::new("Style").size(12.).color(theme::muted()));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(current.label()).size(12.).color(INK));
+            ui.label(RichText::new(current.label()).size(12.).color(theme::ink()));
         });
     });
     let width = (ui.available_width() - ui.spacing().item_spacing.x * 4.) / 5.;
@@ -473,16 +495,20 @@ fn stroke_styles(ui: &mut egui::Ui, current: &mut StrokeStyle) {
         for style in StrokeStyle::ALL {
             let (r, response) = ui.allocate_exact_size(vec2(width, 30.), egui::Sense::click());
             let selected = *current == style;
-            let c = if selected { ACCENT } else { INK };
+            let c = if selected {
+                theme::accent()
+            } else {
+                theme::ink()
+            };
             ui.painter().rect_filled(
                 r,
                 6.,
                 if selected {
-                    Color32::from_rgb(222, 234, 250)
+                    theme::accent_soft()
                 } else if response.hovered() {
-                    Color32::from_rgb(224, 226, 232)
+                    theme::control_hover()
                 } else {
-                    Color32::from_rgb(234, 235, 239)
+                    theme::control()
                 },
             );
             for mark in mypdf_milestone0::stroke::path(
@@ -552,9 +578,37 @@ pub(super) fn install_annotation_font(ctx: &egui::Context) {
                 .insert(egui::FontFamily::Name(name.clone().into()), vec![name]);
         }
     }
+    ui::add_ui_fonts(&mut fonts);
     ctx.set_fonts(fonts);
 }
 
+/// Paint library artwork fitted and centered inside `rect`.
+pub(super) fn paint_asset(
+    editor: &mut EditorState,
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    rect: Rect,
+    asset: &Asset,
+) {
+    let base = vec2(240.0, 240.0 / asset.aspect.max(0.01));
+    let scale = (rect.width() / base.x).min(rect.height() / base.y);
+    let origin = rect.center() - base * scale / 2.;
+    let mut preview = Annotation::new(
+        0,
+        [0.0, 0.0, base.x, base.y],
+        asset.kind.clone(),
+        asset.style.clone(),
+    );
+    preview.style.width = (1.8 / scale).max(preview.style.width);
+    paint_annotation(
+        editor,
+        ctx,
+        &painter.with_clip_rect(rect),
+        Rect::from_min_size(origin, base * scale),
+        scale,
+        &preview,
+    );
+}
 fn color(rgb: [f32; 3], opacity: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(
         (rgb[0] * 255.0) as u8,
@@ -846,7 +900,7 @@ pub(super) fn page_interaction(
                 .map(|p| page_rect.min + vec2(p[0], p[1]) * scale)
                 .collect();
             for p in &points {
-                painter.circle_filled(*p, 3., ACCENT);
+                painter.circle_filled(*p, 3., theme::accent());
             }
             if response.hovered()
                 && let Some(p) = ctx.pointer_hover_pos()
@@ -856,7 +910,7 @@ pub(super) fn page_interaction(
             if v.closed && points.len() > 2 {
                 points.push(points[0]);
             }
-            painter.add(egui::Shape::line(points, Stroke::new(1.5, ACCENT)));
+            painter.add(egui::Shape::line(points, Stroke::new(1.5, theme::accent())));
         }
     }
     let first_press = ctx.input(|i| {
@@ -887,17 +941,32 @@ pub(super) fn page_interaction(
         editor.pressed = Some((tab.id, page, normal(pos)));
     }
     if response.clicked()
+        && editor.mode == Mode::Sign
+        && editor.tool == Tool::SignArea
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        // A click places a default-size box; digital signing sizes it.
+        let p = normal(pointer);
+        editor.pending_sign_rect = Some((tab.id, page, [p[0], p[1], p[0], p[1]]));
+        editor.tool = Tool::Select;
+    }
+    if response.clicked()
         && !vertex_tool
         && matches!(editor.mode, Mode::Read | Mode::Draw | Mode::Annotate)
         && let Some(pointer) = response.interact_pointer_pos()
     {
         let p = normal(pointer);
+        let shift = ctx.input(|i| i.modifiers.shift);
         if let Some(a) = hit_annotation(tab, page, p, scale) {
-            tab.selected_annotation = Some(a.id.clone());
-            editor.draft = Some(a);
+            if shift && matches!(editor.mode, Mode::Annotate | Mode::Draw) {
+                selection::toggle(tab, editor, &a);
+            } else {
+                selection::set(tab, editor, vec![a.id.clone()]);
+            }
             editor.library_open = false;
-            editor.tool = Tool::Select;
-            editor.property_edit = None;
+            if editor.tool != Tool::Lasso {
+                editor.tool = Tool::Select;
+            }
         } else if matches!(editor.mode, Mode::Annotate | Mode::Draw)
             && editable
             && matches!(editor.tool, Tool::Note | Tool::Text | Tool::Asset)
@@ -936,10 +1005,8 @@ pub(super) fn page_interaction(
             let a = editor.base_annotation(tab, page, r, p, p, &[p]);
             commit_new(editor, tab, a, status);
             editor.tool = Tool::Select;
-        } else {
-            tab.selected_annotation = None;
-            editor.draft = None;
-            editor.property_edit = None;
+        } else if !shift {
+            selection::set(tab, editor, vec![]);
         }
     }
     let quick_release = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary))
@@ -952,8 +1019,10 @@ pub(super) fn page_interaction(
                     (start[0] - p[0]).hypot(start[1] - p[1]) * scale > 6.0
                 })
             });
+    let selecting = editor.marquee.is_some() || editor.group_gesture.is_some();
     if !vertex_tool
-        && (response.drag_started() || (quick_release && editor.gesture.is_none()))
+        && (response.drag_started()
+            || (quick_release && editor.gesture.is_none() && !selecting))
         && let Some(p) = editor
             .pressed
             .filter(|(id, p, _)| *id == tab.id && *p == page)
@@ -963,6 +1032,15 @@ pub(super) fn page_interaction(
                     .or(response.interact_pointer_pos())
                     .map(normal)
             })
+        // A marquee, lasso or group drag claims the press first.
+        && !selection::begin(
+            editor,
+            tab,
+            page,
+            p,
+            scale,
+            ctx.input(|i| i.modifiers.shift),
+        )
     {
         let original = if editor.tool == Tool::Select {
             // The resize handle belongs to the rotated bounding box, which can lie outside the mark itself.
@@ -1058,7 +1136,7 @@ pub(super) fn page_interaction(
                 editor.base_annotation(tab, page, r, gesture.start, p, &gesture.points)
             };
             if editor.tool == Tool::SignArea {
-                preview.style.color = [0.11, 0.43, 0.35];
+                preview.style.color = [0.16, 0.41, 0.96];
             }
             gesture.preview = Some(preview);
         }
@@ -1077,10 +1155,7 @@ pub(super) fn page_interaction(
                             *target = a.clone();
                         }
                         match s.commit(entries) {
-                            Ok(()) => {
-                                tab.selected_annotation = Some(a.id.clone());
-                                editor.draft = Some(a);
-                            }
+                            Ok(()) => selection::set(tab, editor, vec![a.id.clone()]),
                             Err(e) => *status = Some((format!("{e:#}"), true)),
                         }
                     }
@@ -1091,6 +1166,19 @@ pub(super) fn page_interaction(
         } else {
             editor.gesture = Some(gesture);
         }
+    }
+    if editor.marquee.is_some() || editor.group_gesture.is_some() {
+        let pointer = response
+            .interact_pointer_pos()
+            .or_else(|| {
+                quick_release
+                    .then(|| ctx.input(|i| i.pointer.latest_pos()))
+                    .flatten()
+            })
+            .map(normal);
+        let released =
+            response.drag_stopped() || quick_release || !ctx.input(|i| i.pointer.primary_down());
+        selection::update(editor, tab, page, pointer, released, scale, status);
     }
     let painter = ui
         .painter()
@@ -1105,7 +1193,10 @@ pub(super) fn page_interaction(
                 .filter(|g| g.tab == tab.id && g.page == page)
                 .and_then(|g| g.preview.as_ref())
                 .filter(|p| p.id == a.id);
-            let actual = preview.cloned().unwrap_or_else(|| a.clone());
+            let actual = selection::preview(editor, tab.id, page, &a.id)
+                .or(preview)
+                .cloned()
+                .unwrap_or_else(|| a.clone());
             paint_annotation(editor, ctx, &painter, page_rect, scale, &actual);
         }
     }
@@ -1119,7 +1210,7 @@ pub(super) fn page_interaction(
     }
     // The outline and handle must follow the same preview as the artwork in
     // this frame, including a drag that picks up a different selected object.
-    let selection = editor
+    let single = editor
         .gesture
         .as_ref()
         .filter(|g| g.tab == tab.id && g.page == page && g.original.is_some())
@@ -1131,7 +1222,7 @@ pub(super) fn page_interaction(
                     .find(|a| Some(&a.id) == tab.selected_annotation.as_ref() && a.page == page)
             })
         });
-    if let Some(a) = selection {
+    if let Some(a) = single {
         let b = a.bounds();
         let r = Rect::from_min_max(
             page_rect.min + vec2(b[0], b[1]) * scale,
@@ -1140,11 +1231,24 @@ pub(super) fn page_interaction(
         painter.rect_stroke(
             r.expand(3.0),
             0.0,
-            Stroke::new(1.2, ACCENT),
+            Stroke::new(1.2, theme::accent()),
             egui::StrokeKind::Outside,
         );
-        painter.rect_filled(Rect::from_center_size(r.max, vec2(8.0, 8.0)), 1.0, ACCENT);
+        painter.rect_filled(
+            Rect::from_center_size(r.max, vec2(8.0, 8.0)),
+            1.0,
+            theme::accent(),
+        );
     }
+    selection::paint(
+        editor,
+        tab,
+        page,
+        &painter,
+        page_rect,
+        scale,
+        response.hover_pos(),
+    );
     if ctx.input(|i| i.pointer.any_released())
         && editor
             .pressed
@@ -1153,7 +1257,7 @@ pub(super) fn page_interaction(
         editor.pressed = None;
     }
     if matches!(editor.mode, Mode::Annotate | Mode::Draw) && !editable && response.hovered() {
-        response.on_hover_text("Signed/certified documents are read-only for annotations. Use Sign to inspect their signatures.");
+        response.on_hover_text("This signed PDF is protected. Choose “Edit anyway…” in the signature bar to annotate it; signatures stay valid for what they signed.");
     }
 }
 fn draw_signature_pad(ui: &mut egui::Ui, editor: &mut EditorState) -> Rect {
@@ -1218,8 +1322,12 @@ fn draw_signature_pad(ui: &mut egui::Ui, editor: &mut EditorState) -> Rect {
         editor.signature_active = false;
     }
     ui.painter().rect_filled(rect, 4.0, Color32::WHITE);
-    ui.painter()
-        .rect_stroke(rect, 4.0, Stroke::new(1.0, MUTED), egui::StrokeKind::Inside);
+    ui.painter().rect_stroke(
+        rect,
+        4.0,
+        Stroke::new(1.0, theme::muted()),
+        egui::StrokeKind::Inside,
+    );
     for stroke in &editor.signature_strokes {
         if stroke.len() > 1 {
             ui.painter().add(egui::Shape::line(
@@ -1227,7 +1335,7 @@ fn draw_signature_pad(ui: &mut egui::Ui, editor: &mut EditorState) -> Rect {
                     .iter()
                     .map(|p| rect.min + vec2(p[0] * rect.width(), p[1] * rect.height()))
                     .collect(),
-                Stroke::new(2.0, INK),
+                Stroke::new(2.0, theme::ink()),
             ));
         }
     }
@@ -1253,6 +1361,7 @@ fn commit_new(
         entries.push(a.clone());
         match s.commit(entries) {
             Ok(()) => {
+                tab.group.clear();
                 tab.selected_annotation = Some(a.id.clone());
                 editor.draft = Some(a);
                 *status = None;
@@ -1261,7 +1370,12 @@ fn commit_new(
         }
     }
 }
-fn hit_annotation(tab: &Tab, page: usize, point: [f32; 2], scale: f32) -> Option<Annotation> {
+pub(super) fn hit_annotation(
+    tab: &Tab,
+    page: usize,
+    point: [f32; 2],
+    scale: f32,
+) -> Option<Annotation> {
     tab.session
         .as_ref()
         .and_then(|s| {
@@ -1284,12 +1398,21 @@ impl Viewer {
         }
         let response = ui.add(button);
         let mut action = None;
+        let mut quick = false;
         egui::Popup::menu(&response)
             .style(|s: &mut egui::Style| s.visuals = egui::Visuals::light())
             .show(|ui| {
                 ui.set_min_width(205.);
                 if ui
-                    .add(ActionButton::new(Icon::Sign, "Signature"))
+                    .add(ActionButton::new(Icon::Sign, "Quick Sign"))
+                    .on_hover_text("Drag a box on the page to sign with your default digital ID")
+                    .clicked()
+                {
+                    quick = true;
+                    ui.close();
+                }
+                if ui
+                    .add(ActionButton::new(Icon::Pen, "Signature"))
                     .on_hover_text("Draw or type a visual signature")
                     .clicked()
                 {
@@ -1305,6 +1428,9 @@ impl Viewer {
                     ui.close();
                 }
             });
+        if quick {
+            self.quick_sign();
+        }
         if let Some(digital) = action
             && self.apply_pending_annotation()
         {
@@ -1364,33 +1490,108 @@ impl Viewer {
                 s.undo();
             }
             tab.selected_annotation = None;
+            tab.group.clear();
             self.editor.draft = None;
             self.editor.gesture = None;
+            self.editor.marquee = None;
+            self.editor.group_gesture = None;
             self.status = None;
         }
     }
     pub(super) fn editor_delete(&mut self) {
-        if let Some(tab) = self.tabs.get_mut(self.active)
-            && let Some(id) = &tab.selected_annotation
-            && let Some(s) = &mut tab.session
-        {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let ids = selection::selected_ids(tab);
+        if ids.is_empty() {
+            return;
+        }
+        if let Some(s) = &mut tab.session {
             match s.commit(
                 s.annotations
                     .iter()
-                    .filter(|a| &a.id != id)
+                    .filter(|a| !ids.contains(&a.id))
                     .cloned()
                     .collect(),
             ) {
                 Ok(()) => {
-                    tab.selected_annotation = None;
-                    self.editor.draft = None;
+                    selection::set(tab, &mut self.editor, vec![]);
                     self.status = None;
                 }
                 Err(e) => self.status = Some((format!("{e:#}"), true)),
             }
         }
     }
+    /// Keyboard actions on selected marks in Annotate and Draw. The caller ensures
+    /// no text field has focus; an in-progress shape keeps its own keys.
+    pub(super) fn selection_keys(&mut self, ctx: &egui::Context) {
+        if self.editor.vertices.is_some()
+            || self.editor.gesture.is_some()
+            || self.editor.marquee.is_some()
+            || self.editor.group_gesture.is_some()
+        {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
+            let page = tab.page;
+            let ids = tab
+                .session
+                .as_ref()
+                .map(|s| {
+                    s.annotations
+                        .iter()
+                        .filter(|a| a.page == page)
+                        .map(|a| a.id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            selection::set(tab, &mut self.editor, ids);
+            return;
+        }
+        let ids = selection::selected_ids(tab);
+        if ids.is_empty() {
+            return;
+        }
+        if ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
+                || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
+        }) {
+            self.editor_delete();
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !egui::Popup::is_any_open(ctx) {
+            selection::set(tab, &mut self.editor, vec![]);
+            return;
+        }
+        let step = if ctx.input(|i| i.modifiers.shift) {
+            10.
+        } else {
+            1.
+        };
+        let mut d = [0., 0.];
+        for (key, x, y) in [
+            (egui::Key::ArrowLeft, -1., 0.),
+            (egui::Key::ArrowRight, 1., 0.),
+            (egui::Key::ArrowUp, 0., -1.),
+            (egui::Key::ArrowDown, 0., 1.),
+        ] {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key)) {
+                d = [d[0] + x * step, d[1] + y * step];
+            }
+        }
+        if d != [0., 0.] && tab.session.as_ref().is_some_and(|s| s.editable) {
+            selection::nudge(tab, d, &mut self.status);
+            // Refresh the single-mark inspector draft so it does not undo the nudge.
+            selection::set(tab, &mut self.editor, ids);
+        }
+    }
     pub(super) fn editor_events(&mut self) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            selection::normalize(tab, &mut self.editor);
+        }
         for result in self.editor.import_rx.try_iter().collect::<Vec<_>>() {
             self.editor.asset_busy = false;
             match result {
@@ -1419,8 +1620,8 @@ impl Viewer {
         egui::TopBottomPanel::top("annotation_ribbon")
             .frame(
                 egui::Frame::new()
-                    .fill(PAPER)
-                    .inner_margin(egui::Margin::symmetric(16, 7)),
+                    .fill(theme::surface())
+                    .inner_margin(egui::Margin::symmetric(16, 6)),
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::horizontal().show(ui, |ui| {
@@ -1438,6 +1639,7 @@ impl Viewer {
                                 let tools: &[Tool] = if self.editor.mode == Mode::Draw {
                                     &[
                                         Tool::Select,
+                                        Tool::Lasso,
                                         Tool::Pen,
                                         Tool::Polyline,
                                         Tool::Polygon,
@@ -1450,6 +1652,7 @@ impl Viewer {
                                 } else {
                                     &[
                                         Tool::Select,
+                                        Tool::Lasso,
                                         Tool::Highlight,
                                         Tool::Underline,
                                         Tool::Strikeout,
@@ -1457,20 +1660,34 @@ impl Viewer {
                                         Tool::Note,
                                     ]
                                 };
+                                // New marks use the current color; highlights stay yellow.
+                                let ink = if self.editor.style.color == HIGHLIGHT {
+                                    DEFAULT_INK
+                                } else {
+                                    self.editor.style.color
+                                };
                                 for &tool in tools {
                                     if matches!(tool, Tool::Highlight | Tool::Pen | Tool::Rectangle)
                                     {
                                         ui.separator();
                                     }
+                                    let mut button = ActionButton::new(tool.icon(), tool.label())
+                                        .compact()
+                                        .selected(
+                                            self.editor.tool == tool && !self.editor.library_open,
+                                        );
+                                    // Annotate shows each markup color; Draw only the active tool's.
+                                    let tinted = self.editor.mode == Mode::Annotate
+                                        || tool == Tool::Pen
+                                        || self.editor.tool == tool;
+                                    if !matches!(tool, Tool::Select | Tool::Lasso) && tinted {
+                                        button = button.tint(color(
+                                            if tool == Tool::Highlight { HIGHLIGHT } else { ink },
+                                            1.,
+                                        ));
+                                    }
                                     if ui
-                                        .add(
-                                            ActionButton::new(tool.icon(), tool.label())
-                                                .compact()
-                                                .selected(
-                                                    self.editor.tool == tool
-                                                        && !self.editor.library_open,
-                                                ),
-                                        )
+                                        .add(button)
                                         .clicked()
                                     {
                                         self.editor.select_tool(tool);
@@ -1505,16 +1722,34 @@ impl Viewer {
                                 }
                                 self.sign_menu(ui, compact, false);
                                 ui.separator();
-                                ui.color_edit_button_rgb(&mut self.editor.style.color)
-                                    .on_hover_text("Color for new annotations");
+                                ui::color_swatch(
+                                    ui,
+                                    &mut self.editor.style.color,
+                                    "Color for new annotations",
+                                );
                             });
                         } else if self.editor.mode == Mode::Sign {
+                            if ui
+                                .add(ActionButton::new(Icon::Sign, "Quick Sign").primary())
+                                .on_hover_text(
+                                    "Drag a box on the page to sign with your default digital ID",
+                                )
+                                .clicked()
+                            {
+                                action = Some("quick_sign");
+                            }
+                            ui.separator();
                             for (icon, label, key) in [
+                                (Icon::Pen, "Signature appearance…", "appearance"),
                                 (Icon::Shield, "Digital IDs…", "identities"),
-                                (Icon::Sign, "Digitally sign…", "sign"),
-                                (Icon::Shield, "Validate signatures…", "validate"),
+                                (Icon::Form, "Sign with options…", "sign"),
+                                (Icon::Check, "Validate signatures…", "validate"),
                             ] {
-                                if ui.add(ActionButton::new(icon, label)).clicked() {
+                                let button = ActionButton::new(icon, label);
+                                if ui
+                                    .add(if compact { button.compact() } else { button })
+                                    .clicked()
+                                {
                                     action = Some(key);
                                 }
                             }
@@ -1522,12 +1757,15 @@ impl Viewer {
                             ui.label(
                                 RichText::new("Read, annotate, sign, or organize your pages.")
                                     .small()
-                                    .color(MUTED),
+                                    .color(theme::muted()),
                             );
                         }
                     });
+                    if self.editor.tool == Tool::SignArea {
+                        ui.label(RichText::new("Drag a box where your signature goes, or click to place it · Esc cancels").small().color(theme::muted()));
+                    }
                     if matches!(self.editor.tool, Tool::Polyline | Tool::Polygon) && self.editor.mode == Mode::Draw {
-                        ui.label(RichText::new("Click to add points · Double-click or Return to finish · Backspace removes a point · Esc cancels").small().color(MUTED));
+                        ui.label(RichText::new("Click to add points · Double-click or Return to finish · Backspace removes a point · Esc cancels").small().color(theme::muted()));
                     }
                 });
             });
@@ -1543,7 +1781,7 @@ impl Viewer {
             return;
         };
         if s.annotations.is_empty() {
-            ui.label(RichText::new("Your annotations appear here. Existing annotations from other apps remain visible but are not editable in this version.").small().color(MUTED));
+            ui.label(RichText::new("Your annotations appear here. Existing annotations from other apps remain visible but are not editable in this version.").small().color(theme::muted()));
         }
         let entries = s.annotations.clone();
         let mut selected = None;
@@ -1553,7 +1791,8 @@ impl Viewer {
                 for a in &entries {
                     if ui
                         .selectable_label(
-                            tab.selected_annotation.as_ref() == Some(&a.id),
+                            tab.selected_annotation.as_ref() == Some(&a.id)
+                                || tab.group.contains(&a.id),
                             format!("Page {} • {}", a.page + 1, a.kind.label()),
                         )
                         .clicked()
@@ -1564,7 +1803,7 @@ impl Viewer {
                         ui.label(
                             RichText::new(text.chars().take(60).collect::<String>())
                                 .small()
-                                .color(MUTED),
+                                .color(theme::muted()),
                         );
                     }
                     ui.separator();
@@ -1572,11 +1811,166 @@ impl Viewer {
             });
         if let Some(a) = selected {
             tab.jump(a.page);
-            tab.selected_annotation = Some(a.id.clone());
-            self.editor.draft = Some(a);
+            selection::set(tab, &mut self.editor, vec![a.id]);
+        }
+    }
+    /// Shared properties, alignment and actions for a multi-object selection.
+    fn group_inspector(&mut self, ctx: &egui::Context) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let marks: Vec<Annotation> = selection::members(tab).into_iter().cloned().collect();
+        let Some(first) = marks.first().cloned() else {
+            return;
+        };
+        let editable = tab.session.as_ref().is_some_and(|s| s.editable);
+        let mut changed: Option<Vec<Annotation>> = None;
+        let mut arranged = None;
+        let mut duplicate = false;
+        let mut delete = false;
+        let mut focus = false;
+        // Apply one property to every mark, on top of earlier edits this frame.
+        let apply = |changed: &mut Option<Vec<Annotation>>, edit: &dyn Fn(&mut Annotation)| {
+            let next = changed.get_or_insert_with(|| marks.clone());
+            for a in next.iter_mut() {
+                edit(a);
+            }
+        };
+        egui::SidePanel::right("annotation_inspector")
+            .default_width(254.)
+            .width_range(230.0..=340.0)
+            .resizable(true)
+            .frame(egui::Frame::new().fill(theme::paper()).inner_margin(16.))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = vec2(8., 10.);
+                egui::ScrollArea::vertical()
+                    .id_salt("group_properties")
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui::title(ui, &format!("{} objects", marks.len()), 17.);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(format!("PAGE {}", first.page + 1))
+                                            .size(10.)
+                                            .color(theme::muted()),
+                                    );
+                                },
+                            );
+                        });
+                        ui.separator();
+                        ui.add_enabled_ui(editable, |ui| {
+                            ui::caption(ui, "Color");
+                            let mut color = first.style.color;
+                            if color_palette(ui, &mut color) {
+                                apply(&mut changed, &|a| {
+                                    if !matches!(a.kind, Kind::Image { .. }) {
+                                        a.style.color = color;
+                                    }
+                                    if let Kind::Svg { tint, .. } = &mut a.kind {
+                                        *tint = true;
+                                    }
+                                });
+                            }
+                            let mut opacity = first.style.opacity * 100.;
+                            focus |= property_slider(
+                                ui,
+                                "Opacity",
+                                &mut opacity,
+                                5.0..=100.0,
+                                "%",
+                            )
+                            .is_some();
+                            if opacity != first.style.opacity * 100. {
+                                apply(&mut changed, &|a| a.style.opacity = opacity / 100.);
+                            }
+                            let mut width = first.style.width;
+                            focus |= property_slider(ui, "Stroke", &mut width, 0.5..=20., " pt")
+                                .is_some();
+                            if width != first.style.width {
+                                apply(&mut changed, &|a| a.style.width = width);
+                            }
+                            let mut stroke = first.style.stroke;
+                            stroke_styles(ui, &mut stroke);
+                            if stroke != first.style.stroke {
+                                apply(&mut changed, &|a| a.style.stroke = stroke);
+                            }
+                            ui.separator();
+                            ui::caption(ui, "Align");
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 2.;
+                                for (align, icon, label) in selection::Align::ALL {
+                                    if ui.add(ActionButton::new(icon, label).compact()).clicked() {
+                                        arranged = Some(selection::aligned(&marks, align));
+                                    }
+                                }
+                            });
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                duplicate =
+                                    ui.add(ActionButton::new(Icon::Plus, "Duplicate")).clicked();
+                                delete = ui
+                                    .add(ActionButton::new(Icon::Trash, "Delete").compact())
+                                    .clicked();
+                            });
+                        });
+                        if !editable {
+                            ui.label(RichText::new("Read-only document").small().color(theme::muted()));
+                        }
+                        ui.label(
+                            RichText::new(
+                                "Drag to move · Corners to scale · Shift-click to add or remove · Arrow keys nudge",
+                            )
+                            .size(11.)
+                            .color(theme::muted()),
+                        );
+                    });
+            });
+        self.editor.text_editing |= focus;
+        let pointer_active = ctx.input(|i| i.pointer.any_down() || i.pointer.any_released());
+        if let Some(next) = changed {
+            // A slider drag or a focused value field is one undo step.
+            let previous = self
+                .editor
+                .group_edit
+                .filter(|(id, _)| *id == tab.id && (pointer_active || focus))
+                .map(|(_, revision)| revision);
+            if let Some(revision) = selection::commit(tab, &next, previous, &mut self.status) {
+                self.editor.group_edit = Some((tab.id, revision));
+            }
+        }
+        if !ctx.input(|i| i.pointer.any_down()) && !focus {
+            self.editor.group_edit = None;
+        }
+        if let Some(next) = arranged {
+            selection::commit(tab, &next, None, &mut self.status);
+        }
+        if duplicate && let Some(s) = &mut tab.session {
+            let copies: Vec<_> = marks.iter().map(Annotation::duplicate).collect();
+            let mut entries = s.annotations.clone();
+            entries.extend(copies.iter().cloned());
+            match s.commit(entries) {
+                Ok(()) => {
+                    let ids = copies.into_iter().map(|a| a.id).collect();
+                    selection::set(tab, &mut self.editor, ids);
+                }
+                Err(e) => self.status = Some((format!("{e:#}"), true)),
+            }
+        }
+        if delete {
+            self.editor_delete();
         }
     }
     pub(super) fn annotation_inspector(&mut self, ctx: &egui::Context) {
+        if self
+            .tabs
+            .get(self.active)
+            .is_some_and(|t| t.group.len() >= 2)
+        {
+            self.group_inspector(ctx);
+            return;
+        }
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -1597,22 +1991,17 @@ impl Viewer {
                     .default_width(254.)
                     .width_range(230.0..=340.0)
                     .resizable(true)
-                    .frame(egui::Frame::new().fill(PAPER).inner_margin(16.))
+                    .frame(egui::Frame::new().fill(theme::paper()).inner_margin(16.))
                     .show(ctx, |ui| {
                         ui.spacing_mut().item_spacing = vec2(8., 10.);
-                        ui.label(RichText::new("Drawing").size(19.).strong());
+                        ui.label(RichText::new("Drawing").size(17.).family(ui::semibold()));
                         ui.label(
-                            RichText::new("Click a drawing to select it.")
+                            RichText::new("Click a drawing to select it, or drag across several.")
                                 .small()
-                                .color(MUTED),
+                                .color(theme::muted()),
                         );
                         ui.separator();
-                        ui.label(
-                            RichText::new("NEW DRAWINGS")
-                                .size(10.)
-                                .strong()
-                                .color(MUTED),
-                        );
+                        ui::caption(ui, "New drawings");
                         color_palette(ui, &mut self.editor.style.color);
                         self.editor.text_editing |= property_slider(
                             ui,
@@ -1647,7 +2036,7 @@ impl Viewer {
             .default_width(254.)
             .width_range(230.0..=340.0)
             .resizable(true)
-            .frame(egui::Frame::new().fill(PAPER).inner_margin(16.))
+            .frame(egui::Frame::new().fill(theme::paper()).inner_margin(16.))
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = vec2(8., 10.);
                 ui.spacing_mut().interact_size.y = 26.;
@@ -1656,14 +2045,18 @@ impl Viewer {
                     .id_salt("annotation_properties")
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(selected.kind.label()).size(19.).strong());
+                            ui.label(
+                                RichText::new(selected.kind.label())
+                                    .size(17.)
+                                    .family(ui::semibold()),
+                            );
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
                                         RichText::new(format!("PAGE {}", selected.page + 1))
                                             .size(10.)
-                                            .color(MUTED),
+                                            .color(theme::muted()),
                                     );
                                 },
                             );
@@ -1675,6 +2068,7 @@ impl Viewer {
                             if let Some(text) = a.kind.text_mut() {
                                 let r = ui.add(
                                     egui::TextEdit::multiline(text)
+                                        .margin(ui::FIELD_MARGIN)
                                         .desired_rows(3)
                                         .char_limit(8000)
                                         .desired_width(f32::INFINITY),
@@ -1686,7 +2080,7 @@ impl Viewer {
                             }
                             let image = matches!(a.kind, Kind::Image { .. });
                             if !image {
-                                ui.label(RichText::new("COLOR").size(10.).strong().color(MUTED));
+                                ui::caption(ui, "Color");
                                 if color_palette(ui, &mut a.style.color)
                                     && let Kind::Svg { tint, .. } = &mut a.kind
                                 {
@@ -1713,14 +2107,7 @@ impl Viewer {
                                         a.style.fill = fill.then_some(a.style.color);
                                     }
                                     if let Some(fill) = &mut a.style.fill {
-                                        let mut custom = *fill;
-                                        if ui
-                                            .color_edit_button_rgb(&mut custom)
-                                            .on_hover_text("Fill color")
-                                            .changed()
-                                        {
-                                            *fill = custom;
-                                        }
+                                        ui::color_swatch(ui, fill, "Fill color");
                                     }
                                 });
                             }
@@ -1752,9 +2139,9 @@ impl Viewer {
                                             r,
                                             5.,
                                             if selected {
-                                                Color32::from_rgb(222, 234, 250)
+                                                theme::accent_soft()
                                             } else {
-                                                Color32::from_rgb(234, 235, 239)
+                                                theme::control()
                                             },
                                         );
                                         ui.painter().line_segment(
@@ -1762,7 +2149,14 @@ impl Viewer {
                                                 r.left_center() + vec2(9., 0.),
                                                 r.right_center() - vec2(9., 0.),
                                             ],
-                                            Stroke::new(width, if selected { ACCENT } else { INK }),
+                                            Stroke::new(
+                                                width,
+                                                if selected {
+                                                    theme::accent()
+                                                } else {
+                                                    theme::ink()
+                                                },
+                                            ),
                                         );
                                         response.widget_info(|| {
                                             egui::WidgetInfo::selected(
@@ -1816,7 +2210,9 @@ impl Viewer {
                                         .into_iter()
                                         .enumerate()
                                         {
-                                            ui.label(RichText::new(label).small().color(MUTED));
+                                            ui.label(
+                                                RichText::new(label).small().color(theme::muted()),
+                                            );
                                             let r = ui.add_sized(
                                                 vec2(64., 26.),
                                                 egui::DragValue::new(value)
@@ -1856,12 +2252,17 @@ impl Viewer {
                             });
                         });
                         if !editable {
-                            ui.label(RichText::new("Read-only document").small().color(MUTED));
+                            ui.label(
+                                RichText::new("Read-only document")
+                                    .small()
+                                    .color(theme::muted()),
+                            );
                         }
                         ui.separator();
                         egui::CollapsingHeader::new("Save to library").show(ui, |ui| {
                             let r = ui.add(
                                 egui::TextEdit::singleline(&mut self.editor.asset_name)
+                                    .margin(ui::FIELD_MARGIN)
                                     .hint_text("Asset name")
                                     .char_limit(200)
                                     .desired_width(f32::INFINITY),
@@ -1874,7 +2275,7 @@ impl Viewer {
                         ui.label(
                             RichText::new("Drag to move · Corner to resize")
                                 .size(11.)
-                                .color(MUTED),
+                                .color(theme::muted()),
                         );
                     });
             });
@@ -1964,14 +2365,13 @@ impl Viewer {
             egui::SidePanel::right("asset_library_panel")
                 .exact_width(270.0)
                 .resizable(false)
-                .frame(egui::Frame::new().fill(PAPER).inner_margin(14.0))
+                .frame(egui::Frame::new().fill(theme::paper()).inner_margin(14.0))
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.heading(&self.editor.library_tab);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
-                                .small_button("×")
-                                .on_hover_text("Close asset panel")
+                                .add(ActionButton::new(Icon::Close, "Close asset panel").compact())
                                 .clicked()
                             {
                                 open = false;
@@ -1981,7 +2381,7 @@ impl Viewer {
                     ui.label(
                         RichText::new("Choose artwork, then click or drag on a page.")
                             .small()
-                            .color(MUTED),
+                            .color(theme::muted()),
                     );
                     ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
@@ -1991,7 +2391,7 @@ impl Viewer {
                             self.editor.svg.stamp = self.editor.library_tab == "Stamps";
                         }
                         if ui
-                            .add(ActionButton::new(Icon::Star, "Create with prompt…"))
+                            .add(ActionButton::new(Icon::Sparkle, "Create with prompt…"))
                             .clicked()
                         {
                             self.editor.create_stamp_prompt();
@@ -2042,6 +2442,7 @@ impl Viewer {
                     });
                     let search = ui.add(
                         egui::TextEdit::singleline(&mut self.editor.library_query)
+                            .margin(ui::FIELD_MARGIN)
                             .hint_text("Search this collection…")
                             .desired_width(f32::INFINITY)
                             .char_limit(200),
@@ -2054,7 +2455,7 @@ impl Viewer {
                         });
                     }
                     if let Some(error) = &self.editor.library_error {
-                        ui.colored_label(Color32::from_rgb(155, 47, 39), error);
+                        ui.colored_label(theme::danger(), error);
                     }
                     let query = self.editor.library_query.to_lowercase();
                     let mut entries: Vec<(Option<usize>, Asset)> =
@@ -2138,9 +2539,9 @@ impl Viewer {
                                                     rect,
                                                     5.0,
                                                     if hover {
-                                                        Color32::from_rgb(235, 242, 255)
+                                                        theme::accent_soft()
                                                     } else {
-                                                        Color32::WHITE
+                                                        theme::surface()
                                                     },
                                                 );
                                                 ui.painter().rect_stroke(
@@ -2149,12 +2550,21 @@ impl Viewer {
                                                     Stroke::new(
                                                         1.0,
                                                         if hover {
-                                                            ACCENT
+                                                            theme::accent()
                                                         } else {
-                                                            Color32::from_rgb(223, 230, 242)
+                                                            theme::line()
                                                         },
                                                     ),
                                                     egui::StrokeKind::Inside,
+                                                );
+                                                // Artwork sits on white paper in both themes.
+                                                ui.painter().rect_filled(
+                                                    Rect::from_min_max(
+                                                        rect.min + vec2(6.0, 5.0),
+                                                        pos2(rect.right() - 6.0, rect.top() + 69.0),
+                                                    ),
+                                                    4.0,
+                                                    Color32::WHITE,
                                                 );
                                                 let base = vec2(240.0, 240.0 / asset.aspect);
                                                 let scale =
@@ -2200,7 +2610,7 @@ impl Viewer {
                                                     egui::Align2::CENTER_CENTER,
                                                     label,
                                                     FontId::proportional(12.0),
-                                                    INK,
+                                                    theme::ink(),
                                                 );
                                                 if response
                                                     .on_hover_text(format!("Place {}", asset.name))
@@ -2280,7 +2690,7 @@ impl Viewer {
                             "Built-in vector artwork • resize and recolor after placing"
                         })
                         .small()
-                        .color(MUTED),
+                        .color(theme::muted()),
                     );
                 });
             self.editor.library_open = open;
@@ -2315,7 +2725,12 @@ impl Viewer {
             self.import_library_asset(ctx, None, self.editor.library_tab == "Stamps");
         }
     }
-    fn import_library_asset(&mut self, ctx: &egui::Context, target: Option<Asset>, stamp: bool) {
+    pub(super) fn import_library_asset(
+        &mut self,
+        ctx: &egui::Context,
+        target: Option<Asset>,
+        stamp: bool,
+    ) {
         if let Some(path) = self.native_pick(
             rfd::FileDialog::new()
                 .set_title("Import reusable artwork")
@@ -2376,12 +2791,16 @@ impl Viewer {
             let mut open = true;
             let mut save = false;
             egui::Window::new("Handwritten signature").collapsible(false).open(&mut open).default_width(480.0).show(ctx, |ui| {
-                ui.label("This places a visual annotation. For certificate-based signing, choose Sign → Digital Signature.");
+                ui.label(if self.digital.adopt_asset {
+                    "Draw or type your signature. It becomes the image in your digital signatures."
+                } else {
+                    "This places a visual annotation. For certificate-based signing, choose Sign → Digital Signature."
+                });
                 ui.horizontal(|ui| { ui.selectable_value(&mut self.editor.signature_is_typed, false, "Draw");
  ui.selectable_value(&mut self.editor.signature_is_typed, true, "Type"); });
-                if self.editor.signature_is_typed { let r = ui.add(egui::TextEdit::singleline(&mut self.editor.signature_typed).hint_text("Signature text").char_limit(200)); self.editor.text_editing |= r.has_focus(); }
+                if self.editor.signature_is_typed { let r = ui.add(egui::TextEdit::singleline(&mut self.editor.signature_typed).margin(ui::FIELD_MARGIN).hint_text("Signature text").char_limit(200)); self.editor.text_editing |= r.has_focus(); }
                 else { draw_signature_pad(ui, &mut self.editor); }
-                let r = ui.add(egui::TextEdit::singleline(&mut self.editor.signature_name).hint_text("Library name").char_limit(200)); self.editor.text_editing |= r.has_focus();
+                let r = ui.add(egui::TextEdit::singleline(&mut self.editor.signature_name).margin(ui::FIELD_MARGIN).hint_text("Library name").char_limit(200)); self.editor.text_editing |= r.has_focus();
                 save = ui.button("Save signature to library").clicked();
             });
             self.editor.signature_open = open;
@@ -2420,6 +2839,10 @@ impl Viewer {
                         3.0,
                     );
                     match self.editor.add_asset(asset.clone()) {
+                        Ok(()) if self.digital.adopt_asset => {
+                            // digital_events adopts it as the signature appearance.
+                            self.editor.signature_open = false;
+                        }
                         Ok(()) => {
                             self.editor.placed = Some(asset);
                             self.editor.signature_open = false;
@@ -2597,7 +3020,7 @@ impl Viewer {
         let mut edit = false;
         egui::Window::new("Manage asset").open(&mut open).collapsible(false).default_width(360.).show(ctx, |ui| {
             ui.label("Name");
-            let r = ui.add(egui::TextEdit::singleline(&mut asset.name).char_limit(200).desired_width(f32::INFINITY));
+            let r = ui.add(egui::TextEdit::singleline(&mut asset.name).margin(ui::FIELD_MARGIN).char_limit(200).desired_width(f32::INFINITY));
             self.editor.text_editing |= r.has_focus();
             ui.checkbox(&mut asset.stamp,"Include in Stamps collection");
             ui.add_space(8.);
@@ -2605,10 +3028,10 @@ impl Viewer {
                 if matches!(asset.kind, Kind::Svg { .. }) { edit=ui.add(ActionButton::new(Icon::Text,"Edit SVG…")).clicked(); }
                 replace=ui.add_enabled(!self.editor.asset_busy,ActionButton::new(Icon::Import,"Replace artwork…")).clicked();
             });
-            ui.label(RichText::new("Library updates affect future placements. Existing marks in PDFs keep their own artwork.").small().color(MUTED));
+            ui.label(RichText::new("Library updates affect future placements. Existing marks in PDFs keep their own artwork.").small().color(theme::muted()));
             ui.add_space(8.);
             save=ui.add(ActionButton::new(Icon::Save,"Save changes").primary()).clicked();
-            if let Some(e)=&self.editor.library_error { ui.colored_label(Color32::DARK_RED,e); }
+            if let Some(e)=&self.editor.library_error { ui.colored_label(theme::danger(),e); }
         });
         if save {
             match self.editor.add_asset(asset.clone()) {
@@ -2704,23 +3127,23 @@ impl Viewer {
                     RichText::new(
                         "Paste SVG code. Preview, refine, then place as scalable artwork.",
                     )
-                    .color(MUTED),
+                    .color(theme::muted()),
                 );
                 ui.add_space(10.);
                 if self.editor.svg.prompt_open {
-                    egui::Frame::new().fill(Color32::from_rgb(233,239,249)).corner_radius(8.).inner_margin(12.).show(ui, |ui| {
-                        ui.label(RichText::new("1  Describe your stamp").strong());
-                        let r = ui.add(egui::TextEdit::multiline(&mut self.editor.svg.prompt).hint_text("e.g. A round APPROVED stamp with a check mark, dark green, clean double border").desired_rows(3).desired_width(f32::INFINITY).char_limit(8000));
+                    egui::Frame::new().fill(theme::accent_soft()).corner_radius(8.).inner_margin(12.).show(ui, |ui| {
+                        ui.label(RichText::new("1  Describe your stamp").family(ui::semibold()));
+                        let r = ui.add(egui::TextEdit::multiline(&mut self.editor.svg.prompt).margin(ui::FIELD_MARGIN).hint_text("e.g. A round APPROVED stamp with a check mark, dark green, clean double border").desired_rows(3).desired_width(f32::INFINITY).char_limit(8000));
                         self.editor.text_editing |= r.has_focus();
-                        if ui.add_enabled(!self.editor.svg.prompt.trim().is_empty(), ActionButton::new(Icon::Extract,"Copy prompt").primary()).clicked() {
+                        if ui.add_enabled(!self.editor.svg.prompt.trim().is_empty(), ActionButton::new(Icon::Copy,"Copy prompt").primary()).clicked() {
                             ctx.copy_text(mypdf_milestone0::svg::stamp_prompt(&self.editor.svg.prompt));
                         }
-                        ui.label(RichText::new("2  Run it in your preferred LLM, then paste the answer into SVG source below.").small().color(MUTED));
+                        ui.label(RichText::new("2  Run it in your preferred LLM, then paste the answer into SVG source below.").small().color(theme::muted()));
                     });
                     ui.add_space(8.);
                 } else if self.editor.svg.target.is_none() && ui.add(ActionButton::new(Icon::Star,"Build an LLM prompt…")).clicked() { self.editor.svg.prompt_open=true; }
                 let r = ui.add(
-                    egui::TextEdit::singleline(&mut self.editor.svg.name)
+                    egui::TextEdit::singleline(&mut self.editor.svg.name).margin(ui::FIELD_MARGIN)
                         .hint_text("Asset name")
                         .char_limit(200),
                 );
@@ -2728,13 +3151,13 @@ impl Viewer {
                 if self.editor.svg.target.is_none() { ui.checkbox(&mut self.editor.svg.stamp,"Include in Stamps collection"); }
                 ui.add_space(8.);
                 ui.columns(2, |cols| {
-                    cols[0].label(RichText::new("SVG source").strong());
+                    cols[0].label(RichText::new("SVG source").family(ui::semibold()));
                     egui::ScrollArea::both()
                         .id_salt("svg_source_scroll")
                         .max_height(if self.editor.svg.prompt_open { 200. } else { 340. })
                         .show(&mut cols[0], |ui| {
                             let r = ui.add(
-                                egui::TextEdit::multiline(&mut self.editor.svg.source)
+                                egui::TextEdit::multiline(&mut self.editor.svg.source).margin(ui::FIELD_MARGIN)
                                     .code_editor()
                                     .desired_width(f32::INFINITY)
                                     .desired_rows(18)
@@ -2752,7 +3175,7 @@ impl Viewer {
                             Err(e) => self.editor.svg.error=Some(format!("{e:#}")),
                         }
                     }
-                    cols[1].label(RichText::new("Preview").strong());
+                    cols[1].label(RichText::new("Preview").family(ui::semibold()));
                     let (r, _) = cols[1].allocate_exact_size(
                         vec2(cols[1].available_width(), if self.editor.svg.prompt_open { 200. } else { 300. }),
                         egui::Sense::hover(),
@@ -2783,7 +3206,7 @@ impl Viewer {
                     }
                 });
                 if let Some(e) = &self.editor.svg.error {
-                    ui.colored_label(Color32::from_rgb(160, 52, 45), e);
+                    ui.colored_label(theme::danger(), e);
                 }
                 ui.add_space(10.);
                 ui.horizontal(|ui| {
@@ -2807,7 +3230,7 @@ impl Viewer {
                     ui.label(
                         RichText::new("Vectors and text · Inline styles · No external resources")
                             .small()
-                            .color(MUTED),
+                            .color(theme::muted()),
                     );
                 });
             });
@@ -2964,7 +3387,7 @@ mod tests {
                     .shapes
                     .iter()
                     .filter_map(|s| match &s.shape {
-                        egui::Shape::Rect(r) if r.stroke.color == ACCENT => Some(r.rect),
+                        egui::Shape::Rect(r) if r.stroke.color == theme::accent() => Some(r.rect),
                         _ => None,
                     })
                     .collect();
@@ -2979,7 +3402,7 @@ mod tests {
                     .shapes
                     .iter()
                     .filter_map(|s| match &s.shape {
-                        egui::Shape::Rect(r) if r.fill == ACCENT => Some(r.rect),
+                        egui::Shape::Rect(r) if r.fill == theme::accent() => Some(r.rect),
                         _ => None,
                     })
                     .collect();

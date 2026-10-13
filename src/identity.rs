@@ -147,6 +147,22 @@ pub fn fingerprint(der: &[u8]) -> String {
         .collect()
 }
 
+/// A readable key description such as "RSA 2048-bit" or "ECDSA P-256".
+pub fn key_description(der: &[u8]) -> Option<String> {
+    use rsa::traits::PublicKeyParts;
+    let (_, c) = x509_parser::parse_x509_certificate(der).ok()?;
+    let spki = c.public_key().raw;
+    if let Ok(key) = rsa::RsaPublicKey::from_public_key_der(spki) {
+        return Some(format!("RSA {}-bit", key.n().bits()));
+    }
+    if p256::PublicKey::from_public_key_der(spki).is_ok() {
+        return Some("ECDSA P-256".into());
+    }
+    if p384::PublicKey::from_public_key_der(spki).is_ok() {
+        return Some("ECDSA P-384".into());
+    }
+    None
+}
 pub fn algorithm(der: &[u8]) -> Result<SignatureAlgorithm> {
     let (_, c) = x509_parser::parse_x509_certificate(der)
         .map_err(|e| anyhow::anyhow!("invalid certificate: {e}"))?;
