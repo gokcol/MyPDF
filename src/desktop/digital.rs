@@ -16,6 +16,7 @@ pub(super) enum Panel {
     Appearance,
     Sign,
     Validate,
+    Trusted,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Source {
@@ -139,6 +140,11 @@ enum Event {
         revision: u64,
     },
     Preview(Vec<u8>),
+    /// The operating system's trust in a certificate changed.
+    SystemTrust {
+        der: Vec<u8>,
+        trusted: bool,
+    },
     Failed(String),
 }
 struct ImportDraft {
@@ -206,6 +212,14 @@ pub(super) struct DigitalState {
     appearance_tx: mpsc::Sender<Result<Vec<u8>, String>>,
     appearance_rx: mpsc::Receiver<Result<Vec<u8>, String>>,
     appearance_preview: Option<Result<TextureHandle, String>>,
+    /// Certificates the user trusts for validation, kept between sessions.
+    pub(super) trust: mypdf_milestone0::trust::TrustList,
+    /// Bumped whenever trust changes, so signature checks run again.
+    pub(super) trust_generation: u64,
+    /// Whether the operating system trusts a certificate, by DER.
+    system_trust: HashMap<Vec<u8>, bool>,
+    /// Add a newly created personal ID to the system store and trust it there.
+    create_trust: bool,
 }
 fn bounded_read(path: &std::path::Path, limit: u64) -> anyhow::Result<Vec<u8>> {
     let mut bytes = vec![];
@@ -231,6 +245,9 @@ impl DigitalState {
     }
     fn at(root: PathBuf) -> Self {
         use sha2::{Digest, Sha256};
+        let trust_path = root.join("trusted_certificates.json");
+        let trust = mypdf_milestone0::trust::TrustList::open(&trust_path)
+            .unwrap_or_else(|_| mypdf_milestone0::trust::TrustList::new(&trust_path));
         let catalogue = root.join("identities.json");
         let (contents, catalogue_error, raw) = match bounded_read(&catalogue, 4 * 1024 * 1024) {
             Ok(raw) => match serde_json::from_slice::<CatalogueFile>(&raw)
@@ -334,6 +351,10 @@ impl DigitalState {
             appearance_tx,
             appearance_rx,
             appearance_preview: None,
+            trust,
+            trust_generation: 0,
+            system_trust: HashMap::new(),
+            create_trust: cfg!(any(target_os = "macos", target_os = "windows")),
         };
         state.select_default();
         state
@@ -651,6 +672,68 @@ enum Action {
     ImportArtwork,
     /// Draw or type a signature and use it as the signature artwork.
     DrawArtwork,
+    /// Trust a certificate in MyPDF.
+    TrustAdd(Vec<u8>),
+    /// Stop trusting a certificate in MyPDF (by SHA-256).
+    TrustRemove(String),
+    /// Read a .cer/.crt/.pem file and trust it in MyPDF.
+    TrustImport,
+    /// Export a trusted certificate (by SHA-256).
+    TrustExport(String),
+    /// Trust (or stop trusting) a certificate in the operating system.
+    SystemTrust(Vec<u8>, bool),
+}
+
+/// The operating system's trust store, at the start of a sentence.
+fn system_store_title() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Windows"
+    } else {
+        "This Mac"
+    }
+}
+
+/// The operating system's trust store, in words for buttons.
+fn system_store() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Windows"
+    } else {
+        "this Mac"
+    }
+}
+
+/// Trust, or stop trusting, a certificate in the operating system.
+fn platform_trust(der: &[u8], trust: bool) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    return if trust {
+        mypdf_milestone0::keychain::trust(der)
+    } else {
+        mypdf_milestone0::keychain::untrust(der)
+    };
+    #[cfg(target_os = "windows")]
+    return if trust {
+        mypdf_milestone0::windows_trust::trust(der)
+    } else {
+        mypdf_milestone0::windows_trust::untrust(der)
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (der, trust);
+        anyhow::bail!("This system has no certificate trust store MyPDF can change")
+    }
+}
+
+/// Add a digital ID to the operating system's store (Keychain or Personal store).
+fn platform_import(pkcs12: &[u8], password: &str) -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    return mypdf_milestone0::keychain::import_identity(pkcs12, password);
+    #[cfg(target_os = "windows")]
+    return mypdf_milestone0::windows_trust::import_identity(pkcs12, password);
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (pkcs12, password);
+        anyhow::bail!("This system has no certificate store MyPDF can add to")
+    }
 }
 
 fn sign_using(
@@ -767,12 +850,31 @@ impl Viewer {
                             .into();
                 }
                 Event::Created(entry, path) => {
+                    let in_system = self.digital.create_trust
+                        && cfg!(any(target_os = "macos", target_os = "windows"));
+                    if in_system {
+                        self.digital.system_trust.insert(entry.der.clone(), true);
+                        self.digital.trust_generation += 1;
+                    }
                     self.digital.remember(entry);
                     self.digital.creating = false;
-                    self.digital.message = format!(
-                        "Personal ID saved to {}. Its self-signed certificate needs separate recipient trust.",
-                        path.display()
-                    );
+                    self.digital.message = if in_system {
+                        format!(
+                            "Personal ID saved to {} and added to {} as a trusted certificate.",
+                            path.display(),
+                            system_store_title()
+                        )
+                    } else {
+                        format!(
+                            "Personal ID saved to {}. Its self-signed certificate needs separate recipient trust.",
+                            path.display()
+                        )
+                    };
+                    if in_system {
+                        let path = (!self.digital.keychain_path.trim().is_empty())
+                            .then(|| PathBuf::from(self.digital.keychain_path.trim()));
+                        self.digital.refresh_store(ctx, path);
+                    }
                 }
                 Event::Exported(path) => {
                     self.digital.message = format!(
@@ -828,6 +930,18 @@ impl Viewer {
                         ),
                         false,
                     ));
+                }
+                Event::SystemTrust { der, trusted } => {
+                    self.digital.system_trust.insert(der, trusted);
+                    self.digital.trust_generation += 1;
+                    self.digital.message = if trusted {
+                        format!("{} now trusts this certificate.", system_store_title())
+                    } else {
+                        format!(
+                            "{} no longer trusts this certificate.",
+                            system_store_title()
+                        )
+                    };
                 }
                 Event::Failed(error) => {
                     if !self.digital.open {
@@ -947,11 +1061,12 @@ impl Viewer {
             .default_height(540.0)
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 10.;
-                const PANELS: [(Panel, &str); 4] = [
+                const PANELS: [(Panel, &str); 5] = [
                     (Panel::Identities, "Digital IDs"),
                     (Panel::Appearance, "Appearance"),
-                    (Panel::Sign, "Sign document"),
+                    (Panel::Sign, "Sign"),
                     (Panel::Validate, "Validate"),
+                    (Panel::Trusted, "Trusted"),
                 ];
                 let current = PANELS
                     .iter()
@@ -1095,7 +1210,9 @@ impl Viewer {
                             .entries
                             .iter()
                             .find(|e| Some(&e.id) == self.digital.selected.as_ref())
+                            .cloned()
                         {
+                            let entry = &entry;
                             ui::section(ui, "Certificate", |ui| {
                                 certificate_details(ui, entry);
                                 if let Some(choice) = default_choice(ui, &self.digital, entry) {
@@ -1121,6 +1238,7 @@ impl Viewer {
                                         action = Some(Action::ExportP12);
                                     }
                                 });
+                                trust_controls(ui, &mut self.digital.system_trust, &self.digital.trust, &entry.der, &mut action);
                             });
                         }
                         let mut cancel = false;
@@ -1217,8 +1335,17 @@ impl Viewer {
                                         }
                                     });
                                 self.editor.text_editing |= focus;
+                                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                                ui.checkbox(
+                                    &mut self.digital.create_trust,
+                                    if cfg!(target_os = "windows") {
+                                        "Add to Windows and trust it there (Windows asks you to confirm)"
+                                    } else {
+                                        "Add to Keychain and trust it on this Mac (macOS asks for your password)"
+                                    },
+                                );
                                 ui.label(
-                                    RichText::new("A self-signed ID signs cryptographically; it does not become trusted by Adobe or change trusted roots.")
+                                    RichText::new("A personal ID is self-signed: MyPDF and this computer can trust it, but other people's apps (such as Adobe Acrobat) trust it only after they add your certificate.")
                                         .small()
                                         .color(theme::muted()),
                                 );
@@ -1605,6 +1732,73 @@ impl Viewer {
                         {
                             action = Some(Action::Sign);
                         }
+                    }
+                    Panel::Trusted => {
+                        ui.label(
+                            RichText::new("Signatures from these certificates show as trusted in MyPDF. You can add a certificate here or from a signature's details.")
+                                .color(theme::muted()),
+                        );
+                        if let Some(system) = mypdf_milestone0::trust::system_name() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "MyPDF also trusts what {system} trusts: its built-in root certificates and any certificate you mark “Always Trust”{}.",
+                                    if cfg!(target_os = "macos") { " in Keychain Access" } else { " in your certificate stores" }
+                                ))
+                                .small()
+                                .color(theme::muted()),
+                            );
+                        }
+                        if ui
+                            .add(ActionButton::new(Icon::Import, "Add certificate…"))
+                            .on_hover_text("Trust a .cer, .crt or .pem certificate")
+                            .clicked()
+                        {
+                            action = Some(Action::TrustImport);
+                        }
+                        if self.digital.trust.entries().is_empty() {
+                            ui::callout(ui, ui::Tone::Info, "No certificates yet. Add one here, or choose “Add to trusted certificates” in a signature's details.");
+                        }
+                        for t in self.digital.trust.entries() {
+                            egui::Frame::new()
+                                .fill(theme::surface())
+                                .stroke(Stroke::new(1., theme::line()))
+                                .corner_radius(10)
+                                .inner_margin(12)
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    let name = |dn: &str| {
+                                        dn.split(", ")
+                                            .find_map(|p| p.strip_prefix("CN="))
+                                            .unwrap_or(dn)
+                                            .to_owned()
+                                    };
+                                    let font = ui::strong(ui, 13.5);
+                                    ui.label(RichText::new(name(&t.subject)).font(font).color(theme::ink()));
+                                    ui.label(
+                                        RichText::new(format!("Issued by {} · valid until {}", name(&t.issuer), t.not_after))
+                                            .size(12.)
+                                            .color(theme::muted()),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!("SHA-256 {}…", &t.sha256[..16.min(t.sha256.len())]))
+                                            .size(11.)
+                                            .color(theme::muted()),
+                                    );
+                                    ui.horizontal(|ui| {
+                                        if ui.add(ActionButton::new(Icon::Export, "Export…")).clicked() {
+                                            action = Some(Action::TrustExport(t.sha256.clone()));
+                                        }
+                                        if ui.add(ActionButton::new(Icon::Trash, "Remove")).clicked() {
+                                            action = Some(Action::TrustRemove(t.sha256.clone()));
+                                        }
+                                    });
+                                });
+                        }
+                        ui.label(
+                            RichText::new("Adobe Acrobat keeps its own list. Someone who receives your signed PDF trusts your certificate in Acrobat from the signature's properties: Show Signer's Certificate, then Trust.")
+                                .small()
+                                .color(theme::muted()),
+                        );
                     }
                     Panel::Validate => {
                         ui::section(ui, "Document", |ui| {
@@ -2186,6 +2380,8 @@ impl Viewer {
                     };
                     let password = std::mem::take(&mut self.digital.create_password);
                     self.digital.create_confirm = Zeroizing::new(String::new());
+                    let add_to_system = self.digital.create_trust
+                        && cfg!(any(target_os = "macos", target_os = "windows"));
                     self.digital.spawn(ctx, move || {
                         let created = identity::create_personal(&details, &password)?;
                         write_new(&path, &created.pkcs12)?;
@@ -2193,6 +2389,10 @@ impl Viewer {
                             .into_iter()
                             .next()
                             .context("Created identity was not readable")?;
+                        if add_to_system {
+                            platform_import(&created.pkcs12, &password)?;
+                            platform_trust(&imported.certificate_der, true)?;
+                        }
                         Ok(Event::Created(Entry::file(path.clone(), imported), path))
                     });
                 }
@@ -2299,6 +2499,72 @@ impl Viewer {
                 self.digital.adopt_asset = true;
                 self.editor.signature_open = true;
             }
+            Action::TrustAdd(der) => match self.digital.trust.add(&der) {
+                Ok(_) => {
+                    self.digital.trust_generation += 1;
+                    self.digital.message =
+                        "MyPDF now trusts this certificate when it checks signatures.".into();
+                }
+                Err(e) => self.digital.error = Some(format!("{e:#}")),
+            },
+            Action::TrustRemove(sha256) => match self.digital.trust.remove(&sha256) {
+                Ok(_) => {
+                    self.digital.trust_generation += 1;
+                    self.digital.message = "MyPDF no longer trusts this certificate.".into();
+                }
+                Err(e) => self.digital.error = Some(format!("{e:#}")),
+            },
+            Action::TrustImport => {
+                if let Some(path) = self.native_pick(
+                    rfd::FileDialog::new()
+                        .set_title("Trust a certificate")
+                        .add_filter("X.509 certificate", &["cer", "crt", "pem", "der"]),
+                ) {
+                    let added = bounded_read(&path, 1024 * 1024)
+                        .and_then(|bytes| mypdf_milestone0::trust::read_certificate(&bytes))
+                        .and_then(|der| self.digital.trust.add(&der));
+                    match added {
+                        Ok(true) => {
+                            self.digital.trust_generation += 1;
+                            self.digital.message =
+                                "Certificate added to your trusted certificates.".into();
+                        }
+                        Ok(false) => {
+                            self.digital.message = "That certificate is already trusted.".into()
+                        }
+                        Err(e) => self.digital.error = Some(format!("{e:#}")),
+                    }
+                }
+            }
+            Action::TrustExport(sha256) => {
+                if let Some(trusted) = self
+                    .digital
+                    .trust
+                    .entries()
+                    .iter()
+                    .find(|t| t.sha256 == sha256)
+                    .cloned()
+                    && let Some(path) = self.native_save(
+                        rfd::FileDialog::new()
+                            .set_title("Export certificate • new filename")
+                            .add_filter("X.509 certificate", &["cer"])
+                            .set_file_name("certificate.cer"),
+                    )
+                {
+                    self.digital.spawn(ctx, move || {
+                        write_new(&path, &trusted.der)?;
+                        Ok(Event::Exported(path))
+                    });
+                }
+            }
+            Action::SystemTrust(der, trust) => {
+                self.digital.spawn(ctx, move || {
+                    platform_trust(&der, trust)?;
+                    let trusted =
+                        mypdf_milestone0::trust::system_trusts(std::slice::from_ref(&der));
+                    Ok(Event::SystemTrust { der, trusted })
+                });
+            }
             Action::Place => {
                 self.digital.open = false;
                 self.editor.mode = editing::Mode::Sign;
@@ -2393,6 +2659,18 @@ impl Viewer {
 #[cfg(test)]
 impl DigitalState {
     /// Visual QA: sample Keychain, file and certificate identities.
+    pub(super) fn preview_trusted(&mut self) {
+        for name in ["Jane Appleseed", "Example Studio Signing CA"] {
+            let created = identity::create(name, "synthetic-preview-trust", true).unwrap();
+            let der = identity::inspect_pkcs12(&created.pkcs12, "synthetic-preview-trust")
+                .unwrap()
+                .remove(0)
+                .certificate_der;
+            self.trust.add(&der).unwrap();
+        }
+        self.open = true;
+        self.panel = Panel::Trusted;
+    }
     pub(super) fn preview_identities(&mut self, panel: Panel) {
         let info = |subject: &str, until: &str| IdentityInfo {
             subject: subject.into(),
@@ -2775,6 +3053,55 @@ fn certificate_info(ui: &mut egui::Ui, info: &IdentityInfo) {
     }
 }
 
+/// Trust buttons for a certificate: in MyPDF, and in the operating system.
+fn trust_controls(
+    ui: &mut egui::Ui,
+    system: &mut HashMap<Vec<u8>, bool>,
+    trust: &mypdf_milestone0::trust::TrustList,
+    der: &[u8],
+    action: &mut Option<Action>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        if trust.contains(der) {
+            if ui
+                .add(ActionButton::new(Icon::Close, "Remove from MyPDF trust"))
+                .clicked()
+            {
+                *action = Some(Action::TrustRemove(
+                    mypdf_milestone0::identity::fingerprint(der),
+                ));
+            }
+        } else if ui
+            .add(ActionButton::new(Icon::Shield, "Trust in MyPDF"))
+            .on_hover_text("Show signatures from this certificate as trusted in MyPDF")
+            .clicked()
+        {
+            *action = Some(Action::TrustAdd(der.to_vec()));
+        }
+        if mypdf_milestone0::trust::system_name().is_some() {
+            let trusted = *system
+                .entry(der.to_vec())
+                .or_insert_with(|| mypdf_milestone0::trust::system_trusts(&[der.to_vec()]));
+            let label = if trusted {
+                format!("Stop trusting on {}", system_store())
+            } else {
+                format!("Trust on {}", system_store())
+            };
+            if ui
+                .add(ActionButton::new(Icon::Check, &label))
+                .on_hover_text(if cfg!(target_os = "windows") {
+                    "Changes your Windows trusted root certificates; Windows asks you to confirm"
+                } else {
+                    "Changes this certificate's trust in Keychain; macOS asks for your password"
+                })
+                .clicked()
+            {
+                *action = Some(Action::SystemTrust(der.to_vec(), !trusted));
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2895,6 +3222,81 @@ mod tests {
                 .unwrap()
                 .contains("Store locked")
         );
+    }
+    #[test]
+    fn certificates_trusted_in_mypdf_change_the_verdict_and_persist() {
+        use eframe::App;
+        let temp = tempfile::tempdir().unwrap();
+        let created = identity::create("Trusted Colleague", "synthetic-trust-flow", true).unwrap();
+        let signer =
+            identity::FileSigner::load(&created.pkcs12, "synthetic-trust-flow", None).unwrap();
+        let der = underskrift::CryptoSigner::certificate_der(&signer).to_vec();
+        let font = mypdf_milestone0::document::default_font().unwrap();
+        let signed = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(signing::sign_custom(
+                &mypdf_milestone0::document::fixture(&font).unwrap(),
+                &signer,
+                &DesktopSigningRequest::default(),
+            ))
+            .unwrap();
+        let pdf = temp.path().join("Signed.pdf");
+        std::fs::write(&pdf, signed).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(
+            &eframe::CreationContext::_new_kittest(ctx.clone()),
+            vec![pdf],
+        );
+        let profile = temp.path().join("profile");
+        app.digital = DigitalState::at(profile.clone());
+        let trusted = |app: &Viewer| {
+            app.tabs[0]
+                .signatures
+                .views
+                .as_ref()
+                .and_then(|v| v.as_ref().ok())
+                .and_then(|v| {
+                    v.iter()
+                        .find_map(|v| v.evidence.as_ref().map(|e| e.trusted_by.clone()))
+                })
+        };
+        let until = |app: &mut Viewer, ready: &dyn Fn(&Viewer) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !ready(app) {
+                assert!(std::time::Instant::now() < deadline, "{:?}", app.status);
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1100., 760.))),
+                        ..Default::default()
+                    },
+                    |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        until(&mut app, &|a| trusted(a).is_some());
+        assert_eq!(
+            trusted(&app),
+            Some(None),
+            "a new personal ID is not trusted"
+        );
+
+        app.digital_action(Action::TrustAdd(der.clone()), &ctx);
+        until(&mut app, &|a| {
+            trusted(a) == Some(Some("your trusted certificates".into()))
+        });
+        // The list is kept for the next launch.
+        assert!(DigitalState::at(profile.clone()).trust.contains(&der));
+
+        // The Trusted tab lists it; removing it reverts the verdict.
+        app.digital.open = true;
+        app.digital.panel = Panel::Trusted;
+        until(&mut app, &|a| !a.digital.trust.entries().is_empty());
+        let sha = app.digital.trust.entries()[0].sha256.clone();
+        app.digital_action(Action::TrustRemove(sha), &ctx);
+        until(&mut app, &|a| trusted(a) == Some(None));
+        assert!(!DigitalState::at(profile).trust.contains(&der));
     }
     #[test]
     fn digital_signature_asks_for_the_area_before_the_signing_window() {

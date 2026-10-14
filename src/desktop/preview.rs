@@ -192,6 +192,7 @@ fn native_visual_preview() {
         "QuickPrompt",
         "QuickSign",
         "HeaderFooter",
+        "Trusted",
         "Redact",
         "Flatten",
         "Signatures",
@@ -304,6 +305,9 @@ fn native_visual_preview() {
         app.digital.open = false;
         if collection == "DigitalIds" {
             app.digital.preview_identities(digital::Panel::Identities);
+        }
+        if collection == "Trusted" {
+            app.digital.preview_trusted();
         }
         if collection == "Appearance" {
             app.digital.preview_identities(digital::Panel::Appearance);

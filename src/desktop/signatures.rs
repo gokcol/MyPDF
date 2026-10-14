@@ -20,7 +20,7 @@ type Overview = Result<Vec<SignatureView>, String>;
 /// Per-document signature state.
 #[derive(Default)]
 pub(super) struct TabSignatures {
-    /// Session revision and trusted-certificate count the overview was built for.
+    /// Session revision and trust generation the overview was built for.
     key: Option<(u64, usize)>,
     job: Option<mpsc::Receiver<Overview>>,
     pub views: Option<Overview>,
@@ -241,7 +241,8 @@ impl Viewer {
                 }
             }
         }
-        let trusted = self.trusted.clone();
+        let trusted = self.digital.trust.ders();
+        let generation = self.digital.trust_generation;
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
@@ -257,7 +258,7 @@ impl Viewer {
         let Some(inputs) = Inputs::of(tab) else {
             return;
         };
-        let key = (inputs.revision, trusted.len());
+        let key = (inputs.revision, generation as usize);
         if tab.signatures.key == Some(key) {
             return;
         }
@@ -514,17 +515,16 @@ impl Viewer {
                                 } else {
                                     "The document was changed after this signature was applied. View the signed version to see exactly what was signed."
                                 };
-                                let identity = if e.trusted {
-                                    "The signer's certificate is trusted for this session."
-                                } else {
-                                    "The signer's identity is unknown because the certificate is not in your trusted certificates."
+                                let identity = match &e.trusted_by {
+                                    Some(by) => format!("The signer's identity is trusted: {by} vouches for this certificate."),
+                                    None => "The signer's identity is unknown because the certificate is not in your trusted certificates.".to_owned(),
                                 };
                                 let time = if e.timestamp.is_some() {
                                     "Signing time comes from an embedded timestamp (not independently checked)."
                                 } else {
                                     "Signing time is from the clock on the signer's computer."
                                 };
-                                for line in [integrity, identity, time] {
+                                for line in [integrity, identity.as_str(), time] {
                                     ui.horizontal_top(|ui| {
                                         ui.label(RichText::new("•").color(theme::muted()));
                                         ui.add(egui::Label::new(RichText::new(line).size(12.5).color(theme::ink())).wrap());
@@ -593,8 +593,8 @@ impl Viewer {
                                     if let Some(der) = &e.signer_der {
                                         if !e.trusted
                                             && ui
-                                                .add(ActionButton::new(Icon::Shield, "Trust for this session"))
-                                                .on_hover_text("Treat this signer's certificate as trusted until you quit")
+                                                .add(ActionButton::new(Icon::Shield, "Add to trusted certificates"))
+                                                .on_hover_text("Trust this signer's certificate in MyPDF from now on; manage the list in Digital IDs → Trusted")
                                                 .clicked()
                                         {
                                             trust = Some(der.clone());
@@ -636,10 +636,17 @@ impl Viewer {
         if let Some(page) = jump {
             tab.jump(page);
         }
-        if let Some(der) = trust
-            && !self.trusted.contains(&der)
-        {
-            self.trusted.push(der);
+        if let Some(der) = trust {
+            match self.digital.trust.add(&der) {
+                Ok(_) => {
+                    self.digital.trust_generation += 1;
+                    self.status = Some((
+                        "Certificate added to your trusted certificates • manage them in Digital IDs → Trusted".into(),
+                        false,
+                    ));
+                }
+                Err(e) => self.status = Some((format!("{e:#}"), true)),
+            }
         }
         if let Some((der, name)) = export
             && let Some(path) = self.native_save(
@@ -927,7 +934,8 @@ mod tests {
             .as_ref()
             .and_then(|e| e.signer_der.clone())
             .unwrap();
-        app.trusted.push(der);
+        app.digital.trust.add(&der).unwrap();
+        app.digital.trust_generation += 1;
         until(&mut app, &|a| first(a) == Some((true, true, true)));
 
         // Editing needs an explicit unlock, then saves after the signed bytes.

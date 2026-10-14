@@ -5,11 +5,15 @@ use core_foundation::{
     base::TCFType,
 };
 use security_framework::{
+    certificate::SecCertificate,
     identity::SecIdentity,
     import_export::Pkcs12ImportOptions,
     item::{ItemClass, ItemSearchOptions, Limit, Reference, SearchResult},
     key::{Algorithm, SecKey},
     os::macos::keychain::{CreateOptions, SecKeychain},
+    policy::SecPolicy,
+    trust::SecTrust,
+    trust_settings::{Domain, TrustSettings},
 };
 use serde::Serialize;
 use std::path::Path;
@@ -20,6 +24,78 @@ unsafe extern "C" {
     fn SecKeychainDelete(keychain: security_framework_sys::base::SecKeychainRef) -> i32;
     fn SecKeychainCopySearchList(search_list: *mut CFArrayRef) -> i32;
     fn SecKeychainSetSearchList(search_list: CFArrayRef) -> i32;
+    fn SecTrustSettingsRemoveTrustSettings(
+        certificate: security_framework_sys::base::SecCertificateRef,
+        domain: security_framework_sys::trust_settings::SecTrustSettingsDomain,
+    ) -> i32;
+}
+
+/// Whether macOS trusts this chain (signer first, then intermediates) for
+/// general X.509 use: the system roots plus the user's own trust settings
+/// ("Always Trust" in Keychain Access). No network access.
+pub fn evaluate(chain: &[Vec<u8>]) -> bool {
+    let certificates: Vec<SecCertificate> = chain
+        .iter()
+        .filter_map(|der| SecCertificate::from_der(der).ok())
+        .collect();
+    if certificates.len() != chain.len() || certificates.is_empty() {
+        return false;
+    }
+    let Ok(mut trust) =
+        SecTrust::create_with_certificates(&certificates, &[SecPolicy::create_x509()])
+    else {
+        return false;
+    };
+    let _ = trust.set_network_fetch_allowed(false);
+    trust.evaluate_with_error().is_ok()
+}
+
+/// Mark a certificate "Always Trust" for this user, as Keychain Access does.
+/// macOS asks for the user's password before changing trust settings.
+pub fn trust(der: &[u8]) -> Result<()> {
+    let certificate = SecCertificate::from_der(der).context("Not a valid certificate")?;
+    TrustSettings::new(Domain::User)
+        .set_trust_settings_always(&certificate)
+        .context("macOS did not change the certificate's trust settings")
+}
+
+/// Remove this user's trust settings for a certificate.
+pub fn untrust(der: &[u8]) -> Result<()> {
+    let certificate = SecCertificate::from_der(der).context("Not a valid certificate")?;
+    let status = unsafe {
+        SecTrustSettingsRemoveTrustSettings(
+            certificate.as_concrete_TypeRef(),
+            security_framework_sys::trust_settings::kSecTrustSettingsDomainUser,
+        )
+    };
+    ensure!(
+        status == 0,
+        "macOS did not remove the certificate's trust settings (error {status})"
+    );
+    Ok(())
+}
+
+/// Whether this user has trust settings for the certificate itself.
+pub fn has_user_trust_settings(der: &[u8]) -> bool {
+    TrustSettings::new(Domain::User)
+        .iter()
+        .map(|mut certificates| certificates.any(|c| c.to_der() == der))
+        .unwrap_or(false)
+}
+
+/// Add a PKCS#12 identity (certificate and private key) to the login keychain.
+pub fn import_identity(pkcs12: &[u8], password: &str) -> Result<()> {
+    let keychain = SecKeychain::default().context("The login keychain is not available")?;
+    let imported = Pkcs12ImportOptions::new()
+        .passphrase(password)
+        .keychain(keychain)
+        .import(pkcs12)
+        .context("macOS could not add the digital ID to your keychain")?;
+    ensure!(
+        imported.iter().any(|i| i.identity.is_some()),
+        "The file did not contain a digital ID"
+    );
+    Ok(())
 }
 
 pub struct KeychainSigner {
