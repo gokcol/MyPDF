@@ -43,6 +43,17 @@ pub fn ensure_acroform(
     // 3. Add annotation reference to page /Annots
     add_annot_to_page(doc, sig_field_id, page_index)?;
 
+    // MyPDF interoperability patch: the widget names its page (/P), as
+    // Acrobat-created signature widgets do.
+    if let Some(page_id) = doc.get_pages().get(&(page_index + 1)).copied() {
+        if let Ok(field) = doc
+            .get_object_mut(sig_field_id)
+            .and_then(Object::as_dict_mut)
+        {
+            field.set("P", Object::Reference(page_id));
+        }
+    }
+
     Ok(())
 }
 

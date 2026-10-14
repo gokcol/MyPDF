@@ -511,9 +511,40 @@ impl PdfSigner {
             let xobj_id = doc.add_object(Object::Stream(xobj_stream));
             appearance_object_ids.push(xobj_id);
 
+            // MyPDF interoperability patch: wrap the artwork in Acrobat's layered
+            // signature appearance (/N -> /FRM -> /n0 blank + /n2 artwork). Acrobat
+            // treats the XObject inside a signature appearance as that /FRM form and
+            // reads its /Resources; an image there fails validation with
+            // "Expected a dict object".
+            let bbox = Object::Array(appearance.bbox.iter().map(|&v| Object::Real(v)).collect());
+            let mut form = |content: &[u8], xobjects: &[(&str, lopdf::ObjectId)]| {
+                let mut dict = Dictionary::new();
+                dict.set("Type", Object::Name(b"XObject".to_vec()));
+                dict.set("Subtype", Object::Name(b"Form".to_vec()));
+                dict.set("BBox", bbox.clone());
+                let mut resources = Dictionary::new();
+                if !xobjects.is_empty() {
+                    let mut names = Dictionary::new();
+                    for (name, id) in xobjects {
+                        names.set(name.as_bytes(), Object::Reference(*id));
+                    }
+                    resources.set("XObject", Object::Dictionary(names));
+                }
+                dict.set("Resources", Object::Dictionary(resources));
+                let id = doc.add_object(Object::Stream(Stream::new(dict, content.to_vec())));
+                appearance_object_ids.push(id);
+                id
+            };
+            let blank = form(b"% DSBlank\n", &[]);
+            let frm = form(
+                b"q 1 0 0 1 0 0 cm /n0 Do Q\nq 1 0 0 1 0 0 cm /n2 Do Q\n",
+                &[("n0", blank), ("n2", xobj_id)],
+            );
+            let normal = form(b"q 1 0 0 1 0 0 cm /FRM Do Q\n", &[("FRM", frm)]);
+
             // Add /AP << /N <xobj_ref> >> to the signature field
             let mut ap_dict = Dictionary::new();
-            ap_dict.set("N", Object::Reference(xobj_id));
+            ap_dict.set("N", Object::Reference(normal));
             sig_field_dict.set("AP", Object::Dictionary(ap_dict));
         }
 
@@ -532,6 +563,7 @@ impl PdfSigner {
             meta.root_id,
             contents_hex_size,
         );
+    writer.carry_trailer(&doc.trailer);
 
         // Add all objects that are new or modified.
         // New objects: sig_dict, sig_field

@@ -144,6 +144,7 @@ pub fn prepare_doc_timestamp(
         meta.root_id,
         contents_hex_size,
     );
+    writer.carry_trailer(&doc.trailer);
 
     // The DocTimeStamp dict is the "sig dict" for ByteRange tracking
     writer.set_sig_dict_id(ts_dict_id);

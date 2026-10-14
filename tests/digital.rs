@@ -452,3 +452,79 @@ async fn flattened_pdfs_can_be_signed_and_signed_pdfs_are_not_flattened() {
     let error = redact::flatten_document(&signed, 100.).unwrap_err();
     assert!(format!("{error:#}").contains("signatures"), "{error:#}");
 }
+
+/// Acrobat fails to validate visible signatures whose appearance draws an image
+/// directly ("Expected a dict object"); it expects its layered /FRM, /n0, /n2
+/// structure. Incremental updates must also repeat the trailer's /Info.
+#[tokio::test]
+async fn visible_signatures_use_acrobat_layered_appearances_and_keep_the_trailer() {
+    use lopdf::{Document, Object, dictionary};
+    let mut doc = Document::load_mem(&source(0)).unwrap();
+    let info = doc.add_object(dictionary! { "Title" => Object::string_literal("Layered") });
+    doc.trailer.set("Info", info);
+    let mut with_info = vec![];
+    doc.save_to(&mut with_info).unwrap();
+
+    let signer = identity::FileSigner::load(&id().pkcs12, PASSWORD, None).unwrap();
+    let request = signing::DesktopSigningRequest {
+        field: "Layered".into(),
+        rect: Some([72., 100., 312., 172.]),
+        name: "Layered Test".into(),
+        ..Default::default()
+    };
+    let signed = signing::sign_custom(&with_info, &signer, &request)
+        .await
+        .unwrap();
+    let report = signing::verify(&signed, None).unwrap();
+    assert!(report[0].crypto_valid && report[0].digest_matches && report[0].covers_current_file);
+
+    // The update's own trailer repeats /Info.
+    let last = signed.windows(7).rposition(|w| w == b"trailer").unwrap();
+    let trailer = String::from_utf8_lossy(&signed[last..]);
+    assert!(trailer.contains("/Info"), "{trailer}");
+
+    let doc = Document::load_mem(&signed).unwrap();
+    let page = doc.get_pages()[&1];
+    let widget = doc
+        .objects
+        .values()
+        .filter_map(|o| o.as_dict().ok())
+        .find(|d| d.get(b"FT").and_then(Object::as_name).ok() == Some(b"Sig"))
+        .expect("the signature widget");
+    assert_eq!(widget.get(b"P").unwrap().as_reference().unwrap(), page);
+    let xobjects = |id: lopdf::ObjectId| -> lopdf::Dictionary {
+        let stream = doc.get_object(id).unwrap().as_stream().unwrap();
+        let resources = stream.dict.get(b"Resources").unwrap().as_dict().unwrap();
+        resources
+            .get(b"XObject")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .clone()
+    };
+    let normal = widget
+        .get(b"AP")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"N")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let top = xobjects(normal);
+    assert_eq!(top.len(), 1);
+    let frm = top.get(b"FRM").unwrap().as_reference().unwrap();
+    let layers = xobjects(frm);
+    let n2 = layers.get(b"n2").unwrap().as_reference().unwrap();
+    assert!(layers.get(b"n0").is_ok());
+    let artwork = xobjects(n2);
+    assert!(artwork.iter().any(|(_, v)| {
+        v.as_reference()
+            .ok()
+            .and_then(|r| doc.get_object(r).ok())
+            .and_then(|o| o.as_stream().ok())
+            .and_then(|s| s.dict.get(b"Subtype").ok())
+            .and_then(|s| s.as_name().ok())
+            == Some(b"Image")
+    }));
+}
