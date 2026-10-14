@@ -337,6 +337,8 @@ pub(super) enum Icon {
     Check,
     Warning,
     Info,
+    HeaderFooter,
+    History,
 }
 
 pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -392,6 +394,17 @@ pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: 
         }
     };
     match icon {
+        Icon::HeaderFooter => {
+            box_at([0.18, 0.08], [0.82, 0.92], 0.06);
+            fill_box([0.3, 0.17], [0.7, 0.27], 0.02, color);
+            line(&[[0.3, 0.45], [0.7, 0.45]]);
+            line(&[[0.3, 0.57], [0.58, 0.57]]);
+            fill_box([0.3, 0.73], [0.7, 0.83], 0.02, color);
+        }
+        Icon::History => {
+            line(&arc([0.5, 0.52], 0.36, 0., 360.));
+            line(&[[0.5, 0.31], [0.5, 0.52], [0.65, 0.62]]);
+        }
         Icon::Reload => {
             line(&arc([0.5, 0.52], 0.32, -60., 230.));
             line(&[[0.6, 0.1], [0.68, 0.25], [0.52, 0.3]]);

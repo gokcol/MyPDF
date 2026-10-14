@@ -4,6 +4,7 @@ pub mod content;
 pub mod convert;
 pub mod document;
 pub mod forms;
+pub mod header_footer;
 pub mod home;
 pub mod identity;
 #[cfg(target_os = "macos")]

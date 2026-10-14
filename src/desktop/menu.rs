@@ -97,6 +97,30 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             &item("find", "Find…", Code::KeyF, Modifiers::empty()),
         ],
     );
+    let header_footer = Submenu::with_items(
+        "Header and Footer",
+        true,
+        &[
+            &MenuItem::with_id("hf_page_numbers", "Add Page Numbers…", true, None),
+            &MenuItem::with_id("hf_bates", "Add Bates Numbers…", true, None),
+            &MenuItem::with_id("hf_text", "Add Text…", true, None),
+            &P::separator(),
+            &MenuItem::with_id("hf_remove_numbers", "Remove Page Numbers…", true, None),
+            &MenuItem::with_id("hf_remove_all", "Remove All Text", true, None),
+        ],
+    );
+    let Ok(header_footer) = header_footer else {
+        return (None, rx);
+    };
+    let edit_pdf = Submenu::with_items(
+        "Edit PDF",
+        true,
+        &[
+            &MenuItem::with_id("edit_text", "Text", true, None),
+            &MenuItem::with_id("edit_images", "Image", true, None),
+            &header_footer,
+        ],
+    );
     let appearance = Submenu::with_items(
         "Appearance",
         true,
@@ -159,7 +183,7 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
         return (None, rx);
     };
     let result = (|| -> muda::Result<()> {
-        menu.append_items(&[&app?, &file?, &edit, &view?, &sign?, &window?])?;
+        menu.append_items(&[&app?, &file?, &edit, &edit_pdf?, &view?, &sign?, &window?])?;
         menu.init_for_nsapp();
         Ok(())
     })();

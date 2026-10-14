@@ -84,6 +84,8 @@ pub(super) enum Edit {
         id: lopdf::ObjectId,
         value: String,
     },
+    HeaderFooter(mypdf_milestone0::header_footer::Stamp),
+    RemoveHeaderFooter(Vec<mypdf_milestone0::header_footer::Kind>),
 }
 pub(super) enum AfterText {
     Save(u64),
@@ -500,6 +502,28 @@ impl Viewer {
                         }
                         Edit::Field { id, value } => forms::fill(&bytes, id, &value)?,
                         Edit::Block { page, block } => text_block::replace(&bytes, page, &block)?,
+                        Edit::HeaderFooter(stamp) => {
+                            let (bytes, pages) =
+                                mypdf_milestone0::header_footer::apply(&bytes, &stamp)?;
+                            note = Some(format!(
+                                "Added to {pages} page{} • Save a Copy to keep your changes",
+                                if pages == 1 { "" } else { "s" }
+                            ));
+                            bytes
+                        }
+                        Edit::RemoveHeaderFooter(kinds) => {
+                            let (bytes, pages) =
+                                mypdf_milestone0::header_footer::remove(&bytes, &kinds)?;
+                            anyhow::ensure!(
+                                pages > 0,
+                                "No header or footer text added by MyPDF was found"
+                            );
+                            note = Some(format!(
+                                "Removed from {pages} page{} • Undo restores it",
+                                if pages == 1 { "" } else { "s" }
+                            ));
+                            bytes
+                        }
                     };
                     Ok((id, revision, result, note))
                 }))
@@ -699,7 +723,7 @@ impl Viewer {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add_space(((ui.available_width() - 640.) / 2.).max(0.));
+                    ui.add_space(((ui.available_width() - 820.) / 2.).max(0.));
                     if ui
                         .add_enabled(
                             editable,
@@ -785,6 +809,8 @@ impl Viewer {
                         self.content.image_mode = true;
                         self.inspector = true;
                     }
+                    ui.separator();
+                    self.header_footer_menu(ui, editable);
                 });
             });
     }

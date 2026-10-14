@@ -1,6 +1,7 @@
 mod content;
 mod digital;
 mod editing;
+mod header_footer;
 mod home;
 pub mod icon;
 mod menu;
@@ -292,6 +293,7 @@ pub struct Viewer {
     signature_busy: bool,
     signature_tx: mpsc::Sender<signatures::SignatureJob>,
     signature_rx: mpsc::Receiver<signatures::SignatureJob>,
+    header_footer: header_footer::HeaderFooterState,
 }
 impl Viewer {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> Self {
@@ -330,6 +332,7 @@ impl Viewer {
             signature_busy: false,
             signature_tx,
             signature_rx,
+            header_footer: header_footer::HeaderFooterState::new(),
         };
         for path in paths {
             app.open(path, &cc.egui_ctx);
@@ -546,6 +549,13 @@ impl Viewer {
                     | "actual"
                     | "fit_width"
                     | "fit_page"
+                    | "edit_text"
+                    | "edit_images"
+                    | "hf_page_numbers"
+                    | "hf_bates"
+                    | "hf_text"
+                    | "hf_remove_numbers"
+                    | "hf_remove_all"
             )
         {
             return;
@@ -562,6 +572,20 @@ impl Viewer {
                 self.digital.panel = digital::Panel::Identities;
             }
             "quick_sign" => self.quick_sign(),
+            "edit_text" | "edit_images" => {
+                self.editor.mode = editing::Mode::Edit;
+                self.content.image_mode = action == "edit_images";
+                self.inspector = true;
+            }
+            "hf_page_numbers" => {
+                self.open_header_footer(mypdf_milestone0::header_footer::Kind::PageNumber)
+            }
+            "hf_bates" => self.open_header_footer(mypdf_milestone0::header_footer::Kind::Bates),
+            "hf_text" => self.open_header_footer(mypdf_milestone0::header_footer::Kind::Text),
+            "hf_remove_numbers" => self.request_remove_page_numbers(),
+            "hf_remove_all" => {
+                self.remove_header_footer(ctx, mypdf_milestone0::header_footer::Kind::ALL.to_vec())
+            }
             "theme_system" => ui::set_theme_preference(ctx, egui::ThemePreference::System),
             "theme_light" => ui::set_theme_preference(ctx, egui::ThemePreference::Light),
             "theme_dark" => ui::set_theme_preference(ctx, egui::ThemePreference::Dark),
@@ -1635,6 +1659,7 @@ impl eframe::App for Viewer {
         self.digital_events(ctx);
         self.editor_windows(ctx);
         self.digital_window(ctx);
+        self.header_footer_window(ctx);
         self.signature_dialogs(ctx);
         self.close_dialog(ctx);
         if self.exit_approved {
