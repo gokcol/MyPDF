@@ -159,7 +159,30 @@ impl CryptoSigner for KeychainSigner {
     }
 }
 
-fn identities(keychain: Option<&SecKeychain>) -> Result<Vec<SecIdentity>> {
+/// Identities in Keychain and, when no particular keychain is named, on smart
+/// cards and USB tokens macOS recognises (CryptoTokenKit). The flag marks tokens.
+fn identities(keychain: Option<&SecKeychain>) -> Result<Vec<(SecIdentity, bool)>> {
+    let mut all: Vec<(SecIdentity, bool)> = search(keychain, false)?
+        .into_iter()
+        .map(|i| (i, false))
+        .collect();
+    if keychain.is_none() {
+        // A token can be unavailable or locked; Keychain identities still count.
+        for token in search(None, true).unwrap_or_default() {
+            let der = token.certificate().map(|c| c.to_der()).ok();
+            match all
+                .iter_mut()
+                .find(|(i, _)| i.certificate().map(|c| c.to_der()).ok() == der)
+            {
+                Some(existing) => existing.1 = true,
+                None => all.push((token, true)),
+            }
+        }
+    }
+    Ok(all)
+}
+
+fn search(keychain: Option<&SecKeychain>, tokens: bool) -> Result<Vec<SecIdentity>> {
     let mut query = ItemSearchOptions::new();
     query
         .class(ItemClass::identity())
@@ -167,6 +190,9 @@ fn identities(keychain: Option<&SecKeychain>) -> Result<Vec<SecIdentity>> {
         .limit(Limit::All);
     if let Some(keychain) = keychain {
         query.keychains(std::slice::from_ref(keychain));
+    }
+    if tokens {
+        query.access_group_token();
     }
     match query.search() {
         Ok(items) => Ok(items
@@ -190,17 +216,20 @@ pub struct StoredIdentity {
     #[serde(skip_serializing)]
     pub certificate_der: Vec<u8>,
     pub eligible: bool,
+    /// On a smart card or USB token rather than in Keychain.
+    pub token: bool,
 }
 pub fn list(path: Option<&Path>) -> Result<Vec<StoredIdentity>> {
     let keychain = path.map(SecKeychain::open).transpose()?;
     identities(keychain.as_ref())?
         .iter()
-        .map(|id| {
+        .map(|(id, token)| {
             let der = id.certificate()?.to_der();
             Ok(StoredIdentity {
                 certificate: crate::identity::info(&der)?,
                 certificate_der: der.clone(),
                 eligible: crate::identity::check_certificate(&der).is_ok(),
+                token: *token,
             })
         })
         .collect()
@@ -209,6 +238,7 @@ pub fn select(path: Option<&Path>, sha256: &str) -> Result<KeychainSigner> {
     let keychain = path.map(SecKeychain::open).transpose()?;
     let matches: Vec<_> = identities(keychain.as_ref())?
         .into_iter()
+        .map(|(id, _)| id)
         .filter(|id| {
             id.certificate().is_ok_and(|c| {
                 crate::identity::fingerprint(&c.to_der()).eq_ignore_ascii_case(sha256)
@@ -267,7 +297,7 @@ impl TemporaryKeychain {
             stored.len() == 1,
             "test identity was not found in its Keychain"
         );
-        KeychainSigner::new(stored.into_iter().next().unwrap())
+        KeychainSigner::new(stored.into_iter().next().unwrap().0)
     }
     pub fn close(&mut self) -> Result<()> {
         if self.closed {

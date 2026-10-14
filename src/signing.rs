@@ -235,6 +235,47 @@ impl AppearanceLayout {
     }
 }
 
+/// What sits behind a visible signature.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub enum Background {
+    /// Image-only appearances are clear; others are white with a thin frame.
+    #[default]
+    Auto,
+    /// Nothing: the page shows through.
+    Clear,
+    White,
+    /// A soft blue-gray card.
+    Tinted,
+    /// White with a thin frame.
+    Framed,
+}
+impl Background {
+    pub const CHOICES: [Background; 4] = [
+        Background::Clear,
+        Background::White,
+        Background::Tinted,
+        Background::Framed,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Background::Auto => "Automatic",
+            Background::Clear => "None",
+            Background::White => "White",
+            Background::Tinted => "Soft tint",
+            Background::Framed => "Framed",
+        }
+    }
+    /// Fill and frame colors, if any.
+    pub fn colors(self) -> Option<([f32; 3], Option<[f32; 3]>)> {
+        match self {
+            Background::Auto | Background::Clear => None,
+            Background::White => Some(([1.0; 3], None)),
+            Background::Tinted => Some(([0.925, 0.945, 0.99], None)),
+            Background::Framed => Some(([1.0; 3], Some([0.11, 0.43, 0.35]))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DesktopSigningRequest {
     pub field: String,
@@ -245,6 +286,11 @@ pub struct DesktopSigningRequest {
     pub location: String,
     pub artwork: Option<crate::assets::Asset>,
     pub layout: AppearanceLayout,
+    /// "Digitally signed by …" with the signer's name.
+    pub show_name: bool,
+    /// The signing date and time.
+    pub show_date: bool,
+    pub background: Background,
 }
 impl Default for DesktopSigningRequest {
     fn default() -> Self {
@@ -257,8 +303,17 @@ impl Default for DesktopSigningRequest {
             location: String::new(),
             artwork: None,
             layout: AppearanceLayout::default(),
+            show_name: true,
+            show_date: true,
+            background: Background::Auto,
         }
     }
+}
+
+/// The signing time as shown in a signature, such as "2026-10-14 18:30 UTC".
+fn signing_time_label() -> String {
+    let now = time::OffsetDateTime::now_utc();
+    format!("{} {:02}:{:02} UTC", now.date(), now.hour(), now.minute())
 }
 
 pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
@@ -314,11 +369,60 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
         );
         Ok(raster.into_png()?)
     };
-    if request.layout == AppearanceLayout::ImageOnly {
+    let background = match request.background {
+        Background::Auto if request.layout == AppearanceLayout::ImageOnly => Background::Clear,
+        Background::Auto => Background::Framed,
+        chosen => chosen,
+    };
+    let transparent = background == Background::Clear;
+    let backdrop: Vec<Annotation> = background
+        .colors()
+        .map(|(fill, frame)| {
+            Annotation::new(
+                0,
+                if frame.is_some() {
+                    [1.0, 1.0, w - 1.0, h - 1.0]
+                } else {
+                    [0.0, 0.0, w, h]
+                },
+                Kind::Rectangle,
+                Style {
+                    fill: Some(fill),
+                    color: frame.unwrap_or(fill),
+                    width: if frame.is_some() { 0.6 } else { 0.1 },
+                    ..Default::default()
+                },
+            )
+        })
+        .into_iter()
+        .collect();
+    let mut lines = vec![];
+    if request.layout != AppearanceLayout::ImageOnly {
+        if request.show_name {
+            lines.push(format!(
+                "Digitally signed by {}",
+                if request.name.trim().is_empty() {
+                    "certificate holder"
+                } else {
+                    request.name.trim()
+                }
+            ));
+        }
+        if request.show_date {
+            lines.push(signing_time_label());
+        }
+        for extra in [&request.reason, &request.location] {
+            if !extra.trim().is_empty() {
+                lines.push(extra.trim().to_owned());
+            }
+        }
+    }
+    // With no details to show, the image fills the box on its own.
+    if request.layout == AppearanceLayout::ImageOnly || lines.is_empty() {
         let artwork = request
             .artwork
             .as_ref()
-            .context("Choose a signature image for an image-only appearance")?;
+            .context("Choose what the signature shows: your name, the date, a note or an image")?;
         artwork.validate()?;
         // Fit the artwork inside the box, keeping its proportions.
         let (aw, ah) = if (w - 4.0) / (h - 4.0) > artwork.aspect {
@@ -331,18 +435,16 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
         if matches!(artwork.kind, Kind::Text { .. } | Kind::Stamp { .. }) {
             style.font_size = style.font_size.min((ah - 4.0) / 1.25).max(6.0);
         }
-        let mark = Annotation::new(0, [x, y, x + aw, y + ah], artwork.kind.clone(), style);
-        return render(crate::annotations::export(&base, &[mark])?, true);
+        let mut marks = backdrop.clone();
+        marks.push(Annotation::new(
+            0,
+            [x, y, x + aw, y + ah],
+            artwork.kind.clone(),
+            style,
+        ));
+        return render(crate::annotations::export(&base, &marks)?, transparent);
     }
-    let mut annotations = vec![Annotation::new(
-        0,
-        [1.0, 1.0, w - 1.0, h - 1.0],
-        Kind::Rectangle,
-        Style {
-            width: 0.6,
-            ..Default::default()
-        },
-    )];
+    let mut annotations = backdrop;
     let artwork = request
         .artwork
         .as_ref()
@@ -367,21 +469,7 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
     } else {
         8.0
     };
-    let mut text = format!(
-        "Digitally signed by {}\n{}",
-        if request.name.trim().is_empty() {
-            "certificate holder"
-        } else {
-            &request.name
-        },
-        time::OffsetDateTime::now_utc().replace_nanosecond(0)?
-    );
-    if !request.reason.trim().is_empty() {
-        text.push_str(&format!("\n{}", request.reason));
-    }
-    if !request.location.trim().is_empty() {
-        text.push_str(&format!("\n{}", request.location));
-    }
+    let text = lines.join("\n");
     // Try a bounded font-size reduction; never clip or hide appearance details.
     let mut last = None;
     for size in [11.0, 10.0, 9.0, 8.0, 7.0, 6.0] {
@@ -397,7 +485,7 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
             },
         ));
         match crate::annotations::export(&base, &current) {
-            Ok(bytes) => return render(bytes, false),
+            Ok(bytes) => return render(bytes, transparent),
             Err(e) => last = Some(e),
         }
     }

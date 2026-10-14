@@ -45,26 +45,252 @@ fn read(bytes: &[u8]) -> Result<Document> {
         (1..=10_000).contains(&count),
         "PDF must have 1–10,000 pages"
     );
-    // Moving widgets independently from their field tree would silently break forms.
-    let has_forms = doc
-        .catalog()?
-        .get(b"AcroForm")
-        .ok()
-        .and_then(|o| doc.dereference(o).ok())
-        .and_then(|(_, o)| o.as_dict().ok())
-        .and_then(|d| d.get(b"Fields").ok())
-        .and_then(|o| doc.dereference(o).ok())
-        .and_then(|(_, o)| o.as_array().ok())
-        .is_some_and(|a| !a.is_empty());
+    Ok(doc)
+}
+/// A PDF whose pages are only copied, never changed in place: signed PDFs are fine.
+fn read_source(bytes: &[u8]) -> Result<Document> {
     ensure!(
-        !has_forms
-            && !doc.objects.values().any(|o| o.as_dict().is_ok_and(|d| d
-                .get(b"Subtype")
-                .and_then(Object::as_name)
-                .is_ok_and(|n| n == b"Widget"))),
-        "Page tools do not yet support interactive form fields. Export a flattened copy first."
+        bytes.len() as u64 <= crate::viewer::MAX_FILE_BYTES,
+        "PDF exceeds 256 MB"
+    );
+    let doc = Document::load_mem(bytes).context("Could not read PDF pages")?;
+    ensure!(!doc.is_encrypted(), "Encrypted PDFs are not supported");
+    let count = doc.get_pages().len();
+    ensure!(
+        (1..=10_000).contains(&count),
+        "PDF must have 1–10,000 pages"
     );
     Ok(doc)
+}
+
+// Forms: fields stay with their pages. Deleting pages removes their fields;
+// pages copied elsewhere bring their fields, but never their signatures.
+
+/// The document's form dictionary, and its object when it is indirect.
+fn acroform(doc: &Document) -> Option<(Option<ObjectId>, lopdf::Dictionary)> {
+    match doc.catalog().ok()?.get(b"AcroForm").ok()? {
+        Object::Reference(id) => Some((Some(*id), doc.get_dictionary(*id).ok()?.clone())),
+        Object::Dictionary(d) => Some((None, d.clone())),
+        _ => None,
+    }
+}
+fn set_acroform(doc: &mut Document, id: Option<ObjectId>, form: lopdf::Dictionary) -> Result<()> {
+    match id {
+        Some(id) => {
+            doc.objects.insert(id, Object::Dictionary(form));
+        }
+        None => doc.catalog_mut()?.set("AcroForm", form),
+    }
+    Ok(())
+}
+/// References in an array that may itself be indirect.
+fn references(doc: &Document, value: Option<&Object>) -> Vec<ObjectId> {
+    value
+        .and_then(|v| doc.dereference(v).ok())
+        .and_then(|(_, v)| v.as_array().ok())
+        .map(|a| a.iter().filter_map(|o| o.as_reference().ok()).collect())
+        .unwrap_or_default()
+}
+/// Widget annotations on these pages.
+fn widgets_on(doc: &Document, pages: &[ObjectId]) -> HashSet<ObjectId> {
+    pages
+        .iter()
+        .filter_map(|p| doc.get_dictionary(*p).ok())
+        .flat_map(|d| references(doc, d.get(b"Annots").ok()))
+        .filter(|id| {
+            doc.get_dictionary(*id)
+                .and_then(|d| d.get(b"Subtype"))
+                .and_then(Object::as_name)
+                .is_ok_and(|n| n == b"Widget")
+        })
+        .collect()
+}
+/// Whether a widget belongs to a signature field that holds a signature.
+fn signed_signature(doc: &Document, widget: ObjectId) -> bool {
+    let mut id = Some(widget);
+    let mut seen = HashSet::new();
+    let (mut kind, mut value) = (None, false);
+    while let Some(current) = id.filter(|i| seen.insert(*i)) {
+        let Ok(d) = doc.get_dictionary(current) else {
+            break;
+        };
+        kind = kind.or_else(|| {
+            d.get(b"FT")
+                .and_then(Object::as_name)
+                .ok()
+                .map(<[u8]>::to_vec)
+        });
+        value |= d.get(b"V").is_ok_and(|v| !matches!(v, Object::Null));
+        id = d.get(b"Parent").and_then(Object::as_reference).ok();
+    }
+    kind.as_deref() == Some(b"Sig") && value
+}
+/// Take signed signature widgets off these pages; they would claim a signature
+/// that no longer covers the document. Returns the widgets taken off.
+fn drop_signatures(doc: &mut Document, pages: &[ObjectId]) -> Result<HashSet<ObjectId>> {
+    let signed: HashSet<ObjectId> = widgets_on(doc, pages)
+        .into_iter()
+        .filter(|w| signed_signature(doc, *w))
+        .collect();
+    if signed.is_empty() {
+        return Ok(signed);
+    }
+    for &page in pages {
+        let kept: Vec<Object> = references(doc, doc.get_dictionary(page)?.get(b"Annots").ok())
+            .into_iter()
+            .filter(|a| !signed.contains(a))
+            .map(Object::Reference)
+            .collect();
+        doc.get_dictionary_mut(page)?.set("Annots", kept);
+    }
+    Ok(signed)
+}
+/// Remove fields whose widgets are all gone, keeping the rest of the form tree.
+fn prune_fields(doc: &mut Document, gone: &HashSet<ObjectId>) -> Result<()> {
+    fn keep(doc: &mut Document, id: ObjectId, gone: &HashSet<ObjectId>, depth: usize) -> bool {
+        if gone.contains(&id) || depth > 32 {
+            return false;
+        }
+        let Some(kids) = doc
+            .get_dictionary(id)
+            .ok()
+            .and_then(|d| d.get(b"Kids").ok())
+            .map(|k| references(doc, Some(k)))
+        else {
+            return true;
+        };
+        let kept: Vec<Object> = kids
+            .into_iter()
+            .filter(|k| keep(doc, *k, gone, depth + 1))
+            .map(Object::Reference)
+            .collect();
+        if kept.is_empty() {
+            return false;
+        }
+        if let Ok(d) = doc.get_dictionary_mut(id) {
+            d.set("Kids", kept);
+        }
+        true
+    }
+    let Some((id, mut form)) = acroform(doc) else {
+        return Ok(());
+    };
+    if gone.is_empty() {
+        return Ok(());
+    }
+    let fields: Vec<Object> = references(doc, form.get(b"Fields").ok())
+        .into_iter()
+        .filter(|f| keep(doc, *f, gone, 0))
+        .map(Object::Reference)
+        .collect();
+    form.set("Fields", fields);
+    set_acroform(doc, id, form)
+}
+/// A field's own name, as raw PDF text.
+fn field_name(doc: &Document, id: ObjectId) -> Option<Vec<u8>> {
+    doc.get_dictionary(id)
+        .ok()?
+        .get(b"T")
+        .ok()?
+        .as_str()
+        .ok()
+        .map(<[u8]>::to_vec)
+}
+/// "Name" becomes "Name (2)", in the name's own text encoding.
+fn renamed(name: &[u8], n: usize) -> Vec<u8> {
+    let suffix = format!(" ({n})");
+    let mut out = name.to_vec();
+    if name.starts_with(&[0xFE, 0xFF]) {
+        out.extend(suffix.encode_utf16().flat_map(u16::to_be_bytes));
+    } else {
+        out.extend(suffix.bytes());
+    }
+    out
+}
+/// Add another document's top-level fields (already renumbered into `doc`),
+/// renaming any whose name is taken so their values stay separate.
+fn merge_fields(doc: &mut Document, theirs: &lopdf::Dictionary) -> Result<()> {
+    let incoming = references(doc, theirs.get(b"Fields").ok());
+    if incoming.is_empty() {
+        return Ok(());
+    }
+    let (id, mut form) = acroform(doc).unwrap_or((None, lopdf::Dictionary::new()));
+    let mut fields = references(doc, form.get(b"Fields").ok());
+    let mut names: HashSet<Vec<u8>> = fields.iter().filter_map(|f| field_name(doc, *f)).collect();
+    for field in incoming {
+        if let Some(name) = field_name(doc, field) {
+            let mut unique = name.clone();
+            let mut n = 2;
+            while names.contains(&unique) {
+                unique = renamed(&name, n);
+                n += 1;
+            }
+            if unique != name {
+                doc.get_dictionary_mut(field)?.set(
+                    "T",
+                    Object::String(unique.clone(), lopdf::StringFormat::Literal),
+                );
+            }
+            names.insert(unique);
+        }
+        fields.push(field);
+    }
+    form.set(
+        "Fields",
+        fields
+            .into_iter()
+            .map(Object::Reference)
+            .collect::<Vec<_>>(),
+    );
+    let flags = |d: &lopdf::Dictionary| d.get(b"SigFlags").and_then(Object::as_i64).unwrap_or(0);
+    if flags(&form) | flags(theirs) != 0 {
+        form.set("SigFlags", flags(&form) | flags(theirs));
+    }
+    if theirs
+        .get(b"NeedAppearances")
+        .and_then(Object::as_bool)
+        .unwrap_or(false)
+    {
+        form.set("NeedAppearances", true);
+    }
+    if form.get(b"DA").is_err()
+        && let Ok(da) = theirs.get(b"DA")
+    {
+        form.set("DA", da.clone());
+    }
+    // Default resources: add their fonts that ours lack.
+    let fonts = |d: &lopdf::Dictionary, doc: &Document| {
+        d.get(b"DR")
+            .ok()
+            .and_then(|r| doc.dereference(r).ok())
+            .and_then(|(_, r)| r.as_dict().ok())
+            .and_then(|r| r.get(b"Font").ok())
+            .and_then(|f| doc.dereference(f).ok())
+            .and_then(|(_, f)| f.as_dict().ok())
+            .cloned()
+    };
+    if let Some(their_fonts) = fonts(theirs, doc) {
+        let mut our_fonts = fonts(&form, doc).unwrap_or_default();
+        for (name, font) in their_fonts.iter() {
+            if !our_fonts.has(name) {
+                our_fonts.set(name.clone(), font.clone());
+            }
+        }
+        let mut resources = form
+            .get(b"DR")
+            .ok()
+            .and_then(|r| doc.dereference(r).ok())
+            .and_then(|(_, r)| r.as_dict().ok())
+            .cloned()
+            .unwrap_or_default();
+        resources.set("Font", our_fonts);
+        form.set("DR", resources);
+    }
+    if id.is_none() && doc.catalog()?.get(b"AcroForm").is_err() {
+        doc.catalog_mut()?.set("AcroForm", form);
+        return Ok(());
+    }
+    set_acroform(doc, id, form)
 }
 fn inherited(doc: &Document, mut id: ObjectId, key: &[u8]) -> Option<Object> {
     let mut seen = HashSet::new();
@@ -171,6 +397,8 @@ pub fn apply(bytes: &[u8], operation: &Operation) -> Result<Vec<u8>> {
                 "A PDF must keep at least one page"
             );
             let removed: HashSet<_> = selected.iter().map(|i| ids[*i]).collect();
+            let gone = widgets_on(&doc, &removed.iter().copied().collect::<Vec<_>>());
+            prune_fields(&mut doc, &gone)?;
             ids = ids
                 .into_iter()
                 .enumerate()
@@ -195,8 +423,11 @@ pub fn apply(bytes: &[u8], operation: &Operation) -> Result<Vec<u8>> {
             bytes: addition,
         } => {
             ensure!(*at <= ids.len(), "Insertion position is out of range");
-            let mut other = read(addition)?;
-            materialize(&mut other)?;
+            let mut other = read_source(addition)?;
+            let their_pages = materialize(&mut other)?;
+            // Signatures stay with their own document.
+            let dropped = drop_signatures(&mut other, &their_pages)?;
+            prune_fields(&mut other, &dropped)?;
             ensure!(
                 ids.len() + other.get_pages().len() <= 10_000,
                 "Result exceeds 10,000 pages"
@@ -207,8 +438,12 @@ pub fn apply(bytes: &[u8], operation: &Operation) -> Result<Vec<u8>> {
             for &id in &additional {
                 other.get_dictionary_mut(id)?.remove(b"Parent");
             }
+            let their_form = acroform(&other).map(|(_, form)| form);
             doc.max_id = other.max_id;
             doc.objects.extend(other.objects);
+            if let Some(form) = their_form {
+                merge_fields(&mut doc, &form)?;
+            }
             ids.splice(*at..*at, additional);
         }
         Operation::Rotate { pages, clockwise } => {
@@ -340,18 +575,27 @@ fn remove_navigation(doc: &mut Document, removed: &HashSet<ObjectId>) {
 
 /// A page-only output. The source document and its revision history stay untouched.
 pub fn extract(bytes: &[u8], pages: &[usize]) -> Result<Vec<u8>> {
-    let mut doc = read(bytes)?;
+    let mut doc = read_source(bytes)?;
     let ids = materialize(&mut doc)?;
     selection(pages, ids.len())?;
     let kept: Vec<_> = pages.iter().map(|i| ids[*i]).collect();
-    let removed = ids
+    let removed: Vec<ObjectId> = ids
         .iter()
         .filter(|id| !kept.contains(id))
         .copied()
         .collect();
-    remove_navigation(&mut doc, &removed);
+    // The copy keeps the form fields on its pages, but not any signatures.
+    let mut gone = widgets_on(&doc, &removed);
+    gone.extend(drop_signatures(&mut doc, &kept)?);
+    prune_fields(&mut doc, &gone)?;
+    let form = acroform(&doc).map(|(_, form)| form);
+    remove_navigation(&mut doc, &removed.into_iter().collect());
     // A new page-only document does not inherit catalog actions or document-level trees.
-    let root = doc.add_object(dictionary! { "Type" => "Catalog" });
+    let mut catalog = dictionary! { "Type" => "Catalog" };
+    if let Some(form) = form.filter(|f| !references(&doc, f.get(b"Fields").ok()).is_empty()) {
+        catalog.set("AcroForm", form);
+    }
+    let root = doc.add_object(catalog);
     doc.trailer.set("Root", root);
     set_tree(&mut doc, &kept)?;
     serialize(&mut doc)

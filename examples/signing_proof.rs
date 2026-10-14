@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
                 1.5,
             )),
             layout: Default::default(),
+            ..Default::default()
         };
         let png = signing::signature_artwork(&req)?;
         write_new(&out.join(format!("appearance-{rotation}.png")), &png)?;
