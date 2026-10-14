@@ -228,7 +228,7 @@ pub(super) struct EditorState {
     svg: SvgEditor,
     pub mode: Mode,
     pub(super) tool: Tool,
-    style: Style,
+    pub(super) style: Style,
     pub text_editing: bool,
     pub library_open: bool,
     pub signature_open: bool,
@@ -241,6 +241,8 @@ pub(super) struct EditorState {
     pub(super) property_edit: Option<(u64, String, u64, Option<egui::Id>)>,
     pub(super) marquee: Option<selection::Marquee>,
     pub(super) group_gesture: Option<selection::GroupGesture>,
+    pub(super) text_selection: Option<text_selection::TextSelection>,
+    pub(super) marks_clip: Option<clipboard::MarksClip>,
     /// Tab and last revision of a continuous group property edit or nudge.
     pub(super) group_edit: Option<(u64, u64)>,
     /// The asset most recently added to the library, for "use as my signature".
@@ -295,6 +297,8 @@ impl EditorState {
             property_edit: None,
             marquee: None,
             group_gesture: None,
+            text_selection: None,
+            marks_clip: None,
             group_edit: None,
             last_added: None,
             gesture: None,
@@ -872,16 +876,22 @@ pub(super) fn page_interaction(
         }
         return;
     }
-    let sense = if editor.mode == Mode::Read {
-        egui::Sense::click()
-    } else {
-        egui::Sense::click_and_drag()
-    };
     let response = ui.interact(
         page_rect,
         egui::Id::new((tab.id, page, "page_actions")),
-        sense,
+        egui::Sense::click_and_drag(),
     );
+    if editor.mode == Mode::Read {
+        text_selection::interact(
+            &mut editor.text_selection,
+            tab,
+            ctx,
+            page,
+            &response,
+            page_rect,
+            scale,
+        );
+    }
     let page_size = tab.pages[page];
     let normal = |p: egui::Pos2| {
         let p = (p - page_rect.min) / scale;
@@ -1368,6 +1378,14 @@ pub(super) fn page_interaction(
         page_rect,
         scale,
         response.hover_pos(),
+    );
+    text_selection::paint(
+        &editor.text_selection,
+        tab,
+        &painter,
+        page,
+        page_rect,
+        scale,
     );
     if ctx.input(|i| i.pointer.any_released())
         && editor

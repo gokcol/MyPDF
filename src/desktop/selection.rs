@@ -193,7 +193,7 @@ fn picks(tab: &Tab, m: &Marquee) -> Vec<String> {
 }
 
 /// Translate every mark, keeping the whole group on the page.
-fn moved(marks: &[Annotation], d: [f32; 2], page: PageSize) -> Vec<Annotation> {
+pub(super) fn moved(marks: &[Annotation], d: [f32; 2], page: PageSize) -> Vec<Annotation> {
     let b = union_bounds(marks);
     let dx = d[0].clamp(-b[0], (page.width - b[2]).max(-b[0]));
     let dy = d[1].clamp(-b[1], (page.height - b[3]).max(-b[1]));

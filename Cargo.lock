@@ -3553,6 +3553,7 @@ name = "mypdf-milestone0"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "base64 0.22.1",
  "clap",
  "core-foundation 0.10.1",

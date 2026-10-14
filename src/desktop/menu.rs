@@ -118,6 +118,7 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
         &[
             &MenuItem::with_id("edit_text", "Text", true, None),
             &MenuItem::with_id("edit_images", "Image", true, None),
+            &MenuItem::with_id("add_image", "Add Image…", true, None),
             &header_footer,
         ],
     );

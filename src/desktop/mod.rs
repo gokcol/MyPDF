@@ -1,3 +1,4 @@
+mod clipboard;
 mod content;
 mod digital;
 mod editing;
@@ -11,6 +12,7 @@ mod preview;
 mod recovery;
 mod selection;
 mod signatures;
+mod text_selection;
 mod theme;
 mod ui;
 use ui::{ActionButton, Icon};
@@ -603,6 +605,23 @@ impl Viewer {
                 self.digital.panel = digital::Panel::Validate;
             }
             "copy" if self.pages_clipboard_keys(ctx) => self.copy_pages(ctx),
+            "copy" if self.page_text_selection(ctx).is_some() => self.copy_page_text(ctx),
+            "copy" | "cut" if self.marks_keys(ctx) && self.copy_marks(ctx, action == "cut") => {}
+            "paste" if self.paste_keys(ctx) => self.paste(ctx),
+            "add_image" => {
+                self.editor.mode = editing::Mode::Edit;
+                self.add_image_file(ctx);
+            }
+            "select_all"
+                if self.editor.mode == editing::Mode::Read
+                    && !ctx.wants_keyboard_input()
+                    && !self.editor.text_editing =>
+            {
+                self.editor.text_selection = self
+                    .tabs
+                    .get(self.active)
+                    .and_then(|t| text_selection::TextSelection::all(t, t.page));
+            }
             "paste" if self.pages_clipboard_keys(ctx) => self.paste_pages(ctx),
             "cut" => ctx.send_viewport_cmd(egui::ViewportCommand::RequestCut),
             "copy" => ctx.send_viewport_cmd(egui::ViewportCommand::RequestCopy),
@@ -795,6 +814,28 @@ impl Viewer {
             }
             if paste {
                 self.paste_pages(ctx);
+            }
+        } else if self.page_text_selection(ctx).is_some()
+            && ctx.input_mut(|i| {
+                let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+                i.events.retain(|e| !matches!(e, egui::Event::Copy));
+                copy
+            })
+        {
+            self.copy_page_text(ctx);
+        } else if self.marks_keys(ctx) || self.paste_keys(ctx) {
+            let (copy, cut, paste) = ctx.input(|i| {
+                (
+                    i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                    i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
+                    i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))),
+                )
+            });
+            if (copy || cut) && self.marks_keys(ctx) {
+                self.copy_marks(ctx, cut);
+            }
+            if paste && self.paste_keys(ctx) {
+                self.paste(ctx);
             }
         }
         if !self.home.visible

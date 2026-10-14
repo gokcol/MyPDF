@@ -85,6 +85,11 @@ pub(super) enum Edit {
         value: String,
     },
     HeaderFooter(mypdf_milestone0::header_footer::Stamp),
+    AddImage {
+        page: u32,
+        rect: [f32; 4],
+        image: Vec<u8>,
+    },
     RemoveHeaderFooter(Vec<mypdf_milestone0::header_footer::Kind>),
 }
 pub(super) enum AfterText {
@@ -151,6 +156,17 @@ impl ContentState {
                 .map(|f| egui::FontFamily::Name(f.ui_name().into()))
                 .unwrap_or(egui::FontFamily::Proportional),
         )
+    }
+    /// Open Add text in the middle of the page with pasted words, ready to place.
+    pub(super) fn paste_new_text(&mut self, id: u64, page: usize, size: PageSize, text: String) {
+        self.image_mode = false;
+        self.area_mode = false;
+        self.place_text(id, page, [size.width / 2. - 120., size.height / 2.], size);
+        let lines = text.lines().count().max(1) as f32;
+        self.new_rect[3] = (lines * self.new_size * 1.3 + self.new_size)
+            .max(self.new_rect[3])
+            .min(size.height - self.new_rect[1]);
+        self.new_text = text;
     }
     fn place_text(&mut self, id: u64, page: usize, point: [f32; 2], size: PageSize) {
         self.add_target = Some((id, page));
@@ -502,6 +518,13 @@ impl Viewer {
                         }
                         Edit::Field { id, value } => forms::fill(&bytes, id, &value)?,
                         Edit::Block { page, block } => text_block::replace(&bytes, page, &block)?,
+                        Edit::AddImage { page, rect, image } => {
+                            note = Some(
+                                "Image added to the page • Edit → Images moves, resizes or replaces it"
+                                    .into(),
+                            );
+                            content::add_image(&bytes, page, rect, &image)?
+                        }
                         Edit::HeaderFooter(stamp) => {
                             let (bytes, pages) =
                                 mypdf_milestone0::header_footer::apply(&bytes, &stamp)?;
@@ -808,6 +831,13 @@ impl Viewer {
                         }
                         self.content.image_mode = true;
                         self.inspector = true;
+                    }
+                    if ui
+                        .add_enabled(editable, ActionButton::new(Icon::Plus, "Add image…"))
+                        .on_hover_text("Place a PNG or JPEG on this page (or paste one with ⌘V)")
+                        .clicked()
+                    {
+                        self.add_image_file(ctx);
                     }
                     ui.separator();
                     self.header_footer_menu(ui, editable);
