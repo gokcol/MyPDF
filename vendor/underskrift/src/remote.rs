@@ -284,6 +284,7 @@ pub fn prepare_signature(
         meta.root_id,
         contents_hex_size,
     );
+    writer.carry_trailer(&doc.trailer);
 
     writer.set_sig_dict_id(sig_dict_id);
 

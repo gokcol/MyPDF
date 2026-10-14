@@ -41,6 +41,9 @@ pub struct IncrementalWriter {
     prev_xref_offset: usize,
     /// The root object ID (catalog)
     root_id: ObjectId,
+    /// MyPDF interoperability patch: entries of the previous trailer that an
+    /// incremental update must repeat (ISO 32000-1, 7.5.6), such as /Info and /ID.
+    carried: Dictionary,
 }
 
 impl IncrementalWriter {
@@ -66,6 +69,18 @@ impl IncrementalWriter {
             prev_size,
             prev_xref_offset,
             root_id,
+            carried: Dictionary::new(),
+        }
+    }
+
+    /// Repeat the previous trailer's document-level entries (/Info, /ID,
+    /// /Encrypt) in the new trailer, as the PDF specification requires.
+    /// Acrobat reports "Expected a dict object" when /Info goes missing.
+    pub fn carry_trailer(&mut self, previous: &Dictionary) {
+        for key in [b"Info".as_slice(), b"ID", b"Encrypt"] {
+            if let Ok(value) = previous.get(key) {
+                self.carried.set(key, value.clone());
+            }
         }
     }
 
@@ -300,7 +315,7 @@ impl IncrementalWriter {
         // It is one past the largest object number, not a count of this revision.
         let size = self.pending_objects.iter().map(|p| p.id.0 + 1).max().unwrap_or(self.prev_size).max(self.prev_size);
 
-        let mut trailer = Dictionary::new();
+        let mut trailer = self.carried.clone();
         trailer.set("Size", Object::Integer(size as i64));
         trailer.set("Root", Object::Reference(self.root_id));
         trailer.set("Prev", Object::Integer(self.prev_xref_offset as i64));
