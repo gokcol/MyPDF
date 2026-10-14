@@ -427,8 +427,14 @@ fn native_visual_preview() {
         }
         if collection == "BlockText" {
             app.content.block_preview(app.tabs[0].id);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             for _ in 0..3 {
                 preview.capture(&mut app, &ctx);
+            }
+            while !app.content.erased_ready() {
+                assert!(std::time::Instant::now() < deadline);
+                preview.capture(&mut app, &ctx);
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
         // A lasso is drawn only while the mouse button is held, here on the gray canvas.
