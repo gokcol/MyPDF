@@ -10,6 +10,7 @@ mod organize;
 #[cfg(test)]
 mod preview;
 mod recovery;
+mod redaction;
 mod selection;
 mod signatures;
 mod text_selection;
@@ -296,6 +297,7 @@ pub struct Viewer {
     signature_tx: mpsc::Sender<signatures::SignatureJob>,
     signature_rx: mpsc::Receiver<signatures::SignatureJob>,
     header_footer: header_footer::HeaderFooterState,
+    redaction: redaction::Redaction,
 }
 impl Viewer {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> Self {
@@ -335,6 +337,7 @@ impl Viewer {
             signature_tx,
             signature_rx,
             header_footer: header_footer::HeaderFooterState::new(),
+            redaction: redaction::Redaction::new(),
         };
         for path in paths {
             app.open(path, &cc.egui_ctx);
@@ -558,6 +561,8 @@ impl Viewer {
                     | "hf_text"
                     | "hf_remove_numbers"
                     | "hf_remove_all"
+                    | "redact"
+                    | "flatten"
             )
         {
             return;
@@ -585,6 +590,8 @@ impl Viewer {
             "hf_bates" => self.open_header_footer(mypdf_milestone0::header_footer::Kind::Bates),
             "hf_text" => self.open_header_footer(mypdf_milestone0::header_footer::Kind::Text),
             "hf_remove_numbers" => self.request_remove_page_numbers(),
+            "redact" => self.start_redaction(),
+            "flatten" => self.request_flatten(),
             "hf_remove_all" => {
                 self.remove_header_footer(ctx, mypdf_milestone0::header_footer::Kind::ALL.to_vec())
             }
@@ -1610,7 +1617,11 @@ impl Viewer {
                             scale,
                             &mut self.status,
                         );
+                        self.content.paused = self.redaction.active && self.editor.mode == editing::Mode::Edit;
                         content::overlay(&mut self.content,self.editor.mode,tab,ui,page,page_rect,scale);
+                        if self.content.paused {
+                            redaction::overlay(&mut self.redaction, tab, ui, page, page_rect, scale);
+                        }
                         if matches!(self.editor.mode, editing::Mode::Read | editing::Mode::Sign)
                             || tab.signed_original.is_none()
                         {
@@ -1705,7 +1716,9 @@ impl eframe::App for Viewer {
             if self.signature_panel_open() {
                 self.signature_panel(ctx);
             } else if self.inspector {
-                if matches!(
+                if self.editor.mode == editing::Mode::Edit && self.redaction.active {
+                    self.redaction_panel(ctx);
+                } else if matches!(
                     self.editor.mode,
                     editing::Mode::Edit | editing::Mode::Forms | editing::Mode::Convert
                 ) {
@@ -1725,6 +1738,7 @@ impl eframe::App for Viewer {
         self.editor_windows(ctx);
         self.digital_window(ctx);
         self.header_footer_window(ctx);
+        self.redaction_dialogs(ctx);
         self.signature_dialogs(ctx);
         self.close_dialog(ctx);
         if self.exit_approved {

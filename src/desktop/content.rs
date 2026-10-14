@@ -91,6 +91,13 @@ pub(super) enum Edit {
         image: Vec<u8>,
     },
     RemoveHeaderFooter(Vec<mypdf_milestone0::header_footer::Kind>),
+    Redact {
+        areas: Vec<mypdf_milestone0::redact::Area>,
+        options: mypdf_milestone0::redact::Options,
+    },
+    Flatten {
+        dpi: f32,
+    },
 }
 pub(super) enum AfterText {
     Save(u64),
@@ -102,7 +109,7 @@ pub(super) struct ContentState {
     next_existing: Option<InlineText>,
     replacing_text: bool,
     add_after_existing: Option<(u64, usize)>,
-    area_mode: bool,
+    pub(super) area_mode: bool,
     marquee: Option<(Key, egui::Pos2)>,
     selection_hint: Option<String>,
     key: Option<Key>,
@@ -124,6 +131,8 @@ pub(super) struct ContentState {
     inspection: Option<Inspection>,
     selected: Option<usize>,
     pub image_mode: bool,
+    /// Another tool (Redact) owns the page overlay.
+    pub(super) paused: bool,
     rect: [f32; 4],
     field: Option<lopdf::ObjectId>,
     value: String,
@@ -300,6 +309,7 @@ impl ContentState {
             inspection: None,
             selected: None,
             image_mode: false,
+            paused: false,
             rect: [0.; 4],
             field: None,
             value: String::new(),
@@ -524,6 +534,39 @@ impl Viewer {
                                     .into(),
                             );
                             content::add_image(&bytes, page, rect, &image)?
+                        }
+                        Edit::Redact { areas, options } => {
+                            let (bytes, r) =
+                                mypdf_milestone0::redact::apply(&bytes, &areas, &options)?;
+                            let mut parts = vec![];
+                            for (n, what) in [
+                                (r.glyphs, "character"),
+                                (r.images, "image area"),
+                                (r.annotations, "annotation"),
+                                (r.flattened, "flattened page"),
+                            ] {
+                                if n > 0 {
+                                    parts.push(format!("{n} {what}{}", if n == 1 { "" } else { "s" }));
+                                }
+                            }
+                            note = Some(format!(
+                                "Redacted {} • Save a Copy to keep it; Undo is available until then",
+                                if parts.is_empty() {
+                                    "the marked areas".to_owned()
+                                } else {
+                                    parts.join(", ")
+                                }
+                            ));
+                            bytes
+                        }
+                        Edit::Flatten { dpi } => {
+                            let (bytes, pages) =
+                                mypdf_milestone0::redact::flatten_document(&bytes, dpi)?;
+                            note = Some(format!(
+                                "Flattened {pages} page{} into images • Save a Copy to keep it; it can still be signed",
+                                if pages == 1 { "" } else { "s" }
+                            ));
+                            bytes
                         }
                         Edit::HeaderFooter(stamp) => {
                             let (bytes, pages) =
@@ -757,6 +800,7 @@ impl Viewer {
                         && let Some(t) = self.tabs.get(self.active)
                         && !t.pages.is_empty()
                     {
+                        self.redaction.active = false;
                         self.content.area_mode = false;
                         self.content.marquee = None;
                         if self.content.existing.is_some() {
@@ -774,10 +818,12 @@ impl Viewer {
                         .add(ActionButton::new(Icon::Select, "Edit text").selected(
                             !self.content.image_mode
                                 && !self.content.area_mode
-                                && self.content.add_target.is_none(),
+                                && self.content.add_target.is_none()
+                                && !self.redaction.active,
                         ))
                         .clicked()
                     {
+                        self.redaction.active = false;
                         self.content.area_mode = false;
                         self.content.marquee = None;
                         if self.content.pending_text().is_some() {
@@ -793,7 +839,9 @@ impl Viewer {
                         .add_enabled(
                             editable,
                             ActionButton::new(Icon::TextArea, "Select area").selected(
-                                self.content.area_mode && self.content.add_target.is_none(),
+                                self.content.area_mode
+                                    && self.content.add_target.is_none()
+                                    && !self.redaction.active,
                             ),
                         )
                         .on_hover_text(
@@ -801,6 +849,7 @@ impl Viewer {
                         )
                         .clicked()
                     {
+                        self.redaction.active = false;
                         if self.content.pending_text().is_some() {
                             self.content.new_commit = true;
                             self.content.exit_text_tool = true;
@@ -814,13 +863,14 @@ impl Viewer {
                         self.inspector = true;
                     }
                     if ui
-                        .add(
-                            ActionButton::new(Icon::Import, "Images").selected(
-                                self.content.image_mode && self.content.add_target.is_none(),
-                            ),
-                        )
+                        .add(ActionButton::new(Icon::Import, "Images").selected(
+                            self.content.image_mode
+                                && self.content.add_target.is_none()
+                                && !self.redaction.active,
+                        ))
                         .clicked()
                     {
+                        self.redaction.active = false;
                         self.content.area_mode = false;
                         self.content.marquee = None;
                         if self.content.pending_text().is_some() {
@@ -841,6 +891,24 @@ impl Viewer {
                     }
                     ui.separator();
                     self.header_footer_menu(ui, editable);
+                    if ui
+                        .add_enabled(
+                            editable,
+                            ActionButton::new(Icon::Redact, "Redact")
+                                .selected(self.redaction.active),
+                        )
+                        .on_hover_text("Mark text, images or areas and remove them for good")
+                        .clicked()
+                    {
+                        if self.redaction.active {
+                            self.redaction.active = false;
+                        } else if self.content.pending_text().is_some() {
+                            self.content.new_commit = true;
+                            self.content.exit_text_tool = true;
+                        } else {
+                            self.start_redaction();
+                        }
+                    }
                 });
             });
     }
@@ -976,6 +1044,9 @@ impl Viewer {
                     if matches!(self.content.format,Format::Png|Format::Jpeg){ui.horizontal(|ui|{ui.label("Resolution");ui.add(egui::DragValue::new(&mut self.content.dpi).range(72.0..=300.0).suffix(" DPI"));});}
                     ui.add_space(12.);if ui.add(ActionButton::new(Icon::Extract,"Export…").primary()).clicked(){action="export";}
                 });
+                ui.add_space(18.);ui.separator();ui.add_space(12.);ui.label(RichText::new("Flatten").family(ui::semibold()));
+                ui.label(RichText::new("Turn every page into an image so nothing on it can be edited. Annotations and form fields are burned in; the result can still be signed.").small().color(theme::muted()));
+                if ui.add_enabled(ready,ActionButton::new(Icon::Document,"Flatten PDF…")).clicked(){action="flatten";}
                 ui.add_space(16.);ui.label(RichText::new("Word and Markdown conversions use document text and basic paragraphs. Fonts, columns, tables, headers and page layout are not reconstructed. Word import accepts text documents; drawings are reported. No OCR yet.").small().color(theme::muted()));
             });if self.content.busy{ui.spinner();ui.label("Converting…");}
         });
@@ -983,6 +1054,7 @@ impl Viewer {
             "blank" => self.new_blank(ctx),
             "images" | "document" => self.import_conversion(ctx, action == "images"),
             "export" => self.export_conversion(ctx),
+            "flatten" => self.request_flatten(),
             _ => {}
         }
     }
@@ -1909,7 +1981,7 @@ pub(super) fn overlay(
     page_rect: Rect,
     scale: f32,
 ) {
-    if !matches!(mode, editing::Mode::Edit | editing::Mode::Forms) {
+    if !matches!(mode, editing::Mode::Edit | editing::Mode::Forms) || state.paused {
         return;
     }
     if mode == editing::Mode::Edit

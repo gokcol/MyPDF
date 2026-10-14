@@ -419,3 +419,36 @@ async fn signed_pdfs_edit_incrementally_and_signatures_can_be_removed() {
             .any(|s| s.field == "Second" && s.crypto_valid && s.digest_matches)
     );
 }
+
+#[tokio::test]
+async fn redaction_refuses_signed_pdfs_whose_signed_revision_keeps_the_original() {
+    use mypdf_milestone0::redact::{self, Area, Options};
+    let signer = identity::FileSigner::load(&id().pkcs12, PASSWORD, None).unwrap();
+    let signed = signing::sign_custom(&source(0), &signer, &Default::default())
+        .await
+        .unwrap();
+    let error = redact::apply(
+        &signed,
+        &[Area {
+            page: 0,
+            rect: [50., 50., 200., 80.],
+        }],
+        &Options::default(),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("signed"), "{error:#}");
+}
+
+#[tokio::test]
+async fn flattened_pdfs_can_be_signed_and_signed_pdfs_are_not_flattened() {
+    use mypdf_milestone0::redact;
+    let (flat, _) = redact::flatten_document(&source(0), 100.).unwrap();
+    let signer = identity::FileSigner::load(&id().pkcs12, PASSWORD, None).unwrap();
+    let signed = signing::sign_custom(&flat, &signer, &Default::default())
+        .await
+        .unwrap();
+    let report = signing::verify(&signed, None).unwrap();
+    assert!(report[0].crypto_valid && report[0].digest_matches && report[0].covers_current_file);
+    let error = redact::flatten_document(&signed, 100.).unwrap_err();
+    assert!(format!("{error:#}").contains("signatures"), "{error:#}");
+}
