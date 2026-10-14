@@ -4,6 +4,12 @@ use mypdf_milestone0::pages::{self, Operation};
 use std::collections::BTreeSet;
 
 type Change = Result<(u64, u64, Vec<u8>), String>;
+/// Pages copied from one document, ready to paste into any open document.
+pub(super) struct PageClip {
+    bytes: Vec<u8>,
+    pages: usize,
+    from: String,
+}
 pub(super) struct Organizer {
     tab: u64,
     pub selected: BTreeSet<usize>,
@@ -19,11 +25,17 @@ pub(super) struct Organizer {
     rx: mpsc::Receiver<Change>,
     output_tx: mpsc::Sender<Result<String, String>>,
     output_rx: mpsc::Receiver<Result<String, String>>,
+    pub clipboard: Option<Arc<PageClip>>,
+    clip_tx: mpsc::Sender<Result<PageClip, String>>,
+    clip_rx: mpsc::Receiver<Result<PageClip, String>>,
+    /// Pages to select once a paste has reloaded: tab, page count, pages.
+    pending_select: Option<(u64, usize, BTreeSet<usize>)>,
 }
 impl Organizer {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
         let (output_tx, output_rx) = mpsc::channel();
+        let (clip_tx, clip_rx) = mpsc::channel();
         Self {
             tab: 0,
             selected: BTreeSet::new(),
@@ -39,6 +51,10 @@ impl Organizer {
             rx,
             output_tx,
             output_rx,
+            clipboard: None,
+            clip_tx,
+            clip_rx,
+            pending_select: None,
         }
     }
 }
@@ -99,6 +115,22 @@ impl Viewer {
                             Err(e) => self.status = Some((format!("{e:#}"), true)),
                         }
                     }
+                }
+                Err(e) => self.status = Some((e, true)),
+            }
+        }
+        for result in self.organizer.clip_rx.try_iter() {
+            match result {
+                Ok(clip) => {
+                    self.status = Some((
+                        format!(
+                            "Copied {} • Open another PDF in Pages and press ⌘V (or Paste pages) to insert after the selected page",
+                            plural(clip.pages, "page")
+                        ),
+                        false,
+                    ));
+                    ctx.copy_text(format!("{} from {}", plural(clip.pages, "page"), clip.from));
+                    self.organizer.clipboard = Some(Arc::new(clip));
                 }
                 Err(e) => self.status = Some((e, true)),
             }
@@ -169,6 +201,13 @@ impl Viewer {
             self.organizer.range = (tab.page + 1).to_string();
             self.organizer.crop = false;
         }
+        if let Some((id, count, pages)) = &self.organizer.pending_select
+            && *id == tab.id
+            && *count == tab.pages.len()
+        {
+            self.organizer.selected = pages.clone();
+            self.organizer.pending_select = None;
+        }
         self.organizer.selected.retain(|i| *i < tab.pages.len());
         if self.organizer.selected.is_empty() && !tab.pages.is_empty() {
             self.organizer
@@ -190,6 +229,36 @@ impl Viewer {
             .show(ctx, |ui| {
                 egui::ScrollArea::horizontal().show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                count > 0 && !self.organizer.selected.is_empty(),
+                                ActionButton::new(Icon::Copy, "Copy pages"),
+                            )
+                            .on_hover_text(
+                                "Copy the selected pages (⌘C) to paste into any open PDF",
+                            )
+                            .clicked()
+                        {
+                            action = "copy";
+                        }
+                        if ui
+                            .add_enabled(
+                                editable && self.organizer.clipboard.is_some(),
+                                ActionButton::new(Icon::Import, "Paste pages"),
+                            )
+                            .on_hover_text(match &self.organizer.clipboard {
+                                Some(clip) => format!(
+                                    "Insert {} from {} after the selected page (⌘V)",
+                                    plural(clip.pages, "page"),
+                                    clip.from
+                                ),
+                                None => "Copy pages first".into(),
+                            })
+                            .clicked()
+                        {
+                            action = "paste";
+                        }
+                        ui.separator();
                         ui.add_enabled_ui(editable, |ui| {
                             for (icon, label, key) in [
                                 (Icon::Plus, "Blank page", "blank"),
@@ -290,10 +359,88 @@ impl Viewer {
                 );
             }
             "insert" => self.insert_dialog(ctx),
+            "copy" => self.copy_pages(ctx),
+            "paste" => self.paste_pages(ctx),
             "merge" => self.import_pages(ctx, count),
             "extract" => self.export_pages(ctx, false),
             "split" => self.export_pages(ctx, true),
             _ => {}
+        }
+    }
+    /// Copy the selected pages, with their annotations, to the app's page clipboard.
+    pub(super) fn copy_pages(&mut self, ctx: &egui::Context) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Some(s) = &tab.session else { return };
+        let selected: Vec<usize> = if self.organizer.tab == tab.id {
+            self.organizer.selected.iter().copied().collect()
+        } else {
+            vec![tab.page]
+        };
+        if selected.is_empty() {
+            return;
+        }
+        let (source, annotations, revision) =
+            (s.source.clone(), s.annotations.clone(), s.revision());
+        let from = tab.name();
+        let tx = self.organizer.clip_tx.clone();
+        let wake = ctx.clone();
+        self.status = Some(("Copying pages…".into(), false));
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || -> anyhow::Result<PageClip> {
+                    let current = if revision == 0 {
+                        source.to_vec()
+                    } else {
+                        mypdf_milestone0::annotations::export(&source, &annotations)?
+                    };
+                    Ok(PageClip {
+                        bytes: pages::extract(&current, &selected)?,
+                        pages: selected.len(),
+                        from,
+                    })
+                },
+            ))
+            .map_err(|_| "These pages could not be copied.".to_string())
+            .and_then(|r| r.map_err(|e| format!("{e:#}")));
+            let _ = tx.send(result);
+            wake.request_repaint();
+        });
+    }
+    /// Insert the copied pages after the selected page (or at the end).
+    pub(super) fn paste_pages(&mut self, ctx: &egui::Context) {
+        let Some(clip) = self.organizer.clipboard.clone() else {
+            self.status = Some((
+                "Copy pages first: select pages in Pages and press ⌘C.".into(),
+                false,
+            ));
+            return;
+        };
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let count = tab.pages.len();
+        let at = if self.organizer.tab == tab.id {
+            self.organizer.selected.last().map_or(count, |p| p + 1)
+        } else {
+            count
+        };
+        let id = tab.id;
+        self.page_change(
+            ctx,
+            Operation::InsertPdf {
+                at,
+                bytes: clip.bytes.clone(),
+            },
+        );
+        if self.organizer.busy {
+            self.organizer.pending_select =
+                Some((id, count + clip.pages, (at..at + clip.pages).collect()));
+            self.status = Some((
+                format!("Pasting {} from {}…", plural(clip.pages, "page"), clip.from),
+                false,
+            ));
         }
     }
     fn move_pages(&mut self, ctx: &egui::Context, before: usize) {
@@ -763,5 +910,118 @@ impl Viewer {
             self.organizer.dragged = None;
             self.organizer.pressed = None;
         }
+    }
+}
+
+fn plural(n: usize, word: &str) -> String {
+    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::App;
+    use mypdf_milestone0::annotations::{Annotation, Kind, Style};
+
+    #[test]
+    fn pages_copy_with_annotations_and_paste_into_another_open_pdf() {
+        let temp = tempfile::tempdir().unwrap();
+        let font = mypdf_milestone0::document::default_font().unwrap();
+        let first = temp.path().join("Contract.pdf");
+        let second = temp.path().join("Memo.pdf");
+        std::fs::write(&first, mypdf_milestone0::document::fixture(&font).unwrap()).unwrap();
+        std::fs::write(
+            &second,
+            mypdf_milestone0::convert::blank(595., 842.).unwrap(),
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(
+            &eframe::CreationContext::_new_kittest(ctx.clone()),
+            vec![first, second],
+        );
+        let frame = |app: &mut Viewer, events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1200., 820.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+            );
+        };
+        let until = |app: &mut Viewer, ready: &dyn Fn(&Viewer) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !ready(app) {
+                assert!(std::time::Instant::now() < deadline, "{:?}", app.status);
+                frame(app, vec![]);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let ready = |t: &Tab| t.session.as_ref().is_some_and(|s| s.editable);
+        until(&mut app, &|a| a.tabs.iter().all(ready));
+        app.editor.mode = editing::Mode::Pages;
+
+        // Mark page 2 of the contract, then copy just that page.
+        app.active = 0;
+        let session = app.tabs[0].session.as_mut().unwrap();
+        let mut marks = session.annotations.clone();
+        marks.push(Annotation::new(
+            1,
+            [100., 100., 220., 160.],
+            Kind::Rectangle,
+            Style::default(),
+        ));
+        session.commit(marks).unwrap();
+        frame(&mut app, vec![]);
+        app.organizer.selected = BTreeSet::from([1]);
+        app.copy_pages(&ctx);
+        until(&mut app, &|a| a.organizer.clipboard.is_some());
+        assert_eq!(
+            app.tabs[0].pages.len(),
+            2,
+            "copying leaves the source alone"
+        );
+
+        // Paste after the memo's only page; the pasted page becomes the selection.
+        app.active = 1;
+        frame(&mut app, vec![]);
+        app.paste_pages(&ctx);
+        until(&mut app, &|a| {
+            !a.organizer.busy && a.tabs[1].pages.len() == 2 && ready(&a.tabs[1])
+        });
+        frame(&mut app, vec![]);
+        assert_eq!(app.organizer.selected, BTreeSet::from([1]));
+        let memo = app.tabs[1].session.as_ref().unwrap();
+        assert!(
+            memo.annotations
+                .iter()
+                .any(|a| a.page == 1 && matches!(a.kind, Kind::Rectangle)),
+            "annotations travel with the page"
+        );
+        let text = |bytes: &[u8], page| -> String {
+            mypdf_milestone0::document::text_runs(bytes, page)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.text)
+                .collect()
+        };
+        let contract = app.tabs[0].session.as_ref().unwrap().source.clone();
+        assert_eq!(text(&memo.source, 2), text(&contract, 2));
+
+        // ⌘V (a paste event) in Pages pastes the pages again, after the selection.
+        frame(
+            &mut app,
+            vec![egui::Event::Paste("1 page from Contract.pdf".into())],
+        );
+        until(&mut app, &|a| {
+            !a.organizer.busy && a.tabs[1].pages.len() == 3 && ready(&a.tabs[1])
+        });
+        frame(&mut app, vec![]);
+        assert_eq!(app.organizer.selected, BTreeSet::from([2]));
+        app.editor_undo(false);
+        until(&mut app, &|a| {
+            a.tabs[1].pages.len() == 2 && ready(&a.tabs[1])
+        });
     }
 }

@@ -602,6 +602,8 @@ impl Viewer {
                 self.digital.open = true;
                 self.digital.panel = digital::Panel::Validate;
             }
+            "copy" if self.pages_clipboard_keys(ctx) => self.copy_pages(ctx),
+            "paste" if self.pages_clipboard_keys(ctx) => self.paste_pages(ctx),
             "cut" => ctx.send_viewport_cmd(egui::ViewportCommand::RequestCut),
             "copy" => ctx.send_viewport_cmd(egui::ViewportCommand::RequestCopy),
             "paste" => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
@@ -772,7 +774,29 @@ impl Viewer {
             self.open(path, ctx);
         }
     }
+    /// In Pages, Copy and Paste act on whole pages unless a text field has focus.
+    fn pages_clipboard_keys(&self, ctx: &egui::Context) -> bool {
+        !self.home.visible
+            && self.editor.mode == editing::Mode::Pages
+            && !ctx.wants_keyboard_input()
+            && !self.editor.text_editing
+    }
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.pages_clipboard_keys(ctx) {
+            let (copy, paste) = ctx.input_mut(|i| {
+                let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+                let paste = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)));
+                i.events
+                    .retain(|e| !matches!(e, egui::Event::Copy | egui::Event::Paste(_)));
+                (copy, paste)
+            });
+            if copy {
+                self.copy_pages(ctx);
+            }
+            if paste {
+                self.paste_pages(ctx);
+            }
+        }
         if !self.home.visible
             && !ctx.wants_keyboard_input()
             && !self.editor.text_editing
