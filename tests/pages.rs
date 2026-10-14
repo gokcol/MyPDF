@@ -216,9 +216,9 @@ fn combined_annotation_and_page_history_is_reversible_and_tracks_saved_revision(
     assert!(!session.dirty());
 }
 #[test]
-fn page_tools_reject_signatures_certification_encryption_and_form_fields() {
+fn page_tools_refuse_encryption_and_change_signed_pdfs_only_after_unlock() {
     let original = fixture();
-    for kind in ["signature", "certification", "forms", "encryption"] {
+    for kind in ["signature", "certification", "encryption"] {
         let mut doc = Document::load_mem(&original).unwrap();
         match kind {
             "signature" => {
@@ -226,14 +226,6 @@ fn page_tools_reject_signatures_certification_encryption_and_form_fields() {
             }
             "certification" => {
                 doc.catalog_mut().unwrap().set("Perms", dictionary! {});
-            }
-            "forms" => {
-                let field =
-                    doc.add_object(dictionary! {"FT"=>"Tx","T"=>Object::string_literal("Test")});
-                doc.catalog_mut().unwrap().set(
-                    "AcroForm",
-                    dictionary! {"Fields"=>vec![Object::Reference(field)]},
-                );
             }
             _ => {
                 doc.trailer.set("Encrypt", dictionary! {});
@@ -245,9 +237,149 @@ fn page_tools_reject_signatures_certification_encryption_and_form_fields() {
             pages::apply(&bytes, &Operation::Delete(vec![0])).is_err(),
             "{kind}"
         );
-        assert!(pages::extract(&bytes, &[0]).is_err(), "{kind}");
+        // Copying pages out never changes the source, so only encryption stops it.
+        assert_eq!(
+            pages::extract(&bytes, &[0]).is_ok(),
+            kind != "encryption",
+            "{kind}"
+        );
     }
 }
+
+/// The three-page fixture with a text field on each page, named A, B and C,
+/// plus a parent field "Group" with widgets on pages 1 and 3.
+fn with_fields(names: [&str; 3]) -> Vec<u8> {
+    let mut doc = Document::load_mem(&fixture()).unwrap();
+    let pages: Vec<_> = doc.get_pages().into_values().collect();
+    let mut fields = vec![];
+    for (i, name) in names.iter().enumerate() {
+        let field = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx",
+            "T" => Object::string_literal(*name), "V" => Object::string_literal(format!("value {name}")),
+            "Rect" => vec![50.into(), 50.into(), 200.into(), 80.into()], "P" => pages[i],
+        });
+        doc.get_dictionary_mut(pages[i])
+            .unwrap()
+            .set("Annots", vec![Object::Reference(field)]);
+        fields.push(Object::Reference(field));
+    }
+    let group = doc.new_object_id();
+    let mut kids = vec![];
+    for i in [0, 2] {
+        let kid = doc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "Parent" => group,
+            "Rect" => vec![50.into(), 100.into(), 200.into(), 130.into()], "P" => pages[i],
+        });
+        let annots = doc.get_dictionary_mut(pages[i]).unwrap();
+        let mut list = annots.get(b"Annots").unwrap().as_array().unwrap().clone();
+        list.push(Object::Reference(kid));
+        annots.set("Annots", list);
+        kids.push(Object::Reference(kid));
+    }
+    doc.objects.insert(
+        group,
+        dictionary! { "FT" => "Tx", "T" => Object::string_literal("Group"), "V" => Object::string_literal("shared"), "Kids" => kids }.into(),
+    );
+    fields.push(Object::Reference(group));
+    doc.catalog_mut()
+        .unwrap()
+        .set("AcroForm", dictionary! { "Fields" => fields });
+    let mut bytes = vec![];
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+fn field_pages(bytes: &[u8]) -> Vec<(String, Vec<usize>)> {
+    let mut fields: Vec<_> = mypdf_milestone0::forms::fields(bytes)
+        .unwrap()
+        .into_iter()
+        .map(|f| {
+            let mut pages: Vec<_> = f.widgets.iter().map(|w| w.page).collect();
+            pages.sort();
+            (f.name, pages)
+        })
+        .collect();
+    fields.sort();
+    fields
+}
+
+#[test]
+fn pages_with_form_fields_reorder_delete_and_merge() {
+    let source = with_fields(["A", "B", "C"]);
+    assert_eq!(
+        field_pages(&source),
+        vec![
+            ("A".into(), vec![0]),
+            ("B".into(), vec![1]),
+            ("C".into(), vec![2]),
+            ("Group".into(), vec![0, 2]),
+        ]
+    );
+    // Reordering moves each field with its page.
+    let reordered = pages::apply(&source, &Operation::Reorder(vec![2, 0, 1])).unwrap();
+    assert_eq!(
+        field_pages(&reordered),
+        vec![
+            ("A".into(), vec![1]),
+            ("B".into(), vec![2]),
+            ("C".into(), vec![0]),
+            ("Group".into(), vec![0, 1]),
+        ]
+    );
+    // Deleting a page removes its own fields; a field with widgets elsewhere stays.
+    let deleted = pages::apply(&source, &Operation::Delete(vec![0])).unwrap();
+    assert_eq!(
+        field_pages(&deleted),
+        vec![
+            ("B".into(), vec![0]),
+            ("C".into(), vec![1]),
+            ("Group".into(), vec![1]),
+        ]
+    );
+    let values: Vec<_> = mypdf_milestone0::forms::fields(&deleted)
+        .unwrap()
+        .into_iter()
+        .map(|f| f.value)
+        .collect();
+    assert!(values.contains(&"shared".to_owned()) && values.contains(&"value B".to_owned()));
+
+    // Inserting another form brings its fields; a clashing name is renamed.
+    let other = with_fields(["A", "X", "Y"]);
+    let merged = pages::apply(
+        &source,
+        &Operation::InsertPdf {
+            at: 3,
+            bytes: other,
+        },
+    )
+    .unwrap();
+    let names: Vec<String> = field_pages(&merged).into_iter().map(|(n, _)| n).collect();
+    for expected in ["A", "A (2)", "B", "C", "Group", "Group (2)", "X", "Y"] {
+        assert!(
+            names.contains(&expected.to_owned()),
+            "{expected} in {names:?}"
+        );
+    }
+    let a2 = mypdf_milestone0::forms::fields(&merged)
+        .unwrap()
+        .into_iter()
+        .find(|f| f.name == "A (2)")
+        .unwrap();
+    assert_eq!(a2.value, "value A");
+    assert_eq!(a2.widgets[0].page, 3);
+
+    // Extracting keeps the fields on the extracted pages only.
+    let extracted = pages::extract(&source, &[1, 2]).unwrap();
+    assert_eq!(
+        field_pages(&extracted),
+        vec![
+            ("B".into(), vec![0]),
+            ("C".into(), vec![1]),
+            ("Group".into(), vec![1]),
+        ]
+    );
+}
+
 #[test]
 fn ranges_are_validated_and_safe_export_never_overwrites() {
     assert_eq!(

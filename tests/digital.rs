@@ -104,6 +104,7 @@ async fn custom_appearance_signing_handles_all_page_rotations_and_unicode_metada
             location: "İstanbul".into(),
             artwork: None,
             layout: Default::default(),
+            ..Default::default()
         };
         let png = signing::signature_artwork(&request).unwrap();
         assert_eq!(image::load_from_memory(&png).unwrap().width(), 650);
@@ -527,4 +528,35 @@ async fn visible_signatures_use_acrobat_layered_appearances_and_keep_the_trailer
             .and_then(|s| s.as_name().ok())
             == Some(b"Image")
     }));
+}
+
+#[tokio::test]
+async fn signed_pdfs_can_be_reordered_after_unlock_and_copied_without_their_signatures() {
+    use mypdf_milestone0::{pages, signature_edit};
+    let signer = identity::FileSigner::load(&id().pkcs12, PASSWORD, None).unwrap();
+    let request = signing::DesktopSigningRequest {
+        field: "Reviewer".into(),
+        rect: Some([72., 100., 312., 172.]),
+        ..Default::default()
+    };
+    let signed = signing::sign_custom(&source(0), &signer, &request)
+        .await
+        .unwrap();
+
+    // Copied pages are not signed: no signature, and no box pretending to be one.
+    let copy = pages::extract(&signed, &[0]).unwrap();
+    assert!(signing::verify(&copy, None).unwrap().is_empty());
+    assert!(signature_edit::signature_fields(&copy).unwrap().is_empty());
+    assert!(!String::from_utf8_lossy(&copy).contains("/FT /Sig"));
+
+    // Locked until "Edit anyway"; then pages reorder and save after the signed bytes.
+    assert!(pages::apply(&signed, &pages::Operation::Reorder(vec![1, 0])).is_err());
+    signature_edit::unlock(&signed).unwrap();
+    let reordered = pages::apply(&signed, &pages::Operation::Reorder(vec![1, 0])).unwrap();
+    let saved = signature_edit::incremental_update(&signed, &reordered).unwrap();
+    assert!(saved.starts_with(&signed));
+    let report = signing::verify(&saved, None).unwrap();
+    assert!(report[0].crypto_valid && report[0].digest_matches && !report[0].covers_current_file);
+    let fields = signature_edit::signature_fields(&saved).unwrap();
+    assert_eq!(fields[0].page, Some(1), "the signature moved with its page");
 }
