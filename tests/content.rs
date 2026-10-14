@@ -522,3 +522,32 @@ fn added_text_embeds_selected_styles_and_preserves_alignment() {
         .unwrap();
     }
 }
+
+#[test]
+fn images_are_added_as_page_content_where_they_are_displayed() {
+    let source = document::fixture(&document::default_font().unwrap()).unwrap();
+    let mut png = vec![];
+    image::RgbaImage::from_fn(40, 20, |x, _| image::Rgba([x as u8 * 6, 90, 200, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let mut bytes = source.clone();
+    // Page 2 is rotated; the box is in displayed coordinates on both pages.
+    for page in [1, 2] {
+        let before = content::images(&bytes, page).unwrap().len();
+        let rect = [100., 120., 300., 220.];
+        bytes = content::add_image(&bytes, page, rect, &png).unwrap();
+        let images = content::images(&bytes, page).unwrap();
+        assert_eq!(images.len(), before + 1);
+        assert!(
+            images
+                .iter()
+                .any(|i| i.rect.iter().zip(rect).all(|(a, b)| (a - b).abs() < 0.5)),
+            "page {page}: {:?}",
+            images.iter().map(|i| i.rect).collect::<Vec<_>>()
+        );
+    }
+    let temp = tempfile::tempdir().unwrap();
+    assert!(document::render(&bytes, temp.path(), 1.).is_ok());
+    assert!(content::add_image(&source, 1, [0., 0., 0.5, 10.], &png).is_err());
+    assert!(content::add_image(&source, 1, [0., 0., 50., 50.], b"not an image").is_err());
+}

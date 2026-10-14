@@ -453,6 +453,90 @@ pub fn edit_image(bytes: &[u8], page: u32, index: usize, edit: &ImageEdit) -> Re
     doc.get_dictionary_mut(id)?.set("Contents", stream);
     serialize(&mut doc)
 }
+/// Place a PNG or JPEG as page content in a displayed-page rectangle
+/// (left, top, right, bottom), upright on rotated and cropped pages.
+pub fn add_image(bytes: &[u8], page: u32, rect: [f32; 4], image: &[u8]) -> Result<Vec<u8>> {
+    ensure!(
+        rect.iter().all(|v| v.is_finite() && v.abs() < 100_000.)
+            && rect[2] - rect[0] >= 1.
+            && rect[3] - rect[1] >= 1.,
+        "Image must be at least 1 point wide and tall"
+    );
+    let mut doc = editable(bytes)?;
+    let id = *doc.get_pages().get(&page).context("Page not found")?;
+    let geometry = crate::annotations::page_geometry(bytes)?;
+    let (_, transform) = geometry
+        .get(page.saturating_sub(1) as usize)
+        .context("Page geometry missing")?;
+    let decoded = decode_image(image)?;
+    let image_id = embed_image(&mut doc, &decoded)?;
+    let mut res = resources(&doc, id)?;
+    let mut xo = res
+        .get(b"XObject")
+        .ok()
+        .map(|o| doc.dereference(o))
+        .transpose()?
+        .map(|(_, o)| o.as_dict().cloned())
+        .transpose()?
+        .unwrap_or_default();
+    let mut n = 0;
+    let name = loop {
+        let name = format!("MyPDFImage{n}");
+        if !xo.has(name.as_bytes()) {
+            break name;
+        }
+        n += 1;
+    };
+    xo.set(name.as_str(), image_id);
+    res.set("XObject", xo);
+    let old = doc.get_and_decode_page_content(id)?;
+    let mut depth = 0usize;
+    for op in &old.operations {
+        match op.operator.as_str() {
+            "q" => depth += 1,
+            "Q" => {
+                ensure!(depth > 0, "Page has unbalanced graphics state");
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    ensure!(depth == 0, "Page content is unbalanced");
+    let [x, _, right, bottom] = rect;
+    let (w, h) = (right - x, rect[3] - rect[1]);
+    let mut operations = vec![Operation::new("q", vec![])];
+    operations.extend(old.operations);
+    operations.extend([
+        Operation::new("Q", vec![]),
+        Operation::new("q", vec![]),
+        Operation::new(
+            "cm",
+            transform.iter().map(|v| Object::Real(*v as f32)).collect(),
+        ),
+        // Display coordinates have y down; the image's top row goes at the top.
+        Operation::new(
+            "cm",
+            vec![
+                w.into(),
+                0.into(),
+                0.into(),
+                (-h).into(),
+                x.into(),
+                bottom.into(),
+            ],
+        ),
+        Operation::new("Do", vec![Object::Name(name.into_bytes())]),
+        Operation::new("Q", vec![]),
+    ]);
+    let stream = doc.add_object(Stream::new(
+        Dictionary::new(),
+        Content { operations }.encode()?,
+    ));
+    let dict = doc.get_dictionary_mut(id)?;
+    dict.set("Resources", res);
+    dict.set("Contents", stream);
+    serialize(&mut doc)
+}
 /// Transform a PDF widget rectangle into displayed page coordinates.
 pub fn displayed_rect(rect: [f32; 4], inverse: [f64; 6]) -> [f32; 4] {
     let m = Affine::new(inverse).inverse();
