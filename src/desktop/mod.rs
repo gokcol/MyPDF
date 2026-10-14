@@ -2129,10 +2129,11 @@ mod tests {
                 "menu order is Signature, then Digital Signature"
             );
             click(&mut app, if digital { certificate } else { visual });
-            assert_eq!(app.digital.open, digital);
+            // Digital Signature asks for the area first; the window opens after it.
+            assert!(!app.digital.open);
             assert_eq!(app.editor.signature_open, !digital);
             if digital {
-                assert!(app.digital.panel == digital::Panel::Sign);
+                assert!(app.editor.tool == editing::Tool::SignArea);
                 assert!(app.editor.mode == editing::Mode::Sign);
             } else {
                 assert!(app.editor.mode == editing::Mode::Annotate);
