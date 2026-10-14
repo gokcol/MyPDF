@@ -396,11 +396,7 @@ pub(super) fn begin(
         let on_handle = tab.selected_annotation.as_ref().is_some_and(|id| {
             tab.session.as_ref().is_some_and(|s| {
                 s.annotations.iter().any(|a| {
-                    let b = a.bounds();
-                    &a.id == id
-                        && a.page == page
-                        && (p[0] - b[2]).abs() < 12. / scale
-                        && (p[1] - b[3]).abs() < 12. / scale
+                    &a.id == id && a.page == page && editing::corner_at(a, p, scale).is_some()
                 })
             })
         });
@@ -539,14 +535,8 @@ pub(super) fn paint(
             frame.right_bottom(),
             frame.left_bottom(),
         ] {
-            let handle = Rect::from_center_size(c, vec2(9., 9.));
-            painter.rect_filled(handle, 2., Color32::WHITE);
-            painter.rect_stroke(
-                handle,
-                2.,
-                Stroke::new(1.5, theme::accent()),
-                egui::StrokeKind::Middle,
-            );
+            painter.circle_filled(c, 4.5, Color32::WHITE);
+            painter.circle_stroke(c, 4.5, Stroke::new(1.5, theme::accent()));
         }
         let label = format!("{} selected", marks.len());
         let font = ui::font(painter.ctx(), ui::STRONG, 11.);
@@ -557,7 +547,13 @@ pub(super) fn paint(
         );
         painter.rect_filled(pill, 8., theme::accent());
         painter.galley(pill.min + vec2(7., 3.), galley, Color32::WHITE);
-        if editor.group_gesture.is_none()
+        if editor
+            .group_gesture
+            .as_ref()
+            .is_some_and(|g| g.tab == tab.id && matches!(g.drag, Drag::Move))
+        {
+            painter.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if editor.group_gesture.is_none()
             && let Some(pos) = hover
             && page_rect.contains(pos)
         {
@@ -570,7 +566,7 @@ pub(super) fn paint(
                         egui::CursorIcon::ResizeNeSw
                     },
                 ),
-                Some(Drag::Move) => painter.ctx().set_cursor_icon(egui::CursorIcon::Move),
+                Some(Drag::Move) => painter.ctx().set_cursor_icon(egui::CursorIcon::Grab),
                 None => {}
             }
         }

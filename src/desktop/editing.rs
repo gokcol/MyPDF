@@ -96,8 +96,100 @@ struct Gesture {
     start: [f32; 2],
     points: Vec<[f32; 2]>,
     original: Option<Annotation>,
-    resize: bool,
+    /// The corner being dragged (top-left, top-right, bottom-right, bottom-left).
+    resize: Option<usize>,
     preview: Option<Annotation>,
+}
+
+/// The default box for a click-placed note, text box or library item.
+fn placement(editor: &EditorState, tab: &Tab, page: usize, at: [f32; 2], centered: bool) -> Box2 {
+    let (width, height) = match editor.tool {
+        Tool::Note => (32.0, 32.0),
+        Tool::Text => (240.0, 72.0),
+        Tool::Asset => {
+            let aspect = editor.placed.as_ref().map_or(3.0, |a| a.aspect);
+            let category = editor
+                .placed
+                .as_ref()
+                .and_then(|a| editor.builtins.iter().find(|b| b.asset.id == a.id))
+                .map(|b| b.category);
+            let edge = match category {
+                Some("Symbols") => 72.0,
+                Some("Arrows") => 180.0,
+                _ => 240.0,
+            };
+            (edge * aspect.min(1.0), edge / aspect.max(1.0))
+        }
+        _ => (52.0, 52.0),
+    };
+    let size = tab.pages[page];
+    let at = if centered {
+        [at[0] - width / 2.0, at[1] - height / 2.0]
+    } else {
+        at
+    };
+    let x = at[0].clamp(0.0, (size.width - width).max(0.0));
+    let y = at[1].clamp(0.0, (size.height - height).max(0.0));
+    [
+        x,
+        y,
+        (x + width).min(size.width),
+        (y + height).min(size.height),
+    ]
+}
+
+/// Place the armed note, text box or library item at a page point.
+fn place(
+    editor: &mut EditorState,
+    tab: &mut Tab,
+    page: usize,
+    at: [f32; 2],
+    centered: bool,
+    status: &mut Option<(String, bool)>,
+) {
+    let r = placement(editor, tab, page, at, centered);
+    let a = editor.base_annotation(tab, page, r, at, at, &[at]);
+    commit_new(editor, tab, a, status);
+    editor.tool = Tool::Select;
+}
+
+/// The selection corner under a page point, if any.
+pub(super) fn corner_at(a: &Annotation, p: [f32; 2], scale: f32) -> Option<usize> {
+    let b = a.bounds();
+    [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]]
+        .iter()
+        .position(|c| (p[0] - c[0]).abs() < 12.0 / scale && (p[1] - c[1]).abs() < 12.0 / scale)
+}
+
+/// Artwork keeps its proportions when resized; shapes do with Shift.
+fn keeps_proportions(kind: &ann::Kind) -> bool {
+    matches!(
+        kind,
+        ann::Kind::Symbol(_)
+            | ann::Kind::Stamp { .. }
+            | ann::Kind::Svg { .. }
+            | ann::Kind::Image { .. }
+            | ann::Kind::Vector { .. }
+            | ann::Kind::Ink { .. }
+    )
+}
+
+/// The rectangle after dragging `corner` to `p`; the opposite corner stays put.
+fn resized(rect: [f32; 4], corner: usize, p: [f32; 2], proportional: bool) -> [f32; 4] {
+    let (ow, oh) = ((rect[2] - rect[0]).max(1.0), (rect[3] - rect[1]).max(1.0));
+    let right = matches!(corner, 1 | 2);
+    let bottom = matches!(corner, 2 | 3);
+    let ax = if right { rect[0] } else { rect[2] };
+    let ay = if bottom { rect[1] } else { rect[3] };
+    let mut w = (if right { p[0] - ax } else { ax - p[0] }).max(8.0);
+    let mut h = (if bottom { p[1] - ay } else { ay - p[1] }).max(8.0);
+    if proportional {
+        let s = (w / ow).max(h / oh).max(8.0 / ow.min(oh));
+        (w, h) = (ow * s, oh * s);
+    }
+    let x = if right { ax } else { ax - w };
+    let y = if bottom { ay } else { ay - h };
+    [x, y, x + w, y + h]
 }
 type SvgPreviewResult = (String, Result<Arc<Vec<u8>>, String>);
 struct SvgEditor {
@@ -798,6 +890,36 @@ pub(super) fn page_interaction(
             p.y.clamp(0.0, page_size.height),
         ]
     };
+    // Library items dragged from the panel land where they are released.
+    if editable && matches!(editor.mode, Mode::Read | Mode::Annotate | Mode::Draw) {
+        let pointer = ctx.input(|i| i.pointer.latest_pos());
+        if let Some(asset) = response.dnd_hover_payload::<Asset>()
+            && let Some(pos) = pointer
+        {
+            let armed = (editor.tool, editor.placed.replace((*asset).clone()));
+            editor.tool = Tool::Asset;
+            let r = placement(editor, tab, page, normal(pos), true);
+            (editor.tool, editor.placed) = armed;
+            let mut ghost = Annotation::new(page, r, asset.kind.clone(), asset.style.clone());
+            ghost.style.opacity *= 0.55;
+            let painter = ui
+                .painter()
+                .with_clip_rect(page_rect.intersect(ui.clip_rect()));
+            paint_annotation(editor, ctx, &painter, page_rect, scale, &ghost);
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+        if let Some(asset) = response.dnd_release_payload::<Asset>()
+            && let Some(pos) = pointer
+        {
+            if editor.mode == Mode::Read {
+                editor.mode = Mode::Annotate;
+            }
+            editor.placed = Some((*asset).clone());
+            editor.tool = Tool::Asset;
+            editor.draft = None;
+            place(editor, tab, page, normal(pos), true, status);
+        }
+    }
     let vertex_tool = matches!(editor.tool, Tool::Polyline | Tool::Polygon)
         && matches!(editor.mode, Mode::Draw | Mode::Annotate)
         && editable
@@ -971,40 +1093,7 @@ pub(super) fn page_interaction(
             && editable
             && matches!(editor.tool, Tool::Note | Tool::Text | Tool::Asset)
         {
-            let (width, height) = match editor.tool {
-                Tool::Note => (32.0, 32.0),
-                Tool::Text => (240.0, 72.0),
-                Tool::Asset => {
-                    let aspect = editor.placed.as_ref().map_or(3.0, |a| a.aspect);
-                    let category = editor
-                        .placed
-                        .as_ref()
-                        .and_then(|a| editor.builtins.iter().find(|b| b.asset.id == a.id))
-                        .map(|b| b.category);
-                    let edge = match category {
-                        Some("Symbols") => 72.0,
-                        Some("Arrows") => 180.0,
-                        _ => 240.0,
-                    };
-                    (edge * aspect.min(1.0), edge / aspect.max(1.0))
-                }
-                _ => (52.0, 52.0),
-            };
-            let r = [
-                p[0].min((tab.pages[page].width - width).max(0.0)),
-                p[1].min((tab.pages[page].height - height).max(0.0)),
-                0.0,
-                0.0,
-            ];
-            let r = [
-                r[0],
-                r[1],
-                (r[0] + width).min(tab.pages[page].width),
-                (r[1] + height).min(tab.pages[page].height),
-            ];
-            let a = editor.base_annotation(tab, page, r, p, p, &[p]);
-            commit_new(editor, tab, a, status);
-            editor.tool = Tool::Select;
+            place(editor, tab, page, p, false, status);
         } else if !shift {
             selection::set(tab, editor, vec![]);
         }
@@ -1051,23 +1140,17 @@ pub(super) fn page_interaction(
                         .as_ref()?
                         .annotations
                         .iter()
-                        .find(|a| {
-                            if &a.id != id || a.page != page {
-                                return false;
-                            }
-                            let b = a.bounds();
-                            (p[0] - b[2]).abs() < 12.0 / scale && (p[1] - b[3]).abs() < 12.0 / scale
-                        })
+                        .find(|a| &a.id == id && a.page == page && corner_at(a, p, scale).is_some())
                         .cloned()
                 })
                 .or_else(|| hit_annotation(tab, page, p, scale))
         } else {
             None
         };
-        let resize = original.as_ref().is_some_and(|a| {
-            let r = a.bounds();
-            (p[0] - r[2]).abs() < 12.0 / scale && (p[1] - r[3]).abs() < 12.0 / scale
-        });
+        let resize = original
+            .as_ref()
+            .filter(|a| Some(&a.id) == tab.selected_annotation.as_ref())
+            .and_then(|a| corner_at(a, p, scale));
         if (matches!(editor.mode, Mode::Annotate | Mode::Draw)
             && editable
             && (editor.tool != Tool::Select || original.is_some()))
@@ -1104,9 +1187,10 @@ pub(super) fn page_interaction(
             }
             let mut preview = if let Some(original) = &gesture.original {
                 let mut next = original.clone();
-                if gesture.resize {
-                    next.rect[2] = p[0].max(next.rect[0] + 8.0);
-                    next.rect[3] = p[1].max(next.rect[1] + 8.0);
+                if let Some(corner) = gesture.resize {
+                    let proportional =
+                        keeps_proportions(&original.kind) || ctx.input(|i| i.modifiers.shift);
+                    next.rect = resized(original.rect, corner, p, proportional);
                 } else {
                     let w = next.rect[2] - next.rect[0];
                     let h = next.rect[3] - next.rect[1];
@@ -1228,17 +1312,53 @@ pub(super) fn page_interaction(
             page_rect.min + vec2(b[0], b[1]) * scale,
             page_rect.min + vec2(b[2], b[3]) * scale,
         );
+        let frame = r.expand(3.0);
         painter.rect_stroke(
-            r.expand(3.0),
+            frame,
             0.0,
             Stroke::new(1.2, theme::accent()),
-            egui::StrokeKind::Outside,
+            egui::StrokeKind::Middle,
         );
-        painter.rect_filled(
-            Rect::from_center_size(r.max, vec2(8.0, 8.0)),
-            1.0,
-            theme::accent(),
-        );
+        for c in [
+            frame.left_top(),
+            frame.right_top(),
+            frame.right_bottom(),
+            frame.left_bottom(),
+        ] {
+            painter.circle_filled(c, 4.5, Color32::WHITE);
+            painter.circle_stroke(c, 4.5, Stroke::new(1.5, theme::accent()));
+        }
+    }
+    // Grab to move, grabbing while moving, diagonal arrows on the corners.
+    if matches!(editor.mode, Mode::Annotate | Mode::Draw)
+        && editable
+        && matches!(editor.tool, Tool::Select | Tool::Lasso)
+        && editor.group_gesture.is_none()
+        && tab.group.len() < 2
+    {
+        let dragging = editor
+            .gesture
+            .as_ref()
+            .filter(|g| g.tab == tab.id && g.page == page && g.original.is_some());
+        let corner = match dragging {
+            Some(g) => g.resize,
+            None => response.hover_pos().and_then(|pos| {
+                let p = normal(pos);
+                single.and_then(|a| corner_at(a, p, scale))
+            }),
+        };
+        let cursor = match (corner, dragging) {
+            (Some(0 | 2), _) => Some(egui::CursorIcon::ResizeNwSe),
+            (Some(_), _) => Some(egui::CursorIcon::ResizeNeSw),
+            (None, Some(_)) => Some(egui::CursorIcon::Grabbing),
+            (None, None) => response
+                .hover_pos()
+                .and_then(|pos| hit_annotation(tab, page, normal(pos), scale))
+                .map(|_| egui::CursorIcon::Grab),
+        };
+        if let Some(cursor) = cursor {
+            ctx.set_cursor_icon(cursor);
+        }
     }
     selection::paint(
         editor,
@@ -2272,7 +2392,18 @@ impl Viewer {
                                 .clicked();
                         });
                         ui.label(
-                            RichText::new("Drag to move · Corner to resize")
+                            RichText::new(
+                                if self
+                                    .editor
+                                    .draft
+                                    .as_ref()
+                                    .is_some_and(|a| keeps_proportions(&a.kind))
+                                {
+                                    "Drag to move · Drag a corner to resize in proportion"
+                                } else {
+                                    "Drag to move · Drag a corner to resize · Shift keeps proportions"
+                                },
+                            )
                                 .size(11.)
                                 .color(theme::muted()),
                         );
@@ -2356,6 +2487,9 @@ impl Viewer {
         }
     }
     pub(super) fn asset_panel(&mut self, ctx: &egui::Context) {
+        if egui::DragAndDrop::has_payload_of_type::<Asset>(ctx) {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
         let mut import = false;
         if self.editor.library_open {
             let mut open = true;
@@ -2524,8 +2658,14 @@ impl Viewer {
                                             ui.vertical(|ui| {
                                                 let (rect, response) = ui.allocate_exact_size(
                                                     vec2(width, 94.0),
-                                                    egui::Sense::click(),
+                                                    egui::Sense::click_and_drag(),
                                                 );
+                                                if response.drag_started() {
+                                                    egui::DragAndDrop::set_payload(
+                                                        ctx,
+                                                        asset.clone(),
+                                                    );
+                                                }
                                                 response.widget_info(|| {
                                                     egui::WidgetInfo::labeled(
                                                         egui::WidgetType::Button,
@@ -2612,7 +2752,11 @@ impl Viewer {
                                                     theme::ink(),
                                                 );
                                                 if response
-                                                    .on_hover_text(format!("Place {}", asset.name))
+                                                    .on_hover_text(format!(
+                                                        "Click, then click the page to place {} · or drag it onto the page",
+                                                        asset.name
+                                                    ))
+                                                    .on_hover_cursor(egui::CursorIcon::Grab)
                                                     .clicked()
                                                 {
                                                     place = Some(asset.clone());
@@ -3401,15 +3545,25 @@ mod tests {
                     .shapes
                     .iter()
                     .filter_map(|s| match &s.shape {
-                        egui::Shape::Rect(r) if r.fill == theme::accent() => Some(r.rect),
+                        egui::Shape::Circle(c) if c.stroke.color == theme::accent() => {
+                            Some(c.center)
+                        }
                         _ => None,
                     })
                     .collect();
-                assert_eq!(handles.len(), 1, "exactly one resize handle");
-                assert!(
-                    near(handles[0], Rect::from_center_size(rect.max, vec2(8., 8.))),
-                    "handle must track the same frame"
-                );
+                let frame = rect.expand(3.);
+                assert_eq!(handles.len(), 4, "a round handle on each corner");
+                for corner in [
+                    frame.left_top(),
+                    frame.right_top(),
+                    frame.right_bottom(),
+                    frame.left_bottom(),
+                ] {
+                    assert!(
+                        handles.iter().any(|h| h.distance(corner) < 0.02),
+                        "handles must track the same frame"
+                    );
+                }
                 assert!(
                     output.shapes.iter().any(|s| match &s.shape {
                         egui::Shape::Path(p) => near(Rect::from_points(&p.points), rect),
@@ -3514,6 +3668,124 @@ mod tests {
             });
         }
         input(app, ctx, events);
+    }
+    #[test]
+    fn corner_resizing_anchors_the_opposite_corner_and_can_keep_proportions() {
+        let r = [100.0, 100.0, 200.0, 150.0];
+        assert_eq!(
+            resized(r, 2, [260.0, 170.0], false),
+            [100.0, 100.0, 260.0, 170.0]
+        );
+        let free_top_left = resized(r, 0, [80.0, 90.0], false);
+        assert_eq!(free_top_left, [80.0, 90.0, 200.0, 150.0]);
+        let kept = resized(r, 2, [300.0, 160.0], true);
+        assert_eq!(kept, [100.0, 100.0, 300.0, 200.0], "2:1 stays 2:1");
+        let kept = resized(r, 0, [90.0, 40.0], true);
+        assert_eq!([kept[2], kept[3]], [200.0, 150.0]);
+        assert!(((kept[2] - kept[0]) / (kept[3] - kept[1]) - 2.0).abs() < 1e-4);
+        let tiny = resized(r, 2, [0.0, 0.0], true);
+        assert!(tiny[2] - tiny[0] >= 8.0 && tiny[3] - tiny[1] >= 8.0);
+    }
+    #[test]
+    fn library_items_drop_onto_the_page_and_artwork_resizes_in_proportion() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        app.editor.mode = Mode::Annotate;
+        app.editor.tool = Tool::Select;
+        input(&mut app, &ctx, vec![]);
+        let cursor = |app: &mut Viewer, p: [f32; 2]| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 900.0))),
+                    events: vec![egui::Event::PointerMoved(pos2(p[0] + 50.0, p[1] + 50.0))],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        page_interaction(
+                            &mut app.editor,
+                            &mut app.tabs[0],
+                            ui,
+                            0,
+                            Rect::from_min_size(pos2(50.0, 50.0), vec2(612.0, 792.0)),
+                            1.0,
+                            &mut app.status,
+                        );
+                    });
+                },
+            )
+            .platform_output
+            .cursor_icon
+        };
+        let symbol = app
+            .editor
+            .builtins
+            .iter()
+            .find(|b| b.category == "Symbols")
+            .unwrap()
+            .asset
+            .clone();
+
+        // A card being dragged from the library carries its asset; releasing places it.
+        egui::DragAndDrop::set_payload(&ctx, symbol);
+        assert_eq!(cursor(&mut app, [300.0, 400.0]), egui::CursorIcon::Grabbing);
+        pointer(&mut app, &ctx, [300.0, 400.0], Some(false));
+        let annotations = &app.tabs[0].session.as_ref().unwrap().annotations;
+        assert_eq!(annotations.len(), 1, "{:?}", app.status);
+        let a = annotations[0].clone();
+        assert!(keeps_proportions(&a.kind), "{:?}", a.kind);
+        assert!(((a.rect[0] + a.rect[2]) / 2.0 - 300.0).abs() < 0.5);
+        assert!(((a.rect[1] + a.rect[3]) / 2.0 - 400.0).abs() < 0.5);
+        assert_eq!(app.tabs[0].selected_annotation.as_ref(), Some(&a.id));
+        assert!(!egui::DragAndDrop::has_any_payload(&ctx));
+
+        // Grab over the artwork, diagonal arrows on its corners.
+        assert_eq!(cursor(&mut app, [300.0, 400.0]), egui::CursorIcon::Grab);
+        assert_eq!(
+            cursor(&mut app, [a.rect[2], a.rect[3]]),
+            egui::CursorIcon::ResizeNwSe
+        );
+        assert_eq!(
+            cursor(&mut app, [a.rect[2], a.rect[1]]),
+            egui::CursorIcon::ResizeNeSw
+        );
+
+        // Dragging a corner sideways still scales both sides together.
+        let ratio = |r: Box2| (r[2] - r[0]) / (r[3] - r[1]);
+        pointer(&mut app, &ctx, [a.rect[2], a.rect[3]], Some(true));
+        pointer(&mut app, &ctx, [a.rect[2] + 40.0, a.rect[3] + 2.0], None);
+        pointer(&mut app, &ctx, [a.rect[2] + 80.0, a.rect[3] + 5.0], None);
+        pointer(
+            &mut app,
+            &ctx,
+            [a.rect[2] + 80.0, a.rect[3] + 5.0],
+            Some(false),
+        );
+        let b = app.tabs[0].session.as_ref().unwrap().annotations[0].rect;
+        assert!(b[2] - b[0] > a.rect[2] - a.rect[0] + 60.0, "{b:?}");
+        assert!(
+            (ratio(b) - ratio(a.rect)).abs() < 0.01,
+            "{b:?} vs {:?}",
+            a.rect
+        );
+        assert_eq!([b[0], b[1]], [a.rect[0], a.rect[1]]);
+
+        // The top-left handle keeps the bottom-right corner in place.
+        pointer(&mut app, &ctx, [b[0], b[1]], Some(true));
+        pointer(&mut app, &ctx, [b[0] - 15.0, b[1] - 20.0], None);
+        pointer(&mut app, &ctx, [b[0] - 30.0, b[1] - 30.0], None);
+        pointer(&mut app, &ctx, [b[0] - 30.0, b[1] - 30.0], Some(false));
+        let c = app.tabs[0].session.as_ref().unwrap().annotations[0].rect;
+        assert!(c[0] < b[0] && c[1] < b[1], "{c:?}");
+        assert!((c[2] - b[2]).abs() < 0.01 && (c[3] - b[3]).abs() < 0.01);
+        assert!((ratio(c) - ratio(a.rect)).abs() < 0.01);
     }
     #[test]
     fn vertex_tools_commit_once_cancel_and_survive_save() {
