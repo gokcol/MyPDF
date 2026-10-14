@@ -21,6 +21,8 @@ struct BlockDraft {
     selection: text_block::Selection,
     masks: Vec<[f32; 4]>,
     font: usize,
+    /// Font, size, color and right edge when the block opened.
+    initial: (usize, f32, [f32; 3], f32),
 }
 #[derive(Clone)]
 struct InlineText {
@@ -33,6 +35,15 @@ struct InlineText {
     color: [f32; 3],
     font: String,
     focus: bool,
+}
+impl InlineText {
+    /// Whether committing would change the document. An untouched block is
+    /// closed as it is rather than rewritten with uniform formatting.
+    fn changed(&self) -> bool {
+        self.text != self.original
+            || matches!(&self.target, InlineTarget::Block(b)
+                if (b.font, self.size, self.color, self.rect[2]) != b.initial)
+    }
 }
 
 struct Inspection {
@@ -119,6 +130,15 @@ pub(super) struct ContentState {
     format: Format,
     range: String,
     dpi: f32,
+    erased: Option<Erased>,
+}
+/// The page rendered without the words an open block replaces, so the editor
+/// hides only those words and keeps backgrounds, lines and boxes around them.
+struct Erased {
+    key: Key,
+    masks: Vec<[f32; 4]>,
+    rx: Option<mpsc::Receiver<Option<egui::ColorImage>>>,
+    texture: Option<TextureHandle>,
 }
 impl ContentState {
     fn text_font(&self, size: f32) -> FontId {
@@ -200,6 +220,10 @@ impl ContentState {
         }
     }
     #[cfg(test)]
+    pub(super) fn erased_ready(&self) -> bool {
+        self.erased.as_ref().is_some_and(|e| e.rx.is_none())
+    }
+    #[cfg(test)]
     pub(super) fn text_preview(&mut self, id: u64) {
         self.add_target = Some((id, 0));
         self.new_placed = true;
@@ -210,6 +234,13 @@ impl ContentState {
             .position(|f| f.bold && !f.italic)
             .unwrap_or(0);
         self.new_size = 22.;
+    }
+    /// A click away from the open text editor: keep changes, or close an
+    /// untouched selection without rewriting anything.
+    pub(super) fn click_outside(&mut self, tab: u64) {
+        if !self.busy && self.existing.as_ref().is_some_and(|e| e.key.0 == tab) {
+            self.new_commit = true;
+        }
     }
     pub(super) fn pending_text(&self) -> Option<u64> {
         if let Some(text) = &self.existing {
@@ -264,6 +295,7 @@ impl ContentState {
             format: Format::Png,
             range: "1".into(),
             dpi: 144.,
+            erased: None,
         }
     }
 }
@@ -1090,7 +1122,7 @@ impl Viewer {
             ));
             return;
         }
-        if draft.text != draft.original || matches!(draft.target, InlineTarget::Block(_)) {
+        if draft.changed() {
             match draft.target {
                 InlineTarget::Block(block) => {
                     let previous = self.active;
@@ -1243,7 +1275,7 @@ impl Viewer {
                 } else {
                     ui.label(RichText::new(if self.content.area_mode { "Drag a rectangle around the text you want to edit together." } else { "Click text on the page to edit it." }).size(15.).color(theme::ink()));
                     ui.add_space(12.);
-                    ui.label(RichText::new(if self.content.area_mode { "Included text highlights as you drag. Release to open a multiline text area. Esc cancels." } else { "Use Select area to edit several lines together, or Add text for a new block." }).color(theme::muted()));
+                    ui.label(RichText::new(if self.content.area_mode { "Included text highlights as you drag. Release to open a multiline text area. Esc cancels." } else { "Drag across the page, or use Select area, to edit several lines together. Add text starts a new block." }).color(theme::muted()));
                     if let Some(hint) = &self.content.selection_hint { ui.add_space(12.); ui.label(RichText::new(hint).color(theme::muted())); }
                     if self.content.loading { ui.add_space(12.); ui.spinner(); }
                     if let Some(info) = &self.content.inspection && let Err(e) = &info.text {
@@ -1363,6 +1395,7 @@ fn selected_block(
             selection,
             masks,
             font,
+            initial: (font, size, first.color, right),
         }),
         original: text.clone(),
         text,
@@ -1372,6 +1405,63 @@ fn selected_block(
         font: first.font,
         focus: true,
     })
+}
+
+/// Start or finish rendering the page without a block's words; the texture once ready.
+fn erased_page(
+    erased: &mut Option<Erased>,
+    key: Key,
+    block: &BlockDraft,
+    session: &mypdf_milestone0::annotations::Session,
+    ui: &egui::Ui,
+    scale: f32,
+) -> Option<egui::TextureId> {
+    if erased
+        .as_ref()
+        .is_none_or(|e| e.key != key || e.masks != block.masks)
+    {
+        let (tx, rx) = mpsc::channel();
+        let source = session.source.clone();
+        let selection = block.selection.clone();
+        let scale = scale * ui.ctx().pixels_per_point();
+        let wake = ui.ctx().clone();
+        std::thread::spawn(move || {
+            let image = std::panic::catch_unwind(|| {
+                let replacement = text_block::Replacement {
+                    selection,
+                    text: String::new(),
+                    rect: [0., 0., 1., 1.],
+                    size: 12.,
+                    color: [0.; 3],
+                    format: TextFormat::default(),
+                };
+                let bytes = text_block::replace(&source, key.2 as u32 + 1, &replacement).ok()?;
+                let (size, rgba) = viewer::render_page(&bytes, key.2, scale).ok()?;
+                Some(egui::ColorImage::from_rgba_premultiplied(size, &rgba))
+            })
+            .ok()
+            .flatten();
+            let _ = tx.send(image);
+            wake.request_repaint();
+        });
+        *erased = Some(Erased {
+            key,
+            masks: block.masks.clone(),
+            rx: Some(rx),
+            texture: None,
+        });
+    }
+    let e = erased.as_mut()?;
+    if let Some(rx) = &e.rx
+        && let Ok(image) = rx.try_recv()
+    {
+        e.rx = None;
+        e.texture = image.map(|image| {
+            ui.ctx()
+                .load_texture("erased_block_page", image, egui::TextureOptions::LINEAR)
+        });
+    }
+    e.texture.as_ref().map(TextureHandle::id)
 }
 
 fn existing_overlay(
@@ -1428,34 +1518,43 @@ fn existing_overlay(
             });
         }
     }
-    let selecting = state.area_mode && state.existing.is_none();
+    // Dragging across the page selects an area, with or without Select area.
     let background = ui.interact(
         page_rect,
         egui::Id::new((tab.id, page, "text_page_background")),
-        if selecting {
-            egui::Sense::click_and_drag()
-        } else {
-            egui::Sense::click()
-        },
+        egui::Sense::click_and_drag(),
     );
+    if background.drag_started()
+        && !state.busy
+        && !state.loading
+        && state.marquee.is_none()
+        && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+    {
+        if state
+            .existing
+            .as_ref()
+            .is_some_and(|e| e.key.0 == tab.id && e.changed())
+        {
+            state.new_commit = true;
+        } else {
+            state.existing = None;
+            state.next_existing = None;
+            state.marquee = Some((key, origin));
+            state.selection_hint = None;
+        }
+    }
+    let selecting = state.marquee.is_some_and(|(k, _)| k == key)
+        || (state.area_mode && state.existing.is_none());
     let painter = ui
         .painter()
         .with_clip_rect(page_rect.intersect(ui.clip_rect()));
     if selecting {
-        if background.hovered() {
+        if background.hovered() && state.area_mode {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         }
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             state.marquee = None;
             return;
-        }
-        if background.drag_started()
-            && !state.busy
-            && !state.loading
-            && let Some(origin) = ui.input(|i| i.pointer.press_origin())
-        {
-            state.marquee = Some((key, origin));
-            state.selection_hint = None;
         }
         if let Some((start_key, start)) = state.marquee
             && start_key == key
@@ -1559,14 +1658,8 @@ fn existing_overlay(
         } else {
             state.existing = Some(draft);
         }
-    } else if background.clicked()
-        && state
-            .existing
-            .as_ref()
-            .is_some_and(|e| e.key.0 == tab.id && e.key.2 == page)
-        && !state.busy
-    {
-        state.new_commit = true;
+    } else if background.clicked() {
+        state.click_outside(tab.id);
     }
     let Some(draft) = state
         .existing
@@ -1628,11 +1721,40 @@ fn existing_overlay(
     );
     // Hide only the words being replaced; the page around them stays visible.
     if let InlineTarget::Block(block) = &draft.target {
+        let erased = erased_page(
+            &mut state.erased,
+            draft.key,
+            block,
+            session,
+            ui,
+            page_rect.width() / tab.pages[page].width,
+        );
         for mask in &block.masks {
-            painter.rect_filled(screen(*mask).expand(2.), 0., Color32::WHITE);
+            let r = screen(*mask).expand(2.);
+            match erased {
+                Some(texture) => {
+                    let uv = Rect::from_min_max(
+                        pos2(
+                            (r.min.x - page_rect.min.x) / page_rect.width(),
+                            (r.min.y - page_rect.min.y) / page_rect.height(),
+                        ),
+                        pos2(
+                            (r.max.x - page_rect.min.x) / page_rect.width(),
+                            (r.max.y - page_rect.min.y) / page_rect.height(),
+                        ),
+                    );
+                    painter.image(texture, r, uv, Color32::WHITE);
+                }
+                // Until the clean page is ready, and if it cannot be made.
+                None => {
+                    painter.rect_filled(r, 0., Color32::WHITE);
+                }
+            }
         }
     }
-    painter.rect_filled(original.expand(1.5), 0., Color32::WHITE);
+    if !block {
+        painter.rect_filled(original.expand(1.5), 0., Color32::WHITE);
+    }
     let outline = rect.expand2(vec2(5., 3.));
     ui::dashed_rect(&painter, outline, theme::accent());
     if !block {
@@ -2151,6 +2273,171 @@ mod tests {
         assert!(!text.contains("First line") && !text.contains("Second line"));
         app.editor_undo(false);
         assert_eq!(&*app.tabs[0].session.as_ref().unwrap().source, &source);
+    }
+    #[test]
+    fn dragging_empty_space_selects_an_area_and_outside_clicks_close_it_untouched() {
+        use eframe::App;
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        let source = content::add_text(
+            &convert::blank(595., 842.).unwrap(),
+            1,
+            "First line\nSecond line",
+            [50., 70., 400., 100.],
+            18.,
+            [0.; 3],
+        )
+        .unwrap();
+        app.open_memory(PathBuf::from("Area.pdf"), source.clone(), &ctx);
+        app.editor.mode = editing::Mode::Edit;
+        assert!(!app.content.area_mode, "no Select area tool needed");
+        let run = |app: &mut Viewer, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1200., 820.))),
+                    max_texture_side: Some(8192),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+            )
+        };
+        let frame = |app: &mut Viewer, events| {
+            let _ = run(app, events);
+        };
+        let wait =
+            |app: &mut Viewer| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                for _ in 0..3 {
+                    frame(app, vec![]);
+                }
+                while app.content.loading
+                    || app.content.busy
+                    || !app.content.inspection.as_ref().is_some_and(|i| {
+                        i.key.1 == app.tabs[0].session.as_ref().unwrap().revision()
+                    })
+                {
+                    assert!(std::time::Instant::now() < deadline, "{:?}", app.status);
+                    frame(app, vec![]);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                for _ in 0..3 {
+                    frame(app, vec![]);
+                }
+            };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let drag = |app: &mut Viewer, start, end| {
+            frame(
+                app,
+                vec![egui::Event::PointerMoved(start), button(start, true)],
+            );
+            frame(app, vec![egui::Event::PointerMoved(end)]);
+            frame(
+                app,
+                vec![egui::Event::PointerMoved(end), button(end, false)],
+            );
+            for _ in 0..3 {
+                frame(app, vec![]);
+            }
+        };
+        let click = |app: &mut Viewer, at| {
+            frame(app, vec![egui::Event::PointerMoved(at), button(at, true)]);
+            frame(app, vec![button(at, false)]);
+            for _ in 0..3 {
+                frame(app, vec![]);
+            }
+        };
+        wait(&mut app);
+        let id = app.tabs[0].id;
+        let page = ctx
+            .read_response(egui::Id::new((id, 0_usize, "text_page_background")))
+            .unwrap()
+            .rect;
+        let scale = page.width() / 595.;
+        let start = page.min + vec2(40., 60.) * scale;
+        let end = page.min + vec2(420., 160.) * scale;
+        drag(&mut app, start, end);
+        let block = app
+            .content
+            .existing
+            .as_ref()
+            .expect("dragging opens a block");
+        assert!(matches!(&block.target, InlineTarget::Block(b) if b.selection.runs.len() == 2));
+        let area = Rect::from_min_max(
+            page.min + vec2(block.rect[0], block.rect[1]) * scale,
+            page.min + vec2(block.rect[2], block.rect[3]) * scale,
+        );
+
+        // Only the replaced words are masked; lines, boxes and images around them stay.
+        fn white_rects(shape: &egui::Shape, out: &mut Vec<Rect>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| white_rects(s, out)),
+                egui::Shape::Rect(r) if r.fill == Color32::WHITE => out.push(r.rect),
+                _ => {}
+            }
+        }
+        let mut masks = vec![];
+        for clipped in run(&mut app, vec![]).shapes {
+            white_rects(&clipped.shape, &mut masks);
+        }
+        // The page's own paper is white, too.
+        masks.retain(|m| !m.contains_rect(page.shrink(1.)));
+        assert!(
+            !masks
+                .iter()
+                .any(|m| m.intersect(area).area() > area.area() * 0.6),
+            "the block area is not painted over: {masks:?} vs {area:?}"
+        );
+
+        // A click on the gray surround or on empty page space closes an untouched block.
+        click(&mut app, page.min + vec2(-16., 300.));
+        assert!(app.content.existing.is_none());
+        drag(&mut app, start, end);
+        assert!(app.content.existing.is_some());
+        click(&mut app, page.min + vec2(300., 420.) * scale);
+        wait(&mut app);
+        assert!(app.content.existing.is_none());
+        assert_eq!(
+            &*app.tabs[0].session.as_ref().unwrap().source,
+            &source,
+            "nothing rewritten"
+        );
+
+        // Typed changes are kept when clicking outside.
+        drag(&mut app, start, end);
+        frame(
+            &mut app,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+                egui::Event::Text("Rewritten block".into()),
+            ],
+        );
+        click(&mut app, page.min + vec2(300., 420.) * scale);
+        wait(&mut app);
+        assert!(app.content.existing.is_none(), "{:?}", app.status);
+        let bytes = app.tabs[0]
+            .session
+            .as_ref()
+            .unwrap()
+            .snapshot_bytes()
+            .unwrap();
+        let text =
+            String::from_utf8(convert::export_text(&bytes, &[0], Format::Text).unwrap()).unwrap();
+        assert!(
+            text.contains("Rewritten block") && !text.contains("First line"),
+            "{text}"
+        );
     }
     #[test]
     fn existing_text_and_text_annotations_edit_in_place_and_cancel_safely() {

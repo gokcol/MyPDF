@@ -541,6 +541,33 @@ pub fn raster_key(page: usize, size: PageSize, desired: f32, thumbnail: bool) ->
     }
 }
 
+/// Render one displayed page to premultiplied RGBA, outside any worker.
+pub fn render_page(bytes: &[u8], page: usize, scale: f32) -> Result<([usize; 2], Vec<u8>)> {
+    let pdf =
+        Pdf::new(bytes.to_vec()).map_err(|e| anyhow::anyhow!("Could not read this PDF ({e:?})"))?;
+    let page = pdf.pages().get(page).context("Page not found")?;
+    let (width, height) = page.render_dimensions();
+    let scale = scale
+        .min((MAX_RASTER_PIXELS / (width * height)).sqrt())
+        .min(8192.0 / width.max(height))
+        .max(0.001);
+    let raster = hayro::render(
+        page,
+        &hayro::RenderCache::new(),
+        &interpret::InterpreterSettings::default(),
+        &hayro::RenderSettings::default(),
+        &hayro::PixmapSettings {
+            x_scale: scale,
+            y_scale: scale,
+            bg_color: hayro::vello_cpu::color::palette::css::WHITE,
+        },
+    );
+    Ok((
+        [raster.width() as usize, raster.height() as usize],
+        raster.data_as_u8_slice().to_vec(),
+    ))
+}
+
 /// Exact original bytes, atomically published to a fresh path. Existing files are never replaced.
 pub fn save_copy(destination: &Path, bytes: &[u8]) -> Result<()> {
     crate::write_new(destination, bytes)

@@ -1424,6 +1424,10 @@ impl Viewer {
                         tab.group.clear();
                         self.editor.draft = None;
                     }
+                    // In Edit, a click on the gray surround ends the open text editor too.
+                    if canvas_response.clicked() && self.editor.mode == editing::Mode::Edit {
+                        self.content.click_outside(tab.id);
+                    }
                     let center = viewport.center().y;
                     for (page, size) in tab.pages.iter().copied().enumerate() {
                         let top = tops[page];
