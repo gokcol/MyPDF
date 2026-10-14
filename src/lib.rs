@@ -13,6 +13,7 @@ pub mod pages;
 pub mod pdf_font;
 pub mod proof;
 pub mod recovery;
+pub mod redact;
 pub mod signature_edit;
 pub mod signing;
 pub mod stroke;

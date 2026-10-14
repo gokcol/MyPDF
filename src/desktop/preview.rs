@@ -192,6 +192,8 @@ fn native_visual_preview() {
         "QuickPrompt",
         "QuickSign",
         "HeaderFooter",
+        "Redact",
+        "Flatten",
         "Signatures",
     ] {
         if let Ok(only) = std::env::var("MYPDF_PREVIEW_ONLY")
@@ -367,6 +369,15 @@ fn native_visual_preview() {
         if collection == "QuickSign" {
             app.digital.preview_identities(digital::Panel::Sign);
             app.quick_sign();
+        }
+        if collection == "Redact" {
+            app.start_redaction();
+            app.preview_redaction();
+        }
+        if collection == "Flatten" {
+            app.redaction.active = false;
+            app.editor.mode = editing::Mode::Convert;
+            app.request_flatten();
         }
         if collection == "HeaderFooter" {
             app.editor.mode = editing::Mode::Edit;

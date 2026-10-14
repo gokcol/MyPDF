@@ -339,6 +339,7 @@ pub(super) enum Icon {
     Info,
     HeaderFooter,
     History,
+    Redact,
 }
 
 pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -400,6 +401,11 @@ pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: 
             line(&[[0.3, 0.45], [0.7, 0.45]]);
             line(&[[0.3, 0.57], [0.58, 0.57]]);
             fill_box([0.3, 0.73], [0.7, 0.83], 0.02, color);
+        }
+        Icon::Redact => {
+            line(&[[0.12, 0.26], [0.88, 0.26]]);
+            fill_box([0.1, 0.42], [0.9, 0.62], 0.03, color);
+            line(&[[0.12, 0.78], [0.62, 0.78]]);
         }
         Icon::History => {
             line(&arc([0.5, 0.52], 0.36, 0., 360.));
