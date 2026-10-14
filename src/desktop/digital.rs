@@ -866,6 +866,13 @@ impl Viewer {
         if self.digital.open && self.digital.panel == Panel::Appearance {
             self.preview_appearance(ctx);
         }
+        if self.editor.tool == editing::Tool::SignArea
+            && !self.digital.quick
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.editor.select_tool(editing::Tool::Select);
+            self.status = None;
+        }
         if self.digital.quick {
             let cancel = ctx.input(|i| i.key_pressed(egui::Key::Escape));
             if cancel
@@ -900,6 +907,7 @@ impl Viewer {
             } else {
                 self.digital.open = true;
                 self.digital.panel = Panel::Sign;
+                self.status = None;
             }
         }
     }
@@ -1914,10 +1922,11 @@ impl Viewer {
         });
     }
     /// Quick Sign: check the default ID and document, then wait for a box on the page.
-    pub(super) fn quick_sign(&mut self) {
+    /// Why the active document cannot be signed here, if it cannot.
+    fn signing_problem(&mut self) -> bool {
         let Some(tab) = self.tabs.get(self.active).filter(|t| t.bytes.is_some()) else {
             self.status = Some(("Open a PDF to sign it.".into(), false));
-            return;
+            return true;
         };
         let problem = match &tab.capabilities {
             Some(c) if c.certified => Some(
@@ -1932,8 +1941,35 @@ impl Viewer {
         };
         if let Some(problem) = problem {
             self.status = Some((problem.into(), true));
+        }
+        problem.is_some()
+    }
+    /// Digital Signature: first pick the area on the page, then choose the ID and details.
+    pub(super) fn sign_in_area(&mut self) {
+        if self.signing_problem() || !self.apply_pending_annotation() {
             return;
         }
+        let tab = &self.tabs[self.active];
+        self.digital.use_document(Some(tab));
+        self.digital.document = Some(tab.id);
+        self.digital.prepare = tab
+            .capabilities
+            .as_ref()
+            .is_some_and(|c| c.needs_signing_preparation);
+        self.digital.open = false;
+        self.digital.quick = false;
+        self.editor.mode = editing::Mode::Sign;
+        self.editor.start_signature_rectangle();
+        self.status = Some((
+            "Drag a box where the signature goes, or click to place it · Esc cancels".into(),
+            false,
+        ));
+    }
+    pub(super) fn quick_sign(&mut self) {
+        if self.signing_problem() {
+            return;
+        }
+        let tab = &self.tabs[self.active];
         let prepare = tab
             .capabilities
             .as_ref()
@@ -2859,6 +2895,75 @@ mod tests {
                 .unwrap()
                 .contains("Store locked")
         );
+    }
+    #[test]
+    fn digital_signature_asks_for_the_area_before_the_signing_window() {
+        use eframe::App;
+        let temp = tempfile::tempdir().unwrap();
+        let pdf = temp.path().join("Area.pdf");
+        let font = mypdf_milestone0::document::default_font().unwrap();
+        std::fs::write(&pdf, mypdf_milestone0::document::fixture(&font).unwrap()).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(
+            &eframe::CreationContext::_new_kittest(ctx.clone()),
+            vec![pdf],
+        );
+        app.digital = DigitalState::at(temp.path().join("profile"));
+        let frame = |app: &mut Viewer, events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1100., 760.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+            );
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while app.tabs[0].capabilities.is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            frame(&mut app, vec![]);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        app.sign_in_area();
+        assert!(app.editor.tool == editing::Tool::SignArea && !app.digital.open);
+        frame(&mut app, vec![escape]);
+        assert!(app.editor.tool != editing::Tool::SignArea, "Esc cancels");
+
+        app.sign_in_area();
+        for _ in 0..3 {
+            frame(&mut app, vec![]);
+        }
+        let page = ctx
+            .read_response(egui::Id::new((app.tabs[0].id, 0_usize, "page_actions")))
+            .unwrap()
+            .rect;
+        let at = page.min + vec2(300., 300.) * app.tabs[0].scale;
+        for pressed in [true, false] {
+            frame(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(app.digital.open && app.digital.panel == Panel::Sign);
+        assert!(!app.digital.quick && app.digital.visible);
+        let r = app.digital.request.rect.expect("the area is filled in");
+        assert!(((r[0] + r[2]) / 2. - 300.).abs() < 0.5 && ((r[1] + r[3]) / 2. - 300.).abs() < 0.5);
     }
     #[test]
     fn quick_sign_places_a_box_and_saves_a_verified_copy_beside_the_original() {

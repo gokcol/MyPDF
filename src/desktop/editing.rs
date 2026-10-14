@@ -1421,7 +1421,7 @@ impl Viewer {
                 }
                 if ui
                     .add(ActionButton::new(Icon::Shield, "Digital Signature"))
-                    .on_hover_text("Sign with a certificate from .p12/.pfx or macOS Keychain")
+                    .on_hover_text("Pick the area on the page, then sign with a certificate from .p12/.pfx or macOS Keychain")
                     .clicked()
                 {
                     action = Some(true);
@@ -1438,8 +1438,7 @@ impl Viewer {
             self.inspector = true;
             if digital {
                 self.editor.signature_open = false;
-                self.editor.mode = Mode::Sign;
-                self.action("sign", ui.ctx());
+                self.sign_in_area();
             } else {
                 self.digital.open = false;
                 self.editor.mode = Mode::Annotate;
