@@ -1537,9 +1537,7 @@ impl Viewer {
         let response = ui.add(button);
         let mut action = None;
         let mut quick = false;
-        egui::Popup::menu(&response)
-            .style(|s: &mut egui::Style| s.visuals = egui::Visuals::light())
-            .show(|ui| {
+        egui::Popup::menu(&response).show(|ui| {
                 ui.set_min_width(205.);
                 if ui
                     .add(ActionButton::new(Icon::Sign, "Quick Sign"))

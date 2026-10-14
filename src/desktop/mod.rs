@@ -2146,6 +2146,114 @@ mod tests {
     }
 
     #[test]
+    fn sign_menu_items_are_readable_in_both_themes() {
+        // WCAG contrast between two colors.
+        fn contrast(a: Color32, b: Color32) -> f32 {
+            let luminance = |c: Color32| {
+                let ch = |v: u8| {
+                    let v = v as f32 / 255.;
+                    if v <= 0.03928 {
+                        v / 12.92
+                    } else {
+                        ((v + 0.055) / 1.055).powf(2.4)
+                    }
+                };
+                0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+            };
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        }
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+            ctx.set_theme(theme);
+            app.new_blank(&ctx);
+            until(&mut app, &ctx, |a| a.tabs[0].session.is_some());
+            app.editor.mode = editing::Mode::Edit;
+            let run = |app: &mut Viewer, events: Vec<egui::Event>| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1200., 760.))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+                )
+            };
+            let output = run(&mut app, vec![]);
+            let sign = output
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .into_iter()
+                .find(|(_, n)| n.label() == Some("Sign"))
+                .and_then(|(_, n)| n.bounds())
+                .expect("the Sign menu button");
+            let at = pos2(
+                ((sign.x0 + sign.x1) / 2.) as f32,
+                ((sign.y0 + sign.y1) / 2.) as f32,
+            );
+            for pressed in [true, false] {
+                run(
+                    &mut app,
+                    vec![
+                        egui::Event::PointerMoved(at),
+                        egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            // Let the menu finish fading in.
+            for _ in 0..30 {
+                run(&mut app, vec![]);
+            }
+            let shapes = run(&mut app, vec![]).shapes;
+            for label in ["Quick Sign", "Signature", "Digital Signature"] {
+                let (index, text) = shapes
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, s)| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.text() == label => Some((i, t.clone())),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("{label} is in the open menu ({theme:?})"));
+                let color = text.override_text_color.unwrap_or_else(|| {
+                    text.galley
+                        .job
+                        .sections
+                        .first()
+                        .map_or(text.fallback_color, |s| s.format.color)
+                });
+                let area = text.visual_bounding_rect();
+                // The surface right under the label: the last opaque fill drawn before it.
+                fn fill(shape: &egui::Shape, area: Rect) -> Option<Color32> {
+                    match shape {
+                        egui::Shape::Vec(shapes) => shapes.iter().rev().find_map(|s| fill(s, area)),
+                        egui::Shape::Rect(r) if r.fill.a() == 255 && r.rect.contains_rect(area) => {
+                            Some(r.fill)
+                        }
+                        _ => None,
+                    }
+                }
+                let background = shapes[..index]
+                    .iter()
+                    .rev()
+                    .find_map(|s| fill(&s.shape, area))
+                    .expect("the menu background");
+                assert!(
+                    contrast(color, background) >= 4.5,
+                    "{label} in {theme:?}: {color:?} on {background:?}"
+                );
+            }
+        }
+    }
+    #[test]
     fn sign_ribbon_menu_routes_visual_and_certificate_signatures() {
         for (main_ribbon, digital) in [(true, false), (true, true), (false, false), (false, true)] {
             let ctx = egui::Context::default();
