@@ -191,6 +191,7 @@ fn native_visual_preview() {
         "SignDocument",
         "QuickPrompt",
         "QuickSign",
+        "HeaderFooter",
         "Signatures",
     ] {
         if let Ok(only) = std::env::var("MYPDF_PREVIEW_ONLY")
@@ -366,6 +367,10 @@ fn native_visual_preview() {
         if collection == "QuickSign" {
             app.digital.preview_identities(digital::Panel::Sign);
             app.quick_sign();
+        }
+        if collection == "HeaderFooter" {
+            app.editor.mode = editing::Mode::Edit;
+            app.preview_header_footer();
         }
         // The last scene swaps in a signed copy of the document.
         if collection == "Signatures" {
