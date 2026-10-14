@@ -19,6 +19,9 @@ pub struct SignatureEvidence {
     pub byte_range_valid: bool,
     pub covers_current_file: bool,
     pub trusted: bool,
+    /// Who vouches for the signer: "your trusted certificates", "macOS" or
+    /// "Windows". None when the signer is not trusted.
+    pub trusted_by: Option<String>,
     pub certificate_validity: String,
     pub claimed_signing_time: Option<String>,
     pub revocation: String,
@@ -51,7 +54,24 @@ pub fn verify_trusting(bytes: &[u8], trusted: &[&[u8]]) -> Result<Vec<SignatureE
     Ok(report
         .signatures
         .iter()
-        .map(|s| SignatureEvidence {
+        .map(|s| {
+            // The operating system's trust: its roots and the user's trust settings.
+            let chain: Vec<Vec<u8>> = s
+                .signer_cert_der
+                .iter()
+                .chain(&s.chain_certs_der)
+                .cloned()
+                .collect();
+            let trusted_by = if s.chain_trusted {
+                Some("your trusted certificates".to_owned())
+            } else if s.signer_cert_der.is_some() && crate::trust::system_trusts(&chain) {
+                crate::trust::system_name().map(str::to_owned)
+            } else {
+                None
+            };
+            (s, trusted_by)
+        })
+        .map(|(s, trusted_by)| SignatureEvidence {
             field: s.field_name.clone(),
             signer: s
                 .signer_cert_der
@@ -62,7 +82,8 @@ pub fn verify_trusting(bytes: &[u8], trusted: &[&[u8]]) -> Result<Vec<SignatureE
             digest_matches: s.digest_matches,
             byte_range_valid: s.integrity_ok,
             covers_current_file: s.covers_whole_document,
-            trusted: s.chain_trusted,
+            trusted: trusted_by.is_some(),
+            trusted_by,
             certificate_validity: format!("{:?}", s.certificate_validity),
             claimed_signing_time: s.signing_time.clone(),
             revocation: "not checked (offline validation)".into(),

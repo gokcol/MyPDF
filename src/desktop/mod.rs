@@ -290,8 +290,6 @@ pub struct Viewer {
     exit_approved: bool,
     _native_menu: Option<menu::NativeMenu>,
     menu_events: mpsc::Receiver<String>,
-    /// Certificates trusted until the app quits.
-    trusted: Vec<Vec<u8>>,
     signature_prompt: Option<signatures::Prompt>,
     signature_busy: bool,
     signature_tx: mpsc::Sender<signatures::SignatureJob>,
@@ -331,7 +329,6 @@ impl Viewer {
             exit_approved: false,
             _native_menu: native_menu,
             menu_events,
-            trusted: vec![],
             signature_prompt: None,
             signature_busy: false,
             signature_tx,

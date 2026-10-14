@@ -21,10 +21,13 @@ pub mod svg;
 pub mod text_block;
 pub mod text_geometry;
 pub mod text_style;
+pub mod trust;
 pub mod unicode_text;
 pub mod viewer;
 #[cfg(target_os = "windows")]
 pub mod windows_store;
+#[cfg(target_os = "windows")]
+pub mod windows_trust;
 
 use anyhow::{Context, Result};
 use std::io::Write;
