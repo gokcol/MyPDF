@@ -1,0 +1,4 @@
+# MyPDF.exe carries the Microsoft C runtime inside, so it starts on any
+# Windows 10 or 11 PC without the Visual C++ Redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
