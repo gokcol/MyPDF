@@ -6,7 +6,7 @@ Version 0.6.0 adds a Home workspace, local autosave and crash recovery, icon-led
 - **Edit:** type directly on blank or existing pages; click existing text to edit it in place; drag a rectangular selection to reflow several lines together; replace, reposition, resize and delete existing page-level images.
 - **Forms:** build forms with text, check box, radio, dropdown, list box, button, image, date and signature fields; detect fields on paper-style forms; fill, clear, flatten, set tab order, and import or export data as FDF, XFDF or CSV.
 - **Export:** PNG/JPEG ↔ PDF; PDF ↔ Markdown, text and Word `.docx` using text-oriented conversion.
-- **Everyday:** print, an outline sidebar, clickable links, password-protected PDFs, and reducing file size.
+- **Everyday:** print, an outline sidebar, clickable links, password-protected PDFs, reducing file size, recognizing the text of scans (OCR), and watermarks.
 - **SVG:** Annotate → Saved → SVG code; paste code, preview, save and place. Select placed artwork to move, resize, rotate, recolor or edit its SVG source.
 - **Blank PDF:** File → New Blank PDF (⌘N/Ctrl+N). **Blank page:** Pages → Blank Page.
 
@@ -123,6 +123,10 @@ These are also in **Edit PDF → Form**. Fields are standard AcroForm fields wit
 **Password-protected PDFs** ask for their password when opened (a wrong one is simply asked again); a **Protected** label shows in the footer, and every copy you save keeps the password. **File → Protect with Password…** saves a copy that opens only with a password you choose (AES-256, the strongest PDF protection; anyone with the password can print, copy and edit). **File → Remove Password…** saves a copy that opens without one; the original keeps its password. Signed PDFs are not protected here, since that would break their signatures. Protected documents are never written to autosave, so their content is not stored unprotected.
 
 **Reduce File Size…** — File menu or the Export panel — offers *High quality* (pictures at about 200 dpi, for printing), *Balanced* (about 150 dpi, for screens and email) and *Smallest file* (about 100 dpi). Photos and scans are scaled down and stored as JPEG only where that makes them clearly smaller; text, drawings and transparency masks are untouched, uncompressed data is compressed and unused objects are dropped. The status bar shows the size before and after, and Undo restores the original.
+
+**Recognize Text…** (Edit PDF menu, the Export panel, or the button under an empty search) makes scanned pages searchable. MyPDF asks first, then reads each page that has no text of its own with the text recognition built into macOS, on this Mac; nothing is uploaded. It prefers Turkish and the main European languages. The words become an invisible layer over the picture, so search, selection and copy work while the page looks the same; the status bar counts pages as they are read. Pages that already have text are left alone. Recognition needs macOS.
+
+**Watermark…** (Edit ribbon next to Header & Footer, or Edit PDF menu) puts text such as *CONFIDENTIAL*, *DRAFT* or *COPY*, or a PNG/JPEG picture, across the middle of each page. Choose the colour, a size that fits the page or a fixed one, the opacity, the angle (45°, 0°, 90°, −45° or any other), in front of or behind the page, and all pages or a range; the page preview shows the result. Text watermarks use any script and stay searchable. **Remove watermarks** in the same dialog takes off every watermark MyPDF added, even after later edits, leaving headers and footers alone.
 
 **Header & Footer** (Edit ribbon, or **Edit PDF → Header and Footer** in the menu bar) adds real, selectable text to the page margins:
 - **Add Page Numbers…** offers the formats *1*, *Page 1*, *Page 1 of n*, *1 of n*, *1/n* and *- 1 -*, with a start number.

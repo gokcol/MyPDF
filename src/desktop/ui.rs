@@ -351,6 +351,8 @@ pub(super) enum Icon {
     TabOrder,
     Flatten,
     Print,
+    Watermark,
+    Ocr,
 }
 
 pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -474,6 +476,29 @@ pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: 
             line(&[[0.72, 0.2], [0.84, 0.3], [0.72, 0.4]]);
             line(&[[0.12, 0.7], [0.84, 0.7]]);
             line(&[[0.72, 0.6], [0.84, 0.7], [0.72, 0.8]]);
+        }
+        Icon::Watermark => {
+            box_at([0.14, 0.08], [0.86, 0.92], 0.08);
+            line(&[
+                [0.26, 0.66],
+                [0.36, 0.34],
+                [0.5, 0.54],
+                [0.64, 0.34],
+                [0.74, 0.66],
+            ]);
+        }
+        Icon::Ocr => {
+            for (a, b, c) in [
+                ([0.1, 0.3], [0.1, 0.1], [0.3, 0.1]),
+                ([0.7, 0.1], [0.9, 0.1], [0.9, 0.3]),
+                ([0.9, 0.7], [0.9, 0.9], [0.7, 0.9]),
+                ([0.3, 0.9], [0.1, 0.9], [0.1, 0.7]),
+            ] {
+                line(&[a, b, c]);
+            }
+            line(&[[0.3, 0.38], [0.7, 0.38]]);
+            line(&[[0.3, 0.52], [0.7, 0.52]]);
+            line(&[[0.3, 0.66], [0.56, 0.66]]);
         }
         Icon::Print => {
             line(&[[0.28, 0.36], [0.28, 0.1], [0.72, 0.1], [0.72, 0.36]]);
@@ -1232,7 +1257,12 @@ pub(super) fn segmented(ui: &mut egui::Ui, options: &[&str], selected: usize) ->
             track.min + vec2(3. + i as f32 * width, 3.),
             vec2(width, track.height() - 6.),
         );
-        let response = ui.interact(r, ui.id().with(("segment", i)), egui::Sense::click());
+        // Several controls can share a panel; their labels tell them apart.
+        let response = ui.interact(
+            r,
+            ui.id().with(("segment", options, i)),
+            egui::Sense::click(),
+        );
         response.widget_info(|| {
             egui::WidgetInfo::selected(egui::WidgetType::Button, true, i == selected, *label)
         });

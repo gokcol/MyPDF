@@ -135,6 +135,9 @@ pub(super) enum Edit {
         layout: mypdf_milestone0::form_layout::Layout,
     },
     ReduceSize(mypdf_milestone0::compress::Level),
+    Watermark(mypdf_milestone0::watermark::Watermark),
+    RemoveWatermarks,
+    RecognizeText(Arc<super::recognize::Progress>),
 }
 pub(super) enum AfterText {
     Save(u64),
@@ -628,6 +631,40 @@ impl Viewer {
                             ));
                             form_design::set_tab_order(&bytes, order)?
                         }
+                        Edit::Watermark(watermark) => {
+                            let (bytes, n) = mypdf_milestone0::watermark::apply(&bytes, &watermark)?;
+                            note = Some(format!(
+                                "Watermark added to {n} page{} • Undo removes it",
+                                if n == 1 { "" } else { "s" }
+                            ));
+                            bytes
+                        }
+                        Edit::RemoveWatermarks => {
+                            let (bytes, n) = mypdf_milestone0::watermark::remove(&bytes)?;
+                            note = Some(format!(
+                                "Removed the watermark from {n} page{} • Undo brings it back",
+                                if n == 1 { "" } else { "s" }
+                            ));
+                            bytes
+                        }
+                        Edit::RecognizeText(progress) => {
+                            use std::sync::atomic::Ordering;
+                            let (bytes, r) = mypdf_milestone0::ocr::recognize(&bytes, &|done, total| {
+                                progress.done.store(done, Ordering::Relaxed);
+                                progress.total.store(total, Ordering::Relaxed);
+                            })?;
+                            note = Some(format!(
+                                "Text recognized on {} page{} • Search, select and copy now work{} • Save a Copy to keep it",
+                                r.pages,
+                                if r.pages == 1 { "" } else { "s" },
+                                if r.skipped > 0 {
+                                    format!(" • {} page{} already had text", r.skipped, if r.skipped == 1 { "" } else { "s" })
+                                } else {
+                                    String::new()
+                                }
+                            ));
+                            bytes
+                        }
                         Edit::ReduceSize(level) => {
                             let (bytes, r) = mypdf_milestone0::compress::reduce(&bytes, level)?;
                             note = Some(format!(
@@ -1016,6 +1053,13 @@ impl Viewer {
                     ui.separator();
                     self.header_footer_menu(ui, editable);
                     if ui
+                        .add_enabled(editable, ActionButton::new(Icon::Watermark, "Watermark"))
+                        .on_hover_text("CONFIDENTIAL, DRAFT or a picture across each page")
+                        .clicked()
+                    {
+                        self.open_watermark();
+                    }
+                    if ui
                         .add_enabled(
                             editable,
                             ActionButton::new(Icon::Redact, "Redact")
@@ -1174,11 +1218,15 @@ impl Viewer {
                 ui.add_space(18.);ui.separator();ui.add_space(12.);ui.label(RichText::new("Reduce file size").family(ui::semibold()));
                 ui.label(RichText::new("Make pictures and scans smaller for email or upload. Text and drawings stay sharp.").small().color(theme::muted()));
                 if ui.add_enabled(ready,ActionButton::new(Icon::Extract,"Reduce File Size…")).clicked(){action="shrink";}
-                ui.add_space(16.);ui.label(RichText::new("Word and Markdown conversions use document text and basic paragraphs. Fonts, columns, tables, headers and page layout are not reconstructed. Word import accepts text documents; drawings are reported. No OCR yet.").small().color(theme::muted()));
+                ui.add_space(18.);ui.separator();ui.add_space(12.);ui.label(RichText::new("Recognize text").family(ui::semibold()));
+                ui.label(RichText::new("Make scanned pages searchable, so their words can be found, selected and copied. Happens on this Mac.").small().color(theme::muted()));
+                if ui.add_enabled(ready,ActionButton::new(Icon::Ocr,"Recognize Text…")).clicked(){action="ocr";}
+                ui.add_space(16.);ui.label(RichText::new("Word and Markdown conversions use document text and basic paragraphs. Fonts, columns, tables, headers and page layout are not reconstructed. Word import accepts text documents; drawings are reported. Scanned pages need Recognize Text first.").small().color(theme::muted()));
             });if self.content.busy{ui.spinner();ui.label("Converting…");}
         });
         match action {
             "shrink" => self.request_shrink(),
+            "ocr" => self.request_ocr(),
             "blank" => self.new_blank(ctx),
             "images" | "document" => self.import_conversion(ctx, action == "images"),
             "export" => self.export_conversion(ctx),

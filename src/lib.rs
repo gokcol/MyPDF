@@ -15,6 +15,7 @@ pub mod identity;
 #[cfg(target_os = "macos")]
 pub mod keychain;
 pub mod navigation;
+pub mod ocr;
 pub mod pages;
 pub mod pdf_font;
 pub mod proof;
@@ -31,6 +32,7 @@ pub mod text_style;
 pub mod trust;
 pub mod unicode_text;
 pub mod viewer;
+pub mod watermark;
 #[cfg(target_os = "windows")]
 pub mod windows_store;
 #[cfg(target_os = "windows")]
