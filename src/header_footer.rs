@@ -421,7 +421,7 @@ pub fn remove(bytes: &[u8], kinds: &[Kind]) -> Result<(Vec<u8>, usize)> {
     Ok((crate::content::serialize(&mut doc)?, changed))
 }
 
-fn content_ids(doc: &Document, page: ObjectId) -> Result<Vec<ObjectId>> {
+pub(crate) fn content_ids(doc: &Document, page: ObjectId) -> Result<Vec<ObjectId>> {
     Ok(match doc.get_dictionary(page)?.get(b"Contents") {
         Ok(Object::Reference(id)) => match doc.get_object(*id)? {
             Object::Array(items) => items.iter().filter_map(|o| o.as_reference().ok()).collect(),
@@ -433,7 +433,7 @@ fn content_ids(doc: &Document, page: ObjectId) -> Result<Vec<ObjectId>> {
 }
 
 /// Content that opens enough `q` to absorb stray `Q`, and closes what the page left open.
-fn isolation(doc: &Document, page: ObjectId) -> Result<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn isolation(doc: &Document, page: ObjectId) -> Result<(Vec<u8>, Vec<u8>)> {
     let content = doc.get_and_decode_page_content(page)?;
     let (mut depth, mut lowest, mut in_text) = (0i64, 0i64, false);
     for op in &content.operations {

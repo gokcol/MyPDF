@@ -207,6 +207,8 @@ fn native_visual_preview() {
         "Protect",
         "ReduceSize",
         "LinkConfirm",
+        "Watermark",
+        "RecognizeText",
         "Signatures",
     ] {
         if let Ok(only) = std::env::var("MYPDF_PREVIEW_ONLY")
@@ -445,6 +447,15 @@ fn native_visual_preview() {
             app.protect = None;
             app.shrink = Some(mypdf_milestone0::compress::Level::Medium);
         }
+        if collection == "Watermark" {
+            app.link_confirm = None;
+            app.editor.mode = editing::Mode::Edit;
+            app.preview_watermark();
+        }
+        if collection == "RecognizeText" {
+            app.watermark = None;
+            app.ocr_confirm = true;
+        }
         if collection == "LinkConfirm" {
             app.shrink = None;
             app.link_confirm = Some("https://www.example.com/privacy-policy".into());
@@ -465,6 +476,7 @@ fn native_visual_preview() {
             // Let go of any drag from an earlier scene without changing anything.
             app.preview_cancel_drag();
             app.link_confirm = None;
+            app.ocr_confirm = false;
             preview.capture_with(
                 &mut app,
                 &ctx,

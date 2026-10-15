@@ -13,6 +13,7 @@ mod organize;
 mod preview;
 mod print;
 mod protect;
+mod recognize;
 mod recovery;
 mod redaction;
 mod selection;
@@ -21,6 +22,7 @@ mod signatures;
 mod text_selection;
 mod theme;
 mod ui;
+mod watermark;
 use ui::{ActionButton, Icon};
 
 use eframe::egui::{self, Color32, FontId, Rect, RichText, Stroke, TextureHandle, pos2, vec2};
@@ -309,6 +311,9 @@ pub struct Viewer {
     unprotect: bool,
     /// Reduce File Size is open, with this quality chosen.
     shrink: Option<mypdf_milestone0::compress::Level>,
+    watermark: Option<watermark::Draft>,
+    ocr_confirm: bool,
+    ocr_progress: Option<Arc<recognize::Progress>>,
     save_events: mpsc::Receiver<Result<(PathBuf, u64, u64), String>>,
     save_tx: mpsc::Sender<Result<(PathBuf, u64, u64), String>>,
     close_intent: Option<Option<u64>>,
@@ -352,6 +357,9 @@ impl Viewer {
             protect: None,
             unprotect: false,
             shrink: None,
+            watermark: None,
+            ocr_confirm: false,
+            ocr_progress: None,
             focus_search: false,
             status: None,
             saving: false,
@@ -596,6 +604,8 @@ impl Viewer {
                     | "protect"
                     | "unprotect"
                     | "shrink"
+                    | "ocr"
+                    | "watermark"
                     | "close"
                     | "undo"
                     | "redo"
@@ -646,6 +656,11 @@ impl Viewer {
             "protect" => self.request_protect(),
             "unprotect" => self.request_unprotect(),
             "shrink" => self.request_shrink(),
+            "ocr" => self.request_ocr(),
+            "watermark" => {
+                self.editor.mode = editing::Mode::Edit;
+                self.open_watermark();
+            }
             "form_detect" | "form_clear" | "form_tab_rows" | "form_tab_columns"
             | "form_flatten" | "form_import" | "form_export" => {
                 self.inspector = true;
@@ -1428,7 +1443,10 @@ impl Viewer {
                 if !tab.index_done { ui.label(RichText::new(format!("Indexing {}/{} pages…", tab.indexed, tab.pages.len())).color(theme::muted()).size(11.0)); }
                 if tab.searching || tab.search_dirty && !tab.query.is_empty() { ui.label(RichText::new("Searching…").color(theme::muted()).size(11.0)); }
                 if tab.search_limited { ui.label(RichText::new("Search is partial: this document reached the text index limit.").color(theme::muted()).size(12.0)); }
-                if !tab.query.is_empty() && tab.hits.is_empty() && tab.index_done && !tab.search_limited && !tab.searching && !tab.search_dirty { ui.label(RichText::new("No searchable matches. Scanned pages need OCR, which comes in a later milestone.").color(theme::muted()).size(12.0)); }
+                if !tab.query.is_empty() && tab.hits.is_empty() && tab.index_done && !tab.search_limited && !tab.searching && !tab.search_dirty {
+                    ui.label(RichText::new("No matches. If this is a scan, its words need to be recognized first.").color(theme::muted()).size(12.0));
+                    if ui.add(ActionButton::new(Icon::Ocr, "Recognize Text…")).clicked() { self.ocr_confirm = true; }
+                }
                 let mut chosen = None;
                 egui::ScrollArea::vertical().id_salt((tab.id, "search_results")).show(ui, |ui| {
                     for (i, hit) in tab.hits.iter().enumerate().take(1000) { let selected = i == tab.hit; egui::Frame::new().fill(if selected { theme::accent_soft() } else { Color32::TRANSPARENT }).stroke(Stroke::new(1., if selected { theme::accent_line() } else { Color32::TRANSPARENT })).corner_radius(8.0).inner_margin(8.0).show(ui, |ui| {
@@ -1850,6 +1868,8 @@ impl eframe::App for Viewer {
         self.protect_dialogs(ctx);
         self.shrink_dialog(ctx);
         self.link_dialog(ctx);
+        self.watermark_dialog(ctx);
+        self.ocr_dialogs(ctx);
         self.page_dialogs(ctx);
         self.digital_events(ctx);
         self.editor_windows(ctx);
