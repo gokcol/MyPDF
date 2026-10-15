@@ -264,3 +264,7 @@ For automation, identity commands accept `--password-file` instead of a prompt. 
 The PKCS#12 adapter uses `p12-keystore` for modern AES-encrypted PKCS#12 and authenticated imports. It does not use underskrift's legacy PKCS#12 loader. ECDSA uses RustCrypto's prehash signing interface so a digest is signed exactly once; it does not use the candidate library's ECDSA software signer.
 
 `vendor/underskrift` is crates.io release 0.1.4, upstream commit `17bca3c4ac49af475772678f1e9ccd35bfaaa3af`, with three narrowly scoped patches: include the claimed local signing time in PDF `/M`, and calculate trailer `/Size` from object numbers instead of counting rewritten objects, and encode Unicode signature metadata as UTF-16BE PDF strings. These are documented in `THIRD_PARTY_NOTICES.md`. Optional SVT/OpenSSL features are disabled. The `tsp` feature is enabled because upstream's verification module requires it to compile, but no timestamp service is configured.
+
+## License
+
+MyPDF is licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option. The vendored `underskrift` signing library keeps its own BSD-2-Clause license; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

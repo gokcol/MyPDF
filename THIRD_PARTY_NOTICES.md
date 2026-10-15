@@ -1,6 +1,6 @@
 # Third-party source and local changes
 
-The Rust dependency versions and registry checksums are pinned in `Cargo.lock`. Each dependency retains its declared license. A complete release license audit is still required before publishing binaries or selecting the final project license.
+The Rust dependency versions and registry checksums are pinned in `Cargo.lock`. Each dependency retains its declared license. MyPDF itself is licensed under MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`). A complete license audit of the dependencies is still required before publishing binaries.
 
 ## Vendored underskrift
 
@@ -17,7 +17,7 @@ Local modifications:
 
 3. `src/core/sig_dict.rs`, `src/signer.rs`: encode non-ASCII reason/location/contact strings as UTF-16BE hexadecimal PDF strings, keeping ASCII literal escaping.
 
-The upstream package as downloaded does not include a standalone license file. Preserve its manifest/source metadata; obtain the author's license notice before publishing the vendored distribution.
+The upstream package and repository include no standalone license file. `vendor/underskrift/LICENSE` reproduces the standard BSD-2-Clause text that the manifest declares; replace it with the author's own notice if upstream adds one.
 
 The application bypasses the upstream legacy PKCS#12 loader and ECDSA software signer. Its own PKCS#12/key adapters use the `p12-keystore` and RustCrypto libraries. Apple Security APIs remain responsible for native Keychain key operations.
 
