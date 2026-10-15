@@ -202,6 +202,11 @@ impl Tab {
     }
 }
 
+/// "1 page", "12 pages".
+fn pages_label(count: usize) -> String {
+    format!("{count} page{}", if count == 1 { "" } else { "s" })
+}
+
 /// A small rounded status label tinted with `color`.
 fn pill(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
     egui::Frame::new()
@@ -1504,7 +1509,7 @@ impl Viewer {
             } else if self.outline {
                 navigate::outline_list(tab, ui, ctx);
             } else {
-                ui.label(RichText::new(format!("{} pages", tab.pages.len())).color(theme::muted()).size(11.5));
+                ui.label(RichText::new(pages_label(tab.pages.len())).color(theme::muted()).size(11.5));
                 egui::ScrollArea::vertical().id_salt((tab.id, "thumbnails")).show_rows(ui, 176.0, tab.pages.len(), |ui, range| {
                     for page in range { let size = tab.pages[page]; let factor = (132.0 / size.width).min(146.0 / size.height); let display = vec2(size.width * factor, size.height * factor); let key = viewer::raster_key(page, size, factor * ctx.pixels_per_point(), true); tab.request(key);
                         let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 176.0), egui::Sense::click());

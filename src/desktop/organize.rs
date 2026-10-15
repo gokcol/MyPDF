@@ -303,8 +303,8 @@ impl Viewer {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(format!(
-                            "{} pages · {} selected",
-                            count,
+                            "{} · {} selected",
+                            pages_label(count),
                             self.organizer.selected.len()
                         ))
                         .color(theme::muted())
@@ -645,8 +645,8 @@ impl Viewer {
                         &pages::extract(&current, &selected)?,
                     )?;
                     Ok(format!(
-                        "Extracted {} pages to {}",
-                        selected.len(),
+                        "Extracted {} to {}",
+                        pages_label(selected.len()),
                         destination.display()
                     ))
                 }
