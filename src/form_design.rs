@@ -1132,10 +1132,8 @@ fn form_fields(doc: &Document, form: ObjectId) -> Vec<Object> {
 }
 
 /// Displayed-to-PDF mapping of a page, which may be turned by a right angle.
-fn page_transform(bytes: &[u8], page: usize) -> Result<Affine> {
-    let geometry = crate::annotations::page_geometry(bytes)?;
-    let (_, inverse) = geometry.get(page).context("Page not found")?;
-    let m = Affine::new(*inverse);
+pub(crate) fn page_transform(inverse: [f64; 6]) -> Result<Affine> {
+    let m = Affine::new(inverse);
     let c = m.as_coeffs();
     ensure!(
         c[1].abs() < 1e-6 && c[2].abs() < 1e-6 || c[0].abs() < 1e-6 && c[3].abs() < 1e-6,
@@ -1712,19 +1710,44 @@ pub fn add(
     kind: FieldType,
     properties: &Properties,
 ) -> Result<(Vec<u8>, ObjectId)> {
-    check_rect(rect)?;
-    let m = page_transform(bytes, page)?;
+    let (bytes, ids) = add_many(bytes, &[(page, rect, kind, properties.clone())])?;
+    Ok((bytes, ids[0]))
+}
+
+/// A field to add: page (from 0), displayed rectangle, kind and settings.
+pub type NewField = (usize, [f32; 4], FieldType, Properties);
+/// Add several fields in one pass, as a table or detection does.
+pub fn add_many(bytes: &[u8], fields: &[NewField]) -> Result<(Vec<u8>, Vec<ObjectId>)> {
+    let geometry = crate::annotations::page_geometry(bytes)?;
     let mut doc = content::editable(bytes)?;
+    let mut ids = vec![];
+    for (page, rect, kind, properties) in fields {
+        let (_, inverse) = geometry.get(*page).context("Page not found")?;
+        let m = page_transform(*inverse)?;
+        ids.push(add_in(&mut doc, m, *page, *rect, *kind, properties)?);
+    }
+    Ok((content::serialize(&mut doc)?, ids))
+}
+/// Add one field to a loaded document; `m` maps the page's displayed coordinates to PDF.
+pub(crate) fn add_in(
+    doc: &mut Document,
+    m: Affine,
+    page: usize,
+    rect: [f32; 4],
+    kind: FieldType,
+    properties: &Properties,
+) -> Result<ObjectId> {
+    check_rect(rect)?;
     let page_id = *doc
         .get_pages()
         .get(&(page as u32 + 1))
         .context("Page not found")?;
-    let form = acroform(&mut doc)?;
+    let form = acroform(doc)?;
     let pdf_rect = to_pdf(m, rect);
     check_name(&properties.name)?;
-    let existing = names(&doc).get(properties.name.trim()).copied();
+    let existing = names(doc).get(properties.name.trim()).copied();
     let group = existing
-        .filter(|id| kind == FieldType::Radio && kind_of(&doc, *id) == Some(FieldType::Radio));
+        .filter(|id| kind == FieldType::Radio && kind_of(doc, *id) == Some(FieldType::Radio));
     ensure!(
         existing.is_none() || group.is_some(),
         "A field named “{}” already exists. Choose another name.",
@@ -1738,7 +1761,7 @@ pub fn add(
         "F" => 4,
     };
     // On a landscape page that is a turned portrait page, the field turns with it.
-    let turned = page_rotation(&doc, page_id);
+    let turned = page_rotation(doc, page_id);
     if turned != 0 {
         widget.set("MK", dictionary! { "R" => turned });
     }
@@ -1754,7 +1777,7 @@ pub fn add(
                         "V" => "Off",
                         "Kids" => Vec::<Object>::new(),
                     });
-                    let mut fields = form_fields(&doc, form);
+                    let mut fields = form_fields(doc, form);
                     fields.push(group.into());
                     doc.get_dictionary_mut(form)?.set("Fields", fields);
                     group
@@ -1766,19 +1789,19 @@ pub fn add(
                 .get_dictionary(group)?
                 .get(b"Kids")
                 .ok()
-                .map(|o| resolve(&doc, o).clone())
+                .map(|o| resolve(doc, o).clone())
                 .and_then(|o| o.as_array().ok().cloned())
                 .unwrap_or_default();
             kids.push(id.into());
             doc.get_dictionary_mut(group)?.set("Kids", kids);
-            let mut list = annots(&doc, page_id);
+            let mut list = annots(doc, page_id);
             list.push(id.into());
-            set_annots(&mut doc, page_id, list)?;
+            set_annots(doc, page_id, list)?;
             // A new button in an existing group gets the next free export value.
             let mut properties = properties.clone();
-            let taken: HashSet<String> = widgets_of(&doc, group)
+            let taken: HashSet<String> = widgets_of(doc, group)
                 .into_iter()
-                .flat_map(|w| on_states(&doc, w))
+                .flat_map(|w| on_states(doc, w))
                 .collect();
             if taken.contains(properties.export_value.trim()) {
                 properties.export_value = (1..)
@@ -1786,9 +1809,9 @@ pub fn add(
                     .find(|v| !taken.contains(v))
                     .unwrap();
             }
-            write_properties(&mut doc, group, id, kind, &properties)?;
-            refresh(&mut doc, group, false)?;
-            return Ok((content::serialize(&mut doc)?, group));
+            write_properties(doc, group, id, kind, &properties)?;
+            refresh(doc, group, false)?;
+            return Ok(group);
         }
         _ => {
             let (ft, ff) = match kind {
@@ -1804,12 +1827,12 @@ pub fn add(
             widget.set("Ff", ff);
             widget.set("T", pdf_text(properties.name.trim()));
             let id = doc.add_object(widget);
-            let mut fields = form_fields(&doc, form);
+            let mut fields = form_fields(doc, form);
             fields.push(id.into());
             doc.get_dictionary_mut(form)?.set("Fields", fields);
-            let mut list = annots(&doc, page_id);
+            let mut list = annots(doc, page_id);
             list.push(id.into());
-            set_annots(&mut doc, page_id, list)?;
+            set_annots(doc, page_id, list)?;
             id
         }
     };
@@ -1818,9 +1841,9 @@ pub fn add(
         let sig_flags = form.get(b"SigFlags").and_then(Object::as_i64).unwrap_or(0);
         form.set("SigFlags", sig_flags | 1);
     }
-    write_properties(&mut doc, field, field, kind, properties)?;
-    refresh(&mut doc, field, false)?;
-    Ok((content::serialize(&mut doc)?, field))
+    write_properties(doc, field, field, kind, properties)?;
+    refresh(doc, field, false)?;
+    Ok(field)
 }
 
 /// Change a field's settings. `widget` picks the radio button whose export
@@ -1865,7 +1888,8 @@ pub fn place(bytes: &[u8], widget: ObjectId, rect: [f32; 4]) -> Result<Vec<u8>> 
     let doc = Document::load_mem(bytes)?;
     let (_, on) = page_map(&doc);
     let page = *on.get(&widget).context("The field is not on a page")?;
-    let m = page_transform(bytes, page)?;
+    let geometry = crate::annotations::page_geometry(bytes)?;
+    let m = page_transform(geometry.get(page).context("Page not found")?.1)?;
     let mut doc = content::editable(bytes)?;
     let field = field_of(&doc, widget);
     ensure!(

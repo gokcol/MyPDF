@@ -200,6 +200,7 @@ fn native_visual_preview() {
         "FormEmpty",
         "FormDesign",
         "FormOrder",
+        "FormLayout",
         "Signatures",
     ] {
         if let Ok(only) = std::env::var("MYPDF_PREVIEW_ONLY")
@@ -417,6 +418,12 @@ fn native_visual_preview() {
         }
         if collection == "FormDesign" {
             app.preview_form();
+        }
+        if collection == "FormLayout" {
+            app.editor.mode = editing::Mode::Forms;
+            app.forms.show_order = false;
+            app.forms.selected = None;
+            app.forms.layout_dialog = Some(mypdf_milestone0::form_layout::Layout::table());
         }
         if collection == "FormOrder" {
             app.editor.mode = editing::Mode::Forms;

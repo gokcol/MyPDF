@@ -117,7 +117,7 @@ const BOX_CHARACTERS: [char; 11] = [
     '☐', '☑', '☒', '□', '▢', '❑', '❏', '⬜', '◻', '\u{f06f}', '\u{f0a8}',
 ];
 
-fn label_kind(label: &str) -> Option<FieldType> {
+pub(crate) fn label_kind(label: &str) -> Option<FieldType> {
     let lower = label.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| lower.contains(w));
     if has(&[
@@ -473,11 +473,19 @@ pub fn add_detected(bytes: &[u8], suggestions: &[Suggestion]) -> Result<(Vec<u8>
         .into_iter()
         .map(|f| f.name)
         .collect();
-    let mut bytes = bytes.to_vec();
-    let mut added = 0;
+    let mut counters: std::collections::HashMap<FieldType, usize> = Default::default();
+    let mut fields = vec![];
     for s in suggestions {
         let base = if s.name.is_empty() {
-            form_design::next_name(&bytes, s.kind)
+            // Acrobat-style names for unlabelled fields: Text1, Check Box1, …
+            let n = counters.entry(s.kind).or_insert(0);
+            loop {
+                *n += 1;
+                let name = format!("{}{n}", s.kind.base_name());
+                if !taken.contains(&name) {
+                    break name;
+                }
+            }
         } else {
             s.name.clone()
         };
@@ -493,10 +501,9 @@ pub fn add_detected(bytes: &[u8], suggestions: &[Suggestion]) -> Result<(Vec<u8>
             .unwrap();
         let mut properties = Properties::new(s.kind, &name);
         properties.multiline = s.multiline;
-        let (next, _) = form_design::add(&bytes, s.page, s.rect, s.kind, &properties)?;
-        bytes = next;
         taken.insert(name);
-        added += 1;
+        fields.push((s.page, s.rect, s.kind, properties));
     }
-    Ok((bytes, added))
+    let (bytes, ids) = form_design::add_many(bytes, &fields)?;
+    Ok((bytes, ids.len()))
 }
