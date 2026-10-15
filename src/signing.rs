@@ -335,6 +335,10 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
         request.name.len() <= 200 && request.reason.len() <= 1000 && request.location.len() <= 300,
         "Signature appearance details are too long"
     );
+    // A small box is laid out larger and scaled down as a whole, like an image,
+    // so its details always fit and keep their proportions.
+    let k = (160.0 / w).max(64.0 / h).max(1.0);
+    let (w, h) = (w * k, h * k);
     let mut doc = Document::with_version("1.7");
     let pages = doc.new_object_id();
     let content = doc.add_object(Stream::new(dictionary! {}, vec![]));
@@ -433,15 +437,13 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
         let (x, y) = ((w - aw) / 2.0, (h - ah) / 2.0);
         let mut style = artwork.style.clone();
         if matches!(artwork.kind, Kind::Text { .. } | Kind::Stamp { .. }) {
-            style.font_size = style.font_size.min((ah - 4.0) / 1.25).max(6.0);
+            style.font_size = style.font_size.min((ah - 4.0) / 1.25).max(1.0);
         }
         let mut marks = backdrop.clone();
-        marks.push(Annotation::new(
-            0,
-            [x, y, x + aw, y + ah],
-            artwork.kind.clone(),
-            style,
-        ));
+        marks.push(fit_text(
+            &base,
+            Annotation::new(0, [x, y, x + aw, y + ah], artwork.kind.clone(), style),
+        )?);
         return render(crate::annotations::export(&base, &marks)?, transparent);
     }
     let mut annotations = backdrop;
@@ -457,39 +459,57 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
         let y = (h - ah) / 2.0;
         let mut style = artwork.style.clone();
         if matches!(artwork.kind, Kind::Text { .. } | Kind::Stamp { .. }) {
-            style.font_size = style.font_size.min((ah - 8.0) / 1.25).max(6.0);
+            style.font_size = style.font_size.min((ah - 8.0) / 1.25).max(1.0);
         }
-        annotations.push(Annotation::new(
-            0,
-            [x, y, x + aw, y + ah],
-            artwork.kind.clone(),
-            style,
-        ));
+        annotations.push(fit_text(
+            &base,
+            Annotation::new(0, [x, y, x + aw, y + ah], artwork.kind.clone(), style),
+        )?);
         w * 0.36
     } else {
         8.0
     };
-    let text = lines.join("\n");
-    // Try a bounded font-size reduction; never clip or hide appearance details.
-    let mut last = None;
-    for size in [11.0, 10.0, 9.0, 8.0, 7.0, 6.0] {
-        let mut current = annotations.clone();
-        current.push(Annotation::new(
+    // The details shrink until they fit whatever box was drawn; nothing is clipped or hidden.
+    annotations.push(fit_text(
+        &base,
+        Annotation::new(
             0,
             [left, 4.0, w - 5.0, h - 4.0],
-            Kind::Text { text: text.clone() },
+            Kind::Text {
+                text: lines.join("\n"),
+            },
             Style {
-                font_size: size,
+                font_size: 11.0,
                 color: [0.12, 0.19, 0.18],
                 ..Default::default()
             },
-        ));
-        match crate::annotations::export(&base, &current) {
-            Ok(bytes) => return render(bytes, transparent),
-            Err(e) => last = Some(e),
+        ),
+    )?);
+    render(
+        crate::annotations::export(&base, &annotations)?,
+        transparent,
+    )
+}
+
+/// Shrink a text or stamp mark until it fits its box; other marks are kept as they are.
+fn fit_text(
+    base: &[u8],
+    mut mark: crate::annotations::Annotation,
+) -> Result<crate::annotations::Annotation> {
+    use crate::annotations::Kind;
+    if !matches!(mark.kind, Kind::Text { .. } | Kind::Stamp { .. }) {
+        return Ok(mark);
+    }
+    let mut size = mark.style.font_size.max(1.0);
+    loop {
+        mark.style.font_size = size;
+        match crate::annotations::export(base, std::slice::from_ref(&mark)) {
+            Ok(_) => return Ok(mark),
+            // At one point there is nothing legible left to shrink.
+            Err(e) if size <= 1.0 => return Err(e),
+            Err(_) => size = (size * 0.9).max(1.0),
         }
     }
-    Err(last.unwrap_or_else(|| anyhow::anyhow!("Signature details do not fit in the rectangle")))
 }
 
 pub async fn sign_custom(

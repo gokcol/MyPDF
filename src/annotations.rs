@@ -282,7 +282,7 @@ impl Annotation {
                 .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
                 && (0.01..=1.0).contains(&self.style.opacity)
                 && (0.1..=30.0).contains(&self.style.width)
-                && (6.0..=144.0).contains(&self.style.font_size),
+                && (1.0..=144.0).contains(&self.style.font_size),
             "Invalid annotation style"
         );
         self.kind.validate()
