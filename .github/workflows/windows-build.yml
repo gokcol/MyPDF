@@ -1,5 +1,6 @@
 name: Windows build
-# Builds MyPDF.exe for 64-bit Windows and packs it in a zip with the licenses.
+# Builds MyPDF.exe for 64-bit Windows, packs it in a zip with the licenses,
+# and builds the MyPDF-<version>-Setup.exe installer with Inno Setup.
 # Run it by hand (Actions → Windows build → Run workflow). The zip is a download
 # on the run's page; name a release tag to also attach it to that release.
 on:
@@ -40,16 +41,30 @@ jobs:
           $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File -Encoding ascii -NoNewline "$name.zip.sha256"
           "NAME=$name" | Out-File -Encoding utf8 -Append $env:GITHUB_ENV
+          "SETUP=MyPDF-$version-Setup" | Out-File -Encoding utf8 -Append $env:GITHUB_ENV
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y | Out-Null }
+          # The installer carries the same product version as MyPDF.exe.
+          $crate = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          & $iscc "/DAppVersion=$crate" "/DSource=$pwd\pack\MyPDF" "/O$pwd" "/F$env:SETUP" packaging\windows\MyPDF.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $hash = (Get-FileHash "$env:SETUP.exe" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $env:SETUP.exe" | Out-File -Encoding ascii -NoNewline "$env:SETUP.exe.sha256"
       - uses: actions/upload-artifact@v6
         with:
           name: ${{ env.NAME }}
           path: |
             ${{ env.NAME }}.zip
             ${{ env.NAME }}.zip.sha256
+            ${{ env.SETUP }}.exe
+            ${{ env.SETUP }}.exe.sha256
       - name: Attach to the release
         if: ${{ inputs.release != '' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE: ${{ inputs.release }}
-        run: gh release upload $env:RELEASE "$env:NAME.zip" "$env:NAME.zip.sha256" --clobber --repo $env:GITHUB_REPOSITORY
+        run: gh release upload $env:RELEASE "$env:NAME.zip" "$env:NAME.zip.sha256" "$env:SETUP.exe" "$env:SETUP.exe.sha256" --clobber --repo $env:GITHUB_REPOSITORY
