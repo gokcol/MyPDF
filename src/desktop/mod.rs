@@ -105,6 +105,10 @@ struct Tab {
     search_limited: bool,
     search_dirty: bool,
     rasters: HashMap<RasterKey, Raster>,
+    /// The previous version's page images, shown until the edited pages are drawn.
+    stale: HashMap<usize, Raster>,
+    /// The next document change only edits page content, so old images may stand in.
+    keep_stale: bool,
     pending: HashSet<RasterKey>,
     render_errors: HashMap<usize, String>,
 }
@@ -403,6 +407,8 @@ impl Viewer {
             search_limited: false,
             search_dirty: false,
             rasters: HashMap::new(),
+            stale: HashMap::new(),
+            keep_stale: false,
             pending: HashSet::new(),
             render_errors: HashMap::new(),
         });
@@ -725,6 +731,9 @@ impl Viewer {
                     }
                     Event::Raster { key, size, rgba } => {
                         tab.pending.remove(&key);
+                        if !key.thumbnail {
+                            tab.stale.remove(&key.page);
+                        }
                         let bytes = rgba.len();
                         let image = egui::ColorImage::from_rgba_premultiplied(size, &rgba);
                         let texture = ctx.load_texture(
@@ -1578,6 +1587,14 @@ impl Viewer {
                                     Color32::WHITE,
                                 );
                             }
+                        } else if let Some(raster) = tab.stale.get(&page) {
+                            // The page before the edit, until the edited page is drawn.
+                            ui.painter().image(
+                                raster.texture.id(),
+                                page_rect,
+                                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
                         } else {
                             ui.painter().text(
                                 page_rect.center(),

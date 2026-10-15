@@ -70,6 +70,19 @@ impl Tab {
         let wake = ctx.clone();
         self.worker = Worker::from_bytes(source.clone(), move || wake.request_repaint());
         self.bytes = Some(source);
+        // After a content edit, each page keeps its sharpest old image until redrawn.
+        self.stale.clear();
+        if std::mem::take(&mut self.keep_stale) {
+            for (key, raster) in self.rasters.drain() {
+                let sharper = self
+                    .stale
+                    .get(&key.page)
+                    .is_none_or(|old| old.texture.size()[0] < raster.texture.size()[0]);
+                if !key.thumbnail && sharper {
+                    self.stale.insert(key.page, raster);
+                }
+            }
+        }
         self.rasters.clear();
         self.pending.clear();
         self.render_errors.clear();
