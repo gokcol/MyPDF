@@ -168,11 +168,12 @@ pub fn fields(bytes: &[u8]) -> Result<Vec<Field>> {
                     .ok()
                     .and_then(|o| doc.dereference(o).ok())
                     .and_then(|(_, o)| o.as_dict().ok());
+                // Right-angle turns, as on landscape pages, are drawn upright.
                 if mk
                     .and_then(|m| m.get(b"R").ok())
                     .and_then(|o| o.as_i64().ok())
                     .unwrap_or(0)
-                    % 360
+                    % 90
                     != 0
                 {
                     reason = Some("Rotated widget appearances are read-only".into());

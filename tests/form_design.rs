@@ -484,3 +484,84 @@ fn detection_finds_blanks_boxes_lines_and_text_areas() {
     // Detecting again finds nothing new.
     assert!(form_detect::detect(&with_fields).unwrap().is_empty());
 }
+
+/// A portrait page turned to landscape (or upside down) with /Rotate.
+fn turned_page(degrees: i64) -> Vec<u8> {
+    let mut doc = Document::load_mem(&convert::blank(595., 842.).unwrap()).unwrap();
+    let page = *doc.get_pages().get(&1).unwrap();
+    doc.get_dictionary_mut(page).unwrap().set("Rotate", degrees);
+    let mut out = vec![];
+    doc.save_to(&mut out).unwrap();
+    out
+}
+/// Whether text reads left to right, upright, on the displayed page.
+fn reads_upright(bytes: &[u8], text: &str) -> bool {
+    let pdf = hayro::hayro_syntax::Pdf::new(bytes.to_vec()).unwrap();
+    let page = viewer::extract_page(
+        &pdf.pages()[0],
+        &hayro::hayro_interpret::InterpreterCache::new(),
+    );
+    let Some(hit) = page.find(text, 0).into_iter().next() else {
+        return false;
+    };
+    // Letters advance rightwards along one line.
+    let middle = |r: &[f32; 4]| (r[1] + r[3]) / 2.;
+    hit.rects
+        .windows(2)
+        .all(|w| w[1][0] > w[0][0] && (middle(&w[1]) - middle(&w[0])).abs() < 4.)
+}
+
+#[test]
+fn fields_on_turned_pages_are_placed_and_drawn_upright() {
+    for degrees in [90, 180, 270] {
+        let mut bytes = turned_page(degrees);
+        let (w, h) = if degrees == 180 {
+            (595., 842.)
+        } else {
+            (842., 595.)
+        };
+        // Every kind of field, at displayed positions on the landscape page.
+        let mut placed = vec![];
+        for (i, kind) in FieldType::ALL.into_iter().enumerate() {
+            let [fw, fh] = kind.default_size();
+            let x = 30. + (i % 2) as f32 * 270.;
+            let y = 30. + (i / 2) as f32 * 110.;
+            assert!(x + fw < w && y + fh < h);
+            let rect = [x, y, x + fw, y + fh];
+            bytes = add(&bytes, kind, rect).0;
+            placed.push((kind, rect));
+        }
+        let fields = form_design::describe(&bytes).unwrap();
+        for (kind, rect) in &placed {
+            let f = fields.iter().find(|f| f.kind == *kind).unwrap();
+            for (a, b) in f.widgets[0].rect.iter().zip(rect) {
+                assert!(
+                    (a - b).abs() < 0.05,
+                    "{degrees}° {kind:?} {:?} {rect:?}",
+                    f.widgets[0].rect
+                );
+            }
+        }
+        // Everything stays fillable, and typed text reads the right way up.
+        assert!(
+            forms::fields(&bytes)
+                .unwrap()
+                .iter()
+                .all(|f| f.reason.is_none() || f.name == "Button1")
+        );
+        bytes = fill(&bytes, "Text1", "Landscape form");
+        bytes = fill(&bytes, "Check Box1", "Yes");
+        assert!(darkest(&bytes, placed[0].1) < 80, "{degrees}° text drawn");
+        assert!(darkest(&bytes, placed[1].1) < 80, "{degrees}° check drawn");
+        // The appearance, drawn into the page, reads left to right.
+        let (flat, _) = form_design::flatten(&bytes).unwrap();
+        assert!(
+            reads_upright(&flat, "Landscape form"),
+            "{degrees}° flattened"
+        );
+        assert!(
+            darkest(&flat, placed[0].1) < 80,
+            "{degrees}° text stays in place"
+        );
+    }
+}
