@@ -259,7 +259,9 @@ async fn image_only_appearance_is_transparent_compact_and_signs() {
     };
     let png = signing::signature_artwork(&request).unwrap();
     let image = image::load_from_memory(&png).unwrap().into_rgba8();
-    assert_eq!(image.width(), 200);
+    // The box's proportions, at least two pixels per point.
+    assert!(image.width() >= 200);
+    assert_eq!(image.width() * 40, image.height() * 100);
     assert_eq!(image.get_pixel(0, 0)[3], 0, "the page shows through");
     assert!(image.pixels().any(|p| p[3] > 200), "the signature is drawn");
     let signed = signing::sign_custom(&source(0), &signer, &request)
@@ -597,4 +599,63 @@ fn signature_backgrounds_paint_what_their_names_say() {
         frame[1] > frame[0] && frame[0] < 200,
         "a green frame: {frame:?}"
     );
+}
+
+#[test]
+fn signature_text_shrinks_to_fit_the_smallest_box() {
+    use mypdf_milestone0::annotations::{Kind, Style};
+    use mypdf_milestone0::signing::{AppearanceLayout, DesktopSigningRequest, signature_artwork};
+    let typed = mypdf_milestone0::assets::Asset::new(
+        "Typed",
+        Kind::Text {
+            text: "Gökhan Wolfeschlegelsteinhausenbergerdorff".into(),
+        },
+        Style {
+            font_size: 24.,
+            ..Default::default()
+        },
+        3.,
+    );
+    let long_name = "Maximiliane Alexandra Wolfeschlegelsteinhausenbergerdorff von Appleseed-Smith";
+    for (layout, rect, artwork, name, reason) in [
+        // The smallest boxes each layout allows, with long details.
+        (
+            AppearanceLayout::DetailsOnly,
+            [0., 0., 120., 48.],
+            None,
+            long_name,
+            "Approved by the board of directors after review",
+        ),
+        (
+            AppearanceLayout::ImageAndDetails,
+            [0., 0., 120., 48.],
+            Some(typed.clone()),
+            long_name,
+            "Approved",
+        ),
+        (
+            AppearanceLayout::ImageOnly,
+            [0., 0., 24., 12.],
+            Some(typed.clone()),
+            "",
+            "",
+        ),
+        (
+            AppearanceLayout::ImageOnly,
+            [0., 0., 300., 14.],
+            Some(typed.clone()),
+            "",
+            "",
+        ),
+    ] {
+        let png = signature_artwork(&DesktopSigningRequest {
+            rect: Some(rect),
+            layout,
+            artwork,
+            name: name.into(),
+            reason: reason.into(),
+            ..Default::default()
+        });
+        assert!(png.is_ok(), "{layout:?} {rect:?}: {:?}", png.err());
+    }
 }
