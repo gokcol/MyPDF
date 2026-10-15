@@ -8,6 +8,7 @@ mod home;
 pub mod icon;
 mod menu;
 mod navigate;
+pub mod open_with;
 mod organize;
 #[cfg(test)]
 mod preview;
@@ -1799,6 +1800,14 @@ impl eframe::App for Viewer {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         theme::sync(ctx.theme());
         self.tick += 1;
+        let arrivals = open_with::take(ctx);
+        if arrivals.focus {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        for path in arrivals.paths {
+            self.open(path, ctx);
+        }
         self.content_events(ctx);
         self.page_events(ctx);
         self.events(ctx);
