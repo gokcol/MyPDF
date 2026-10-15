@@ -201,6 +201,7 @@ fn native_visual_preview() {
         "FormDesign",
         "FormOrder",
         "FormLayout",
+        "FormDrag",
         "Signatures",
     ] {
         if let Ok(only) = std::env::var("MYPDF_PREVIEW_ONLY")
@@ -419,6 +420,10 @@ fn native_visual_preview() {
         if collection == "FormDesign" {
             app.preview_form();
         }
+        if collection == "FormDrag" {
+            app.forms.layout_dialog = None;
+            app.editor.mode = editing::Mode::Forms;
+        }
         if collection == "FormLayout" {
             app.editor.mode = editing::Mode::Forms;
             app.forms.show_order = false;
@@ -432,6 +437,18 @@ fn native_visual_preview() {
         }
         // The last scene swaps in a signed copy of the document.
         if collection == "Signatures" {
+            // Let go of any drag from an earlier scene without changing anything.
+            app.preview_cancel_drag();
+            preview.capture_with(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerButton {
+                    pos: pos2(5., 5.),
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
             let signed = fixture.path().join("Signed contract.pdf");
             let bytes = std::fs::read(&pdf).unwrap();
             std::fs::write(
@@ -481,6 +498,41 @@ fn native_visual_preview() {
             assert!(std::time::Instant::now() < deadline);
             preview.capture(&mut app, &ctx);
             std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if collection == "FormDrag" {
+            // Halfway through dragging the dropdown down and to the right.
+            app.preview_form_select("Country");
+            preview.capture(&mut app, &ctx);
+            let page = ctx
+                .read_response(egui::Id::new((app.tabs[0].id, 0_usize, "form_page")))
+                .unwrap()
+                .rect;
+            let scale = app.tabs[0].scale;
+            let from = page.min + vec2(160., 551.) * scale;
+            let to = from + vec2(110., 70.) * scale;
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            preview.capture_with(&mut app, &ctx, vec![egui::Event::PointerMoved(from)]);
+            preview.capture_with(&mut app, &ctx, vec![button(from, true)]);
+            for i in 1..=8 {
+                preview.capture_with(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(
+                        from + (to - from) * i as f32 / 8.,
+                    )],
+                );
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !app.ghost_ready() {
+                assert!(std::time::Instant::now() < deadline);
+                preview.capture(&mut app, &ctx);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
         if collection == "FormDesign" {
             app.preview_form_select("Country");

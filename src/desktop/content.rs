@@ -383,6 +383,7 @@ impl Viewer {
                         }
                         match s.commit_document(bytes) {
                             Ok(()) => {
+                                tab.keep_stale = true;
                                 self.editor.draft = None;
                                 self.content.key = None;
                                 if self.content.replacing_text {

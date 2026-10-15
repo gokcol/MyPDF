@@ -46,6 +46,182 @@ pub(super) enum Confirm {
     Clear,
     Flatten,
 }
+/// A field being moved or resized, drawn where it is going: its pixels from the
+/// page image, over a picture of the page without it.
+struct Ghost {
+    tab: u64,
+    page: usize,
+    from: [f32; 4],
+    to: [f32; 4],
+    revision: u64,
+    /// When the change was handed over; the ghost stays until the page is redrawn.
+    dropped: Option<std::time::Instant>,
+    rx: Option<mpsc::Receiver<Option<egui::ColorImage>>>,
+    erased: Option<TextureHandle>,
+}
+/// The page as it would look without one widget.
+fn without_widget(bytes: &[u8], widget: lopdf::ObjectId) -> anyhow::Result<Vec<u8>> {
+    let mut doc = lopdf::Document::load_mem(bytes)?;
+    for page in doc.get_pages().into_values().collect::<Vec<_>>() {
+        let annots = doc.get_dictionary(page)?.get(b"Annots").ok().cloned();
+        let keep = |list: &Vec<lopdf::Object>| -> Vec<lopdf::Object> {
+            list.iter()
+                .filter(|a| a.as_reference().ok() != Some(widget))
+                .cloned()
+                .collect()
+        };
+        match annots {
+            Some(lopdf::Object::Reference(id)) => {
+                if let Ok(list) = doc
+                    .get_object(id)
+                    .and_then(lopdf::Object::as_array)
+                    .map(keep)
+                {
+                    *doc.get_object_mut(id)? = lopdf::Object::Array(list);
+                }
+            }
+            Some(lopdf::Object::Array(list)) => {
+                doc.get_dictionary_mut(page)?.set("Annots", keep(&list));
+            }
+            _ => {}
+        }
+    }
+    let mut out = vec![];
+    doc.save_to(&mut out)?;
+    Ok(out)
+}
+fn start_ghost(
+    state: &mut FormState,
+    tab: &Tab,
+    page: usize,
+    widget: lopdf::ObjectId,
+    rect: [f32; 4],
+    ui: &egui::Ui,
+    scale: f32,
+) {
+    let Some(session) = tab.session.as_ref() else {
+        return;
+    };
+    let source = session.source.clone();
+    let factor = (scale * ui.ctx().pixels_per_point()).clamp(0.5, 3.);
+    let (tx, rx) = mpsc::channel();
+    let wake = ui.ctx().clone();
+    std::thread::spawn(move || {
+        let image = std::panic::catch_unwind(|| {
+            let bytes = without_widget(&source, widget).ok()?;
+            let (size, rgba) = viewer::render_page(&bytes, page, factor).ok()?;
+            Some(egui::ColorImage::from_rgba_premultiplied(size, &rgba))
+        })
+        .ok()
+        .flatten();
+        let _ = tx.send(image);
+        wake.request_repaint();
+    });
+    state.ghost = Some(Ghost {
+        tab: tab.id,
+        page,
+        from: rect,
+        to: rect,
+        revision: session.revision(),
+        dropped: None,
+        rx: Some(rx),
+        erased: None,
+    });
+}
+/// Draw a moving field: the page without it at its old place, its pixels at the new one.
+fn paint_ghost(
+    state: &mut FormState,
+    tab: &Tab,
+    ui: &egui::Ui,
+    page: usize,
+    page_rect: Rect,
+    scale: f32,
+) {
+    let Some(ghost) = &mut state.ghost else {
+        return;
+    };
+    if ghost.tab != tab.id || ghost.page != page {
+        return;
+    }
+    if let Some(rx) = &ghost.rx
+        && let Ok(image) = rx.try_recv()
+    {
+        ghost.rx = None;
+        ghost.erased = image.map(|i| {
+            ui.ctx()
+                .load_texture("form_ghost_page", i, egui::TextureOptions::LINEAR)
+        });
+    }
+    let revision = tab.session.as_ref().map_or(0, |s| s.revision());
+    let redrawn =
+        revision > ghost.revision && tab.rasters.keys().any(|k| k.page == page && !k.thumbnail);
+    match ghost.dropped {
+        // The edited page is drawn, or the change did not happen.
+        Some(at) if redrawn || at.elapsed() > std::time::Duration::from_secs(4) => {
+            state.ghost = None;
+            return;
+        }
+        None if state.grab.is_none() => {
+            state.ghost = None;
+            return;
+        }
+        _ => {}
+    }
+    // The image the page shows now: before the edit lands, or the old one kept meanwhile.
+    let source = tab.stale.get(&page).map(|r| r.texture.id()).or_else(|| {
+        let wanted = (scale * ui.ctx().pixels_per_point() * 100.) as u16;
+        tab.rasters
+            .iter()
+            .filter(|(k, _)| k.page == page && !k.thumbnail)
+            .min_by_key(|(k, _)| k.scale.abs_diff(wanted))
+            .map(|(_, r)| r.texture.id())
+    });
+    let size = tab.pages[page];
+    let uv = |r: [f32; 4]| {
+        Rect::from_min_max(
+            pos2(r[0] / size.width, r[1] / size.height),
+            pos2(r[2] / size.width, r[3] / size.height),
+        )
+    };
+    let painter = ui
+        .painter()
+        .with_clip_rect(page_rect.intersect(ui.clip_rect()));
+    if let Some(erased) = &ghost.erased {
+        // A little wider than the field, so its smoothed border edge is covered too.
+        let f = ghost.from;
+        let cover = [
+            (f[0] - 2.).max(0.),
+            (f[1] - 2.).max(0.),
+            (f[2] + 2.).min(size.width),
+            (f[3] + 2.).min(size.height),
+        ];
+        painter.image(
+            erased.id(),
+            screen(page_rect, scale, cover),
+            uv(cover),
+            Color32::WHITE,
+        );
+    }
+    if let Some(source) = source {
+        painter.image(
+            source,
+            screen(page_rect, scale, ghost.to),
+            uv(ghost.from),
+            Color32::WHITE,
+        );
+    }
+}
+/// A finished drag: keep the ghost until the moved field is drawn, or drop it.
+fn drop_ghost(state: &mut FormState, moved: bool) {
+    if moved {
+        if let Some(ghost) = &mut state.ghost {
+            ghost.dropped = Some(std::time::Instant::now());
+        }
+    } else {
+        state.ghost = None;
+    }
+}
+
 /// Property edits not applied yet.
 struct Draft {
     field: lopdf::ObjectId,
@@ -69,6 +245,7 @@ pub(super) struct FormState {
     /// Select this field once the document is newer than this revision: name, page, rectangle.
     pending_select: Option<(String, usize, [f32; 4], u64)>,
     grab: Option<(u64, usize, Grab, [f32; 4])>,
+    ghost: Option<Ghost>,
     pending_edit: Option<Edit>,
     draft: Option<Draft>,
     value: Option<(lopdf::ObjectId, u64, String)>,
@@ -85,6 +262,7 @@ impl FormState {
             selected: None,
             pending_select: None,
             grab: None,
+            ghost: None,
             pending_edit: None,
             draft: None,
             value: None,
@@ -276,6 +454,7 @@ pub(super) fn overlay(
         state.selected = None;
     }
 
+    paint_ghost(state, tab, ui, page, page_rect, scale);
     let hovered_field = ui.ctx().pointer_hover_pos();
     for field in fields {
         for w in field.widgets.iter().filter(|w| w.page == page) {
@@ -359,6 +538,7 @@ pub(super) fn overlay(
                             },
                             w.rect,
                         ));
+                        start_ghost(state, tab, page, w.id, w.rect, ui, scale);
                     }
                     if handle.dragged()
                         && let Some((_, _, Grab::Resize { rect, corner, .. }, live)) =
@@ -366,13 +546,18 @@ pub(super) fn overlay(
                     {
                         let d = handle.total_drag_delta().unwrap_or_default() / scale;
                         *live = resized(*rect, *corner, d);
+                        if let Some(ghost) = &mut state.ghost {
+                            ghost.to = *live;
+                        }
                     }
                     if handle.drag_stopped()
                         && let Some((_, _, Grab::Resize { widget, rect, .. }, live)) =
                             state.grab.take()
-                        && live != rect
                     {
-                        state.pending_edit = Some(Edit::PlaceField { widget, rect: live });
+                        drop_ghost(state, live != rect);
+                        if live != rect {
+                            state.pending_edit = Some(Edit::PlaceField { widget, rect: live });
+                        }
                     }
                 }
             }
@@ -401,6 +586,7 @@ pub(super) fn overlay(
                     },
                     w.rect,
                 ));
+                start_ghost(state, tab, page, w.id, w.rect, ui, scale);
             }
             if response.dragged()
                 && let Some((_, _, Grab::Move { rect, .. }, live)) = &mut state.grab
@@ -410,12 +596,17 @@ pub(super) fn overlay(
                 let x = (rect[0] + d.x).clamp(0., (size.width - w_).max(0.));
                 let y = (rect[1] + d.y).clamp(0., (size.height - h_).max(0.));
                 *live = [x, y, x + w_, y + h_];
+                if let Some(ghost) = &mut state.ghost {
+                    ghost.to = *live;
+                }
             }
             if response.drag_stopped()
                 && let Some((_, _, Grab::Move { widget, rect }, live)) = state.grab.take()
-                && live != rect
             {
-                state.pending_edit = Some(Edit::PlaceField { widget, rect: live });
+                drop_ghost(state, live != rect);
+                if live != rect {
+                    state.pending_edit = Some(Edit::PlaceField { widget, rect: live });
+                }
             }
         }
     }
@@ -1936,6 +2127,18 @@ impl Viewer {
         self.editor.mode = editing::Mode::Forms;
         self.inspector = true;
     }
+    /// Visual QA: whether a dragged field's picture of the page without it is ready.
+    pub(super) fn ghost_ready(&self) -> bool {
+        self.forms
+            .ghost
+            .as_ref()
+            .is_some_and(|g| g.erased.is_some())
+    }
+    /// Visual QA: forget a drag in progress, so releasing the mouse changes nothing.
+    pub(super) fn preview_cancel_drag(&mut self) {
+        self.forms.grab = None;
+        self.forms.ghost = None;
+    }
     /// Visual QA: select a field by name once the page is inspected.
     pub(super) fn preview_form_select(&mut self, name: &str) {
         let fields = self
@@ -2055,8 +2258,38 @@ mod tests {
             "{r:?}"
         );
 
-        // Drag it somewhere else.
+        // Drag it somewhere else: the field itself is drawn where it goes, and the
+        // page never goes blank while it is redrawn.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !app.tabs[0]
+            .rasters
+            .keys()
+            .any(|k| k.page == 0 && !k.thumbnail)
+        {
+            assert!(std::time::Instant::now() < deadline);
+            frame(&mut app, vec![]);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         drag(&mut app, at([200., 300.]), at([260., 340.]));
+        let ghost = app
+            .forms
+            .ghost
+            .as_ref()
+            .expect("the dropped field is still drawn");
+        assert!(ghost.dropped.is_some() && ((ghost.to[0] + ghost.to[2]) / 2. - 260.).abs() < 2.);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while app.forms.ghost.is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            frame(&mut app, vec![]);
+            let shown = app.tabs[0]
+                .rasters
+                .keys()
+                .any(|k| k.page == 0 && !k.thumbnail)
+                || app.tabs[0].stale.contains_key(&0);
+            assert!(shown, "an image of the page is always shown");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.tabs[0].session.as_ref().unwrap().revision() > 0);
         settle(&mut app);
         let moved = fields(&app)
             .into_iter()
