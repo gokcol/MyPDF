@@ -349,6 +349,37 @@ pub fn docx_text(bytes: &[u8]) -> Result<String> {
     }
     Ok(text)
 }
+/// Break a line where it reaches the width: between words when it can, and
+/// inside a word only when that word alone is too wide. Leading spaces stay.
+fn wrap(line: &str, fits: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut lines = vec![];
+    let mut current = String::new();
+    for word in line.split_inclusive(' ') {
+        let next = format!("{current}{word}");
+        if current.trim().is_empty() || fits(next.trim_end()) {
+            current = next;
+        } else {
+            lines.push(current.trim_end().to_owned());
+            current = word.to_owned();
+        }
+        // A word wider than the line is split where it reaches the edge.
+        while !fits(current.trim_end()) && current.trim_end().chars().count() > 1 {
+            let mut prefix = String::new();
+            for c in current.chars() {
+                let longer = format!("{prefix}{c}");
+                if !prefix.is_empty() && !fits(&longer) {
+                    break;
+                }
+                prefix = longer;
+            }
+            current = current[prefix.len()..].to_owned();
+            lines.push(prefix);
+        }
+    }
+    lines.push(current.trim_end().to_owned());
+    lines
+}
+
 /// Typeset UTF-8 text/basic Markdown on A4 with an embedded Unicode font.
 pub fn text_to_pdf(text: &str, markdown: bool) -> Result<Vec<u8>> {
     ensure!(
@@ -390,17 +421,7 @@ pub fn text_to_pdf(text: &str, markdown: bool) -> Result<Vec<u8>> {
             markdown && !code && (1..=6).contains(&n) && raw.as_bytes().get(n) == Some(&b' ');
         let line = if heading { &raw[n + 1..] } else { raw };
         let size = if heading { 24. - n as f32 * 2. } else { 11. };
-        let mut lines = vec![];
-        let mut current = String::new();
-        for c in line.chars() {
-            let mut next = current.clone();
-            next.push(c);
-            if !current.is_empty() && font.width(&next, size) > 491. {
-                lines.push(std::mem::take(&mut current));
-            }
-            current.push(c);
-        }
-        lines.push(current);
+        let lines = wrap(line, |text| font.width(text, size) <= 491.);
         for line in lines {
             if y - size < 52. {
                 add_page(&mut d, &mut body, &mut kids);
@@ -424,4 +445,22 @@ pub fn text_to_pdf(text: &str, markdown: bool) -> Result<Vec<u8>> {
     let root = d.add_object(dictionary! {"Type"=>"Catalog","Pages"=>rootpages});
     d.trailer.set("Root", root);
     content::serialize(&mut d)
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::wrap;
+
+    #[test]
+    fn lines_break_between_words() {
+        let fits = |n: usize| move |t: &str| t.chars().count() <= n;
+        assert_eq!(wrap("aaa bbb ccc", fits(7)), ["aaa bbb", "ccc"]);
+        assert_eq!(wrap("one two", fits(20)), ["one two"]);
+        assert_eq!(wrap("", fits(5)), [""]);
+        // Too long for any line: split inside the word.
+        assert_eq!(wrap("abcdefghij", fits(4)), ["abcd", "efgh", "ij"]);
+        assert_eq!(wrap("hi abcdefghij", fits(4)), ["hi", "abcd", "efgh", "ij"]);
+        // Indentation (as in code) stays on the first line.
+        assert_eq!(wrap("    code here", fits(9)), ["    code", "here"]);
+    }
 }
