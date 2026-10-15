@@ -246,6 +246,10 @@ pub(super) struct DigitalState {
     manager: ManagerState,
     /// The default signature's look, applied to each signing request.
     look: Look,
+    /// Quick Sign into this empty form field: name, page and displayed rectangle.
+    pub(super) target_field: Option<(String, usize, [f32; 4])>,
+    /// The placed box is a form field's: sign it at exactly that size.
+    exact: bool,
 }
 fn bounded_read(path: &std::path::Path, limit: u64) -> anyhow::Result<Vec<u8>> {
     let mut bytes = vec![];
@@ -404,6 +408,8 @@ impl DigitalState {
             default_signature,
             manager: ManagerState::new(),
             look: Look::default(),
+            target_field: None,
+            exact: false,
         };
         state.apply_default_signature();
         state.select_default();
@@ -1082,7 +1088,11 @@ impl Viewer {
             }
         }
         if let Some((tab, page, rect)) = self.editor.pending_sign_rect.take() {
-            let rect = self.fit_signature_box(tab, page, rect);
+            let rect = if std::mem::take(&mut self.digital.exact) {
+                rect
+            } else {
+                self.fit_signature_box(tab, page, rect)
+            };
             self.digital.document = Some(tab);
             self.digital.request.page = page;
             self.digital.request.rect = Some(rect);
@@ -1992,6 +2002,7 @@ impl Viewer {
         ));
     }
     pub(super) fn quick_sign(&mut self) {
+        let target = self.digital.target_field.take();
         if self.signing_problem() {
             return;
         }
@@ -2048,8 +2059,18 @@ impl Viewer {
         self.digital.request.name = entry.signer_name();
         self.digital.open = false;
         self.digital.quick = true;
-        self.editor.mode = editing::Mode::Sign;
-        self.editor.start_signature_rectangle();
+        match target {
+            // A form's signature field: its name and box, no drawing needed.
+            Some((name, page, rect)) => {
+                self.digital.request.field = name;
+                self.digital.exact = true;
+                self.editor.pending_sign_rect = Some((self.tabs[self.active].id, page, rect));
+            }
+            None => {
+                self.editor.mode = editing::Mode::Sign;
+                self.editor.start_signature_rectangle();
+            }
+        }
         self.status = None;
     }
     /// Sign the placed box at once, next to the original as “Name-signed.pdf”.

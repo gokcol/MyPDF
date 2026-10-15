@@ -147,11 +147,29 @@ pub async fn sign(
     Ok(output)
 }
 
+/// The form's empty signature field with this name, if there is one to sign into.
+pub fn empty_signature_field(bytes: &[u8], name: &str) -> Option<lopdf::ObjectId> {
+    crate::forms::fields(bytes)
+        .ok()?
+        .into_iter()
+        .find(|f| {
+            f.name == name
+                && matches!(f.kind, crate::forms::FieldKind::Signature { signed: false })
+                && f.widgets.len() == 1
+                && f.widgets[0].id == f.id
+        })
+        .map(|f| f.id)
+}
+
 fn checked_input(
     bytes: &[u8],
     signer: &dyn CryptoSigner,
     field: &str,
 ) -> Result<Vec<SignatureEvidence>> {
+    if empty_signature_field(bytes, field).is_some() {
+        crate::identity::check_certificate(signer.certificate_der())?;
+        return checked_document(bytes, field);
+    }
     ensure!(
         !field.is_empty()
             && field.len() <= 100
@@ -182,6 +200,11 @@ fn checked_input(
             );
         }
     }
+    checked_document(bytes, field)
+}
+/// Whether the document can take another signature.
+fn checked_document(bytes: &[u8], field: &str) -> Result<Vec<SignatureEvidence>> {
+    let doc = lopdf::Document::load_mem(bytes)?;
     ensure!(
         matches!(
             doc.reference_table.cross_reference_type,
@@ -582,6 +605,7 @@ pub async fn sign_custom(
     };
     let output = PdfSigner::new()
         .options(SigningOptions {
+            existing_field: empty_signature_field(bytes, &request.field),
             field_name: request.field.clone(),
             page: request.page as u32,
             digest_algorithm: signer.digest_algorithm(),

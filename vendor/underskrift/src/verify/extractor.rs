@@ -122,10 +122,11 @@ pub fn extract_signatures_from_doc(doc: &Document) -> Result<Vec<ExtractedSignat
         }
 
         // Get the field name
+        // MyPDF patch: names may be UTF-16 text strings.
         let field_name = field
             .get(b"T")
-            .and_then(Object::as_str)
-            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .ok()
+            .and_then(|t| lopdf::decode_text_string(t).ok())
             .unwrap_or_default();
 
         // Get the signature dictionary (may be inline or referenced via /V)
@@ -229,10 +230,10 @@ fn extract_byte_range_values(sig_dict: &lopdf::Dictionary) -> Option<[usize; 4]>
 
 /// Extract a string field from a signature dictionary.
 fn extract_string_field(dict: &lopdf::Dictionary, key: &[u8]) -> Option<String> {
+    // MyPDF patch: decode PDF text strings, including UTF-16 ones.
     dict.get(key)
-        .and_then(Object::as_str)
         .ok()
-        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .and_then(|o| lopdf::decode_text_string(o).ok())
 }
 
 #[cfg(test)]

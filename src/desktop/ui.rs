@@ -340,6 +340,16 @@ pub(super) enum Icon {
     HeaderFooter,
     History,
     Redact,
+    FieldText,
+    FieldCheck,
+    FieldRadio,
+    FieldDropdown,
+    FieldList,
+    FieldButton,
+    FieldImage,
+    FieldDate,
+    TabOrder,
+    Flatten,
 }
 
 pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -401,6 +411,79 @@ pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: 
             line(&[[0.3, 0.45], [0.7, 0.45]]);
             line(&[[0.3, 0.57], [0.58, 0.57]]);
             fill_box([0.3, 0.73], [0.7, 0.83], 0.02, color);
+        }
+        Icon::FieldText => {
+            box_at([0.08, 0.28], [0.92, 0.72], 0.08);
+            line(&[[0.24, 0.4], [0.24, 0.6]]);
+            line(&[[0.36, 0.5], [0.62, 0.5]]);
+        }
+        Icon::FieldCheck => {
+            box_at([0.16, 0.16], [0.84, 0.84], 0.1);
+            line(&[[0.3, 0.5], [0.45, 0.65], [0.7, 0.36]]);
+        }
+        Icon::FieldRadio => {
+            painter.circle_stroke(rect.center(), rect.width() * 0.36, stroke);
+            painter.circle_filled(rect.center(), rect.width() * 0.16, color);
+        }
+        Icon::FieldDropdown => {
+            box_at([0.08, 0.28], [0.92, 0.72], 0.08);
+            line(&[[0.24, 0.5], [0.5, 0.5]]);
+            line(&[[0.64, 0.44], [0.72, 0.56], [0.8, 0.44]]);
+        }
+        Icon::FieldList => {
+            box_at([0.12, 0.1], [0.88, 0.9], 0.08);
+            line(&[[0.26, 0.3], [0.7, 0.3]]);
+            fill_box([0.2, 0.42], [0.8, 0.58], 0.03, soft);
+            line(&[[0.26, 0.5], [0.7, 0.5]]);
+            line(&[[0.26, 0.7], [0.62, 0.7]]);
+        }
+        Icon::FieldButton => {
+            fill_box([0.08, 0.28], [0.92, 0.72], 0.14, soft);
+            box_at([0.08, 0.28], [0.92, 0.72], 0.14);
+            line(&[[0.34, 0.5], [0.66, 0.5]]);
+        }
+        Icon::FieldImage => {
+            box_at([0.1, 0.16], [0.9, 0.84], 0.08);
+            line(&[
+                [0.18, 0.76],
+                [0.42, 0.48],
+                [0.58, 0.64],
+                [0.68, 0.54],
+                [0.84, 0.74],
+            ]);
+            painter.circle_filled(p(0.68, 0.34), rect.width() * 0.07, color);
+        }
+        Icon::FieldDate => {
+            box_at([0.14, 0.2], [0.86, 0.88], 0.08);
+            line(&[[0.14, 0.4], [0.86, 0.4]]);
+            line(&[[0.34, 0.1], [0.34, 0.28]]);
+            line(&[[0.66, 0.1], [0.66, 0.28]]);
+            for (x, y) in [
+                (0.34, 0.56),
+                (0.5, 0.56),
+                (0.66, 0.56),
+                (0.34, 0.72),
+                (0.5, 0.72),
+            ] {
+                painter.circle_filled(p(x, y), width * 0.75, color);
+            }
+        }
+        Icon::TabOrder => {
+            line(&[[0.12, 0.3], [0.84, 0.3]]);
+            line(&[[0.72, 0.2], [0.84, 0.3], [0.72, 0.4]]);
+            line(&[[0.12, 0.7], [0.84, 0.7]]);
+            line(&[[0.72, 0.6], [0.84, 0.7], [0.72, 0.8]]);
+        }
+        Icon::Flatten => {
+            line(&[
+                [0.5, 0.08],
+                [0.88, 0.28],
+                [0.5, 0.48],
+                [0.12, 0.28],
+                [0.5, 0.08],
+            ]);
+            line(&[[0.12, 0.5], [0.5, 0.7], [0.88, 0.5]]);
+            line(&[[0.12, 0.72], [0.5, 0.92], [0.88, 0.72]]);
         }
         Icon::Redact => {
             line(&[[0.12, 0.26], [0.88, 0.26]]);

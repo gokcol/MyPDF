@@ -3,9 +3,7 @@ use super::*;
 use mypdf_milestone0::{
     content,
     convert::{self, Format},
-    document,
-    forms::{self, FieldKind},
-    text_block,
+    document, form_design, forms, text_block,
     text_style::{self, Alignment, TextFormat},
 };
 
@@ -46,11 +44,13 @@ impl InlineText {
     }
 }
 
-struct Inspection {
-    key: Key,
+pub(super) struct Inspection {
+    pub(super) key: Key,
     text: Result<Vec<document::TextRun>, String>,
     images: Result<Vec<content::ImageObject>, String>,
-    fields: Result<Vec<forms::Field>, String>,
+    pub(super) fields: Result<Vec<forms::Field>, String>,
+    /// Every field of the document, as the form designer sees it.
+    pub(super) designed: Result<Vec<mypdf_milestone0::form_design::Designed>, String>,
 }
 /// Tab, base revision, new bytes, and an optional note for the status bar.
 type Change = Result<(u64, u64, Vec<u8>, Option<String>), String>;
@@ -98,6 +98,37 @@ pub(super) enum Edit {
     Flatten {
         dpi: f32,
     },
+    AddField {
+        page: usize,
+        rect: [f32; 4],
+        kind: mypdf_milestone0::form_design::FieldType,
+        properties: mypdf_milestone0::form_design::Properties,
+    },
+    UpdateField {
+        field: lopdf::ObjectId,
+        widget: lopdf::ObjectId,
+        properties: mypdf_milestone0::form_design::Properties,
+    },
+    PlaceField {
+        widget: lopdf::ObjectId,
+        rect: [f32; 4],
+    },
+    RemoveField {
+        field: lopdf::ObjectId,
+        widget: Option<lopdf::ObjectId>,
+    },
+    FieldImage {
+        field: lopdf::ObjectId,
+        image: Vec<u8>,
+    },
+    ClearForm,
+    FlattenForm,
+    DetectFields,
+    TabOrder(mypdf_milestone0::form_design::TabOrder),
+    ImportFormData {
+        data: Vec<u8>,
+        format: mypdf_milestone0::form_data::DataFormat,
+    },
 }
 pub(super) enum AfterText {
     Save(u64),
@@ -128,14 +159,12 @@ pub(super) struct ContentState {
     exit_text_tool: bool,
     next_text: Option<(u64, usize, [f32; 2])>,
     pub(super) loading: bool,
-    inspection: Option<Inspection>,
+    pub(super) inspection: Option<Inspection>,
     selected: Option<usize>,
     pub image_mode: bool,
     /// Another tool (Redact) owns the page overlay.
     pub(super) paused: bool,
     rect: [f32; 4],
-    field: Option<lopdf::ObjectId>,
-    value: String,
     pub busy: bool,
     tx: mpsc::Sender<Change>,
     rx: mpsc::Receiver<Change>,
@@ -311,8 +340,6 @@ impl ContentState {
             image_mode: false,
             paused: false,
             rect: [0.; 4],
-            field: None,
-            value: String::new(),
             busy: false,
             tx,
             rx,
@@ -527,6 +554,93 @@ impl Viewer {
                             content::edit_image(&bytes, page, index, &edit)?
                         }
                         Edit::Field { id, value } => forms::fill(&bytes, id, &value)?,
+                        Edit::AddField {
+                            page,
+                            rect,
+                            kind,
+                            properties,
+                        } => {
+                            note = Some(format!(
+                                "{} added • Undo is available",
+                                kind.label()
+                            ));
+                            form_design::add(&bytes, page, rect, kind, &properties)?.0
+                        }
+                        Edit::UpdateField {
+                            field,
+                            widget,
+                            properties,
+                        } => {
+                            note = Some("Field updated • Undo is available".into());
+                            form_design::update(&bytes, field, widget, &properties)?
+                        }
+                        Edit::PlaceField { widget, rect } => form_design::place(&bytes, widget, rect)?,
+                        Edit::RemoveField { field, widget } => {
+                            note = Some("Field deleted • Undo brings it back".into());
+                            form_design::remove(&bytes, field, widget)?
+                        }
+                        Edit::FieldImage { field, image } => form_design::set_image(&bytes, field, &image)?,
+                        Edit::ClearForm => {
+                            let (bytes, n) = form_design::clear(&bytes)?;
+                            note = Some(format!(
+                                "Cleared {n} field{} • Undo is available",
+                                if n == 1 { "" } else { "s" }
+                            ));
+                            bytes
+                        }
+                        Edit::FlattenForm => {
+                            let (bytes, n) = form_design::flatten(&bytes)?;
+                            anyhow::ensure!(n > 0, "This PDF has no form fields to flatten");
+                            note = Some(format!(
+                                "Flattened {n} field{} into the page • Undo is available until you save",
+                                if n == 1 { "" } else { "s" }
+                            ));
+                            bytes
+                        }
+                        Edit::DetectFields => {
+                            let found = mypdf_milestone0::form_detect::detect(&bytes)?;
+                            anyhow::ensure!(
+                                !found.is_empty(),
+                                "No new fields found. Add fields with the tools in the toolbar."
+                            );
+                            let (bytes, n) =
+                                mypdf_milestone0::form_detect::add_detected(&bytes, &found)?;
+                            note = Some(format!(
+                                "Found and added {n} field{} • Check their names and types, Undo removes them",
+                                if n == 1 { "" } else { "s" }
+                            ));
+                            bytes
+                        }
+                        Edit::TabOrder(order) => {
+                            note = Some(format!(
+                                "Tab order set {} • The numbers show the order",
+                                match order {
+                                    form_design::TabOrder::Rows => "row by row",
+                                    form_design::TabOrder::Columns => "column by column",
+                                }
+                            ));
+                            form_design::set_tab_order(&bytes, order)?
+                        }
+                        Edit::ImportFormData { data, format } => {
+                            let (bytes, report) =
+                                mypdf_milestone0::form_data::import(&bytes, &data, format)?;
+                            let mut parts = vec![format!(
+                                "Filled {} field{}",
+                                report.filled,
+                                if report.filled == 1 { "" } else { "s" }
+                            )];
+                            if !report.unknown.is_empty() {
+                                parts.push(format!(
+                                    "not in this form: {}",
+                                    report.unknown.join(", ")
+                                ));
+                            }
+                            for (name, reason) in &report.rejected {
+                                parts.push(format!("{name}: {reason}"));
+                            }
+                            note = Some(parts.join(" • "));
+                            bytes
+                        }
                         Edit::Block { page, block } => text_block::replace(&bytes, page, &block)?,
                         Edit::AddImage { page, rect, image } => {
                             note = Some(
@@ -599,7 +713,7 @@ impl Viewer {
             wake.request_repaint();
         });
     }
-    fn inspect_content(&mut self, ctx: &egui::Context) {
+    pub(super) fn inspect_content(&mut self, ctx: &egui::Context) {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
@@ -610,7 +724,6 @@ impl Viewer {
         }
         self.content.key = Some(key);
         self.content.selected = None;
-        self.content.field = None;
         self.content.inspection = None;
         self.content.loading = true;
         let bytes = s.source.clone();
@@ -623,11 +736,14 @@ impl Viewer {
                 let images =
                     content::images(&bytes, key.2 as u32 + 1).map_err(|e| format!("{e:#}"));
                 let fields = forms::fields(&bytes).map_err(|e| format!("{e:#}"));
+                let designed =
+                    mypdf_milestone0::form_design::describe(&bytes).map_err(|e| format!("{e:#}"));
                 Inspection {
                     key,
                     text,
                     images,
                     fields,
+                    designed,
                 }
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
@@ -636,6 +752,7 @@ impl Viewer {
                     text: Err("Unsupported page content".into()),
                     images: Err("Unsupported images".into()),
                     fields: Err("Unsupported form structure".into()),
+                    designed: Err("Unsupported form structure".into()),
                 });
             let _ = tx.send(result);
             wake.request_repaint();
@@ -647,15 +764,15 @@ impl Viewer {
             self.conversion_panel(ctx);
             return;
         }
-        if !matches!(mode, editing::Mode::Edit | editing::Mode::Forms) {
+        if mode != editing::Mode::Edit {
             return;
         }
-        if mode == editing::Mode::Edit && self.content.add_target.is_some() {
+        if self.content.add_target.is_some() {
             self.new_text_panel(ctx);
             return;
         }
         self.inspect_content(ctx);
-        if mode == editing::Mode::Edit && !self.content.image_mode {
+        if !self.content.image_mode {
             self.existing_text_panel(ctx);
             return;
         }
@@ -670,11 +787,11 @@ impl Viewer {
         let mut change = None;
         let mut replace = None;
         egui::SidePanel::right("content_inspector").exact_width(310.).resizable(false).frame(egui::Frame::new().fill(theme::paper()).inner_margin(18.)).show(ctx,|ui|{
-            ui.heading(if mode==editing::Mode::Forms{"Fill forms"}else{"Edit PDF"});ui.label(RichText::new(format!("Page {}",page+1)).small().color(theme::muted()));ui.add_space(12.);
+            ui.heading("Edit PDF");ui.label(RichText::new(format!("Page {}",page+1)).small().color(theme::muted()));ui.add_space(12.);
             if self.content.loading{ui.spinner();ui.label("Inspecting page…");return;}
             let Some(info)=&self.content.inspection else{ui.label("Open a PDF to begin.");return};
             if !editable{ui.label(RichText::new(if self.content.busy{"Applying changes…"}else{"This document is read-only."}).color(theme::muted()));}
-            if mode==editing::Mode::Edit{
+            {
                 ui.horizontal(|ui|{if ui.selectable_value(&mut self.content.image_mode,false,"Text").changed()|ui.selectable_value(&mut self.content.image_mode,true,"Images").changed(){self.content.selected=None;}});ui.add_space(8.);
                 if self.content.image_mode{
                     match &info.images{Err(e)=>{ui.label(e);},Ok(images)=>{
@@ -694,26 +811,6 @@ impl Viewer {
                 }else{
                     ui.label("Click text on the page to edit it.");
                 }
-            }else{
-                match &info.fields{Err(e)=>{ui.label(e);},Ok(fields)=>{
-                    let visible:Vec<_>=fields.iter().filter(|f|f.widgets.iter().any(|w|w.page==page)).collect();
-                    if visible.is_empty(){ui.label("No fillable fields on this page. Open a PDF containing a standard AcroForm.");}
-                    egui::ScrollArea::vertical().id_salt("form_fields").max_height(240.).show(ui,|ui|{for f in visible{if ui.selectable_label(self.content.field==Some(f.id),format!("{}{}",f.name,if f.required{" *"}else{""})).clicked(){self.content.field=Some(f.id);self.content.value=f.value.clone();}}});
-                    if let Some(f)=fields.iter().find(|f|Some(f.id)==self.content.field){
-                        ui.separator();ui.label(RichText::new(&f.name).family(ui::semibold()));
-                        if let Some(reason)=&f.reason{ui.label(reason);return;}
-                        ui.add_enabled_ui(editable,|ui|{
-                            match &f.kind{
-                                FieldKind::Text{multiline,max}=>{let edit=if *multiline{egui::TextEdit::multiline(&mut self.content.value).margin(ui::FIELD_MARGIN).desired_rows(5)}else{egui::TextEdit::singleline(&mut self.content.value).margin(ui::FIELD_MARGIN)};let r=ui.add(edit.desired_width(f32::INFINITY).char_limit(max.unwrap_or(32768)));self.editor.text_editing|=r.has_focus();}
-                                FieldKind::Choice{options,editable}=>{egui::ComboBox::from_id_salt("field_choice").selected_text(options.iter().find(|(v,_)|*v==self.content.value).map(|(_,l)|l.as_str()).unwrap_or(&self.content.value)).width(264.).show_ui(ui,|ui|{ui.selectable_value(&mut self.content.value,String::new(),"(empty)");for(v,label)in options{ui.selectable_value(&mut self.content.value,v.clone(),label);}});if *editable{let r=ui.text_edit_singleline(&mut self.content.value);self.editor.text_editing|=r.has_focus();}}
-                                FieldKind::Button{radio,states}=>{if !*radio&&states.len()==1{let mut checked=self.content.value==states[0];if ui.checkbox(&mut checked,"Checked").changed(){self.content.value=if checked{states[0].clone()}else{"Off".into()};}}else{for state in states{ui.radio_value(&mut self.content.value,state.clone(),state);}ui.radio_value(&mut self.content.value,"Off".into(),"Clear selection");}}
-                                FieldKind::Unsupported=>{}
-                            }
-                            ui.add_space(10.);if ui.add_enabled(self.content.value!=f.value,ActionButton::new(Icon::Save,"Apply field value").primary()).clicked(){change=Some(Edit::Field{id:f.id,value:self.content.value.clone()});}
-                        });
-                    }
-                    ui.add_space(12.);ui.label(RichText::new("Values and widget appearances are saved together. Apply each field, then Save a Copy.").small().color(theme::muted()));
-                }}
             }
         });
         if let Some(index) = replace
@@ -1981,13 +2078,10 @@ pub(super) fn overlay(
     page_rect: Rect,
     scale: f32,
 ) {
-    if !matches!(mode, editing::Mode::Edit | editing::Mode::Forms) || state.paused {
+    if mode != editing::Mode::Edit || state.paused {
         return;
     }
-    if mode == editing::Mode::Edit
-        && state.add_target.is_some()
-        && !state.busy
-        && tab.session.as_ref().is_some_and(|s| s.editable)
+    if state.add_target.is_some() && !state.busy && tab.session.as_ref().is_some_and(|s| s.editable)
     {
         let response = ui
             .interact(
@@ -2151,7 +2245,7 @@ pub(super) fn overlay(
         }
         return;
     }
-    if mode == editing::Mode::Edit && !state.image_mode {
+    if !state.image_mode {
         existing_overlay(state, tab, ui, page, page_rect, scale);
         return;
     }
@@ -2164,37 +2258,17 @@ pub(super) fn overlay(
     let painter = ui
         .painter()
         .with_clip_rect(page_rect.intersect(ui.clip_rect()));
-    let selected_field = state.field;
-    let boxes: Vec<(usize, [f32; 4], bool)> = if mode == editing::Mode::Forms {
-        info.fields
-            .as_ref()
-            .map(|fields| {
-                fields
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(i, f)| {
-                        f.widgets
-                            .iter()
-                            .filter(move |w| w.page == page)
-                            .map(move |w| (i, w.rect, selected_field == Some(f.id)))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else if state.image_mode {
-        info.images
-            .as_ref()
-            .map(|images| {
-                images
-                    .iter()
-                    .enumerate()
-                    .map(|(i, m)| (i, m.rect, state.selected == Some(i)))
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        vec![]
-    };
+    let boxes: Vec<(usize, [f32; 4], bool)> = info
+        .images
+        .as_ref()
+        .map(|images| {
+            images
+                .iter()
+                .enumerate()
+                .map(|(i, m)| (i, m.rect, state.selected == Some(i)))
+                .collect()
+        })
+        .unwrap_or_default();
     for (i, r, selected) in boxes {
         let r = Rect::from_min_max(
             page_rect.min + vec2(r[0], r[1]) * scale,
@@ -2225,17 +2299,11 @@ pub(super) fn overlay(
                 egui::Sense::click(),
             )
             .clicked()
+            && let Ok(images) = &info.images
         {
-            if mode == editing::Mode::Forms {
-                if let Ok(fields) = &info.fields {
-                    state.field = Some(fields[i].id);
-                    state.value = fields[i].value.clone();
-                }
-            } else if let Ok(images) = &info.images {
-                state.selected = Some(i);
-                let r = images[i].rect;
-                state.rect = [r[0], r[1], r[2] - r[0], r[3] - r[1]];
-            }
+            state.selected = Some(i);
+            let r = images[i].rect;
+            state.rect = [r[0], r[1], r[2] - r[0], r[3] - r[1]];
         }
     }
 }

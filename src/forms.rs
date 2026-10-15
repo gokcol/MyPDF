@@ -1,7 +1,7 @@
 //! Standard AcroForm values with explicit, portable widget appearances.
-use crate::{content, pdf_font::PdfFont};
+use crate::{content, form_design};
 use anyhow::{Context, Result, ensure};
-use lopdf::{Document, Object, ObjectId, Stream, dictionary};
+use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -17,6 +17,15 @@ pub enum FieldKind {
     Button {
         radio: bool,
         states: Vec<String>,
+    },
+    /// A text field that holds a date in an Acrobat format such as dd.mm.yyyy.
+    Date {
+        format: String,
+    },
+    /// A button that shows a picture people choose.
+    Image,
+    Signature {
+        signed: bool,
     },
     Unsupported,
 }
@@ -168,7 +177,10 @@ pub fn fields(bytes: &[u8]) -> Result<Vec<Field>> {
                 {
                     reason = Some("Rotated widget appearances are read-only".into());
                 }
-                if wd.has(b"AA") || wd.has(b"A") {
+                // Date formatting and Acrobat's picture chooser are understood without running them.
+                let understood = (!wd.has(b"AA") || form_design::date_format(&doc, id).is_some())
+                    && (!wd.has(b"A") || form_design::is_image_field(&doc, id));
+                if !understood {
                     reason = Some(
                         "Fields with actions are read-only; scripts are never executed".into(),
                     );
@@ -186,7 +198,7 @@ pub fn fields(bytes: &[u8]) -> Result<Vec<Field>> {
         if flags & 1 != 0 {
             reason = Some("Read-only field".into());
         }
-        if inherited(&doc, id, b"AA").is_some() {
+        if inherited(&doc, id, b"AA").is_some() && form_design::date_format(&doc, id).is_none() {
             reason = Some("Fields with validation or calculation scripts are read-only".into());
         }
         if widgets.is_empty() {
@@ -202,11 +214,14 @@ pub fn fields(bytes: &[u8]) -> Result<Vec<Field>> {
                         "Password, file-select, comb and rich-text fields are read-only".into(),
                     );
                 }
-                FieldKind::Text {
-                    multiline: flags & (1 << 12) != 0,
-                    max: inherited(&doc, id, b"MaxLen")
-                        .and_then(|o| o.as_i64().ok())
-                        .map(|v| v.max(0) as usize),
+                match form_design::date_format(&doc, id) {
+                    Some(format) => FieldKind::Date { format },
+                    None => FieldKind::Text {
+                        multiline: flags & (1 << 12) != 0,
+                        max: inherited(&doc, id, b"MaxLen")
+                            .and_then(|o| o.as_i64().ok())
+                            .map(|v| v.max(0) as usize),
+                    },
                 }
             }
             Some(b"Ch") => {
@@ -234,6 +249,12 @@ pub fn fields(bytes: &[u8]) -> Result<Vec<Field>> {
                     editable: flags & (1 << 18) != 0,
                 }
             }
+            Some(b"Btn") if flags & (1 << 16) != 0 && form_design::is_image_field(&doc, id) => {
+                FieldKind::Image
+            }
+            Some(b"Sig") => FieldKind::Signature {
+                signed: inherited(&doc, id, b"V").is_some(),
+            },
             Some(b"Btn") => {
                 if flags & (1 << 16) != 0 {
                     reason = Some("Push buttons are read-only".into());
@@ -261,7 +282,7 @@ pub fn fields(bytes: &[u8]) -> Result<Vec<Field>> {
                 }
             }
             _ => {
-                reason = Some("Signature and unknown field types are read-only here".into());
+                reason = Some("Unknown field types are read-only here".into());
                 FieldKind::Unsupported
             }
         };
@@ -310,7 +331,7 @@ pub fn fill(bytes: &[u8], id: ObjectId, value: &str) -> Result<Vec<u8>> {
         "{}",
         field.reason.unwrap_or_default()
     );
-    let display = match &field.kind {
+    let stored = match &field.kind {
         FieldKind::Text { multiline, max } => {
             ensure!(
                 *multiline || !value.contains(['\n', '\r']),
@@ -322,16 +343,21 @@ pub fn fill(bytes: &[u8], id: ObjectId, value: &str) -> Result<Vec<u8>> {
             );
             value.to_owned()
         }
+        FieldKind::Date { format } => {
+            if value.trim().is_empty() {
+                String::new()
+            } else {
+                let date = crate::form_data::parse_date(format, value)
+                    .with_context(|| format!("Enter the date as {format}"))?;
+                crate::form_data::format_date(format, date)
+            }
+        }
         FieldKind::Choice { options, editable } => {
             ensure!(
                 *editable || value.is_empty() || options.iter().any(|(v, _)| v == value),
                 "Choose one of the field's options"
             );
-            options
-                .iter()
-                .find(|(v, _)| v == value)
-                .map(|(_, l)| l.clone())
-                .unwrap_or_else(|| value.into())
+            value.to_owned()
         }
         FieldKind::Button { states, radio } => {
             ensure!(
@@ -362,89 +388,21 @@ pub fn fill(bytes: &[u8], id: ObjectId, value: &str) -> Result<Vec<u8>> {
             }
             return content::serialize(&mut doc);
         }
+        FieldKind::Image => anyhow::bail!("Choose a picture for an image field"),
+        FieldKind::Signature { .. } => anyhow::bail!("Sign a signature field with Sign"),
         FieldKind::Unsupported => anyhow::bail!("Unsupported form field"),
     };
-    let display = display
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .replace('\t', "    ");
-    let font = PdfFont::embed(&mut doc, &display)?;
     for w in &field.widgets {
         if w.id != id {
             doc.get_dictionary_mut(w.id)?.remove(b"V");
         }
-        let r = rect(doc.get_dictionary(w.id)?)?;
-        let width = (r[2] - r[0]).abs();
-        let height = (r[3] - r[1]).abs();
-        let multiline = matches!(
-            field.kind,
-            FieldKind::Text {
-                multiline: true,
-                ..
-            }
-        );
-        let mut size = 12.0_f32.min((height - 4.).max(4.));
-        let lines = loop {
-            let mut lines = vec![];
-            for paragraph in display.split('\n') {
-                let mut line = String::new();
-                for c in paragraph.chars() {
-                    let mut candidate = line.clone();
-                    candidate.push(c);
-                    if multiline && !line.is_empty() && font.width(&candidate, size) > width - 6. {
-                        lines.push(std::mem::take(&mut line));
-                    }
-                    line.push(c);
-                }
-                lines.push(line);
-            }
-            if lines.iter().all(|l| font.width(l, size) <= width - 6.)
-                && lines.len() as f32 * size * 1.2 <= height - 4.
-            {
-                break lines;
-            }
-            size -= 0.5;
-            ensure!(
-                size >= 4.,
-                "The value will not fit in this field. Shorten it before saving."
-            );
-        };
-        let mut body = format!(
-            "q 1 1 1 rg 0 0 {width} {height} re f 0.7 G 0.5 w 0.25 0.25 {} {} re S 2 2 {} {} re W n BT /F0 {size} Tf 0 g\n",
-            width - 0.5,
-            height - 0.5,
-            width - 4.,
-            height - 4.
-        );
-        let align = inherited(&doc, id, b"Q")
-            .and_then(|o| o.as_i64().ok())
-            .unwrap_or(0);
-        for (i, line) in lines.iter().enumerate() {
-            let textw = font.width(line, size);
-            let x = match align {
-                1 => (width - textw) / 2.,
-                2 => width - textw - 3.,
-                _ => 3.,
-            };
-            let y = if multiline {
-                height - size - 3. - i as f32 * size * 1.2
-            } else {
-                (height - size) / 2. + size * 0.2
-            };
-            body.push_str(&format!("1 0 0 1 {x} {y} Tm <{}> Tj\n", font.hex(line)?));
-        }
-        body.push_str("ET Q");
-        let mut stream = Stream::new(
-            dictionary! {"Type"=>"XObject","Subtype"=>"Form","BBox"=>vec![0.into(),0.into(),width.into(),height.into()],"Resources"=>dictionary!{"Font"=>dictionary!{"F0"=>font.id}}},
-            body.into_bytes(),
-        );
-        stream.compress()?;
-        let ap = doc.add_object(stream);
-        doc.get_dictionary_mut(w.id)?
-            .set("AP", dictionary! {"N"=>ap});
     }
     let d = doc.get_dictionary_mut(id)?;
-    d.set("V", crate::annotations::text_string(value));
+    if stored.is_empty() {
+        d.remove(b"V");
+    } else {
+        d.set("V", crate::annotations::text_string(&stored));
+    }
     d.remove(b"RV");
     if let FieldKind::Choice { options, .. } = &field.kind {
         if let Some(i) = options.iter().position(|(v, _)| v == value) {
@@ -453,5 +411,6 @@ pub fn fill(bytes: &[u8], id: ObjectId, value: &str) -> Result<Vec<u8>> {
             d.remove(b"I");
         }
     }
+    form_design::refresh(&mut doc, id, true)?;
     content::serialize(&mut doc)
 }

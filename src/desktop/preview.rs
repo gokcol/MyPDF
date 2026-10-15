@@ -197,6 +197,9 @@ fn native_visual_preview() {
         "Trusted",
         "Redact",
         "Flatten",
+        "FormEmpty",
+        "FormDesign",
+        "FormOrder",
         "Signatures",
     ] {
         if let Ok(only) = std::env::var("MYPDF_PREVIEW_ONLY")
@@ -407,6 +410,19 @@ fn native_visual_preview() {
             app.editor.mode = editing::Mode::Edit;
             app.preview_header_footer();
         }
+        if collection == "FormEmpty" {
+            app.redaction.active = false;
+            app.editor.mode = editing::Mode::Forms;
+            app.inspector = true;
+        }
+        if collection == "FormDesign" {
+            app.preview_form();
+        }
+        if collection == "FormOrder" {
+            app.editor.mode = editing::Mode::Forms;
+            app.forms.selected = None;
+            app.forms.show_order = true;
+        }
         // The last scene swaps in a signed copy of the document.
         if collection == "Signatures" {
             let signed = fixture.path().join("Signed contract.pdf");
@@ -458,6 +474,12 @@ fn native_visual_preview() {
             assert!(std::time::Instant::now() < deadline);
             preview.capture(&mut app, &ctx);
             std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if collection == "FormDesign" {
+            app.preview_form_select("Country");
+            for _ in 0..3 {
+                preview.capture(&mut app, &ctx);
+            }
         }
         if collection == "InlineText" {
             app.content.existing_preview(app.tabs[0].id);
