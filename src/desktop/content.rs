@@ -138,6 +138,8 @@ pub(super) enum Edit {
     Watermark(mypdf_milestone0::watermark::Watermark),
     RemoveWatermarks,
     RecognizeText(Arc<super::recognize::Progress>),
+    /// Fill fields with the saved details.
+    FillDetails(Vec<mypdf_milestone0::form_profile::Suggestion>),
 }
 pub(super) enum AfterText {
     Save(u64),
@@ -644,6 +646,15 @@ impl Viewer {
                             note = Some(format!(
                                 "Removed the watermark from {n} page{} • Undo brings it back",
                                 if n == 1 { "" } else { "s" }
+                            ));
+                            bytes
+                        }
+                        Edit::FillDetails(chosen) => {
+                            let bytes = mypdf_milestone0::form_profile::fill(&bytes, &chosen)?;
+                            note = Some(format!(
+                                "Filled {} field{} with your details • Undo is available",
+                                chosen.len(),
+                                if chosen.len() == 1 { "" } else { "s" }
                             ));
                             bytes
                         }

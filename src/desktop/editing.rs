@@ -6,7 +6,7 @@ use mypdf_milestone0::{
     assets::{self, Asset, Library},
 };
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Mode {
     Read,
     Annotate,

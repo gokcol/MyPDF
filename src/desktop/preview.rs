@@ -131,6 +131,8 @@ impl TriangleVertices for [u32] {
     }
 }
 
+const PREVIEW_AGREEMENT: &str = "# Service Agreement\n\nThis agreement is made between Northwind Ltd and the Client.\n\n## 1. Services\n\nNorthwind delivers the monthly report by the fifth working day.\n\n## 2. Payment\n\nPayment is due within thirty days of the invoice date.\n\nLate payments carry a fee of 2% per month.\n\n## 3. Term\n\nThis agreement lasts for twelve months and renews automatically.\n\n## 4. Disputes\n\nDisputes are settled by the courts of Ankara.";
+
 #[test]
 #[ignore = "Manual visual QA; writes only to the explicitly selected preview directory"]
 fn native_visual_preview() {
@@ -209,6 +211,11 @@ fn native_visual_preview() {
         "LinkConfirm",
         "Watermark",
         "RecognizeText",
+        "MyDetails",
+        "FillDetails",
+        "Zen",
+        "CompareChoose",
+        "Compare",
         "Signatures",
     ] {
         if let Ok(only) = std::env::var("MYPDF_PREVIEW_ONLY")
@@ -456,6 +463,108 @@ fn native_visual_preview() {
             app.watermark = None;
             app.ocr_confirm = true;
         }
+        if collection == "MyDetails" {
+            app.ocr_confirm = false;
+            app.editor.mode = editing::Mode::Forms;
+            app.details.editor = Some(mypdf_milestone0::form_profile::Profile {
+                full_name: "Ayşe Yılmaz".into(),
+                email: "ayse@example.com".into(),
+                phone: "+90 555 123 45 67".into(),
+                company: "Northwind Ltd".into(),
+                city: "İstanbul".into(),
+                country: "Türkiye".into(),
+                ..Default::default()
+            });
+        }
+        if collection == "FillDetails" {
+            use mypdf_milestone0::form_profile::{Detail, Suggestion};
+            app.details.editor = None;
+            app.details.review = Some(
+                [
+                    ("Adi_Soyadi", Detail::FullName, "Ayşe Yılmaz"),
+                    ("E_posta", Detail::Email, "ayse@example.com"),
+                    ("Telefon", Detail::Phone, "+90 555 123 45 67"),
+                    ("Sirket", Detail::Company, "Northwind Ltd"),
+                    ("Tarih", Detail::Today, "15.10.2026"),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(i, (name, detail, value))| {
+                    (
+                        Suggestion {
+                            field: (i as u32 + 1, 0),
+                            name: name.into(),
+                            detail,
+                            value: value.into(),
+                        },
+                        i != 3,
+                    )
+                })
+                .collect(),
+            );
+        }
+        if collection == "Zen" {
+            app.details.review = None;
+            app.ocr_confirm = false;
+            app.editor.mode = editing::Mode::Read;
+            app.toggle_zen(&ctx);
+        }
+        if collection == "CompareChoose" {
+            if app.zen.is_some() {
+                app.toggle_zen(&ctx);
+            }
+            app.request_compare();
+        }
+        if collection == "Compare" {
+            app.compare_chooser = None;
+            let versions = [
+                ("Agreement v1.pdf", PREVIEW_AGREEMENT.to_owned()),
+                (
+                    "Agreement v2.pdf",
+                    PREVIEW_AGREEMENT
+                        .replace("fifth", "third")
+                        .replace("thirty days", "sixty days")
+                        .replace("Late payments carry a fee of 2% per month.\n\n", "")
+                        .replace(
+                            "renews automatically.",
+                            "renews automatically.\n\nEither party may end it with sixty days' notice.",
+                        ),
+                ),
+            ]
+            .map(|(name, text)| {
+                let path = fixture.path().join(name);
+                std::fs::write(&path, mypdf_milestone0::convert::text_to_pdf(&text, true).unwrap()).unwrap();
+                app.open(path.clone(), &ctx);
+                let path = std::fs::canonicalize(&path).unwrap();
+                app.tabs.iter().find(|t| t.path == path).unwrap().id
+            });
+            app.start_compare(
+                comparison::Pick::Tab(versions[0]),
+                comparison::Pick::Tab(versions[1]),
+                &ctx,
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let drawn = |app: &Viewer| {
+                app.comparison.as_ref().is_some_and(|c| c.result.is_some())
+                    && versions.iter().all(|id| {
+                        app.tabs
+                            .iter()
+                            .find(|t| t.id == *id)
+                            .is_some_and(|t| t.rasters.keys().any(|k| !k.thumbnail))
+                    })
+            };
+            while !drawn(&app) {
+                assert!(std::time::Instant::now() < deadline);
+                preview.capture(&mut app, &ctx);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if let Some(c) = &mut app.comparison {
+                c.select(1);
+            }
+            for _ in 0..3 {
+                preview.capture(&mut app, &ctx);
+            }
+        }
         if collection == "LinkConfirm" {
             app.shrink = None;
             app.link_confirm = Some("https://www.example.com/privacy-policy".into());
@@ -473,6 +582,9 @@ fn native_visual_preview() {
         }
         // The last scene swaps in a signed copy of the document.
         if collection == "Signatures" {
+            app.comparison = None;
+            app.tabs.truncate(1);
+            app.active = 0;
             // Let go of any drag from an earlier scene without changing anything.
             app.preview_cancel_drag();
             app.link_confirm = None;

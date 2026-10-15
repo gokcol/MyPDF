@@ -77,6 +77,7 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             &item("save", "Save As…", Code::KeyS, Modifiers::SHIFT),
             &P::separator(),
             &item("print", "Print…", Code::KeyP, Modifiers::empty()),
+            &MenuItem::with_id("compare", "Compare Documents…", true, None),
             &P::separator(),
             &MenuItem::with_id("protect", "Protect with Password…", true, None),
             &MenuItem::with_id("unprotect", "Remove Password…", true, None),
@@ -124,6 +125,9 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
         &[
             &MenuItem::with_id("form_detect", "Detect Form Fields", true, None),
             &P::separator(),
+            &MenuItem::with_id("form_fill_details", "Fill with My Details…", true, None),
+            &MenuItem::with_id("my_details", "My Details…", true, None),
+            &P::separator(),
             &MenuItem::with_id("form_tab_rows", "Tab Order by Rows", true, None),
             &MenuItem::with_id("form_tab_columns", "Tab Order by Columns", true, None),
             &P::separator(),
@@ -170,6 +174,7 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
         true,
         &[
             &MenuItem::with_id("home", "Home (⇧⌘H)", true, None),
+            &MenuItem::with_id("zen", "Zen Mode (⇧⌘F)", true, None),
             &appearance,
             &P::separator(),
             &item("zoom_in", "Zoom In", Code::Equal, Modifiers::empty()),
