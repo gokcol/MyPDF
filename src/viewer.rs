@@ -316,6 +316,8 @@ pub enum Event {
         key: RasterKey,
         error: String,
     },
+    /// The file opens only with a password; these are its protected bytes.
+    PasswordNeeded(Arc<[u8]>),
     Failed(String),
 }
 
@@ -401,6 +403,10 @@ fn run_worker(
     alive: &AtomicBool,
     send: &impl Fn(Event),
 ) -> Result<()> {
+    if crate::security::needs_password(&bytes) {
+        send(Event::PasswordNeeded(bytes));
+        return Ok(());
+    }
     let (annotations, capabilities, rendering, editing_warning) =
         match lopdf::Document::load_mem(&bytes) {
             Ok(mut doc) => {
@@ -426,7 +432,8 @@ fn run_worker(
                 Some(format!("Editing is unavailable for this PDF: {e}")),
             ),
         };
-    let pdf = Pdf::new(rendering).map_err(|e| anyhow::anyhow!("Could not read this PDF ({e:?}). Password-protected PDFs are not supported in this milestone."))?;
+    let pdf =
+        Pdf::new(rendering).map_err(|e| anyhow::anyhow!("Could not read this PDF ({e:?})."))?;
     if pdf.pages().is_empty() || pdf.pages().len() > 10_000 {
         bail!("The PDF must contain between 1 and 10,000 pages.");
     }

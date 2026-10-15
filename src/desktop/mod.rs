@@ -7,12 +7,16 @@ mod header_footer;
 mod home;
 pub mod icon;
 mod menu;
+mod navigate;
 mod organize;
 #[cfg(test)]
 mod preview;
+mod print;
+mod protect;
 mod recovery;
 mod redaction;
 mod selection;
+mod shrink;
 mod signatures;
 mod text_selection;
 mod theme;
@@ -20,6 +24,7 @@ mod ui;
 use ui::{ActionButton, Icon};
 
 use eframe::egui::{self, Color32, FontId, Rect, RichText, Stroke, TextureHandle, pos2, vec2};
+use mypdf_milestone0::navigation;
 use mypdf_milestone0::viewer::{self, Event, PageSize, PageText, RasterKey, SearchHit, Worker};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -107,6 +112,12 @@ struct Tab {
     rasters: HashMap<RasterKey, Raster>,
     /// The previous version's page images, shown until the edited pages are drawn.
     stale: HashMap<usize, Raster>,
+    /// The outline and links, read in the background.
+    nav: Option<navigate::Nav>,
+    /// A protected file waiting for its password.
+    locked: Option<protect::Locked>,
+    /// The password copies are saved with.
+    password: Option<zeroize::Zeroizing<String>>,
     /// The next document change only edits page content, so old images may stand in.
     keep_stale: bool,
     pending: HashSet<RasterKey>,
@@ -285,9 +296,19 @@ pub struct Viewer {
     accessible_text: bool,
     recovery: recovery::Recovery,
     search: bool,
+    /// The sidebar shows the document's outline.
+    outline: bool,
     focus_search: bool,
     status: Option<(String, bool)>,
     saving: bool,
+    /// The file name the next Save a Copy suggests.
+    save_name: Option<String>,
+    /// A web or mail link waiting for the user to agree to open it.
+    link_confirm: Option<String>,
+    protect: Option<protect::ProtectDraft>,
+    unprotect: bool,
+    /// Reduce File Size is open, with this quality chosen.
+    shrink: Option<mypdf_milestone0::compress::Level>,
     save_events: mpsc::Receiver<Result<(PathBuf, u64, u64), String>>,
     save_tx: mpsc::Sender<Result<(PathBuf, u64, u64), String>>,
     close_intent: Option<Option<u64>>,
@@ -325,6 +346,12 @@ impl Viewer {
             accessible_text: false,
             recovery: recovery::Recovery::new(&cc.egui_ctx),
             search: false,
+            outline: false,
+            save_name: None,
+            link_confirm: None,
+            protect: None,
+            unprotect: false,
+            shrink: None,
             focus_search: false,
             status: None,
             saving: false,
@@ -408,6 +435,9 @@ impl Viewer {
             search_dirty: false,
             rasters: HashMap::new(),
             stale: HashMap::new(),
+            nav: None,
+            locked: None,
+            password: None,
             keep_stale: false,
             pending: HashSet::new(),
             render_errors: HashMap::new(),
@@ -498,11 +528,16 @@ impl Viewer {
             .map(|s| s.annotations.clone())
             .unwrap_or_default();
         let signed_original = tab.signed_original.clone();
+        let password = tab.password.clone();
         let stem = tab.path.file_stem().unwrap_or_default().to_string_lossy();
+        let name = self
+            .save_name
+            .take()
+            .unwrap_or_else(|| format!("{stem}-copy.pdf"));
         let dialog = rfd::FileDialog::new()
             .set_title("Save a Copy • choose a new filename")
             .add_filter("PDF document", &["pdf"])
-            .set_file_name(format!("{stem}-copy.pdf"))
+            .set_file_name(name)
             .set_directory(tab.path.parent().unwrap_or(std::path::Path::new(".")));
         let Some(destination) = self.native_save(dialog) else {
             self.close_after_save = None;
@@ -524,6 +559,11 @@ impl Viewer {
                     Some(original) => {
                         mypdf_milestone0::signature_edit::incremental_update(&original, &bytes)?
                     }
+                    None => bytes,
+                };
+                // A protected document's copies keep its password.
+                let bytes = match &password {
+                    Some(password) => mypdf_milestone0::security::protect(&bytes, password)?,
                     None => bytes,
                 };
                 viewer::save_copy(&destination, &bytes)?;
@@ -552,6 +592,10 @@ impl Viewer {
             && matches!(
                 action,
                 "save"
+                    | "print"
+                    | "protect"
+                    | "unprotect"
+                    | "shrink"
                     | "close"
                     | "undo"
                     | "redo"
@@ -598,6 +642,10 @@ impl Viewer {
             "hf_remove_numbers" => self.request_remove_page_numbers(),
             "redact" => self.start_redaction(),
             "flatten" => self.request_flatten(),
+            "print" => self.print_document(ctx),
+            "protect" => self.request_protect(),
+            "unprotect" => self.request_unprotect(),
+            "shrink" => self.request_shrink(),
             "form_detect" | "form_clear" | "form_tab_rows" | "form_tab_columns"
             | "form_flatten" | "form_import" | "form_export" => {
                 self.inspector = true;
@@ -754,6 +802,9 @@ impl Viewer {
                         tab.pending.remove(&key);
                         tab.render_errors.insert(key.page, error);
                     }
+                    Event::PasswordNeeded(encrypted) => {
+                        tab.locked = Some(protect::Locked::new(encrypted));
+                    }
                     Event::Failed(error) => {
                         tab.pending.clear();
                         tab.error = Some(error);
@@ -889,6 +940,7 @@ impl Viewer {
                 (egui::Key::N, "new"),
                 (egui::Key::O, "open"),
                 (egui::Key::S, "save"),
+                (egui::Key::P, "print"),
                 (egui::Key::W, "close"),
                 (egui::Key::F, "find"),
                 (egui::Key::Equals, "zoom_in"),
@@ -1067,8 +1119,9 @@ impl Viewer {
                         (Icon::Blank, "New blank PDF", "new"),
                         (Icon::Open, "Open…", "open"),
                         (Icon::Save, "Save a Copy…", "save"),
+                        (Icon::Print, "Print… (⌘P)", "print"),
                     ] {
-                        let enabled = key != "save"
+                        let enabled = !matches!(key, "save" | "print")
                             || (!self.saving
                                 && self
                                     .tabs
@@ -1275,6 +1328,11 @@ impl Viewer {
                         } else if let Some(warning) = &tab.editing_warning {
                             pill(ui, "Read-only", theme::muted()).on_hover_text(warning);
                         }
+                        if tab.password.is_some() {
+                            pill(ui, "Protected", theme::accent()).on_hover_text(
+                                "Opens with a password. Copies you save keep it; File → Remove Password… saves one without.",
+                            );
+                        }
                     }
                     if let Some(e) = &self.recovery.error {
                         if ui.small_button("Autosave issue").on_hover_text(e).clicked() {
@@ -1319,14 +1377,21 @@ impl Viewer {
                 .width_range(190.0..=360.0)
                 .frame(egui::Frame::new().fill(theme::paper()).inner_margin(12.0))
                 .show(ctx, |ui| {
-                    match ui::segmented(ui, &["Pages", "Search", "Marks"], 2) {
+                    match ui::segmented(ui, &["Pages", "Outline", "Search", "Marks"], 3) {
                         Some(0) => {
                             self.editor.annotation_sidebar = false;
                             self.search = false;
+                            self.outline = false;
                         }
                         Some(1) => {
                             self.editor.annotation_sidebar = false;
+                            self.search = false;
+                            self.outline = true;
+                        }
+                        Some(2) => {
+                            self.editor.annotation_sidebar = false;
                             self.search = true;
+                            self.outline = false;
                             self.focus_search = true;
                         }
                         _ => {}
@@ -1339,9 +1404,11 @@ impl Viewer {
         let tab = &mut self.tabs[self.active];
         let tick = self.tick;
         egui::SidePanel::left("sidebar").resizable(true).default_width(220.0).width_range(190.0..=360.0).frame(egui::Frame::new().fill(theme::paper()).inner_margin(12.0)).show(ctx, |ui| {
-            match ui::segmented(ui, &["Pages", "Search", "Marks"], usize::from(self.search)) {
-                Some(0) => self.search = false,
-                Some(1) => { self.search = true; self.focus_search = true; }
+            let current = if self.search { 2 } else if self.outline { 1 } else { 0 };
+            match ui::segmented(ui, &["Pages", "Outline", "Search", "Marks"], current) {
+                Some(0) => { self.search = false; self.outline = false; }
+                Some(1) => { self.search = false; self.outline = true; }
+                Some(2) => { self.search = true; self.outline = false; self.focus_search = true; }
                 Some(_) => self.editor.annotation_sidebar = true,
                 None => {}
             }
@@ -1370,6 +1437,8 @@ impl Viewer {
                     }); }
                 });
                 if let Some(index) = chosen { tab.select_hit(index); }
+            } else if self.outline {
+                navigate::outline_list(tab, ui, ctx);
             } else {
                 ui.label(RichText::new(format!("{} pages", tab.pages.len())).color(theme::muted()).size(11.5));
                 egui::ScrollArea::vertical().id_salt((tab.id, "thumbnails")).show_rows(ui, 176.0, tab.pages.len(), |ui, range| {
@@ -1520,6 +1589,8 @@ impl Viewer {
                     );
                 }
                 let mut visible_page = tab.page;
+                let mut follow = None;
+                tab.navigation(ctx);
                 let output = scroll.show_viewport(ui, |ui, viewport| {
                     let (canvas, canvas_response) =
                         ui.allocate_exact_size(vec2(max_width, height), egui::Sense::click());
@@ -1656,6 +1727,9 @@ impl Viewer {
                         {
                             signatures::page_overlay(tab, ui, page, page_rect, scale);
                         }
+                        if let Some(target) = navigate::link_overlay(tab, self.editor.mode, ui, page, page_rect, scale) {
+                            follow = Some(target);
+                        }
                         ui.painter().rect_stroke(
                             page_rect,
                             0.0,
@@ -1665,6 +1739,11 @@ impl Viewer {
                     }
                 });
                 tab.document_view = Some((output.inner_rect, output.state.offset, max_width));
+                match follow {
+                    Some(navigation::Target::Page(page)) => tab.jump(page),
+                    Some(navigation::Target::Uri(uri)) => self.link_confirm = Some(uri),
+                    None => {}
+                }
                 if visible_page != tab.page {
                     tab.page = visible_page;
                     tab.page_input = (visible_page + 1).to_string();
@@ -1767,6 +1846,10 @@ impl eframe::App for Viewer {
         self.finish_new_text(ctx);
         self.form_events(ctx);
         self.form_dialogs(ctx);
+        self.password_prompt(ctx);
+        self.protect_dialogs(ctx);
+        self.shrink_dialog(ctx);
+        self.link_dialog(ctx);
         self.page_dialogs(ctx);
         self.digital_events(ctx);
         self.editor_windows(ctx);

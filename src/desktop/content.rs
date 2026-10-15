@@ -134,6 +134,7 @@ pub(super) enum Edit {
         rect: [f32; 4],
         layout: mypdf_milestone0::form_layout::Layout,
     },
+    ReduceSize(mypdf_milestone0::compress::Level),
 }
 pub(super) enum AfterText {
     Save(u64),
@@ -626,6 +627,16 @@ impl Viewer {
                                 }
                             ));
                             form_design::set_tab_order(&bytes, order)?
+                        }
+                        Edit::ReduceSize(level) => {
+                            let (bytes, r) = mypdf_milestone0::compress::reduce(&bytes, level)?;
+                            note = Some(format!(
+                                "Reduced from {} to {} ({}% smaller) • Save a Copy to keep it",
+                                super::shrink::size(r.before),
+                                super::shrink::size(r.after),
+                                100 - r.after * 100 / r.before.max(1)
+                            ));
+                            bytes
                         }
                         Edit::InsertLayout { page, rect, layout } => {
                             let (bytes, n) =
@@ -1160,10 +1171,14 @@ impl Viewer {
                 ui.add_space(18.);ui.separator();ui.add_space(12.);ui.label(RichText::new("Flatten").family(ui::semibold()));
                 ui.label(RichText::new("Turn every page into an image so nothing on it can be edited. Annotations and form fields are burned in; the result can still be signed.").small().color(theme::muted()));
                 if ui.add_enabled(ready,ActionButton::new(Icon::Document,"Flatten PDF…")).clicked(){action="flatten";}
+                ui.add_space(18.);ui.separator();ui.add_space(12.);ui.label(RichText::new("Reduce file size").family(ui::semibold()));
+                ui.label(RichText::new("Make pictures and scans smaller for email or upload. Text and drawings stay sharp.").small().color(theme::muted()));
+                if ui.add_enabled(ready,ActionButton::new(Icon::Extract,"Reduce File Size…")).clicked(){action="shrink";}
                 ui.add_space(16.);ui.label(RichText::new("Word and Markdown conversions use document text and basic paragraphs. Fonts, columns, tables, headers and page layout are not reconstructed. Word import accepts text documents; drawings are reported. No OCR yet.").small().color(theme::muted()));
             });if self.content.busy{ui.spinner();ui.label("Converting…");}
         });
         match action {
+            "shrink" => self.request_shrink(),
             "blank" => self.new_blank(ctx),
             "images" | "document" => self.import_conversion(ctx, action == "images"),
             "export" => self.export_conversion(ctx),
