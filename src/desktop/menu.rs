@@ -27,6 +27,10 @@ impl NativeMenu {
 #[cfg(not(target_os = "macos"))]
 pub struct NativeMenu;
 
+/// What MyPDF is, in the About window and the README.
+#[cfg(all(target_os = "macos", not(test)))]
+const ABOUT: &str = "MyPDF was built with the help of Claude, Anthropic's AI assistant, to make everyday business paperwork easier. It is provided as is, without warranty of any kind: keep copies of important documents and use it at your own risk.";
+
 #[cfg(all(target_os = "macos", not(test)))]
 pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String>) {
     use muda::{
@@ -51,11 +55,8 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
                 Some("About MyPDF"),
                 Some(muda::AboutMetadata {
                     name: Some("MyPDF".into()),
-                    version: Some("0.6 • Native PDF editor".into()),
-                    comments: Some(
-                        "Native PDF viewer, annotations and certificate signing. Built with Rust."
-                            .into(),
-                    ),
+                    version: Some(format!("{} · Native PDF editor", env!("CARGO_PKG_VERSION"))),
+                    comments: Some(ABOUT.into()),
                     ..Default::default()
                 }),
             ),
