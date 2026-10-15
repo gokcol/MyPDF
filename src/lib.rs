@@ -1,5 +1,6 @@
 pub mod annotations;
 pub mod assets;
+pub mod compress;
 pub mod content;
 pub mod convert;
 pub mod document;
@@ -13,11 +14,13 @@ pub mod home;
 pub mod identity;
 #[cfg(target_os = "macos")]
 pub mod keychain;
+pub mod navigation;
 pub mod pages;
 pub mod pdf_font;
 pub mod proof;
 pub mod recovery;
 pub mod redact;
+pub mod security;
 pub mod signature_edit;
 pub mod signing;
 pub mod stroke;

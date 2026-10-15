@@ -350,6 +350,7 @@ pub(super) enum Icon {
     FieldDate,
     TabOrder,
     Flatten,
+    Print,
 }
 
 pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -473,6 +474,13 @@ pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: 
             line(&[[0.72, 0.2], [0.84, 0.3], [0.72, 0.4]]);
             line(&[[0.12, 0.7], [0.84, 0.7]]);
             line(&[[0.72, 0.6], [0.84, 0.7], [0.72, 0.8]]);
+        }
+        Icon::Print => {
+            line(&[[0.28, 0.36], [0.28, 0.1], [0.72, 0.1], [0.72, 0.36]]);
+            box_at([0.1, 0.36], [0.9, 0.72], 0.08);
+            fill_box([0.3, 0.6], [0.7, 0.92], 0.02, soft);
+            box_at([0.3, 0.6], [0.7, 0.92], 0.02);
+            painter.circle_filled(p(0.76, 0.48), width * 0.8, color);
         }
         Icon::Flatten => {
             line(&[

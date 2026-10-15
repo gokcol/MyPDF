@@ -6,6 +6,7 @@ Version 0.6.0 adds a Home workspace, local autosave and crash recovery, icon-led
 - **Edit:** type directly on blank or existing pages; click existing text to edit it in place; drag a rectangular selection to reflow several lines together; replace, reposition, resize and delete existing page-level images.
 - **Forms:** build forms with text, check box, radio, dropdown, list box, button, image, date and signature fields; detect fields on paper-style forms; fill, clear, flatten, set tab order, and import or export data as FDF, XFDF or CSV.
 - **Export:** PNG/JPEG ↔ PDF; PDF ↔ Markdown, text and Word `.docx` using text-oriented conversion.
+- **Everyday:** print, an outline sidebar, clickable links, password-protected PDFs, and reducing file size.
 - **SVG:** Annotate → Saved → SVG code; paste code, preview, save and place. Select placed artwork to move, resize, rotate, recolor or edit its SVG source.
 - **Blank PDF:** File → New Blank PDF (⌘N/Ctrl+N). **Blank page:** Pages → Blank Page.
 
@@ -112,6 +113,16 @@ Toggle the left and right panels independently using the two top-right panel ico
 These are also in **Edit PDF → Form**. Fields are standard AcroForm fields with their appearances drawn in, so Acrobat, Preview and browsers show them as designed. Date fields carry Acrobat's date formatting and image fields Acrobat's picture chooser; MyPDF reads them but never runs scripts. Fields work on landscape and upside-down pages too, including portrait pages turned with a rotation setting: their appearance turns with the page so it reads upright. XFA forms are not supported.
 
 **Flatten PDF…** (Export panel, or **Edit PDF → Flatten PDF…**) turns every page into an image at 150, 200 or 300 dpi. Annotations, pasted images and form fields are burned in, and document scripts and form definitions are removed, so nothing can be edited or selected any more. Page sizes and rotation are kept, and the flattened PDF can still be **digitally signed**. Already-signed PDFs are not flattened, since that would break their signatures; flatten first, then sign.
+
+**Print… (⌘P)** — File menu or the printer button next to Save — opens the standard macOS print panel with the document as it looks now, including annotations and form values. Large pages shrink to fit the paper.
+
+**Outline** is a sidebar tab next to Pages: the document's headings (bookmarks), indented by level with their page numbers. Click one to go there; the section you are reading is highlighted. Documents without an outline say so.
+
+**Links** in a PDF work in Read: a link to another page goes there, and a web or email link asks before opening your browser or mail app, showing the address. In the other modes, ⌘-click follows a link, so tools keep working over it. Scripts and links to files are never followed.
+
+**Password-protected PDFs** ask for their password when opened (a wrong one is simply asked again); a **Protected** label shows in the footer, and every copy you save keeps the password. **File → Protect with Password…** saves a copy that opens only with a password you choose (AES-256, the strongest PDF protection; anyone with the password can print, copy and edit). **File → Remove Password…** saves a copy that opens without one; the original keeps its password. Signed PDFs are not protected here, since that would break their signatures. Protected documents are never written to autosave, so their content is not stored unprotected.
+
+**Reduce File Size…** — File menu or the Export panel — offers *High quality* (pictures at about 200 dpi, for printing), *Balanced* (about 150 dpi, for screens and email) and *Smallest file* (about 100 dpi). Photos and scans are scaled down and stored as JPEG only where that makes them clearly smaller; text, drawings and transparency masks are untouched, uncompressed data is compressed and unused objects are dropped. The status bar shows the size before and after, and Undo restores the original.
 
 **Header & Footer** (Edit ribbon, or **Edit PDF → Header and Footer** in the menu bar) adds real, selectable text to the page margins:
 - **Add Page Numbers…** offers the formats *1*, *Page 1*, *Page 1 of n*, *1 of n*, *1/n* and *- 1 -*, with a start number.

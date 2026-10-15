@@ -250,7 +250,8 @@ impl Viewer {
         }
         for tab in &self.tabs {
             let Some(s) = &tab.session else { continue };
-            if !s.dirty() {
+            // A protected document's content is never written out unprotected.
+            if !s.dirty() || tab.password.is_some() {
                 continue;
             }
             let t = self
@@ -428,6 +429,14 @@ impl Viewer {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl Viewer {
+    /// Whether autosave is keeping track of a tab's changes.
+    pub(super) fn recovery_tracks(&self, id: u64) -> bool {
+        self.recovery.tracking.contains_key(&id)
     }
 }
 

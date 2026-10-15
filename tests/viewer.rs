@@ -132,6 +132,7 @@ fn worker_loads_indexes_and_renders_without_a_window() {
                 raster = true;
             }
             Event::Failed(e) | Event::RasterFailed { error: e, .. } => panic!("{e}"),
+            Event::PasswordNeeded(_) => panic!("an unprotected PDF asked for a password"),
             Event::IndexFinished { limited } => assert!(!limited),
         }
     }

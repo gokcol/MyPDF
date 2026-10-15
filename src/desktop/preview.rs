@@ -202,6 +202,11 @@ fn native_visual_preview() {
         "FormOrder",
         "FormLayout",
         "FormDrag",
+        "Outline",
+        "PasswordPrompt",
+        "Protect",
+        "ReduceSize",
+        "LinkConfirm",
         "Signatures",
     ] {
         if let Ok(only) = std::env::var("MYPDF_PREVIEW_ONLY")
@@ -424,6 +429,26 @@ fn native_visual_preview() {
             app.forms.layout_dialog = None;
             app.editor.mode = editing::Mode::Forms;
         }
+        if collection == "Outline" {
+            app.forms.layout_dialog = None;
+            app.editor.mode = editing::Mode::Read;
+            app.preview_outline();
+        }
+        if collection == "PasswordPrompt" {
+            app.outline = false;
+            app.preview_password_prompt();
+        }
+        if collection == "Protect" {
+            app.preview_protect();
+        }
+        if collection == "ReduceSize" {
+            app.protect = None;
+            app.shrink = Some(mypdf_milestone0::compress::Level::Medium);
+        }
+        if collection == "LinkConfirm" {
+            app.shrink = None;
+            app.link_confirm = Some("https://www.example.com/privacy-policy".into());
+        }
         if collection == "FormLayout" {
             app.editor.mode = editing::Mode::Forms;
             app.forms.show_order = false;
@@ -439,6 +464,7 @@ fn native_visual_preview() {
         if collection == "Signatures" {
             // Let go of any drag from an earlier scene without changing anything.
             app.preview_cancel_drag();
+            app.link_confirm = None;
             preview.capture_with(
                 &mut app,
                 &ctx,

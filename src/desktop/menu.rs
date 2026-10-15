@@ -76,6 +76,12 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             &item("save", "Save a Copy…", Code::KeyS, Modifiers::empty()),
             &item("save", "Save As…", Code::KeyS, Modifiers::SHIFT),
             &P::separator(),
+            &item("print", "Print…", Code::KeyP, Modifiers::empty()),
+            &P::separator(),
+            &MenuItem::with_id("protect", "Protect with Password…", true, None),
+            &MenuItem::with_id("unprotect", "Remove Password…", true, None),
+            &MenuItem::with_id("shrink", "Reduce File Size…", true, None),
+            &P::separator(),
             &item("close", "Close Tab", Code::KeyW, Modifiers::empty()),
         ],
     );

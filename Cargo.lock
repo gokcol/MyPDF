@@ -3563,6 +3563,7 @@ dependencies = [
  "image",
  "lopdf 0.45.0",
  "muda",
+ "objc2 0.6.5",
  "p12-keystore",
  "p256",
  "p384",
