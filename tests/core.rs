@@ -87,7 +87,9 @@ fn replace_unicode_cmap_and_split_tj_text() {
 
 #[test]
 fn unavailable_glyph_missing_text_and_invalid_page_fail() {
-    assert!(document::replace_run(fixture(), 1, document::ORIGINAL, "Invoice 🦀").is_err());
+    // U+0378 is unassigned, so no font has it. (Emoji are not a test of this:
+    // Windows has an emoji font that can be embedded; macOS has not.)
+    assert!(document::replace_run(fixture(), 1, document::ORIGINAL, "Invoice \u{0378}").is_err());
     assert!(document::replace_run(fixture(), 1, "missing text", "hello").is_err());
     assert!(document::replace_run(fixture(), 0, document::ORIGINAL, "hello").is_err());
     assert!(document::replace_run(fixture(), 99, document::ORIGINAL, "hello").is_err());
