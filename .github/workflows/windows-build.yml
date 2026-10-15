@@ -1,0 +1,50 @@
+name: Windows build
+# Builds MyPDF.exe for 64-bit Windows and packs it in a zip with the licenses.
+# Run it by hand (Actions → Windows build → Run workflow). The zip is a download
+# on the run's page; name a release tag to also attach it to that release.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or tag to build
+        default: main
+      release:
+        description: Attach the zip to this release tag (leave empty for a test build)
+        default: ""
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release --bin mypdf
+      - name: Pack
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          $name = "MyPDF-$version-windows-x64"
+          New-Item -ItemType Directory -Path "pack\MyPDF" | Out-Null
+          Copy-Item target\release\mypdf.exe pack\MyPDF\MyPDF.exe
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY_NOTICES.md pack\MyPDF\
+          Compress-Archive -Path pack\MyPDF -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii -NoNewline "$name.zip.sha256"
+          "NAME=$name" | Out-File -Encoding utf8 -Append $env:GITHUB_ENV
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: |
+            ${{ env.NAME }}.zip
+            ${{ env.NAME }}.zip.sha256
+      - name: Attach to the release
+        if: ${{ inputs.release != '' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release }}
+        run: gh release upload $env:RELEASE "$env:NAME.zip" "$env:NAME.zip.sha256" --clobber --repo $env:GITHUB_REPOSITORY

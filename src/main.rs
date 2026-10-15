@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use clap::{Parser, Subcommand};
 use mypdf_milestone0::{document, identity, proof, signing, write_new};
 use std::path::{Path, PathBuf};
@@ -241,6 +241,8 @@ async fn main() -> Result<()> {
             field,
             invisible,
         } => {
+            // Keychain signing exists only on macOS.
+            use anyhow::Context as _;
             ensure!(!output.exists(), "output already exists");
             let signer = mypdf_milestone0::keychain::select(keychain.as_deref(), &sha256)
                 .context("cannot select Keychain signing identity")?;
