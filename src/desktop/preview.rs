@@ -187,7 +187,9 @@ fn native_visual_preview() {
         "Group",
         "Lasso",
         "DigitalIds",
-        "Appearance",
+        "MySignatures",
+        "MySignaturesEditor",
+        "NewDigitalId",
         "SignDocument",
         "QuickPrompt",
         "QuickSign",
@@ -309,8 +311,10 @@ fn native_visual_preview() {
         if collection == "Trusted" {
             app.digital.preview_trusted();
         }
-        if collection == "Appearance" {
-            app.digital.preview_identities(digital::Panel::Appearance);
+        if collection == "NewDigitalId" {
+            app.digital.preview_new_id();
+        }
+        if collection.starts_with("MySignatures") {
             use mypdf_milestone0::annotations::{Kind, Style};
             let strokes = vec![
                 (0..=60)
@@ -352,15 +356,31 @@ fn native_visual_preview() {
                 ids.push(asset.id.clone());
                 library.put(asset).unwrap();
             }
-            app.digital.preview_appearance(
-                ids.pop().unwrap(),
-                mypdf_milestone0::signing::AppearanceLayout::ImageOnly,
-            );
+            ids.reverse();
+            app.digital.preview_signatures(&ids);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-            while !app.digital.appearance_ready() {
+            preview.capture(&mut app, &ctx);
+            while !app.digital.previews_ready() {
                 assert!(std::time::Instant::now() < deadline);
                 preview.capture(&mut app, &ctx);
                 std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if collection == "MySignaturesEditor" {
+                // Scroll the window down to the editor.
+                for _ in 0..40 {
+                    preview.capture_with(
+                        &mut app,
+                        &ctx,
+                        vec![
+                            egui::Event::PointerMoved(pos2(600., 500.)),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: vec2(0., -40.),
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                }
             }
         }
         if collection == "SignDocument" {

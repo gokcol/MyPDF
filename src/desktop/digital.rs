@@ -10,10 +10,13 @@ use std::io::Read;
 use underskrift::CryptoSigner;
 use zeroize::Zeroizing;
 
+mod manager;
+use manager::{Look, ManagerState, SavedSignature};
+
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Panel {
+    Signatures,
     Identities,
-    Appearance,
     Sign,
     Validate,
     Trusted,
@@ -34,7 +37,7 @@ enum Source {
     Certificate,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct DefaultIdentity {
+pub(super) struct DefaultIdentity {
     source: Source,
     sha256: String,
 }
@@ -45,6 +48,13 @@ struct Catalogue {
     default_identity: Option<DefaultIdentity>,
     #[serde(default)]
     appearance: Appearance,
+    #[serde(default)]
+    signatures: Vec<SavedSignature>,
+    #[serde(default)]
+    default_signature: Option<String>,
+    /// Written with saved signatures: the old appearance is not migrated again.
+    #[serde(default)]
+    signatures_managed: bool,
 }
 /// The remembered look of a visible signature: library artwork and layout.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -77,6 +87,9 @@ struct Entry {
     der: Vec<u8>,
     eligible: bool,
     explanation: Option<String>,
+    /// On a smart card or USB token.
+    #[serde(default)]
+    token: bool,
 }
 impl Entry {
     fn file(path: PathBuf, imported: identity::ImportedIdentity) -> Self {
@@ -90,6 +103,7 @@ impl Entry {
             der: imported.certificate_der,
             eligible: imported.eligible,
             explanation: imported.explanation,
+            token: false,
         }
     }
     fn label(&self) -> String {
@@ -113,7 +127,14 @@ impl Entry {
                     .and_then(|n| n.as_str().ok())
                     .map(str::to_owned)
             })
-            .unwrap_or_else(|| self.info.subject.clone())
+            .unwrap_or_else(|| {
+                let subject = &self.info.subject;
+                subject
+                    .split(", ")
+                    .find_map(|p| p.strip_prefix("CN="))
+                    .unwrap_or(subject)
+                    .to_owned()
+            })
     }
     fn reference(&self) -> DefaultIdentity {
         DefaultIdentity {
@@ -139,7 +160,13 @@ enum Event {
         tab: u64,
         revision: u64,
     },
-    Preview(Vec<u8>),
+    /// A digital ID created in the system store, for a signature.
+    Stored {
+        entry: Entry,
+        signature: Option<String>,
+        /// Whether the system now trusts it (an empty error: not asked to).
+        trusted: Result<(), String>,
+    },
     /// The operating system's trust in a certificate changed.
     SystemTrust {
         der: Vec<u8>,
@@ -200,18 +227,11 @@ pub(super) struct DigitalState {
     quick_prompt: bool,
     /// The next asset added to the library becomes the signature artwork.
     pub(super) adopt_asset: bool,
-    /// The appearance the current preview was rendered for.
-    previewed: Option<(Option<String>, AppearanceLayout, bool)>,
-    preview: Option<TextureHandle>,
     report: Option<(u64, u64, Vec<SignatureEvidence>, bool)>,
     trust_id: Option<String>,
     use_explicit_trust: bool,
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
-    /// Appearance previews render on their own channel so they never touch `busy`.
-    appearance_tx: mpsc::Sender<Result<Vec<u8>, String>>,
-    appearance_rx: mpsc::Receiver<Result<Vec<u8>, String>>,
-    appearance_preview: Option<Result<TextureHandle, String>>,
     /// Certificates the user trusts for validation, kept between sessions.
     pub(super) trust: mypdf_milestone0::trust::TrustList,
     /// Bumped whenever trust changes, so signature checks run again.
@@ -220,6 +240,12 @@ pub(super) struct DigitalState {
     system_trust: HashMap<Vec<u8>, bool>,
     /// Add a newly created personal ID to the system store and trust it there.
     create_trust: bool,
+    /// Saved signatures; the default one drives Quick Sign.
+    signatures: Vec<SavedSignature>,
+    default_signature: Option<String>,
+    manager: ManagerState,
+    /// The default signature's look, applied to each signing request.
+    look: Look,
 }
 fn bounded_read(path: &std::path::Path, limit: u64) -> anyhow::Result<Vec<u8>> {
     let mut bytes = vec![];
@@ -273,7 +299,32 @@ impl DigitalState {
             mut entries,
             default_identity,
             appearance,
+            mut signatures,
+            mut default_signature,
+            signatures_managed,
         } = contents;
+        // Earlier versions kept one appearance and a default certificate:
+        // they become the first saved signature.
+        if !signatures_managed
+            && signatures.is_empty()
+            && (default_identity.is_some() || appearance.asset_id.is_some())
+        {
+            let image_only = appearance.layout == AppearanceLayout::ImageOnly;
+            let first = SavedSignature {
+                identity: default_identity.clone(),
+                asset_id: appearance.asset_id.clone(),
+                show_name: !image_only,
+                show_date: !image_only,
+                background: if image_only {
+                    signing::Background::Clear
+                } else {
+                    signing::Background::Framed
+                },
+                ..Default::default()
+            };
+            default_signature = Some(first.id.clone());
+            signatures.push(first);
+        }
         entries.retain_mut(|entry| {
             let Ok(info) = identity::info(&entry.der) else {
                 return false;
@@ -299,11 +350,10 @@ impl DigitalState {
             true
         });
         let (tx, rx) = mpsc::channel();
-        let (appearance_tx, appearance_rx) = mpsc::channel();
         let (store_tx, store_rx) = mpsc::channel();
         let mut state = Self {
             open: false,
-            panel: Panel::Identities,
+            panel: Panel::Signatures,
             busy: false,
             entries,
             selected: None,
@@ -341,29 +391,53 @@ impl DigitalState {
             quick: false,
             quick_prompt: false,
             adopt_asset: false,
-            previewed: None,
-            preview: None,
             report: None,
             trust_id: None,
             use_explicit_trust: false,
             tx,
             rx,
-            appearance_tx,
-            appearance_rx,
-            appearance_preview: None,
             trust,
             trust_generation: 0,
             system_trust: HashMap::new(),
             create_trust: cfg!(any(target_os = "macos", target_os = "windows")),
+            signatures,
+            default_signature,
+            manager: ManagerState::new(),
+            look: Look::default(),
         };
+        state.apply_default_signature();
         state.select_default();
         state
+    }
+    /// The signature Quick Sign uses.
+    fn default_signature(&self) -> Option<&SavedSignature> {
+        let id = self.default_signature.as_ref()?;
+        self.signatures.iter().find(|s| &s.id == id)
+    }
+    /// Make the default signature's ID, image and look the ones signing uses.
+    pub(super) fn apply_default_signature(&mut self) {
+        let Some(signature) = self.default_signature().cloned() else {
+            // Every remembered default became a signature when the catalogue was read.
+            self.default_identity = None;
+            self.look = Look {
+                show_name: true,
+                show_date: true,
+                ..Default::default()
+            };
+            return;
+        };
+        self.default_identity = signature.identity.clone();
+        self.asset_id = signature.asset_id.clone();
+        self.layout = signature.layout().unwrap_or(AppearanceLayout::DetailsOnly);
+        self.look = Look::of(&signature);
+        self.manager.sign_with = Some(signature.id);
     }
     pub fn use_document(&mut self, tab: Option<&Tab>) {
         if let Some(tab) = tab
             && self.document != Some(tab.id)
         {
             self.document = Some(tab.id);
+            self.apply_default_signature();
             self.select_default();
             self.sign_password = Zeroizing::new(String::new());
             self.request = DesktopSigningRequest::default();
@@ -382,7 +456,6 @@ impl DigitalState {
                 .capabilities
                 .as_ref()
                 .is_some_and(|c| c.needs_signing_preparation && !c.signed);
-            self.preview = None;
         }
         if let Some(entry) = self
             .entries
@@ -463,6 +536,9 @@ impl DigitalState {
                 asset_id: self.asset_id.clone(),
                 layout: self.layout,
             },
+            signatures: self.signatures.clone(),
+            default_signature: self.default_signature.clone(),
+            signatures_managed: true,
         })?;
         anyhow::ensure!(
             raw.len() <= 4 * 1024 * 1024,
@@ -493,14 +569,6 @@ impl DigitalState {
             ));
         }
     }
-    /// Remember the signature appearance for later sessions.
-    fn save_appearance(&mut self) {
-        if let Err(e) = self.save_catalogue() {
-            self.error = Some(format!(
-                "The signature appearance applies to this session, but could not be saved: {e:#}"
-            ));
-        }
-    }
     fn is_default(&self, entry: &Entry) -> bool {
         self.default_identity.as_ref() == Some(&entry.reference())
     }
@@ -519,23 +587,6 @@ impl DigitalState {
         {
             self.request.name = entry.signer_name();
         }
-    }
-    fn set_default(&mut self, id: Option<&str>) -> anyhow::Result<()> {
-        let reference = id
-            .map(|id| {
-                self.entries
-                    .iter()
-                    .find(|e| e.id == id && e.eligible && !matches!(e.source, Source::Certificate))
-                    .map(Entry::reference)
-                    .context("Choose an available signing identity first")
-            })
-            .transpose()?;
-        let old = std::mem::replace(&mut self.default_identity, reference);
-        if let Err(e) = self.save_catalogue() {
-            self.default_identity = old;
-            return Err(e);
-        }
-        Ok(())
     }
     fn refresh_store(&mut self, ctx: &egui::Context, path: Option<PathBuf>) {
         if self.scanning {
@@ -642,6 +693,10 @@ fn discover_store(path: Option<&std::path::Path>) -> anyhow::Result<Vec<Entry>> 
                 explanation: (!i.eligible).then(|| {
                     "This certificate does not currently meet the signing requirements.".into()
                 }),
+                #[cfg(target_os = "macos")]
+                token: i.token,
+                #[cfg(not(target_os = "macos"))]
+                token: false,
             }
         })
         .collect());
@@ -661,13 +716,10 @@ enum Action {
     ExportPublic,
     ExportP12,
     ExportSave,
-    Preview,
     Place,
     Sign,
     Verify,
     Forget(String),
-    SetDefault(String),
-    ClearDefault,
     /// Import an image or SVG and use it as the signature artwork.
     ImportArtwork,
     /// Draw or type a signature and use it as the signature artwork.
@@ -682,6 +734,12 @@ enum Action {
     TrustExport(String),
     /// Trust (or stop trusting) a certificate in the operating system.
     SystemTrust(Vec<u8>, bool),
+    /// Open "Create my digital ID", for a signature or for a new one.
+    NewId(Option<String>),
+    /// Create the digital ID described in the dialog, in the system store.
+    CreateInStore,
+    /// Start a signature that signs with this digital ID.
+    NewSignature(DefaultIdentity),
 }
 
 /// The operating system's trust store, at the start of a sentence.
@@ -882,20 +940,48 @@ impl Viewer {
                         path.display()
                     )
                 }
-                Event::Preview(png) => match mypdf_milestone0::assets::decode_png(&png) {
-                    Ok(image) => {
-                        let image = image.into_rgba8();
-                        self.digital.preview = Some(ctx.load_texture(
-                            "signature_preview",
-                            egui::ColorImage::from_rgba_unmultiplied(
-                                [image.width() as usize, image.height() as usize],
-                                &image,
-                            ),
-                            egui::TextureOptions::LINEAR,
-                        ));
+                Event::Stored {
+                    entry,
+                    signature,
+                    trusted,
+                } => {
+                    let reference = entry.reference();
+                    if trusted.is_ok() {
+                        self.digital.system_trust.insert(entry.der.clone(), true);
+                        self.digital.trust_generation += 1;
                     }
-                    Err(e) => self.digital.error = Some(format!("{e:#}")),
-                },
+                    self.digital.manager.new_id = None;
+                    self.digital.remember(entry);
+                    // The new ID signs for the signature that asked for it, or a new one.
+                    match signature.filter(|id| self.digital.signatures.iter().any(|s| &s.id == id))
+                    {
+                        Some(id) => {
+                            if let Some(s) = self.digital.signatures.iter_mut().find(|s| s.id == id)
+                            {
+                                s.identity = Some(reference);
+                            }
+                            self.digital.manager.selected = Some(id);
+                            self.digital.commit_signatures();
+                        }
+                        None => {
+                            self.digital.add_signature(Some(reference));
+                        }
+                    }
+                    self.digital.panel = Panel::Signatures;
+                    self.digital.message = match trusted {
+                        Ok(()) => format!(
+                            "Your digital ID is ready, and {} trusts it.",
+                            system_store()
+                        ),
+                        Err(e) if e.is_empty() => "Your digital ID is ready.".into(),
+                        Err(e) => format!(
+                            "Your digital ID is ready. It is not marked as trusted on {}: {e}",
+                            system_store()
+                        ),
+                    };
+                    #[cfg(not(test))]
+                    self.digital.refresh_store(ctx, None);
+                }
                 Event::Verified {
                     tab,
                     revision,
@@ -955,31 +1041,27 @@ impl Viewer {
             && let Some(id) = self.editor.last_added.take()
         {
             self.digital.adopt_asset = false;
-            self.digital.asset_id = Some(id);
-            self.digital.save_appearance();
-            self.status = Some((
-                "Signature image set for your digital signatures.".into(),
-                false,
-            ));
+            let target = self
+                .digital
+                .manager
+                .adopt_into
+                .take()
+                .or_else(|| self.digital.manager.selected.clone());
+            match self
+                .digital
+                .signatures
+                .iter_mut()
+                .find(|s| Some(&s.id) == target.as_ref())
+            {
+                Some(signature) => {
+                    signature.asset_id = Some(id);
+                    self.digital.commit_signatures();
+                }
+                None => self.digital.asset_id = Some(id),
+            }
+            self.status = Some(("The image is now part of your signature.".into(), false));
         }
-        for result in self.digital.appearance_rx.try_iter().collect::<Vec<_>>() {
-            self.digital.appearance_preview = Some(result.and_then(|png| {
-                let image = mypdf_milestone0::assets::decode_png(&png)
-                    .map_err(|e| format!("{e:#}"))?
-                    .into_rgba8();
-                Ok(ctx.load_texture(
-                    "signature_appearance",
-                    egui::ColorImage::from_rgba_unmultiplied(
-                        [image.width() as usize, image.height() as usize],
-                        &image,
-                    ),
-                    egui::TextureOptions::LINEAR,
-                ))
-            }));
-        }
-        if self.digital.open && self.digital.panel == Panel::Appearance {
-            self.preview_appearance(ctx);
-        }
+        self.digital.manager.receive(ctx);
         if self.editor.tool == editing::Tool::SignArea
             && !self.digital.quick
             && ctx.input(|i| i.key_pressed(egui::Key::Escape))
@@ -1005,7 +1087,6 @@ impl Viewer {
             self.digital.request.page = page;
             self.digital.request.rect = Some(rect);
             self.digital.visible = true;
-            self.digital.preview = None;
             if std::mem::take(&mut self.digital.quick) {
                 let file = self
                     .digital
@@ -1027,15 +1108,13 @@ impl Viewer {
     }
     pub(super) fn digital_window(&mut self, ctx: &egui::Context) {
         self.quick_sign_prompt(ctx);
+        if let Some(action) = self.digital.new_id_dialog(ctx, &mut self.editor) {
+            self.digital_action(action, ctx);
+        }
         if !self.digital.open {
+            self.digital.save_if_dirty();
             return;
         }
-        let before = (
-            self.digital.request.clone(),
-            self.digital.asset_id.clone(),
-            self.digital.visible,
-        );
-        let appearance = (self.digital.asset_id.clone(), self.digital.layout);
         let mut quick = false;
         let active = self.tabs.get(self.active);
         let mut open = true;
@@ -1046,24 +1125,19 @@ impl Viewer {
             .as_ref()
             .map(|l| l.entries.clone())
             .unwrap_or_default();
-        let default_entry = self
-            .digital
-            .entries
-            .iter()
-            .find(|e| e.eligible && self.digital.is_default(e))
-            .map(Entry::label);
-        egui::Window::new("Digital IDs and signatures")
+        egui::Window::new("Signatures")
+            .id(egui::Id::new("digital_window"))
             .open(&mut open)
             .collapsible(false)
             .vscroll(true)
             .max_height((ctx.content_rect().height() - 160.0).max(260.0))
-            .default_width(610.0)
-            .default_height(540.0)
+            .default_width(640.0)
+            .default_height(560.0)
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 10.;
                 const PANELS: [(Panel, &str); 5] = [
+                    (Panel::Signatures, "My signatures"),
                     (Panel::Identities, "Digital IDs"),
-                    (Panel::Appearance, "Appearance"),
                     (Panel::Sign, "Sign"),
                     (Panel::Validate, "Validate"),
                     (Panel::Trusted, "Trusted"),
@@ -1073,13 +1147,15 @@ impl Viewer {
                     .position(|(p, _)| *p == self.digital.panel)
                     .unwrap_or(0);
                 if let Some(i) = ui::segmented(ui, &PANELS.map(|(_, name)| name), current) {
+                    self.digital.save_if_dirty();
                     self.digital.panel = PANELS[i].0;
-                    self.digital.preview = None;
+                    self.digital.error = None;
+                    self.digital.message.clear();
                 }
                 if self.digital.busy {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(RichText::new("Working… Input files are preserved.").color(theme::muted()));
+                        ui.label(RichText::new("Working… Your files are not changed.").color(theme::muted()));
                     });
                 }
                 for error in [&self.digital.error, &self.digital.catalogue_error]
@@ -1094,153 +1170,27 @@ impl Viewer {
                 if self.digital.scanning {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(RichText::new(format!("Loading {}…", store_label())).color(theme::muted()));
+                        ui.label(RichText::new("Looking for digital IDs, cards and tokens…").color(theme::muted()));
                     });
                 }
                 if let Some(error) = &self.digital.store_error {
                     ui::callout(ui, ui::Tone::Danger, error);
                 }
-                if self.digital.default_identity.is_some()
-                    && !self
-                        .digital
-                        .entries
-                        .iter()
-                        .any(|e| e.eligible && self.digital.is_default(e))
-                {
-                    ui::callout(
-                        ui,
-                        ui::Tone::Warning,
-                        "Your default certificate is unavailable. Refresh the store or choose another identity.",
-                    );
-                    if ui
-                        .add(ActionButton::new(Icon::Close, "Clear default certificate"))
-                        .clicked()
-                    {
-                        action = Some(Action::ClearDefault);
-                    }
-                }
                 ui.add_enabled_ui(!self.digital.busy, |ui| match self.digital.panel {
-                    Panel::Identities => {
-                        ui.horizontal_wrapped(|ui| {
-                            if ui
-                                .add(ActionButton::new(Icon::Import, "Import .p12 / .pfx…"))
-                                .clicked()
-                            {
-                                action = Some(Action::Import);
-                            }
-                            if ui
-                                .add(ActionButton::new(Icon::Shield, "Create personal ID…"))
-                                .clicked()
-                            {
-                                action = Some(Action::Create);
-                            }
-                            if ui
-                                .add(ActionButton::new(Icon::Open, "Read .cer / .crt / .pem…"))
-                                .clicked()
-                            {
-                                action = Some(Action::ReadCertificate);
-                            }
-                            #[cfg(any(target_os = "macos", target_os = "windows"))]
-                            if ui
+                    Panel::Signatures => {
+                        self.digital.signatures_panel(ui, &mut self.editor, &assets, &mut action);
+                        if !self.digital.signatures.is_empty() {
+                            quick = ui
                                 .add_enabled(
-                                    !self.digital.scanning,
-                                    ActionButton::new(Icon::Reload, "Refresh certificates"),
+                                    active.is_some_and(|t| t.bytes.is_some()),
+                                    ActionButton::new(Icon::Sign, "Quick Sign").primary(),
                                 )
-                                .clicked()
-                            {
-                                action = Some(Action::Keychain);
-                            }
-                        });
-                        #[cfg(target_os = "macos")]
-                        egui::CollapsingHeader::new("Other Keychain").show(ui, |ui| {
-                            let r = ui::field(ui, "Keychain file", |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.digital.keychain_path)
-                                        .margin(ui::FIELD_MARGIN)
-                                        .desired_width(f32::INFINITY)
-                                        .hint_text("Empty uses the system search list"),
-                                )
-                            });
-                            self.editor.text_editing |= r.has_focus();
-                        });
-                        ui.horizontal(|ui| {
-                            ui::caption(ui, "Your identities");
-                            if !self.digital.store_message.is_empty() {
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            RichText::new(&self.digital.store_message)
-                                                .size(11.5)
-                                                .color(theme::muted()),
-                                        );
-                                    },
-                                );
-                            }
-                        });
-                        if self.digital.entries.is_empty() {
-                            ui::callout(
-                                ui,
-                                ui::Tone::Info,
-                                "Import a protected identity, create a personal ID, or select one from Keychain.",
-                            );
-                        } else if default_entry.is_none() {
-                            ui::callout(
-                                ui,
-                                ui::Tone::Info,
-                                "Select an identity and choose “Use as default certificate” to enable Quick Sign.",
-                            );
+                                .on_hover_text("Drag a box on the page to sign with the starred signature")
+                                .clicked();
                         }
-                        ui.spacing_mut().item_spacing.y = 6.;
-                        for entry in &self.digital.entries {
-                            let selected = self.digital.selected.as_ref() == Some(&entry.id);
-                            match identity_row(ui, entry, selected, self.digital.is_default(entry)) {
-                                Some(RowClick::Select) => {
-                                    self.digital.selected = Some(entry.id.clone())
-                                }
-                                Some(RowClick::Forget) => {
-                                    action = Some(Action::Forget(entry.id.clone()))
-                                }
-                                None => {}
-                            }
-                        }
-                        ui.spacing_mut().item_spacing.y = 10.;
-                        if let Some(entry) = self
-                            .digital
-                            .entries
-                            .iter()
-                            .find(|e| Some(&e.id) == self.digital.selected.as_ref())
-                            .cloned()
-                        {
-                            let entry = &entry;
-                            ui::section(ui, "Certificate", |ui| {
-                                certificate_details(ui, entry);
-                                if let Some(choice) = default_choice(ui, &self.digital, entry) {
-                                    action = Some(choice);
-                                }
-                                ui.horizontal_wrapped(|ui| {
-                                    if ui
-                                        .add(ActionButton::new(
-                                            Icon::Export,
-                                            "Export public certificate…",
-                                        ))
-                                        .clicked()
-                                    {
-                                        action = Some(Action::ExportPublic);
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            matches!(entry.source, Source::File { .. }),
-                                            ActionButton::new(Icon::Save, "Export encrypted .p12…"),
-                                        )
-                                        .clicked()
-                                    {
-                                        action = Some(Action::ExportP12);
-                                    }
-                                });
-                                trust_controls(ui, &mut self.digital.system_trust, &self.digital.trust, &entry.der, &mut action);
-                            });
-                        }
+                    }
+                    Panel::Identities => {
+                        self.digital.identities_panel(ui, &mut self.editor, &mut action);
                         let mut cancel = false;
                         if let Some(import) = &mut self.digital.import {
                             ui::section(ui, "Unlock identity", |ui| {
@@ -1403,100 +1353,6 @@ impl Viewer {
                             self.digital.export = None;
                         }
                     }
-                    Panel::Appearance => {
-                        ui.label(
-                            RichText::new("Quick Sign draws this inside the box you place on the page. Your choice is remembered.")
-                                .color(theme::muted()),
-                        );
-                        ui::section(ui, "Layout", |ui| {
-                            layout_picker(ui, &mut self.digital.layout);
-                        });
-                        if self.digital.layout != AppearanceLayout::DetailsOnly {
-                            ui::section(ui, "Signature image", |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    if ui.add(ActionButton::new(Icon::Pen, "Draw or type…")).clicked() {
-                                        action = Some(Action::DrawArtwork);
-                                    }
-                                    if ui
-                                        .add(ActionButton::new(Icon::Import, "Import image…"))
-                                        .on_hover_text("PNG, JPEG or SVG")
-                                        .clicked()
-                                    {
-                                        action = Some(Action::ImportArtwork);
-                                    }
-                                    if self.digital.asset_id.is_some()
-                                        && self.digital.layout != AppearanceLayout::ImageOnly
-                                        && ui.add(ActionButton::new(Icon::Close, "No image")).clicked()
-                                    {
-                                        self.digital.asset_id = None;
-                                    }
-                                });
-                                if assets.is_empty() {
-                                    ui::callout(
-                                        ui,
-                                        ui::Tone::Info,
-                                        "Draw your signature or import an image to use it here.",
-                                    );
-                                }
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing = vec2(8., 8.);
-                                    // Newest first: a just-drawn signature is easy to find.
-                                    for asset in assets.iter().rev().take(60) {
-                                        let selected = self.digital.asset_id.as_ref() == Some(&asset.id);
-                                        if artwork_card(ui, &mut self.editor, asset, selected) {
-                                            self.digital.asset_id = Some(asset.id.clone());
-                                        }
-                                    }
-                                });
-                            });
-                        }
-                        ui::section(ui, "Preview", |ui| {
-                            match &self.digital.appearance_preview {
-                                _ if self.digital.layout == AppearanceLayout::ImageOnly
-                                    && self.digital.asset_id.is_none() =>
-                                {
-                                    ui::callout(ui, ui::Tone::Info, "Choose a signature image to preview it.");
-                                }
-                                Some(Ok(image)) => {
-                                    let size = image.size_vec2() / 2.;
-                                    let size = size * (ui.available_width() / size.x).min(1.);
-                                    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                                    if self.digital.layout == AppearanceLayout::ImageOnly {
-                                        checkerboard(ui.painter(), rect);
-                                    }
-                                    ui.painter().image(
-                                        image.id(),
-                                        rect,
-                                        Rect::from_min_max(pos2(0., 0.), pos2(1., 1.)),
-                                        theme::surface(),
-                                    );
-                                }
-                                Some(Err(e)) => ui::callout(ui, ui::Tone::Danger, e),
-                                None => {
-                                    ui.spinner();
-                                }
-                            }
-                        });
-                        match &default_entry {
-                            Some(label) => ui::callout(
-                                ui,
-                                ui::Tone::Success,
-                                &format!("Quick Sign signs with {label}."),
-                            ),
-                            None => ui::callout(
-                                ui,
-                                ui::Tone::Warning,
-                                "Choose a default certificate under Digital IDs to use Quick Sign.",
-                            ),
-                        }
-                        quick = ui
-                            .add_enabled(
-                                active.is_some_and(|t| t.bytes.is_some()),
-                                ActionButton::new(Icon::Sign, "Quick Sign").primary(),
-                            )
-                            .on_hover_text("Drag a box on the page to sign")
-                            .clicked();
-                    }
                     Panel::Sign => {
                         ui::section(ui, "Document", |ui| {
                             if let Some(tab) = active {
@@ -1514,83 +1370,167 @@ impl Viewer {
                                 ui.label(RichText::new("Open a PDF to sign it.").color(theme::muted()));
                             }
                         });
-                        ui::section(ui, "Signing identity", |ui| {
-                            ui.horizontal(|ui| {
-                                egui::ComboBox::from_id_salt("signing_id")
-                                    .selected_text(
-                                        self.digital
-                                            .entries
-                                            .iter()
-                                            .find(|e| Some(&e.id) == self.digital.selected.as_ref())
-                                            .map_or("Choose signing identity".into(), Entry::label),
-                                    )
-                                    .width((ui.available_width() - 44.).max(200.))
-                                    .show_ui(ui, |ui| {
-                                        for entry in self.digital.entries.iter().filter(|e| {
-                                            e.eligible && !matches!(e.source, Source::Certificate)
-                                        }) {
-                                            if ui
-                                                .selectable_value(
-                                                    &mut self.digital.selected,
-                                                    Some(entry.id.clone()),
-                                                    entry.label(),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.digital.request.name = entry.signer_name();
-                                                self.digital.sign_password = Zeroizing::new(String::new());
-                                                self.digital.preview = None;
-                                                ui.close();
-                                            }
-                                        }
-                                    });
-                                #[cfg(any(target_os = "macos", target_os = "windows"))]
-                                if ui
-                                    .add_enabled(
-                                        !self.digital.scanning,
-                                        ActionButton::new(Icon::Reload, "Refresh certificates").compact(),
+                        ui::section(ui, "Signature", |ui| {
+                            if self.digital.signatures.is_empty() {
+                                ui::callout(
+                                    ui,
+                                    ui::Tone::Info,
+                                    "Create a signature first: choose your digital ID and how it looks.",
+                                );
+                                if ui.add(ActionButton::new(Icon::Plus, "Create a signature").primary()).clicked() {
+                                    self.digital.panel = Panel::Signatures;
+                                    self.digital.add_signature(None);
+                                }
+                                return;
+                            }
+                            let chosen = self
+                                .digital
+                                .manager
+                                .sign_with
+                                .clone()
+                                .filter(|id| self.digital.signatures.iter().any(|s| &s.id == id))
+                                .or_else(|| self.digital.default_signature.clone())
+                                .or_else(|| self.digital.signatures.first().map(|s| s.id.clone()));
+                            if let Some(id) = &chosen
+                                && self.digital.manager.sign_with.as_ref() != Some(id)
+                            {
+                                self.digital.use_signature(id);
+                            }
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = vec2(10., 10.);
+                                for signature in self.digital.signatures.clone() {
+                                    let request = self.digital.signature_request(&signature, &assets);
+                                    let preview = self.digital.manager.preview(ui.ctx(), &request);
+                                    let ready = self.digital.signer_of(&signature).is_some()
+                                        && signature.layout().is_some();
+                                    if manager::signature_card(
+                                        ui,
+                                        &signature,
+                                        preview.as_ref(),
+                                        self.digital.default_signature.as_ref() == Some(&signature.id),
+                                        chosen.as_ref() == Some(&signature.id),
+                                        ready,
                                     )
                                     .clicked()
-                                {
-                                    action = Some(Action::Keychain);
+                                    {
+                                        self.digital.use_signature(&signature.id);
+                                    }
                                 }
                             });
-                            if let Some(entry) = self
-                                .digital
-                                .entries
-                                .iter()
-                                .find(|e| Some(&e.id) == self.digital.selected.as_ref())
-                            {
-                                if let Some(choice) = default_choice(ui, &self.digital, entry) {
-                                    action = Some(choice);
+                            let Some(signature) = chosen
+                                .and_then(|id| self.digital.signatures.iter().find(|s| s.id == id))
+                                .cloned()
+                            else {
+                                return;
+                            };
+                            match self.digital.signer_of(&signature).cloned() {
+                                Some(entry) => {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Signs with {} · {}",
+                                            entry.signer_name(),
+                                            manager::place(&entry)
+                                        ))
+                                        .color(theme::muted()),
+                                    );
+                                    if matches!(entry.source, Source::File { .. }) {
+                                        let r = ui::field(ui, "Passphrase of the digital ID file", |ui| {
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut *self.digital.sign_password)
+                                                    .margin(ui::FIELD_MARGIN)
+                                                    .password(true)
+                                                    .desired_width(f32::INFINITY)
+                                                    .char_limit(1024),
+                                            )
+                                        });
+                                        self.editor.text_editing |= r.has_focus();
+                                    }
                                 }
-                                egui::CollapsingHeader::new("Certificate details")
-                                    .show(ui, |ui| certificate_details(ui, entry));
-                                if matches!(entry.source, Source::File { .. }) {
-                                    let r = ui::field(ui, "Identity passphrase", |ui| {
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut *self.digital.sign_password)
-                                                .margin(ui::FIELD_MARGIN)
-                                                .password(true)
-                                                .desired_width(f32::INFINITY)
-                                                .char_limit(1024),
-                                        )
-                                    });
-                                    self.editor.text_editing |= r.has_focus();
+                                None => {
+                                    ui::callout(
+                                        ui,
+                                        ui::Tone::Warning,
+                                        &format!("“{}” has no digital ID that is available now.", signature.name),
+                                    );
+                                    if ui.add(ActionButton::new(Icon::Pen, "Edit signature")).clicked() {
+                                        self.digital.panel = Panel::Signatures;
+                                        self.digital.manager.selected = Some(signature.id.clone());
+                                    }
                                 }
                             }
                         });
-                        ui::section(ui, "Signature details", |ui| {
+                        ui::section(ui, "On the page", |ui| {
+                            ui.checkbox(&mut self.digital.visible, "Show the signature on the page");
+                            if !self.digital.visible {
+                                ui.label(
+                                    RichText::new("The document is signed without a visible box. Readers find the signature in their signatures panel.")
+                                        .size(12.)
+                                        .color(theme::muted()),
+                                );
+                                return;
+                            }
+                            let mut request = self.digital.request.clone();
+                            request.artwork = self
+                                .digital
+                                .asset_id
+                                .as_ref()
+                                .and_then(|id| assets.iter().find(|a| &a.id == id))
+                                .cloned();
+                            request.layout = self.digital.layout;
+                            self.digital.look.apply(&mut request);
+                            if let Some([l, t, r, b]) = request.rect {
+                                let preview = self.digital.manager.preview(ui.ctx(), &request);
+                                match &preview {
+                                    Some(Err(e)) => ui::callout(ui, ui::Tone::Warning, e),
+                                    _ => {
+                                        let (w, h) = (r - l, b - t);
+                                        let width = ui.available_width().min(w * 1.4).max(40.);
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            vec2(width, (width * h / w.max(1.)).min(260.)),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().rect_stroke(
+                                            rect.expand(1.),
+                                            6,
+                                            Stroke::new(1., theme::line()),
+                                            egui::StrokeKind::Outside,
+                                        );
+                                        manager::paint_preview(
+                                            ui,
+                                            rect,
+                                            preview.as_ref(),
+                                            self.digital.look.background == signing::Background::Clear,
+                                        );
+                                    }
+                                }
+                            }
+                            if let Some(tab) = active {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("Page {}", self.digital.request.page + 1))
+                                            .color(theme::muted()),
+                                    );
+                                    if ui
+                                        .add(ActionButton::new(Icon::Rectangle, "Place it again…"))
+                                        .on_hover_text("Drag a new box on the page")
+                                        .clicked()
+                                    {
+                                        action = Some(Action::Place);
+                                    }
+                                    let _ = tab;
+                                });
+                            }
+                        });
+                        egui::CollapsingHeader::new("More options").id_salt("sign_more").show(ui, |ui| {
                             let mut focus = false;
                             egui::Grid::new("signature_details")
                                 .num_columns(2)
                                 .spacing(vec2(12., 8.))
                                 .show(ui, |ui| {
                                     for (label, value, hint, limit) in [
+                                        ("Reason", &mut self.digital.request.reason, "Optional, such as “I approve this document”", 1000),
+                                        ("Location", &mut self.digital.request.location, "Optional, such as Istanbul", 300),
                                         ("Field name", &mut self.digital.request.field, "New signature field", 100),
-                                        ("Name", &mut self.digital.request.name, "Shown in the appearance", 200),
-                                        ("Reason", &mut self.digital.request.reason, "Optional", 1000),
-                                        ("Location", &mut self.digital.request.location, "Optional", 300),
                                     ] {
                                         ui.label(RichText::new(label).color(theme::muted()));
                                         focus |= ui
@@ -1604,35 +1544,21 @@ impl Viewer {
                                             .has_focus();
                                         ui.end_row();
                                     }
-                                });
-                            self.editor.text_editing |= focus;
-                        });
-                        ui::section(ui, "Appearance", |ui| {
-                            ui.checkbox(&mut self.digital.visible, "Visible signature appearance");
-                            if !self.digital.visible {
-                                return;
-                            }
-                            layout_picker(ui, &mut self.digital.layout);
-                            if let Some(tab) = active {
-                                ui.horizontal(|ui| {
-                                    let mut page = self.digital.request.page + 1;
-                                    ui.label(RichText::new("Page").color(theme::muted()));
-                                    if ui
-                                        .add(egui::DragValue::new(&mut page).range(1..=tab.pages.len().max(1)))
-                                        .changed()
-                                    {
-                                        self.digital.request.page = page - 1;
-                                        self.digital.preview = None;
-                                    }
-                                    if ui
-                                        .add(ActionButton::new(Icon::Rectangle, "Draw signature rectangle on page"))
-                                        .clicked()
-                                    {
-                                        action = Some(Action::Place);
+                                    if let Some(tab) = active {
+                                        ui.label(RichText::new("Page").color(theme::muted()));
+                                        let mut page = self.digital.request.page + 1;
+                                        if ui
+                                            .add(egui::DragValue::new(&mut page).range(1..=tab.pages.len().max(1)))
+                                            .changed()
+                                        {
+                                            self.digital.request.page = page - 1;
+                                        }
+                                        ui.end_row();
                                     }
                                 });
-                            }
-                            if let Some(r) = &mut self.digital.request.rect {
+                            if self.digital.visible
+                                && let Some(r) = &mut self.digital.request.rect
+                            {
                                 egui::Grid::new("signature_rect").num_columns(4).show(ui, |ui| {
                                     let mut x = r[0];
                                     let mut y = r[1];
@@ -1651,47 +1577,7 @@ impl Viewer {
                                     *r = [x, y, x + w, y + h];
                                 });
                             }
-                            ui::field(ui, "Artwork", |ui| {
-                                egui::ComboBox::from_id_salt("signature_artwork")
-                                    .selected_text(
-                                        self.digital
-                                            .asset_id
-                                            .as_ref()
-                                            .and_then(|id| assets.iter().find(|a| &a.id == id))
-                                            .map_or("No artwork", |a| a.name.as_str()),
-                                    )
-                                    .width(ui.available_width())
-                                    .show_ui(ui, |ui| {
-                                        if ui.selectable_value(&mut self.digital.asset_id, None, "No artwork").clicked() {
-                                            ui.close();
-                                        }
-                                        for asset in assets {
-                                            if ui
-                                                .selectable_value(&mut self.digital.asset_id, Some(asset.id.clone()), &asset.name)
-                                                .clicked()
-                                            {
-                                                ui.close();
-                                            }
-                                        }
-                                    });
-                            });
-                            if ui.add(ActionButton::new(Icon::Read, "Preview appearance")).clicked() {
-                                action = Some(Action::Preview);
-                            }
-                            if let Some(image) = &self.digital.preview {
-                                let size = image.size_vec2();
-                                egui::Frame::new()
-                                    .fill(Color32::WHITE)
-                                    .stroke(Stroke::new(1., theme::line()))
-                                    .corner_radius(8)
-                                    .inner_margin(8)
-                                    .show(ui, |ui| {
-                                        ui.add(egui::Image::new(image).fit_to_exact_size(vec2(
-                                            480.0_f32.min(size.x / 2.0),
-                                            (size.y / size.x * 480.0).min(220.0),
-                                        )));
-                                    });
-                            }
+                            self.editor.text_editing |= focus;
                         });
                         if let Some(tab) = active {
                             if let Some(caps) = &tab.capabilities {
@@ -1924,23 +1810,11 @@ impl Viewer {
                     }
                 });
             });
-        if before
-            != (
-                self.digital.request.clone(),
-                self.digital.asset_id.clone(),
-                self.digital.visible,
-            )
-        {
-            self.digital.preview = None;
-        }
-        if appearance != (self.digital.asset_id.clone(), self.digital.layout) {
-            self.digital.preview = None;
-            self.digital.save_appearance();
-        }
         if quick {
             self.quick_sign();
         }
         if !open {
+            self.digital.save_if_dirty();
             self.digital.sign_password = Zeroizing::new(String::new());
             self.digital.create_password = Zeroizing::new(String::new());
             self.digital.create_confirm = Zeroizing::new(String::new());
@@ -1987,49 +1861,6 @@ impl Viewer {
         let x = x.clamp(0., size.width - w);
         let y = y.clamp(0., size.height - h);
         [x, y, x + w, y + h]
-    }
-    /// Render the remembered appearance with sample details when it changes.
-    fn preview_appearance(&mut self, ctx: &egui::Context) {
-        let key = (self.digital.asset_id.clone(), self.digital.layout, true);
-        if self.digital.previewed.as_ref() == Some(&key) {
-            return;
-        }
-        self.digital.previewed = Some(key);
-        let artwork = self.signature_artwork();
-        let layout = self.digital.layout;
-        if layout == AppearanceLayout::ImageOnly && artwork.is_none() {
-            self.digital.appearance_preview = None;
-            return;
-        }
-        let name = self
-            .digital
-            .entries
-            .iter()
-            .find(|e| e.eligible && self.digital.is_default(e))
-            .map_or_else(|| "Your Name".to_owned(), Entry::signer_name);
-        let (w, h) = match layout {
-            AppearanceLayout::ImageOnly => {
-                let aspect = artwork.as_ref().map_or(3., |a| a.aspect);
-                (220., (220. / aspect).clamp(24., 110.))
-            }
-            _ => (300., 90.),
-        };
-        let request = DesktopSigningRequest {
-            rect: Some([0., 0., w, h]),
-            name,
-            artwork,
-            layout,
-            ..Default::default()
-        };
-        let tx = self.digital.appearance_tx.clone();
-        let wake = ctx.clone();
-        std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(|| signing::signature_artwork(&request))
-                .map_err(|_| "The preview could not be drawn.".to_string())
-                .and_then(|r| r.map_err(|e| format!("{e:#}")));
-            let _ = tx.send(result);
-            wake.request_repaint();
-        });
     }
     /// The library artwork chosen for the signature appearance.
     fn signature_artwork(&self) -> Option<mypdf_milestone0::assets::Asset> {
@@ -2092,6 +1923,7 @@ impl Viewer {
         }
         request.artwork = self.signature_artwork();
         request.layout = self.digital.layout;
+        self.digital.look.apply(&mut request);
         let password = std::mem::take(&mut self.digital.sign_password);
         self.status = Some(("Signing…".into(), false));
         self.digital.spawn(ctx, move || {
@@ -2163,6 +1995,10 @@ impl Viewer {
         if self.signing_problem() {
             return;
         }
+        // Quick Sign always uses the starred signature.
+        self.digital.save_if_dirty();
+        self.digital.apply_default_signature();
+        self.digital.select_default();
         let tab = &self.tabs[self.active];
         let prepare = tab
             .capabilities
@@ -2176,20 +2012,27 @@ impl Viewer {
             .cloned()
         else {
             self.digital.open = true;
-            self.digital.panel = Panel::Identities;
-            self.digital.error = Some(if self.digital.entries.iter().any(|e| e.eligible) {
-                "Quick Sign needs a default certificate: select an identity, then choose “Use as default certificate”.".into()
-            } else {
-                "Quick Sign needs a digital ID: import a .p12/.pfx, create a personal ID, or refresh certificates.".into()
+            self.digital.panel = Panel::Signatures;
+            self.digital.error = Some(match self.digital.default_signature() {
+                None => "Quick Sign needs a signature. Create one: choose your digital ID and how it looks.".into(),
+                Some(s) => format!("“{}” needs a digital ID that is available now. Choose one under “Signs with”.", s.name),
             });
+            self.digital.manager.selected = self.digital.default_signature.clone();
             return;
         };
-        if self.digital.layout == AppearanceLayout::ImageOnly && self.signature_artwork().is_none()
+        let nothing = self
+            .digital
+            .default_signature()
+            .is_some_and(|s| s.layout().is_none());
+        if nothing
+            || self.digital.layout == AppearanceLayout::ImageOnly
+                && self.signature_artwork().is_none()
         {
             self.digital.open = true;
-            self.digital.panel = Panel::Appearance;
+            self.digital.panel = Panel::Signatures;
+            self.digital.manager.selected = self.digital.default_signature.clone();
             self.digital.error = Some(
-                "Choose a signature image, or switch to a layout with signing details.".into(),
+                "Choose what your signature shows: your name, the date, a note or an image.".into(),
             );
             return;
         }
@@ -2404,7 +2247,7 @@ impl Viewer {
                         .add_filter("X.509 certificate", &["cer", "crt", "pem"]),
                 ) {
                     self.digital.spawn(ctx, move || { let der = identity::read_certificate(&bounded_read(&path, 1024 * 1024)?)?;
- let info = identity::info(&der)?; Ok(Event::Certificate(Entry { id: format!("{:032x}", rand::random::<u128>()), source: Source::Certificate, info, der, eligible: false, explanation: Some("A public certificate has no private key. It can be inspected/exported and used for explicit verification, but cannot sign.".into()) })) });
+ let info = identity::info(&der)?; Ok(Event::Certificate(Entry { id: format!("{:032x}", rand::random::<u128>()), source: Source::Certificate, info, der, eligible: false, explanation: Some("A public certificate has no private key. It can be inspected/exported and used for explicit verification, but cannot sign.".into()), token: false })) });
                 }
             }
             Action::Keychain => {
@@ -2472,22 +2315,6 @@ impl Viewer {
  let data = signer.export(&alias, &new_password)?; write_new(&destination, &data)?; Ok(Event::Exported(destination)) } else { anyhow::bail!("Keychain private keys are not exported. Export its public certificate instead.") } });
                     }
                 }
-            }
-            Action::Preview => {
-                let mut request = self.digital.request.clone();
-                request.layout = self.digital.layout;
-                request.artwork = self.digital.asset_id.as_ref().and_then(|id| {
-                    self.editor
-                        .library
-                        .as_ref()?
-                        .entries
-                        .iter()
-                        .find(|a| &a.id == id)
-                        .cloned()
-                });
-                self.digital.spawn(ctx, move || {
-                    Ok(Event::Preview(signing::signature_artwork(&request)?))
-                });
             }
             Action::ImportArtwork => {
                 self.editor.last_added = None;
@@ -2624,16 +2451,44 @@ impl Viewer {
                     });
                 }
             }
-            Action::SetDefault(id) => match self.digital.set_default(Some(&id)) {
-                Ok(()) => self.digital.message = "Default signing certificate saved.".into(),
-                Err(e) => self.digital.error = Some(format!("{e:#}")),
-            },
-            Action::ClearDefault => {
-                if let Err(e) = self.digital.set_default(None) {
-                    self.digital.error = Some(format!("{e:#}"));
+            Action::NewId(signature) => {
+                if cfg!(any(target_os = "macos", target_os = "windows")) {
+                    let name = self
+                        .digital
+                        .entries
+                        .iter()
+                        .find(|e| e.eligible)
+                        .map(Entry::signer_name)
+                        .unwrap_or_default();
+                    self.digital.manager.new_id = Some(manager::NewId {
+                        signature,
+                        name,
+                        email: String::new(),
+                        trust: true,
+                    });
                 } else {
-                    self.digital.message = "Default certificate cleared.".into();
+                    // Without a system store, the ID is a passphrase-protected file.
+                    self.digital.panel = Panel::Identities;
+                    self.digital.creating = true;
                 }
+            }
+            Action::CreateInStore => {
+                if let Some(draft) = &self.digital.manager.new_id {
+                    let (name, email, trust, signature) = (
+                        draft.name.clone(),
+                        draft.email.clone(),
+                        draft.trust,
+                        draft.signature.clone(),
+                    );
+                    self.digital.spawn(ctx, move || {
+                        manager::create_in_store(&name, &email, trust, signature)
+                    });
+                }
+            }
+            Action::NewSignature(reference) => {
+                self.digital.save_if_dirty();
+                self.digital.add_signature(Some(reference));
+                self.digital.panel = Panel::Signatures;
             }
             Action::Forget(id) => {
                 if self
@@ -2672,100 +2527,125 @@ impl DigitalState {
         self.panel = Panel::Trusted;
     }
     pub(super) fn preview_identities(&mut self, panel: Panel) {
-        let info = |subject: &str, until: &str| IdentityInfo {
-            subject: subject.into(),
-            issuer: subject.into(),
-            not_before: "2026-01-04 09:12:00 UTC".into(),
-            not_after: until.into(),
-            sha256: "4F:2A:91:0C:7B:E3:55:18:9D:A0:6C:21:F8:3E:B7:42".into(),
-            algorithm: "ECDSA P-256 with SHA-256".into(),
-            self_issued: true,
+        let make = |name: &str, days: u32| {
+            let created = identity::create_personal(
+                &PersonalId {
+                    name: name.into(),
+                    organization: "Example Studio".into(),
+                    email: String::new(),
+                    validity_days: days,
+                    ecdsa: true,
+                },
+                "synthetic-preview-identity",
+            )
+            .unwrap();
+            (
+                identity::info(&created.certificate_der).unwrap(),
+                created.certificate_der,
+            )
         };
-        let entries = [
-            (
-                Source::Keychain {
-                    path: None,
-                    fingerprint: "a1".into(),
-                },
-                info("CN=Jane Appleseed, O=Example Studio", "2028-01-04"),
-                true,
-            ),
-            (
-                Source::File {
-                    path: "/tmp/jane.p12".into(),
-                    alias: "jane.p12".into(),
-                },
-                info("CN=Jane Appleseed (backup)", "2027-06-30"),
-                true,
-            ),
-            (
-                Source::Certificate,
-                info("CN=Partner Signing CA", "2026-03-01"),
-                false,
-            ),
+        let keychain = |info: &IdentityInfo| Source::Keychain {
+            path: None,
+            fingerprint: info.sha256.clone(),
+        };
+        let samples = [
+            ("Jane Appleseed", 730, 0, true, false),
+            ("Jane Appleseed (e-signature card)", 20, 0, true, true),
+            ("Jane Appleseed (backup)", 365, 1, true, false),
+            ("Partner Signing CA", 365, 2, false, false),
         ];
-        self.entries = entries
+        self.entries = samples
             .into_iter()
             .enumerate()
-            .map(|(i, (source, info, eligible))| Entry {
-                id: format!("{i:032x}"),
-                source,
-                info,
-                der: vec![],
-                eligible,
-                explanation: (!eligible)
-                    .then(|| "Public certificates can verify signatures but cannot sign.".into()),
+            .map(|(i, (name, days, kind, eligible, token))| {
+                let (info, der) = make(name, days);
+                Entry {
+                    id: format!("{i:032x}"),
+                    source: match kind {
+                        0 => keychain(&info),
+                        1 => Source::File {
+                            path: "/tmp/jane.p12".into(),
+                            alias: "jane.p12".into(),
+                        },
+                        _ => Source::Certificate,
+                    },
+                    info,
+                    der,
+                    eligible,
+                    explanation: None,
+                    token,
+                }
             })
             .collect();
-        self.default_identity = Some(self.entries[0].reference());
-        self.selected = Some(self.entries[0].id.clone());
-        self.message = "Default signing certificate saved.".into();
+        let quick = SavedSignature {
+            name: "Work".into(),
+            identity: Some(self.entries[0].reference()),
+            ..Default::default()
+        };
+        self.default_signature = Some(quick.id.clone());
+        self.signatures = vec![quick];
+        self.apply_default_signature();
+        self.select_default();
         self.panel = panel;
         self.open = true;
     }
     /// Visual QA: Quick Sign asking for a .p12 passphrase.
     pub(super) fn preview_quick_prompt(&mut self) {
         self.preview_identities(Panel::Sign);
-        self.selected = Some(self.entries[1].id.clone());
+        self.selected = Some(self.entries[2].id.clone());
         self.open = false;
         self.quick_prompt = true;
     }
-    /// Visual QA: use an artwork with a layout, and report when its preview is drawn.
-    pub(super) fn preview_appearance(&mut self, asset: String, layout: AppearanceLayout) {
-        self.asset_id = Some(asset);
-        self.layout = layout;
+    /// Visual QA: three saved signatures using library images (newest first).
+    pub(super) fn preview_signatures(&mut self, images: &[String]) {
+        self.preview_identities(Panel::Signatures);
+        let id = Some(self.entries[0].reference());
+        let work = SavedSignature {
+            name: "Work".into(),
+            identity: id.clone(),
+            asset_id: images.first().cloned(),
+            background: signing::Background::Framed,
+            ..Default::default()
+        };
+        let initials = SavedSignature {
+            name: "Initials".into(),
+            identity: id.clone(),
+            asset_id: images.get(1).cloned(),
+            show_name: false,
+            show_date: false,
+            background: signing::Background::Clear,
+            ..Default::default()
+        };
+        let approval = SavedSignature {
+            name: "Approval".into(),
+            identity: id,
+            note: "Approved".into(),
+            background: signing::Background::Tinted,
+            ..Default::default()
+        };
+        self.default_signature = Some(work.id.clone());
+        self.manager.selected = Some(work.id.clone());
+        self.signatures = vec![work, initials, approval];
+        self.apply_default_signature();
+        self.message.clear();
     }
-    pub(super) fn appearance_ready(&self) -> bool {
-        self.appearance_preview.is_some()
+    /// Visual QA: "Create my digital ID" on a first run.
+    pub(super) fn preview_new_id(&mut self) {
+        self.open = true;
+        self.panel = Panel::Signatures;
+        self.manager.new_id = Some(manager::NewId {
+            signature: None,
+            name: "Jane Appleseed".into(),
+            email: String::new(),
+            trust: true,
+        });
+    }
+    /// Whether the previews asked for so far are drawn.
+    pub(super) fn previews_ready(&self) -> bool {
+        self.manager.idle() && self.manager.drawn() > 0
     }
 }
 
-/// The three appearance layouts as a segmented control, with a one-line description.
-fn layout_picker(ui: &mut egui::Ui, layout: &mut AppearanceLayout) {
-    const LAYOUTS: [(AppearanceLayout, &str, &str); 3] = [
-        (
-            AppearanceLayout::ImageAndDetails,
-            "Image + details",
-            "Your image beside “Digitally signed by”, your name and the date.",
-        ),
-        (
-            AppearanceLayout::ImageOnly,
-            "Image only",
-            "Just your image, such as a handwritten signature. The page shows through around it.",
-        ),
-        (
-            AppearanceLayout::DetailsOnly,
-            "Details only",
-            "“Digitally signed by”, your name and the date in a bordered box.",
-        ),
-    ];
-    let current = LAYOUTS.iter().position(|l| l.0 == *layout).unwrap_or(0);
-    if let Some(i) = ui::segmented(ui, &LAYOUTS.map(|l| l.1), current) {
-        *layout = LAYOUTS[i].0;
-    }
-    let description = LAYOUTS.iter().find(|l| l.0 == *layout).map_or("", |l| l.2);
-    ui.label(RichText::new(description).size(12.).color(theme::muted()));
-}
 /// A selectable library artwork tile. Returns true when clicked.
 fn artwork_card(
     ui: &mut egui::Ui,
@@ -2917,7 +2797,7 @@ fn identity_row(
     } else {
         rect.right() - 12.
     };
-    let badge_width = if default { 64. } else { 0. };
+    let badge_width = if default { 82. } else { 0. };
     let elide = |text: &str, font: FontId, color: Color32, width: f32| {
         let mut job = egui::text::LayoutJob::single_section(
             text.to_owned(),
@@ -2927,7 +2807,7 @@ fn identity_row(
         ui.painter().layout_job(job)
     };
     let title = elide(
-        &entry.info.subject,
+        &entry.signer_name(),
         ui::strong(ui, 13.5),
         if entry.eligible {
             theme::ink()
@@ -2936,19 +2816,19 @@ fn identity_row(
         },
         right - text_left - badge_width,
     );
-    let detail = if entry.eligible {
-        format!(
-            "{} · valid until {}",
-            entry.source_label(),
-            entry.info.not_after
-        )
-    } else {
-        format!("{} · unavailable", entry.source_label())
+    let (detail, tone) = manager::status(entry);
+    let detail = match &entry.source {
+        Source::File { alias, .. } => format!("{alias} · {detail}"),
+        _ => detail,
     };
     let subtitle = elide(
         &detail,
         FontId::proportional(11.5),
-        theme::muted(),
+        match tone {
+            ui::Tone::Danger => theme::danger(),
+            ui::Tone::Warning => theme::warning(),
+            _ => theme::muted(),
+        },
         right - text_left,
     );
     let title_width = title.size().x;
@@ -2961,13 +2841,13 @@ fn identity_row(
     if default {
         let pill = Rect::from_min_size(
             pos2(text_left + title_width + 8., rect.center().y - 16.),
-            vec2(56., 17.),
+            vec2(74., 17.),
         );
         painter.rect_filled(pill, 8., theme::success().gamma_multiply(0.14));
         painter.text(
             pill.center(),
             egui::Align2::CENTER_CENTER,
-            "Default",
+            "Quick Sign",
             ui::strong(ui, 10.5),
             theme::success(),
         );
@@ -2997,35 +2877,6 @@ fn identity_row(
         .then_some(RowClick::Select)
 }
 
-fn default_choice(ui: &mut egui::Ui, state: &DigitalState, entry: &Entry) -> Option<Action> {
-    if state.is_default(entry) {
-        let mut clear = false;
-        ui.horizontal(|ui| {
-            let (r, _) = ui.allocate_exact_size(vec2(16., 16.), egui::Sense::hover());
-            ui::draw_icon(ui.painter(), r, Icon::Check, theme::success());
-            ui.label(RichText::new("Default signing certificate").color(theme::success()));
-            clear = ui.link("Clear default").clicked();
-        });
-        clear.then_some(Action::ClearDefault)
-    } else if ui
-        .add_enabled(
-            entry.eligible && !matches!(entry.source, Source::Certificate),
-            ActionButton::new(Icon::Star, "Use as default certificate"),
-        )
-        .clicked()
-    {
-        Some(Action::SetDefault(entry.id.clone()))
-    } else {
-        None
-    }
-}
-
-fn certificate_details(ui: &mut egui::Ui, entry: &Entry) {
-    certificate_info(ui, &entry.info);
-    if let Some(explanation) = &entry.explanation {
-        ui.label(RichText::new(explanation).small().color(theme::muted()));
-    }
-}
 fn certificate_info(ui: &mut egui::Ui, info: &IdentityInfo) {
     egui::Grid::new((&info.sha256, "certificate"))
         .num_columns(2)
@@ -3124,7 +2975,8 @@ mod tests {
         .unwrap();
         let mut state = DigitalState::at(temp.path().into());
         assert!(state.default_identity.is_none());
-        state.set_default(Some(&entry.id)).unwrap();
+        assert!(state.signatures.is_empty(), "nothing to migrate");
+        state.add_signature(Some(state.entries[0].reference()));
         let mut state = DigitalState::at(temp.path().into());
         assert_eq!(state.selected, Some(entry.id.clone()));
         assert_eq!(state.request.name, "Default Test");
@@ -3165,6 +3017,7 @@ mod tests {
             der: created.certificate_der,
             eligible: true,
             explanation: None,
+            token: false,
         };
         let mut state = DigitalState::at(temp.path().into());
         state.reconcile_store(None, vec![entry.clone()]);
@@ -3172,7 +3025,7 @@ mod tests {
             state.selected.is_none(),
             "discovery never silently chooses a certificate"
         );
-        state.set_default(Some(&entry.id)).unwrap();
+        let signature = state.add_signature(Some(entry.reference()));
         let mut state = DigitalState::at(temp.path().into());
         assert!(
             state.selected.is_none(),
@@ -3186,21 +3039,27 @@ mod tests {
         state.reconcile_store(None, vec![]);
         assert!(state.selected.is_none());
         assert!(state.default_identity.is_some());
-        assert!(state.set_default(Some("store-one")).is_err());
+        assert!(
+            state
+                .default_signature()
+                .is_some_and(|s| state.signer_of(s).is_none()),
+            "the signature waits for its digital ID"
+        );
         state.reconcile_store(None, vec![fresh]);
         assert_eq!(state.selected.as_deref(), Some("store-one"));
-        state.set_default(None).unwrap();
-        assert!(
-            DigitalState::at(temp.path().into())
-                .default_identity
-                .is_none()
-        );
+        // Deleting the last signature does not bring one back on the next launch.
+        state.delete_signature(&signature);
+        let reloaded = DigitalState::at(temp.path().into());
+        assert!(reloaded.default_identity.is_none() && reloaded.signatures.is_empty());
         let mut public = entry;
         public.id = "public-only".into();
         public.source = Source::Certificate;
         public.eligible = false;
         state.remember(public);
-        assert!(state.set_default(Some("public-only")).is_err());
+        assert!(
+            state.signing_entries().all(|e| e.id != "public-only"),
+            "a certificate alone cannot sign"
+        );
     }
     #[test]
     fn discovery_completion_does_not_finish_an_unrelated_signing_operation() {
@@ -3413,16 +3272,35 @@ mod tests {
 
         // Without a default ID, Quick Sign explains what it needs instead of guessing.
         app.quick_sign();
-        assert!(app.digital.open && app.digital.panel == Panel::Identities);
+        assert!(app.digital.open && app.digital.panel == Panel::Signatures);
         assert!(app.digital.error.is_some() && !app.digital.quick);
         app.digital.open = false;
         app.digital.remember(entry.clone());
-        app.digital.set_default(Some(&entry.id)).unwrap();
-        // Image only needs an image.
-        app.digital.layout = AppearanceLayout::ImageOnly;
+        let signature = app.digital.add_signature(Some(entry.reference()));
+        let edit = |app: &mut Viewer, change: &dyn Fn(&mut SavedSignature)| {
+            let saved = app
+                .digital
+                .signatures
+                .iter_mut()
+                .find(|s| s.id == signature)
+                .unwrap();
+            change(saved);
+            app.digital.commit_signatures();
+        };
+        // A signature that shows nothing asks for something to show.
+        edit(&mut app, &|s| {
+            s.show_name = false;
+            s.show_date = false;
+        });
         app.quick_sign();
-        assert!(app.digital.panel == Panel::Appearance && !app.digital.quick);
-        app.digital.layout = AppearanceLayout::ImageAndDetails;
+        assert!(app.digital.panel == Panel::Signatures && !app.digital.quick);
+        assert!(app.digital.error.as_deref().unwrap().contains("shows"));
+        edit(&mut app, &|s| {
+            s.show_name = true;
+            s.show_date = true;
+            s.note = "Approved".into();
+            s.background = signing::Background::Tinted;
+        });
         app.digital.open = false;
         app.digital.error = None;
 
@@ -3482,13 +3360,322 @@ mod tests {
                 .is_some_and(|(m, error)| !error && m.contains("Contract-signed 2.pdf"))
         );
 
-        // The chosen appearance is remembered across launches.
-        app.digital.layout = AppearanceLayout::ImageOnly;
-        app.digital.asset_id = Some("signature-asset".into());
-        app.digital.save_appearance();
+        // The signature's note is the reason, unless one was typed for this signing.
+        let doc = lopdf::Document::load_mem(&std::fs::read(&signed).unwrap()).unwrap();
+        let reasons: Vec<String> = doc
+            .objects
+            .values()
+            .filter_map(|o| o.as_dict().ok()?.get(b"Reason").ok()?.as_str().ok())
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .collect();
+        assert_eq!(reasons, ["Approved"]);
+        // Signatures are remembered across launches.
         let reloaded = DigitalState::at(temp.path().join("profile"));
-        assert!(reloaded.layout == AppearanceLayout::ImageOnly);
-        assert_eq!(reloaded.asset_id.as_deref(), Some("signature-asset"));
+        let saved = reloaded.default_signature().unwrap();
+        assert_eq!(saved.note, "Approved");
+        assert_eq!(saved.background, signing::Background::Tinted);
+        assert_eq!(reloaded.look.note, "Approved");
+    }
+    #[test]
+    fn the_old_appearance_becomes_a_signature_and_signatures_persist() {
+        let temp = tempfile::tempdir().unwrap();
+        let passphrase = "synthetic-migration-passphrase";
+        let created = identity::create("Migrated Signer", passphrase, true).unwrap();
+        let file = temp.path().join("migrated.p12");
+        std::fs::write(&file, &created.pkcs12).unwrap();
+        let entry = Entry::file(
+            file,
+            identity::inspect_pkcs12(&created.pkcs12, passphrase)
+                .unwrap()
+                .remove(0),
+        );
+        // A catalogue written before saved signatures existed.
+        std::fs::write(
+            temp.path().join("identities.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "entries": [entry],
+                "default_identity": entry.reference(),
+                "appearance": { "asset_id": "ink-1", "layout": "ImageOnly" },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut state = DigitalState::at(temp.path().into());
+        assert_eq!(state.signatures.len(), 1);
+        let first = state.default_signature().unwrap().clone();
+        assert_eq!(first.identity, Some(entry.reference()));
+        assert_eq!(first.asset_id.as_deref(), Some("ink-1"));
+        assert!(!first.show_name && !first.show_date);
+        assert_eq!(first.background, signing::Background::Clear);
+        assert_eq!(state.layout, AppearanceLayout::ImageOnly);
+        assert_eq!(
+            state.selected,
+            Some(entry.id.clone()),
+            "Quick Sign is ready"
+        );
+
+        // Rename it; a new signature signs with the same ID and gets its own name.
+        state.signatures[0].name = "Handwritten".into();
+        let second = state.add_signature(None);
+        let added = state.signature(&second).unwrap();
+        assert_eq!(added.identity, Some(entry.reference()));
+        assert_eq!(added.name, "My signature");
+        state.make_default(&second);
+        assert!(state.look.show_name && state.layout == AppearanceLayout::DetailsOnly);
+
+        let mut state = DigitalState::at(temp.path().into());
+        assert_eq!(state.signatures.len(), 2);
+        assert_eq!(state.signatures[0].name, "Handwritten");
+        assert_eq!(state.default_signature.as_deref(), Some(second.as_str()));
+        // Deleting the Quick Sign signature hands Quick Sign to the next one.
+        state.delete_signature(&second);
+        assert_eq!(state.default_signature.as_deref(), Some(first.id.as_str()));
+        state.delete_signature(&first.id);
+        let state = DigitalState::at(temp.path().into());
+        assert!(
+            state.signatures.is_empty(),
+            "the old appearance is not migrated again"
+        );
+        assert!(state.default_identity.is_none());
+    }
+    #[test]
+    fn a_digital_id_created_in_the_store_signs_for_the_signature_that_asked() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.digital = DigitalState::at(temp.path().join("profile"));
+        let signature = app.digital.add_signature(None);
+        assert!(app.digital.signatures[0].identity.is_none());
+        // What the creation job reports; the real one adds the ID to Keychain or Windows.
+        let created = identity::create("Store Signer", "synthetic-store-signer", true).unwrap();
+        let info = identity::info(&created.certificate_der).unwrap();
+        let entry = Entry {
+            id: "created".into(),
+            source: Source::Keychain {
+                path: None,
+                fingerprint: info.sha256.clone(),
+            },
+            info,
+            der: created.certificate_der,
+            eligible: true,
+            explanation: None,
+            token: false,
+        };
+        app.digital.busy = true;
+        app.digital
+            .tx
+            .send(Event::Stored {
+                entry: entry.clone(),
+                signature: Some(signature.clone()),
+                trusted: Err(String::new()),
+            })
+            .unwrap();
+        app.digital_events(&ctx);
+        assert!(!app.digital.busy);
+        assert_eq!(app.digital.signatures.len(), 1);
+        assert_eq!(app.digital.signatures[0].identity, Some(entry.reference()));
+        assert_eq!(app.digital.default_identity, Some(entry.reference()));
+        assert_eq!(app.digital.selected.as_deref(), Some("created"));
+        assert!(app.digital.message.contains("ready"));
+        assert!(app.digital.panel == Panel::Signatures);
+        // With no signature waiting, the new ID gets one of its own.
+        let mut other = entry.clone();
+        other.id = "second".into();
+        other.source = Source::Keychain {
+            path: None,
+            fingerprint: "second".into(),
+        };
+        app.digital
+            .tx
+            .send(Event::Stored {
+                entry: other.clone(),
+                signature: None,
+                trusted: Ok(()),
+            })
+            .unwrap();
+        app.digital_events(&ctx);
+        assert_eq!(app.digital.signatures.len(), 2);
+        assert_eq!(app.digital.signatures[1].identity, Some(other.reference()));
+        assert!(app.digital.system_trust.get(&other.der) == Some(&true));
+    }
+    #[test]
+    fn previews_draw_every_background_with_and_without_an_image() {
+        use mypdf_milestone0::annotations::{Kind, Style};
+        let ctx = egui::Context::default();
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = DigitalState::at(temp.path().into());
+        let ink = mypdf_milestone0::assets::Asset::new(
+            "Ink",
+            Kind::Ink {
+                strokes: vec![vec![[0.1, 0.6], [0.4, 0.3], [0.7, 0.7], [0.9, 0.4]]],
+            },
+            Style::default(),
+            3.,
+        );
+        let assets = [ink.clone()];
+        let mut keys = HashSet::new();
+        for background in signing::Background::CHOICES {
+            for (asset, details) in [
+                (None, true),
+                (Some(ink.id.clone()), true),
+                (Some(ink.id.clone()), false),
+            ] {
+                let signature = SavedSignature {
+                    asset_id: asset,
+                    show_name: details,
+                    show_date: details,
+                    background,
+                    ..Default::default()
+                };
+                let request = state.signature_request(&signature, &assets);
+                keys.insert(format!("{request:?}"));
+                assert!(
+                    state.manager.preview(&ctx, &request).is_none(),
+                    "drawn in the background"
+                );
+            }
+        }
+        assert_eq!(keys.len(), 12);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !state.manager.idle() {
+            assert!(std::time::Instant::now() < deadline);
+            state.manager.receive(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(state.manager.drawn(), 12);
+        assert!(
+            state.manager.failures().is_empty(),
+            "{:?}",
+            state.manager.failures()
+        );
+        // A missing library image falls back to the details instead of failing.
+        let gone = SavedSignature {
+            asset_id: Some("deleted".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            state.signature_request(&gone, &assets).layout,
+            AppearanceLayout::DetailsOnly
+        );
+    }
+    #[test]
+    fn the_signatures_window_creates_edits_and_deletes_signatures() {
+        use eframe::App;
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.digital = DigitalState::at(temp.path().join("profile"));
+        app.digital.open = true;
+        let frame = |app: &mut Viewer, events: Vec<egui::Event>| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1100., 900.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+            )
+        };
+        // Scroll the window until the control is in view, then click it.
+        let click = |app: &mut Viewer, label: &str, in_window: bool| {
+            let mut at = None;
+            for _ in 0..60 {
+                let output = frame(app, vec![]);
+                let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+                let r = nodes
+                    .iter()
+                    .find(|(_, n)| n.label() == Some(label))
+                    .unwrap_or_else(|| panic!("no “{label}”"))
+                    .1
+                    .bounds()
+                    .unwrap();
+                let center = pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32);
+                let window = ctx
+                    .memory(|m| m.area_rect(egui::Id::new("digital_window")))
+                    .unwrap();
+                if !in_window || (window.top() + 40.0..window.bottom() - 16.).contains(&center.y) {
+                    at = Some(center);
+                    break;
+                }
+                let delta = if center.y > window.center().y {
+                    -60.
+                } else {
+                    60.
+                };
+                frame(
+                    app,
+                    vec![
+                        egui::Event::PointerMoved(window.center()),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: vec2(0., delta),
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            let at = at.unwrap_or_else(|| panic!("“{label}” stays out of view"));
+            for pressed in [true, false] {
+                frame(
+                    app,
+                    vec![
+                        egui::Event::PointerMoved(at),
+                        egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            frame(app, vec![]);
+        };
+        for _ in 0..3 {
+            frame(&mut app, vec![]);
+        }
+        // First run: one button creates the first signature, which Quick Sign uses.
+        click(&mut app, "Create a signature", true);
+        assert_eq!(app.digital.signatures.len(), 1);
+        let first = app.digital.signatures[0].id.clone();
+        assert_eq!(
+            app.digital.default_signature.as_deref(),
+            Some(first.as_str())
+        );
+        click(&mut app, "Soft tint", true);
+        assert_eq!(
+            app.digital.signatures[0].background,
+            signing::Background::Tinted
+        );
+        click(&mut app, "Date and time", true);
+        assert!(!app.digital.signatures[0].show_date);
+        click(&mut app, "Duplicate", true);
+        assert_eq!(app.digital.signatures.len(), 2);
+        assert_eq!(app.digital.signatures[1].name, "My signature copy");
+        assert_eq!(
+            app.digital.signatures[1].background,
+            signing::Background::Tinted
+        );
+        click(&mut app, "Use for Quick Sign", true);
+        let copy = app.digital.signatures[1].id.clone();
+        assert_eq!(
+            app.digital.default_signature.as_deref(),
+            Some(copy.as_str())
+        );
+        click(&mut app, "Delete…", true);
+        assert_eq!(
+            app.digital.manager.confirm_delete.as_deref(),
+            Some(copy.as_str())
+        );
+        click(&mut app, "Delete", false);
+        assert_eq!(app.digital.signatures.len(), 1);
+        assert_eq!(
+            app.digital.default_signature.as_deref(),
+            Some(first.as_str())
+        );
+        let reloaded = DigitalState::at(temp.path().join("profile"));
+        assert_eq!(reloaded.signatures, app.digital.signatures);
     }
     #[test]
     fn catalogue_contains_only_public_metadata_and_detects_other_writers() {

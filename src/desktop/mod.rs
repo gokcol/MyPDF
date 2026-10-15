@@ -597,7 +597,7 @@ impl Viewer {
             "theme_dark" => ui::set_theme_preference(ctx, egui::ThemePreference::Dark),
             "appearance" => {
                 self.digital.open = true;
-                self.digital.panel = digital::Panel::Appearance;
+                self.digital.panel = digital::Panel::Signatures;
             }
             "sign" => {
                 self.digital.open = true;

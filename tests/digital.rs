@@ -560,3 +560,41 @@ async fn signed_pdfs_can_be_reordered_after_unlock_and_copied_without_their_sign
     let fields = signature_edit::signature_fields(&saved).unwrap();
     assert_eq!(fields[0].page, Some(1), "the signature moved with its page");
 }
+
+#[test]
+fn signature_backgrounds_paint_what_their_names_say() {
+    use mypdf_milestone0::signing::{Background, DesktopSigningRequest, signature_artwork};
+    // Pixels at the frame (left edge) and in empty space (right edge), mid-height.
+    let sample = |background| {
+        let png = signature_artwork(&DesktopSigningRequest {
+            rect: Some([0., 0., 200., 60.]),
+            name: "Jane".into(),
+            background,
+            ..Default::default()
+        })
+        .unwrap();
+        let image = mypdf_milestone0::assets::decode_png(&png)
+            .unwrap()
+            .into_rgba8();
+        let y = image.height() / 2;
+        (
+            image.get_pixel(2, y).0,
+            image.get_pixel(image.width() - 8, y).0,
+        )
+    };
+    let (_, clear) = sample(Background::Clear);
+    assert_eq!(clear[3], 0, "the page shows through");
+    let (_, white) = sample(Background::White);
+    assert_eq!(white, [255, 255, 255, 255]);
+    let (_, tint) = sample(Background::Tinted);
+    assert!(
+        tint[3] == 255 && tint[2] > tint[0] && tint[0] < 245,
+        "{tint:?}"
+    );
+    let (frame, inside) = sample(Background::Framed);
+    assert_eq!(inside, [255, 255, 255, 255]);
+    assert!(
+        frame[1] > frame[0] && frame[0] < 200,
+        "a green frame: {frame:?}"
+    );
+}
