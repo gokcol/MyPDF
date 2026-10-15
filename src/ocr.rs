@@ -8,6 +8,7 @@ use lopdf::{Object, Stream, dictionary};
 
 const MARK: &[u8] = b"MyPDFOCR";
 /// Pages are read at this many pixels per point (about 216 dpi).
+#[cfg(target_os = "macos")]
 const SCALE: f32 = 3.0;
 
 /// A recognized line in displayed page coordinates.

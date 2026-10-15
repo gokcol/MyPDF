@@ -7,8 +7,8 @@
     <key>CFBundleExecutable</key><string>MyPDF</string>
     <key>CFBundleIconFile</key><string>MyPDF</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.6.0</string>
-    <key>CFBundleVersion</key><string>6</string>
+    <key>CFBundleShortVersionString</key><string>0.95</string>
+    <key>CFBundleVersion</key><string>95</string>
     <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -19,5 +19,5 @@
         <key>LSHandlerRank</key><string>Alternate</string>
         <key>LSItemContentTypes</key><array><string>com.adobe.pdf</string></array>
     </dict></array>
-    <key>NSHumanReadableCopyright</key><string>MyPDF contributors</string>
+    <key>NSHumanReadableCopyright</key><string>© 2026 MyPDF contributors · MIT OR Apache-2.0</string>
 </dict></plist>

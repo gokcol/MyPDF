@@ -1,6 +1,8 @@
 # MyPDF — native Rust desktop PDF editor
 
-Version 0.6.0 adds a Home workspace, local autosave and crash recovery, icon-led mode tabs and tool ribbons, independent panel toggles, and on-page text editing with rectangular block selection. macOS first, portable Rust core, no WebViews. Windows builds are deferred by request.
+Version 0.95 is the first public release: a signed and notarized Mac app for Apple Silicon with reading, annotation, text and image editing, forms (design, fill, detect, layouts, *My details*), Compare Documents, OCR, watermarks, passwords, Zen mode and digital signatures. Download it from [Releases](https://github.com/gokcol/MyPDF/releases). macOS first, portable Rust core, no WebViews. Windows builds are deferred by request.
+
+> MyPDF was built with the help of Claude, Anthropic's AI assistant, to make everyday business paperwork easier. It is provided as is, without warranty of any kind: keep copies of important documents and use it at your own risk.
 
 - **Home:** Open/drop PDFs, create a blank PDF, launch common tools, and browse local Recents and Favorites with page previews.
 - **Edit:** type directly on blank or existing pages; click existing text to edit it in place; drag a rectangular selection to reflow several lines together; replace, reposition, resize and delete existing page-level images.
