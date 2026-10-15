@@ -53,14 +53,12 @@ pub fn hand_over(_: &[PathBuf]) -> bool {
     false
 }
 
-/// Listen for files the system asks MyPDF to open, and on Windows list
-/// MyPDF under Open With. Call before the app starts, so the files a launch
-/// was asked to open are not missed.
+/// Listen for files the system asks MyPDF to open. Call before the app
+/// starts, so the files a launch was asked to open are not missed. (On
+/// Windows the installer lists MyPDF under Open With, when the user agrees.)
 pub fn install() {
     #[cfg(target_os = "macos")]
     mac::install();
-    #[cfg(windows)]
-    windows::register();
 }
 
 /// Requests from MyPDFs started with a file while another one is open: each
@@ -178,113 +176,6 @@ mod mailbox {
                 }
                 send(root, paths).is_ok()
             }
-        }
-    }
-}
-
-/// Open With for PDFs, for this Windows user. Windows keeps the user's own
-/// choice of default app; this only adds MyPDF to the list.
-#[cfg(windows)]
-mod windows {
-    use std::ptr::{null, null_mut};
-    use windows_sys::Win32::System::Registry::{
-        HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ,
-        RegCloseKey, RegCreateKeyExW, RegGetValueW, RegSetValueExW,
-    };
-    use windows_sys::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
-
-    fn wide(text: &str) -> Vec<u16> {
-        text.encode_utf16().chain([0]).collect()
-    }
-    /// A text value under HKEY_CURRENT_USER.
-    fn read(key: &str, name: Option<&str>) -> Option<String> {
-        let (key, name) = (wide(key), name.map(wide));
-        let name = name.as_ref().map_or(null(), |n| n.as_ptr());
-        let mut buffer = vec![0u16; 1024];
-        let mut size = (buffer.len() * 2) as u32;
-        // SAFETY: NUL-terminated names and a buffer of the given size.
-        let status = unsafe {
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                key.as_ptr(),
-                name,
-                RRF_RT_REG_SZ,
-                null_mut(),
-                buffer.as_mut_ptr().cast(),
-                &mut size,
-            )
-        };
-        if status != 0 {
-            return None;
-        }
-        let end = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
-        Some(String::from_utf16_lossy(&buffer[..end]))
-    }
-    fn write(key: &str, name: Option<&str>, value: &str) -> bool {
-        let (key, name, value) = (wide(key), name.map(wide), wide(value));
-        let mut handle: HKEY = null_mut();
-        // SAFETY: NUL-terminated names and value; the key is closed again.
-        unsafe {
-            if RegCreateKeyExW(
-                HKEY_CURRENT_USER,
-                key.as_ptr(),
-                0,
-                null(),
-                REG_OPTION_NON_VOLATILE,
-                KEY_SET_VALUE,
-                null(),
-                &mut handle,
-                null_mut(),
-            ) != 0
-            {
-                return false;
-            }
-            let written = RegSetValueExW(
-                handle,
-                name.as_ref().map_or(null(), |n| n.as_ptr()),
-                0,
-                REG_SZ,
-                value.as_ptr().cast(),
-                (value.len() * 2) as u32,
-            ) == 0;
-            RegCloseKey(handle);
-            written
-        }
-    }
-
-    pub(super) fn register() {
-        let Ok(exe) = std::env::current_exe() else {
-            return;
-        };
-        let (Some(path), Some(file)) = (exe.to_str(), exe.file_name().and_then(|n| n.to_str()))
-        else {
-            return;
-        };
-        let command = format!("\"{path}\" \"%1\"");
-        let classes = r"Software\Classes";
-        let app = format!(r"{classes}\Applications\{file}");
-        let app_command = format!(r"{app}\shell\open\command");
-        // Already listed from this place.
-        if read(&app_command, None).as_deref() == Some(command.as_str()) {
-            return;
-        }
-        let document = format!(r"{classes}\MyPDF.Document");
-        let listed = [
-            write(&app, Some("FriendlyAppName"), "MyPDF"),
-            write(&format!(r"{app}\SupportedTypes"), Some(".pdf"), ""),
-            write(&document, None, "PDF Document"),
-            write(&format!(r"{document}\shell\open\command"), None, &command),
-            write(
-                &format!(r"{classes}\.pdf\OpenWithProgids"),
-                Some("MyPDF.Document"),
-                "",
-            ),
-            // Last, so a launch that could not finish tries again.
-            write(&app_command, None, &command),
-        ];
-        if listed.contains(&true) {
-            // SAFETY: no items; it tells Explorer that file types changed.
-            unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED as i32, SHCNF_IDLIST, null(), null()) };
         }
     }
 }

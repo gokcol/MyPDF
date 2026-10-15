@@ -1,0 +1,21 @@
+MyPDF - a PDF editor for reading, annotating, editing, filling forms,
+comparing versions and signing.
+
+MyPDF was built with the help of Claude, Anthropic's AI assistant, to make
+everyday business paperwork easier. It is provided as is, without warranty
+of any kind: keep copies of important documents and use it at your own risk.
+
+Privacy: MyPDF works on this computer. It does not send your documents or
+any other information to other computers unless you ask it to, for example
+by opening a web link in a document.
+
+What the installer changes:
+- It copies MyPDF to the folder you choose and adds it to the Start menu.
+- If you tick the option, it adds MyPDF to the "Open with" menu for PDF
+  files. Your default PDF app stays the same.
+- You can remove MyPDF at any time in Settings > Apps; that also removes
+  the "Open with" entry. Your saved signatures and details are kept in
+  %LOCALAPPDATA%\MyPDF.
+
+MyPDF is licensed under MIT OR Apache-2.0. Source code:
+https://github.com/gokcol/MyPDF
