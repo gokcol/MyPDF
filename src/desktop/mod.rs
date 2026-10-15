@@ -1,5 +1,7 @@
 mod clipboard;
+mod comparison;
 mod content;
+mod details;
 mod digital;
 mod editing;
 mod form_tools;
@@ -24,6 +26,7 @@ mod text_selection;
 mod theme;
 mod ui;
 mod watermark;
+mod zen;
 use ui::{ActionButton, Icon};
 
 use eframe::egui::{self, Color32, FontId, Rect, RichText, Stroke, TextureHandle, pos2, vec2};
@@ -329,6 +332,12 @@ pub struct Viewer {
     header_footer: header_footer::HeaderFooterState,
     redaction: redaction::Redaction,
     forms: form_tools::FormState,
+    /// Compare Documents: choosing the versions, then the side-by-side view.
+    compare_chooser: Option<comparison::Chooser>,
+    comparison: Option<comparison::Comparison>,
+    /// Zen mode: only the pages, full screen.
+    zen: Option<zen::Zen>,
+    details: details::DetailsState,
 }
 impl Viewer {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> Self {
@@ -378,6 +387,10 @@ impl Viewer {
             header_footer: header_footer::HeaderFooterState::new(),
             redaction: redaction::Redaction::new(),
             forms: form_tools::FormState::new(),
+            compare_chooser: None,
+            comparison: None,
+            zen: None,
+            details: details::DetailsState::new(),
         };
         for path in paths {
             app.open(path, &cc.egui_ctx);
@@ -654,6 +667,13 @@ impl Viewer {
             "redact" => self.start_redaction(),
             "flatten" => self.request_flatten(),
             "print" => self.print_document(ctx),
+            "compare" => self.request_compare(),
+            "zen" => self.toggle_zen(ctx),
+            "form_fill_details" => {
+                self.inspector = true;
+                self.fill_with_details();
+            }
+            "my_details" => self.edit_details(false),
             "protect" => self.request_protect(),
             "unprotect" => self.request_unprotect(),
             "shrink" => self.request_shrink(),
@@ -950,6 +970,15 @@ impl Viewer {
                 self.selection_keys(ctx);
             }
         }
+        // Before ⌘F, which would also match ⇧⌘F.
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::F,
+            )
+        }) {
+            self.toggle_zen(ctx);
+        }
         // macOS menu accelerators own these shortcuts to prevent duplicate dialogs.
         if !cfg!(target_os = "macos") || self._native_menu.is_none() {
             for (key, action) in [
@@ -1017,6 +1046,9 @@ impl Viewer {
         }
     }
     fn toolbar(&mut self, ctx: &egui::Context) {
+        if self.zen.is_some() {
+            return;
+        }
         let mut action = None;
         let mut close = None;
         egui::TopBottomPanel::top("document_tabs")
@@ -1089,7 +1121,7 @@ impl Viewer {
         if let Some(a) = action.take() {
             self.action(a, ctx);
         }
-        if self.home.visible {
+        if self.home.visible || self.comparison.is_some() {
             return;
         }
         egui::TopBottomPanel::top("main_toolbar")
@@ -1128,14 +1160,15 @@ impl Viewer {
                         + 6.
                 };
                 let full = ui.available_width();
-                // File actions (left) and panel toggles (right) need about 230 points.
-                let compact = full < track_width(ui, false) + 260.;
+                // File actions (left) and panel toggles (right) need about 290 points.
+                let compact = full < track_width(ui, false) + 320.;
                 ui.horizontal(|ui| {
                     for (icon, label, key) in [
                         (Icon::Blank, "New blank PDF", "new"),
                         (Icon::Open, "Open…", "open"),
                         (Icon::Save, "Save a Copy…", "save"),
                         (Icon::Print, "Print… (⌘P)", "print"),
+                        (Icon::Compare, "Compare Documents…", "compare"),
                     ] {
                         let enabled = !matches!(key, "save" | "print")
                             || (!self.saving
@@ -1153,7 +1186,7 @@ impl Viewer {
                     let used = ui.min_rect().width();
                     let track = track_width(ui, compact);
                     let centered = (full - track) / 2. - used;
-                    let room = full - track - used - 118.;
+                    let room = full - track - used - 150.;
                     ui.add_space(centered.min(room).max(8.));
                     ui::segment_track(ui, |ui| {
                         for (mode, icon, label) in MODES {
@@ -1175,6 +1208,12 @@ impl Viewer {
                         }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(ActionButton::new(Icon::Zen, "Zen mode · ⇧⌘F").compact())
+                            .clicked()
+                        {
+                            action = Some("zen");
+                        }
                         if ui
                             .add(
                                 ActionButton::new(Icon::Inspector, "Toggle right panel")
@@ -1383,6 +1422,12 @@ impl Viewer {
         }
     }
     fn sidebar(&mut self, ctx: &egui::Context) {
+        const SIDEBAR_TABS: [(Icon, &str); 4] = [
+            (Icon::Library, "Pages"),
+            (Icon::Outline, "Outline"),
+            (Icon::Search, "Search"),
+            (Icon::Note, "Marks"),
+        ];
         if !self.sidebar || self.tabs.is_empty() {
             return;
         }
@@ -1393,7 +1438,7 @@ impl Viewer {
                 .width_range(190.0..=360.0)
                 .frame(egui::Frame::new().fill(theme::paper()).inner_margin(12.0))
                 .show(ctx, |ui| {
-                    match ui::segmented(ui, &["Pages", "Outline", "Search", "Marks"], 3) {
+                    match ui::segmented_icons(ui, &SIDEBAR_TABS, 3) {
                         Some(0) => {
                             self.editor.annotation_sidebar = false;
                             self.search = false;
@@ -1421,7 +1466,7 @@ impl Viewer {
         let tick = self.tick;
         egui::SidePanel::left("sidebar").resizable(true).default_width(220.0).width_range(190.0..=360.0).frame(egui::Frame::new().fill(theme::paper()).inner_margin(12.0)).show(ctx, |ui| {
             let current = if self.search { 2 } else if self.outline { 1 } else { 0 };
-            match ui::segmented(ui, &["Pages", "Outline", "Search", "Marks"], current) {
+            match ui::segmented_icons(ui, &SIDEBAR_TABS, current) {
                 Some(0) => { self.search = false; self.outline = false; }
                 Some(1) => { self.search = false; self.outline = true; }
                 Some(2) => { self.search = true; self.outline = false; self.focus_search = true; }
@@ -1815,9 +1860,11 @@ impl eframe::App for Viewer {
         self.digital_events(ctx);
         self.signature_events(ctx);
         self.shortcuts(ctx);
+        self.zen_keys(ctx);
+        self.compare_tick(ctx);
         self.editor.text_editing = false;
         self.toolbar(ctx);
-        if !self.home.visible {
+        if !self.home.visible && self.comparison.is_none() && self.zen.is_none() {
             self.editor_tools(ctx);
             self.page_tools(ctx);
             self.content_tools(ctx);
@@ -1842,6 +1889,11 @@ impl eframe::App for Viewer {
         }
         if self.home.visible {
             self.home_screen(ctx);
+        } else if self.comparison.is_some() {
+            self.compare_screen(ctx);
+        } else if self.zen.is_some() {
+            self.document(ctx);
+            self.zen_overlay(ctx);
         } else if self.editor.mode == editing::Mode::Pages {
             if self.inspector {
                 self.organizer_panel(ctx);
@@ -1879,6 +1931,8 @@ impl eframe::App for Viewer {
         self.link_dialog(ctx);
         self.watermark_dialog(ctx);
         self.ocr_dialogs(ctx);
+        self.compare_dialog(ctx);
+        self.details_dialogs(ctx);
         self.page_dialogs(ctx);
         self.digital_events(ctx);
         self.editor_windows(ctx);

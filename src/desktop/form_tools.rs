@@ -704,7 +704,7 @@ impl Viewer {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add_space(((ui.available_width() - 1040.) / 2.).max(0.));
+                    ui.add_space(((ui.available_width() - 1160.) / 2.).max(0.));
                     for kind in FieldType::ALL {
                         let selected = self.forms.tool == Some(kind);
                         if ui
@@ -762,6 +762,28 @@ impl Viewer {
                         }
                     });
                     ui.separator();
+                    let mine = ui.add(ActionButton::new(Icon::Person, "My details").dropdown());
+                    egui::Popup::menu(&mine).show(|ui| {
+                        ui.set_min_width(230.);
+                        if ui
+                            .add_enabled(
+                                editable && has_fields,
+                                ActionButton::new(Icon::Person, "Fill with my details…"),
+                            )
+                            .on_hover_text("Put your name, email, address and so on in the empty fields that ask for them")
+                            .clicked()
+                        {
+                            command = Some("form_fill_details");
+                            ui.close();
+                        }
+                        if ui
+                            .add(ActionButton::new(Icon::Text, "Edit my details…"))
+                            .clicked()
+                        {
+                            command = Some("my_details");
+                            ui.close();
+                        }
+                    });
                     if ui
                         .add_enabled(editable, ActionButton::new(Icon::Sparkle, "Detect fields"))
                         .on_hover_text("Find blanks, boxes and lines on every page and turn them into fields")
@@ -834,11 +856,13 @@ impl Viewer {
     /// Form-wide commands, from the toolbar or the menu.
     pub(super) fn form_command(&mut self, command: &str, ctx: &egui::Context) {
         self.editor.mode = editing::Mode::Forms;
-        if !self.form_editable() && command != "form_export" {
+        if !self.form_editable() && !matches!(command, "form_export" | "my_details") {
             self.status = Some(("This document cannot be changed right now.".into(), true));
             return;
         }
         match command {
+            "form_fill_details" => self.fill_with_details(),
+            "my_details" => self.edit_details(false),
             "form_detect" => self.content_change(ctx, Edit::DetectFields),
             "form_tab_rows" => self.content_change(ctx, Edit::TabOrder(TabOrder::Rows)),
             "form_tab_columns" => self.content_change(ctx, Edit::TabOrder(TabOrder::Columns)),

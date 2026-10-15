@@ -353,6 +353,11 @@ pub(super) enum Icon {
     Print,
     Watermark,
     Ocr,
+    Compare,
+    Swap,
+    Person,
+    Outline,
+    Zen,
 }
 
 pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -499,6 +504,52 @@ pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: 
             line(&[[0.3, 0.38], [0.7, 0.38]]);
             line(&[[0.3, 0.52], [0.7, 0.52]]);
             line(&[[0.3, 0.66], [0.56, 0.66]]);
+        }
+        Icon::Compare => {
+            box_at([0.06, 0.14], [0.44, 0.86], 0.06);
+            box_at([0.56, 0.14], [0.94, 0.86], 0.06);
+            line(&[[0.15, 0.34], [0.35, 0.34]]);
+            line(&[[0.15, 0.5], [0.35, 0.5]]);
+            line(&[[0.15, 0.66], [0.3, 0.66]]);
+            line(&[[0.65, 0.34], [0.85, 0.34]]);
+            fill_box([0.62, 0.43], [0.88, 0.57], 0.02, soft);
+            line(&[[0.65, 0.5], [0.85, 0.5]]);
+            line(&[[0.65, 0.66], [0.8, 0.66]]);
+        }
+        Icon::Swap => {
+            line(&[[0.16, 0.32], [0.84, 0.32]]);
+            line(&[[0.68, 0.17], [0.84, 0.32], [0.68, 0.47]]);
+            line(&[[0.84, 0.68], [0.16, 0.68]]);
+            line(&[[0.32, 0.53], [0.16, 0.68], [0.32, 0.83]]);
+        }
+        Icon::Outline => {
+            for (y, x) in [(0.22, 0.1), (0.5, 0.3), (0.78, 0.3)] {
+                painter.circle_filled(p(x + 0.04, y), width * 0.9, color);
+                line(&[[x + 0.18, y], [0.9, y]]);
+            }
+        }
+        Icon::Zen => {
+            // The sun rising over a calm horizon.
+            let sun = arc([0.5, 0.64], 0.2, 180., 360.);
+            painter.add(egui::Shape::convex_polygon(
+                sun.iter().map(|v| p(v[0], v[1])).collect(),
+                soft,
+                Stroke::NONE,
+            ));
+            line(&sun);
+            for angle in [205_f32, 270., 335.] {
+                let a = angle.to_radians();
+                line(&[
+                    [0.5 + a.cos() * 0.31, 0.64 + a.sin() * 0.31],
+                    [0.5 + a.cos() * 0.42, 0.64 + a.sin() * 0.42],
+                ]);
+            }
+            line(&[[0.06, 0.64], [0.94, 0.64]]);
+            line(&[[0.28, 0.82], [0.72, 0.82]]);
+        }
+        Icon::Person => {
+            line(&arc([0.5, 0.32], 0.17, 0., 360.));
+            line(&arc([0.5, 0.94], 0.34, 180., 360.));
         }
         Icon::Print => {
             line(&[[0.28, 0.36], [0.28, 0.1], [0.72, 0.1], [0.72, 0.36]]);
@@ -1248,6 +1299,18 @@ pub(super) fn segment_track<R>(
 
 /// A full-width segmented control. Returns the newly chosen index.
 pub(super) fn segmented(ui: &mut egui::Ui, options: &[&str], selected: usize) -> Option<usize> {
+    segments(ui, options, &[], selected)
+}
+/// A segmented control of icons; the names show on hover.
+pub(super) fn segmented_icons(
+    ui: &mut egui::Ui,
+    options: &[(Icon, &str)],
+    selected: usize,
+) -> Option<usize> {
+    let (icons, names): (Vec<Icon>, Vec<&str>) = options.iter().copied().unzip();
+    segments(ui, &names, &icons, selected)
+}
+fn segments(ui: &mut egui::Ui, options: &[&str], icons: &[Icon], selected: usize) -> Option<usize> {
     let (track, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.), egui::Sense::hover());
     ui.painter().rect_filled(track, 9, theme::track());
     let width = (track.width() - 6.) / options.len().max(1) as f32;
@@ -1272,22 +1335,25 @@ pub(super) fn segmented(ui: &mut egui::Ui, options: &[&str], selected: usize) ->
         } else if response.hovered() {
             ui.painter().rect_filled(r, 7, theme::hover());
         }
-        let font = if i == selected {
-            strong(ui, 12.5)
+        let ink = if i == selected {
+            theme::ink()
         } else {
-            FontId::proportional(12.5)
+            theme::muted()
         };
-        ui.painter().text(
-            r.center(),
-            egui::Align2::CENTER_CENTER,
-            *label,
-            font,
-            if i == selected {
-                theme::ink()
+        let response = if let Some(icon) = icons.get(i) {
+            let glyph = Rect::from_center_size(r.center(), vec2(17., 17.));
+            draw_icon(ui.painter(), glyph, *icon, ink);
+            response.on_hover_text(*label)
+        } else {
+            let font = if i == selected {
+                strong(ui, 12.5)
             } else {
-                theme::muted()
-            },
-        );
+                FontId::proportional(12.5)
+            };
+            ui.painter()
+                .text(r.center(), egui::Align2::CENTER_CENTER, *label, font, ink);
+            response
+        };
         if response
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()

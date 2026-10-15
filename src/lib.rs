@@ -1,5 +1,6 @@
 pub mod annotations;
 pub mod assets;
+pub mod compare;
 pub mod compress;
 pub mod content;
 pub mod convert;
@@ -8,6 +9,7 @@ pub mod form_data;
 pub mod form_design;
 pub mod form_detect;
 pub mod form_layout;
+pub mod form_profile;
 pub mod forms;
 pub mod header_footer;
 pub mod home;
