@@ -355,10 +355,11 @@ fn detail_of(text: &str) -> Option<(Detail, usize)> {
         return None;
     }
     let joined: String = words.concat();
-    // "Address line 2" and "Phone 2" are not the first ones.
+    // "Address line 2", "Phone 2" and "Signer 2 name" are not the first ones.
     if text
-        .trim_end()
-        .ends_with(|c: char| c.is_ascii_digit() && c != '1')
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|n| !n.is_empty())
+        .any(|n| n.parse::<u32>() != Ok(1))
     {
         return None;
     }
@@ -490,6 +491,9 @@ mod tests {
             ("Email Address", Some(Detail::Email)),
             ("Address line 1", Some(Detail::Street)),
             ("Address line 2", None),
+            ("Signer 1 name", Some(Detail::FullName)),
+            ("Signer 2 name", None),
+            ("Phone 2", None),
             ("ZIP", Some(Detail::PostalCode)),
             ("Adı Soyadı", Some(Detail::FullName)),
             ("SOYADI", Some(Detail::LastName)),
