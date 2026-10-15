@@ -472,28 +472,58 @@ fn frame(look: &Look, w: f32, h: f32, round: bool) -> String {
     }
     body
 }
+/// An appearance drawn upright in a `w` × `h` box. On a rotated page its
+/// matrix turns it with the page, so people read it the right way up.
 fn form_stream(
     doc: &mut Document,
+    widget: ObjectId,
     w: f32,
     h: f32,
     body: String,
     resources: Dictionary,
 ) -> Result<ObjectId> {
-    let mut stream = Stream::new(
-        dictionary! {
-            "Type" => "XObject",
-            "Subtype" => "Form",
-            "BBox" => vec![0.into(), 0.into(), Object::Real(w), Object::Real(h)],
-            "Resources" => resources,
-        },
-        body.into_bytes(),
-    );
+    let mut dict = dictionary! {
+        "Type" => "XObject",
+        "Subtype" => "Form",
+        "BBox" => vec![0.into(), 0.into(), Object::Real(w), Object::Real(h)],
+        "Resources" => resources,
+    };
+    let matrix: Option<[i64; 4]> = match rotation(doc, widget) {
+        90 => Some([0, 1, -1, 0]),
+        180 => Some([-1, 0, 0, -1]),
+        270 => Some([0, -1, 1, 0]),
+        _ => None,
+    };
+    if let Some([a, b, c, d]) = matrix {
+        dict.set(
+            "Matrix",
+            vec![a.into(), b.into(), c.into(), d.into(), 0.into(), 0.into()],
+        );
+    }
+    let mut stream = Stream::new(dict, body.into_bytes());
     stream.compress()?;
     Ok(doc.add_object(stream))
 }
+/// How far a widget's appearance turns counterclockwise: 0, 90, 180 or 270.
+fn rotation(doc: &Document, widget: ObjectId) -> i64 {
+    let r = doc
+        .get_dictionary(widget)
+        .ok()
+        .and_then(|d| dict_of(doc, d, b"MK"))
+        .and_then(|mk| mk.get(b"R").ok()?.as_i64().ok())
+        .unwrap_or(0)
+        .rem_euclid(360);
+    if r % 90 == 0 { r } else { 0 }
+}
+/// The widget's size as people see it: turned sideways on a rotated page.
 fn widget_size(doc: &Document, widget: ObjectId) -> Result<(f32, f32)> {
     let r = rect_of(doc.get_dictionary(widget)?)?;
-    Ok(((r[2] - r[0]).max(1.), (r[3] - r[1]).max(1.)))
+    let (w, h) = ((r[2] - r[0]).max(1.), (r[3] - r[1]).max(1.));
+    Ok(if rotation(doc, widget) % 180 == 90 {
+        (h, w)
+    } else {
+        (w, h)
+    })
 }
 
 /// Lines and size that fit text into a box, shrinking from `start` to `minimum`.
@@ -617,7 +647,7 @@ fn text_appearance(
         body.push_str("ET Q EMC\n");
         resources.set("Font", dictionary! { "F0" => font.id });
     }
-    form_stream(doc, w, h, body, resources)
+    form_stream(doc, widget, w, h, body, resources)
 }
 
 /// A list box: its options, the chosen one highlighted.
@@ -670,7 +700,7 @@ fn list_appearance(
         body.push_str("Q\n");
         resources.set("Font", dictionary! { "F0" => font.id });
     }
-    form_stream(doc, w, h, body, resources)
+    form_stream(doc, widget, w, h, body, resources)
 }
 
 /// A check box's or radio button's on or off state.
@@ -721,7 +751,7 @@ fn mark_appearance(
             )),
         }
     }
-    form_stream(doc, w, h, body, Dictionary::new())
+    form_stream(doc, widget, w, h, body, Dictionary::new())
 }
 
 /// A push button with its caption, or an image field with its picture.
@@ -767,7 +797,7 @@ fn button_appearance(
             resources.set("Font", dictionary! { "F0" => font.id });
         }
     }
-    form_stream(doc, w, h, body, resources)
+    form_stream(doc, widget, w, h, body, resources)
 }
 
 /// The widgets of a field: the field itself when it is merged with its widget,
@@ -995,7 +1025,7 @@ pub(crate) fn refresh(doc: &mut Document, field: ObjectId, strict: bool) -> Resu
                 }
                 let (w, h) = widget_size(doc, widget)?;
                 let body = frame(&look, w, h, false);
-                form_stream(doc, w, h, body, Dictionary::new())?.into()
+                form_stream(doc, widget, w, h, body, Dictionary::new())?.into()
             }
         };
         doc.get_dictionary_mut(widget)?
@@ -1101,17 +1131,28 @@ fn form_fields(doc: &Document, form: ObjectId) -> Vec<Object> {
         .unwrap_or_default()
 }
 
-/// Displayed-to-PDF mapping of a page; fields go on upright pages only.
+/// Displayed-to-PDF mapping of a page, which may be turned by a right angle.
 fn page_transform(bytes: &[u8], page: usize) -> Result<Affine> {
     let geometry = crate::annotations::page_geometry(bytes)?;
     let (_, inverse) = geometry.get(page).context("Page not found")?;
     let m = Affine::new(*inverse);
     let c = m.as_coeffs();
     ensure!(
-        c[1].abs() < 1e-6 && c[2].abs() < 1e-6 && c[0] > 0. && c[3] < 0.,
-        "Form fields can be added to upright pages only. Rotate this page back to upright first."
+        c[1].abs() < 1e-6 && c[2].abs() < 1e-6 || c[0].abs() < 1e-6 && c[3].abs() < 1e-6,
+        "This page is turned at an unusual angle, so fields cannot be placed on it"
     );
     Ok(m)
+}
+/// A page's rotation: 0, 90, 180 or 270 degrees clockwise.
+fn page_rotation(doc: &Document, page: ObjectId) -> i64 {
+    content::inherited(doc, page, b"Rotate")
+        .ok()
+        .flatten()
+        .and_then(|o| o.as_i64().ok())
+        .unwrap_or(0)
+        .rem_euclid(360)
+        / 90
+        * 90
 }
 fn to_pdf(m: Affine, rect: [f32; 4]) -> [f32; 4] {
     let a = m * Point::new(rect[0] as f64, rect[1] as f64);
@@ -1587,8 +1628,12 @@ fn write_properties(
     // Widget-level look: colors, border, caption or check style, action.
     let widgets = widgets_of(doc, field);
     for w in &widgets {
+        let turned = rotation(doc, *w);
         let wd = doc.get_dictionary_mut(*w)?;
         let mut mk = Dictionary::new();
+        if turned != 0 {
+            mk.set("R", turned);
+        }
         if let Some(bc) = p.border {
             mk.set("BC", color_array(bc));
         }
@@ -1692,6 +1737,11 @@ pub fn add(
         "P" => page_id,
         "F" => 4,
     };
+    // On a landscape page that is a turned portrait page, the field turns with it.
+    let turned = page_rotation(&doc, page_id);
+    if turned != 0 {
+        widget.set("MK", dictionary! { "R" => turned });
+    }
     let field = match kind {
         FieldType::Radio => {
             let group = match group {
