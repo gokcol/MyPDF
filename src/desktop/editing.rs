@@ -1875,7 +1875,7 @@ impl Viewer {
                             }
                             ui.separator();
                             for (icon, label, key) in [
-                                (Icon::Pen, "Signature appearance…", "appearance"),
+                                (Icon::Pen, "My signatures…", "appearance"),
                                 (Icon::Shield, "Digital IDs…", "identities"),
                                 (Icon::Form, "Sign with options…", "sign"),
                                 (Icon::Check, "Validate signatures…", "validate"),
