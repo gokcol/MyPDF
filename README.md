@@ -4,6 +4,30 @@ Version 0.95 is the first public release: a signed and notarized Mac app for App
 
 > MyPDF was built with the help of Claude, Anthropic's AI assistant, to make everyday business paperwork easier. It is provided as is, without warranty of any kind: keep copies of important documents and use it at your own risk.
 
+## Screenshots
+
+Taken from the running app on macOS, with made-up sample documents (`cargo run --release --example demo_docs -- <folder>` creates them).
+
+**Compare Documents:** two versions side by side, with changed (amber), removed (red) and added (green) words marked and listed.
+
+![Compare Documents showing two versions of a service agreement side by side](docs/screenshots/compare.png)
+
+**Fill with my details:** your saved name, company, email and phone go into the empty fields that ask for them, after a look at what goes where.
+
+![The Fill with my details dialog over a supplier registration form](docs/screenshots/my-details.png)
+
+**Forms, in the dark theme:** the filled form with its fields listed in tab order on the right.
+
+![A filled supplier registration form in Forms mode, dark theme](docs/screenshots/forms-dark.png)
+
+**Annotate:** highlight, underline and strike out text; every mark is listed on the left and its colour, opacity and stroke are on the right.
+
+![A quarterly report with a highlight, an underline and a strike-through](docs/screenshots/annotate.png)
+
+**Home:** open or drop files, start a common task, and pick up recent documents.
+
+![The Home screen with tools and recent documents](docs/screenshots/home.png)
+
 - **Home:** Open/drop PDFs, create a blank PDF, launch common tools, and browse local Recents and Favorites with page previews.
 - **Edit:** type directly on blank or existing pages; click existing text to edit it in place; drag a rectangular selection to reflow several lines together; replace, reposition, resize and delete existing page-level images.
 - **Forms:** build forms with text, check box, radio, dropdown, list box, button, image, date and signature fields; detect fields on paper-style forms; fill, clear, flatten, set tab order, and import or export data as FDF, XFDF or CSV.
@@ -50,7 +74,7 @@ sh scripts/bundle-macos.sh
 sh scripts/bundle-macos.sh --debug
 ```
 
-The Mac bundle is `dist/MyPDF.app`. The bundle script itself installs nothing. The bundle declares that it opens PDFs with the *Alternate* rank, so once it is copied to Applications, MyPDF appears in Finder's **Open With** menu while the default PDF app stays the same. `scripts/release-macos.sh` makes the release: it builds for Apple Silicon, signs with a Developer ID, notarizes and staples the app, and wraps it in a signed, notarized DMG (its header says which settings it needs). On Windows, GitHub Actions lints and tests MyPDF on every push (Recognize Text, Print and Keychain tests are macOS-only), and the hand-run **Windows build** workflow packs `MyPDF.exe` into `MyPDF-<version>-windows-x64.zip` and can attach it to a release. The Windows app is not yet signed, and it has not yet been tried by hand on Windows.
+The Mac bundle is `dist/MyPDF.app`. The bundle script itself installs nothing. The bundle declares that it opens PDFs with the *Alternate* rank, so once it is copied to Applications, MyPDF appears in Finder's **Open With** menu while the default PDF app stays the same. `scripts/release-macos.sh` makes the release: it builds for Apple Silicon, signs with a Developer ID, notarizes and staples the app, and wraps it in a signed, notarized DMG (its header says which settings it needs). On Windows, GitHub Actions lints and tests MyPDF on every push (Recognize Text, Print and Keychain tests are macOS-only), and the hand-run **Windows build** workflow packs `MyPDF.exe` into `MyPDF-<version>-windows-x64.zip` and can attach it to a release. The Windows app is not yet code-signed, so Windows SmartScreen asks before the first launch; the 0.95 preview has been tried by hand on Windows in Parallels Desktop and works.
 
 Open with the toolbar, **File → Open**, **⌘O / Ctrl+O**, drag and drop, launch paths, **Open With → MyPDF** in Finder or Explorer, or by dropping PDFs on the Dock icon. Files sent to a MyPDF that is already open become tabs in its window. On macOS they arrive as the system's open-documents event. On Windows, each launch adds MyPDF to this user's Open With list for .pdf (in the current-user registry; it never changes the default app). A second MyPDF started with a file hands the file to the open one through a small request in the data folder, then quits. The Windows part is type-checked for Windows but has not been run there. Use **⌘F / Ctrl+F** for search; Enter and Shift+Enter navigate results while the search field is focused. Use the zoom menu, +/−, **⌘0 / Ctrl+0** for 100%, and Page Up/Page Down for page navigation. Ctrl+Tab switches tabs. **⌘S / Ctrl+S** opens Save a Copy; choose a fresh filename. macOS also supports ⌘Shift+S.
 
