@@ -7,7 +7,11 @@ fn main() -> eframe::Result {
     let paths = std::env::args_os()
         .skip(1)
         .map(std::path::PathBuf::from)
-        .collect();
+        .collect::<Vec<_>>();
+    if desktop::open_with::hand_over(&paths) {
+        return Ok(());
+    }
+    desktop::open_with::install();
     let viewport = eframe::egui::ViewportBuilder::default();
     #[cfg(target_os = "macos")]
     let viewport = viewport
