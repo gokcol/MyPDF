@@ -10,6 +10,7 @@ use mypdf_milestone0::{
         self, Action as ButtonAction, Align, CheckStyle, DATE_FORMATS, Designed, FieldType,
         Properties, TabOrder,
     },
+    form_layout::{CellKind, Column, Layout, Plan},
     forms::FieldKind,
 };
 
@@ -57,6 +58,12 @@ struct Draft {
 pub(super) struct FormState {
     /// The field type placed by the next drag or click on the page.
     pub tool: Option<FieldType>,
+    /// A layout placed by the next drag or click on the page.
+    pub layout: Option<Layout>,
+    /// The layout being set up in its dialog.
+    pub layout_dialog: Option<Layout>,
+    /// The settings last used for each kind of layout.
+    recent_layouts: Vec<Layout>,
     /// The selected field and the widget (radio button) clicked.
     pub(super) selected: Option<(lopdf::ObjectId, lopdf::ObjectId)>,
     /// Select this field once the document is newer than this revision: name, page, rectangle.
@@ -72,6 +79,9 @@ impl FormState {
     pub fn new() -> Self {
         Self {
             tool: None,
+            layout: None,
+            layout_dialog: None,
+            recent_layouts: vec![],
             selected: None,
             pending_select: None,
             grab: None,
@@ -158,22 +168,23 @@ pub(super) fn overlay(
     let painter = ui.painter().with_clip_rect(clip);
     let to_page = |p: egui::Pos2| (p - page_rect.min) / scale;
     // Behind the fields: clicks on empty paper deselect, drags with a tool create.
+    let placing = state.tool.is_some() || state.layout.is_some();
     let background = ui
         .interact(
             page_rect,
             egui::Id::new((tab.id, page, "form_page")),
-            if state.tool.is_some() && editable {
+            if placing && editable {
                 egui::Sense::click_and_drag()
             } else {
                 egui::Sense::click()
             },
         )
-        .on_hover_cursor(if state.tool.is_some() {
+        .on_hover_cursor(if placing {
             egui::CursorIcon::Crosshair
         } else {
             egui::CursorIcon::Default
         });
-    if let Some(kind) = state.tool.filter(|_| editable) {
+    if placing && editable {
         // The drag begins where the button went down, before the drag threshold.
         if background.drag_started()
             && let Some(p) = ui.input(|i| i.pointer.press_origin())
@@ -208,39 +219,58 @@ pub(super) fn overlay(
                 _ => None,
             };
             // A click places the standard size, its middle at the click.
+            let [w, h] = match (&state.layout, state.tool) {
+                (Some(layout), _) => {
+                    let [w, h] = layout.default_size();
+                    [w.min(size.width - 24.), h.min(size.height - 24.)]
+                }
+                (None, Some(kind)) => kind.default_size(),
+                (None, None) => [100., 22.],
+            };
             let rect = drawn.unwrap_or_else(|| {
-                let [w, h] = kind.default_size();
                 let p = to_page(p);
                 let x = (p.x - w / 2.).clamp(0., (size.width - w).max(0.));
                 let y = (p.y - h / 2.).clamp(0., (size.height - h).max(0.));
                 [x, y, x + w, y + h]
             });
-            // A radio button joins the selected radio group; anything else gets a new name.
-            let group = state
-                .selected
-                .and_then(|(f, _)| fields.iter().find(|d| d.id == f))
-                .filter(|d| kind == FieldType::Radio && d.kind == FieldType::Radio);
-            let properties = match group {
-                Some(group) => group.properties.clone(),
-                None => Properties::new(kind, &next_name(fields, kind)),
-            };
-            let revision = tab.session.as_ref().map_or(0, |s| s.revision());
-            state.pending_select = Some((properties.name.clone(), page, rect, revision));
-            state.pending_edit = Some(Edit::AddField {
-                page,
-                rect,
-                kind,
-                properties,
-            });
-            state.tool = None;
+            if let Some(layout) = state.layout.take() {
+                state.pending_edit = Some(Edit::InsertLayout { page, rect, layout });
+            } else if let Some(kind) = state.tool.take() {
+                // A radio button joins the selected radio group; anything else gets a new name.
+                let group = state
+                    .selected
+                    .and_then(|(f, _)| fields.iter().find(|d| d.id == f))
+                    .filter(|d| kind == FieldType::Radio && d.kind == FieldType::Radio);
+                let properties = match group {
+                    Some(group) => group.properties.clone(),
+                    None => Properties::new(kind, &next_name(fields, kind)),
+                };
+                let revision = tab.session.as_ref().map_or(0, |s| s.revision());
+                state.pending_select = Some((properties.name.clone(), page, rect, revision));
+                state.pending_edit = Some(Edit::AddField {
+                    page,
+                    rect,
+                    kind,
+                    properties,
+                });
+            }
         }
         if let Some((t, g, Grab::Create(_), r)) = &state.grab
             && *t == tab.id
             && *g == page
         {
-            let r = screen(page_rect, scale, *r);
-            painter.rect_filled(r, 2., theme::accent().gamma_multiply(0.12));
-            ui::dashed_rect(&painter, r, theme::accent());
+            let shown = screen(page_rect, scale, *r);
+            painter.rect_filled(shown, 2., theme::accent().gamma_multiply(0.08));
+            ui::dashed_rect(&painter, shown, theme::accent());
+            // A layout shows its rows, columns and fields as it is drawn.
+            if let Some(Ok(plan)) = state.layout.as_ref().map(|l| l.plan(*r)) {
+                paint_plan(
+                    &painter,
+                    &plan,
+                    |p| page_rect.min + vec2(p[0], p[1]) * scale,
+                    scale,
+                );
+            }
         }
     } else if background.clicked() {
         state.selected = None;
@@ -295,7 +325,7 @@ pub(super) fn overlay(
                 painter.rect_filled(chip, 4., theme::accent());
                 painter.galley(chip.min + vec2(4., 2.), galley, Color32::WHITE);
             }
-            if state.tool.is_some() || !editable {
+            if placing || !editable {
                 continue;
             }
             let locked = field.signed;
@@ -390,6 +420,53 @@ pub(super) fn overlay(
         }
     }
 }
+/// A layout's shading, lines, field boxes and labels, for previews.
+fn paint_plan(
+    painter: &egui::Painter,
+    plan: &Plan,
+    at: impl Fn([f32; 2]) -> egui::Pos2,
+    scale: f32,
+) {
+    let rect = |r: [f32; 4]| Rect::from_min_max(at([r[0], r[1]]), at([r[2], r[3]]));
+    for s in &plan.shades {
+        painter.rect_filled(rect(*s), 0., Color32::from_rgb(237, 240, 245));
+    }
+    for l in &plan.lines {
+        painter.line_segment(
+            [at([l[0], l[1]]), at([l[2], l[3]])],
+            Stroke::new(1., Color32::from_rgb(90, 97, 110)),
+        );
+    }
+    for f in &plan.fields {
+        let r = rect(f.rect);
+        painter.rect_filled(r, 2., theme::accent().gamma_multiply(0.14));
+        painter.rect_stroke(
+            r,
+            2.,
+            Stroke::new(1., theme::accent()),
+            egui::StrokeKind::Inside,
+        );
+    }
+    for label in &plan.labels {
+        let r = rect(label.rect);
+        let size = (label.size * scale).clamp(5., 14.);
+        let galley = painter.layout_no_wrap(
+            label.text.clone(),
+            FontId::proportional(size),
+            Color32::from_rgb(34, 38, 46),
+        );
+        let x = if label.centered {
+            r.center().x - galley.size().x / 2.
+        } else {
+            r.left()
+        };
+        painter.with_clip_rect(r.expand(1.)).galley(
+            pos2(x, r.center().y - galley.size().y / 2.),
+            galley,
+            Color32::BLACK,
+        );
+    }
+}
 fn response_dragging(ui: &egui::Ui, tab: u64, page: usize, widget: lopdf::ObjectId) -> bool {
     ui.ctx()
         .dragged_id()
@@ -436,7 +513,7 @@ impl Viewer {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add_space(((ui.available_width() - 900.) / 2.).max(0.));
+                    ui.add_space(((ui.available_width() - 1040.) / 2.).max(0.));
                     for kind in FieldType::ALL {
                         let selected = self.forms.tool == Some(kind);
                         if ui
@@ -466,6 +543,33 @@ impl Viewer {
                             });
                         }
                     }
+                    let layouts = ui.add_enabled(
+                        editable,
+                        ActionButton::new(Icon::Form, "Layouts").dropdown(),
+                    );
+                    egui::Popup::menu(&layouts).show(|ui| {
+                        ui.set_min_width(230.);
+                        for (icon, layout) in [
+                            (Icon::Form, Layout::table()),
+                            (Icon::FieldText, Layout::labeled()),
+                            (Icon::FieldCheck, Layout::checklist()),
+                            (Icon::FieldRadio, Layout::choice()),
+                            (Icon::Sign, Layout::signatures()),
+                        ] {
+                            if ui.add(ActionButton::new(icon, &format!("{}…", layout.title()))).clicked() {
+                                // The last settings of this kind, or its defaults.
+                                let kept = self
+                                    .forms
+                                    .recent_layouts
+                                    .iter()
+                                    .find(|l| l.title() == layout.title())
+                                    .cloned();
+                                self.forms.layout_dialog = Some(kept.unwrap_or(layout));
+                                self.forms.tool = None;
+                                ui.close();
+                            }
+                        }
+                    });
                     ui.separator();
                     if ui
                         .add_enabled(editable, ActionButton::new(Icon::Sparkle, "Detect fields"))
@@ -633,6 +737,7 @@ impl Viewer {
     pub(super) fn form_events(&mut self, ctx: &egui::Context) {
         if self.editor.mode != editing::Mode::Forms {
             self.forms.tool = None;
+            self.forms.layout = None;
             self.forms.grab = None;
             return;
         }
@@ -644,8 +749,10 @@ impl Viewer {
         }
         let typing = self.editor.text_editing || ctx.memory(|m| m.focused().is_some());
         if !typing && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-            if self.forms.tool.is_some() {
+            if self.forms.tool.is_some() || self.forms.layout.is_some() {
                 self.forms.tool = None;
+                self.forms.layout = None;
+                self.status = None;
             } else {
                 self.forms.selected = None;
             }
@@ -711,6 +818,7 @@ impl Viewer {
     }
 
     pub(super) fn form_dialogs(&mut self, ctx: &egui::Context) {
+        self.layout_dialog(ctx);
         let Some(confirm) = &self.forms.confirm else {
             return;
         };
@@ -1576,6 +1684,189 @@ fn today() -> (i32, u32, u32) {
     (now.year(), now.month() as u32, now.day() as u32)
 }
 
+impl Viewer {
+    /// Set up a layout, then place it on the page.
+    fn layout_dialog(&mut self, ctx: &egui::Context) {
+        let Some(layout) = &mut self.forms.layout_dialog else {
+            return;
+        };
+        let mut open = true;
+        let mut place = false;
+        let mut focus = false;
+        egui::Window::new(format!("Add {}", layout.title().to_lowercase()))
+            .id(egui::Id::new("form_layout_dialog"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.)
+            .anchor(egui::Align2::CENTER_CENTER, vec2(0., 0.))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 10.;
+                let lines = |ui: &mut egui::Ui, list: &mut Vec<String>, hint: &str, focus: &mut bool| {
+                    let mut text = list.join("\n");
+                    let r = ui.add(
+                        egui::TextEdit::multiline(&mut text)
+                            .margin(ui::FIELD_MARGIN)
+                            .desired_rows(5)
+                            .desired_width(f32::INFINITY)
+                            .hint_text(hint),
+                    );
+                    *focus |= r.has_focus();
+                    if r.changed() {
+                        *list = text.split('\n').map(String::from).collect();
+                    }
+                };
+                match layout {
+                    Layout::Table {
+                        columns,
+                        rows,
+                        header,
+                        lines: grid,
+                    } => {
+                        ui::field(ui, "Columns", |ui| {
+                            let mut remove = None;
+                            let count = columns.len();
+                            for (i, column) in columns.iter_mut().enumerate() {
+                                ui.horizontal(|ui| {
+                                    focus |= ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut column.title)
+                                                .margin(ui::FIELD_MARGIN)
+                                                .desired_width(130.)
+                                                .hint_text("Title"),
+                                        )
+                                        .has_focus();
+                                    egui::ComboBox::from_id_salt(("layout_column_kind", i))
+                                        .selected_text(column.kind.label())
+                                        .width(100.)
+                                        .show_ui(ui, |ui| {
+                                            for kind in CellKind::ALL {
+                                                ui.selectable_value(&mut column.kind, kind, kind.label());
+                                            }
+                                        });
+                                    ui.add(
+                                        egui::DragValue::new(&mut column.width)
+                                            .range(0.5..=5.0)
+                                            .speed(0.05)
+                                            .prefix("width ")
+                                            .max_decimals(1),
+                                    )
+                                    .on_hover_text("Relative to the other columns");
+                                    if ui
+                                        .add_enabled(count > 1, ActionButton::new(Icon::Close, "Remove column").compact())
+                                        .clicked()
+                                    {
+                                        remove = Some(i);
+                                    }
+                                });
+                                if column.kind == CellKind::Dropdown {
+                                    focus |= ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut column.choices)
+                                                .margin(ui::FIELD_MARGIN)
+                                                .desired_width(f32::INFINITY)
+                                                .hint_text("Choices, separated by commas"),
+                                        )
+                                        .has_focus();
+                                }
+                            }
+                            if let Some(i) = remove {
+                                columns.remove(i);
+                            }
+                            if columns.len() < 12
+                                && ui.add(ActionButton::new(Icon::Plus, "Add column")).clicked()
+                            {
+                                columns.push(Column::new(&format!("Column {}", columns.len() + 1), CellKind::Text, 1.));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Rows").color(theme::muted()));
+                            ui.add(egui::DragValue::new(rows).range(1..=60));
+                            ui.add_space(12.);
+                            ui.checkbox(header, "Header row");
+                            ui.checkbox(grid, "Grid lines");
+                        });
+                    }
+                    Layout::Labeled { labels } => {
+                        ui::field(ui, "Labels, one per line", |ui| {
+                            lines(ui, labels, "Full name\nAddress\nPhone", &mut focus)
+                        });
+                        ui.label(
+                            RichText::new("A label with “date” gets a date field, one with “signature” a signature field.")
+                                .size(11.5)
+                                .color(theme::muted()),
+                        );
+                    }
+                    Layout::Checklist { items } => {
+                        ui::field(ui, "Items, one per line", |ui| lines(ui, items, "First item", &mut focus));
+                    }
+                    Layout::Choice {
+                        question,
+                        options,
+                        across,
+                    } => {
+                        focus |= ui::field(ui, "Question", |ui| {
+                            ui.add(egui::TextEdit::singleline(question).margin(ui::FIELD_MARGIN).desired_width(f32::INFINITY))
+                        })
+                        .has_focus();
+                        ui::field(ui, "Answers, one per line", |ui| lines(ui, options, "Yes\nNo", &mut focus));
+                        let current = if *across { 0 } else { 1 };
+                        if let Some(i) = ui::segmented(ui, &["Side by side", "One below another"], current) {
+                            *across = i == 0;
+                        }
+                    }
+                    Layout::Signatures { signers } => {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Signers").color(theme::muted()));
+                            ui.add(egui::DragValue::new(signers).range(1..=8));
+                        });
+                        ui.label(
+                            RichText::new("Each signer gets a name, a date and a signature field.")
+                                .size(11.5)
+                                .color(theme::muted()),
+                        );
+                    }
+                }
+                // A small picture of the layout at its standard size.
+                let [w, h] = layout.default_size();
+                match layout.plan([0., 0., w, h]) {
+                    Ok(plan) => {
+                        let scale = (ui.available_width() / w).min(180. / h).min(1.);
+                        let (area, _) = ui.allocate_exact_size(vec2(w, h) * scale, egui::Sense::hover());
+                        ui.painter().rect_filled(area.expand(6.), 6, Color32::WHITE);
+                        paint_plan(ui.painter(), &plan, |p| area.min + vec2(p[0], p[1]) * scale, scale);
+                    }
+                    Err(e) => ui::callout(ui, ui::Tone::Warning, &format!("{e:#}")),
+                }
+                ui.horizontal(|ui| {
+                    place = ui
+                        .add_enabled(layout.plan([0., 0., w, h]).is_ok(), ActionButton::new(Icon::Plus, "Place on page").primary())
+                        .on_hover_text("Then drag the area on the page, or click to use this size")
+                        .clicked();
+                });
+            });
+        self.editor.text_editing |= focus;
+        if place && let Some(layout) = self.forms.layout_dialog.take() {
+            self.forms
+                .recent_layouts
+                .retain(|l| l.title() != layout.title());
+            self.forms.recent_layouts.push(layout.clone());
+            self.status = Some((
+                format!(
+                    "Drag the area for the {} on the page, or click to place it · Esc cancels",
+                    layout.title().to_lowercase()
+                ),
+                false,
+            ));
+            self.forms.layout = Some(layout);
+            self.forms.tool = None;
+            self.forms.selected = None;
+        } else if !open {
+            self.forms.layout_dialog = None;
+        }
+    }
+}
+
 #[cfg(test)]
 impl Viewer {
     /// Visual QA: one field of every kind on the first tab, partly filled.
@@ -1793,5 +2084,21 @@ mod tests {
         let left = fields(&app);
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].name, "Text1");
+
+        // A table is placed by dragging its area: the layout's fields follow the drag.
+        app.forms.layout = Some(Layout::table());
+        drag(&mut app, at([60., 400.]), at([540., 532.]));
+        settle(&mut app);
+        let all = fields(&app);
+        assert_eq!(all.len(), 21, "{:?}", app.status);
+        let first = all.iter().find(|f| f.name == "Item 1").unwrap();
+        assert!(
+            (first.widgets[0].rect[0] - 61.5).abs() < 1.5,
+            "{:?}",
+            first.widgets[0].rect
+        );
+        let last = all.iter().find(|f| f.name == "Done 5").unwrap();
+        assert!(last.widgets[0].rect[3] < 533., "{:?}", last.widgets[0].rect);
+        assert!(app.forms.layout.is_none());
     }
 }

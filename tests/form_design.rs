@@ -565,3 +565,112 @@ fn fields_on_turned_pages_are_placed_and_drawn_upright() {
         );
     }
 }
+
+#[test]
+fn layouts_draw_their_lines_and_labels_and_add_their_fields() {
+    use mypdf_milestone0::form_layout::{CellKind, Layout};
+    for degrees in [0, 90] {
+        let mut bytes = turned_page(degrees);
+        let mut table = Layout::table();
+        if let Layout::Table { columns, rows, .. } = &mut table {
+            columns[0].title = "Item".into();
+            columns.push(mypdf_milestone0::form_layout::Column {
+                title: "Status".into(),
+                kind: CellKind::Dropdown,
+                choices: "Open, Done".into(),
+                width: 1.,
+            });
+            *rows = 3;
+        }
+        let placed = [
+            (table, [40., 40., 520., 128.]),
+            (Layout::labeled(), [40., 150., 460., 290.]),
+            (Layout::checklist(), [40., 300., 360., 366.]),
+            (Layout::choice(), [40., 380., 460., 426.]),
+            (Layout::signatures(), [40., 440., 520., 556.]),
+        ];
+        let mut expected = 0;
+        for (layout, rect) in &placed {
+            let (next, n) =
+                mypdf_milestone0::form_layout::insert(&bytes, 0, *rect, layout).unwrap();
+            bytes = next;
+            expected += n;
+        }
+        let fields = form_design::describe(&bytes).unwrap();
+        // A radio group counts as one field with three buttons.
+        assert_eq!(
+            fields.iter().map(|f| f.widgets.len()).sum::<usize>(),
+            expected,
+            "{degrees}°"
+        );
+        let kind = |name: &str| fields.iter().find(|f| f.name == name).map(|f| f.kind);
+        assert_eq!(kind("Item 1"), Some(FieldType::Text));
+        assert_eq!(kind("Quantity 3"), Some(FieldType::Text));
+        assert_eq!(kind("Date 2"), Some(FieldType::Date));
+        assert_eq!(kind("Done 1"), Some(FieldType::Checkbox));
+        assert_eq!(kind("Status 3"), Some(FieldType::Dropdown));
+        assert_eq!(kind("Full name"), Some(FieldType::Text));
+        assert_eq!(kind("Date"), Some(FieldType::Date), "a labelled date field");
+        assert_eq!(kind("Second item"), Some(FieldType::Checkbox));
+        assert_eq!(kind("Signer 2 signature"), Some(FieldType::Signature));
+        let group = fields.iter().find(|f| f.name == "Your answer").unwrap();
+        assert_eq!(group.kind, FieldType::Radio);
+        let exports: Vec<&str> = group.widgets.iter().map(|w| w.export.as_str()).collect();
+        assert_eq!(exports, ["Yes", "No", "Not_sure"]);
+        let status = fields.iter().find(|f| f.name == "Status 1").unwrap();
+        assert_eq!(status.properties.options, ["Open", "Done"]);
+        // Labels are page text, upright; grid lines are drawn.
+        let (flat, _) = form_design::flatten(&bytes).unwrap();
+        for label in [
+            "Quantity",
+            "Full name",
+            "Second item",
+            "Not sure",
+            "Signature",
+        ] {
+            assert!(reads_upright(&flat, label), "{degrees}° {label}");
+        }
+        let ([w, _], rgba) = viewer::render_page(&bytes, 0, 1.).unwrap();
+        let dark = |x: usize, y: usize| {
+            let i = (y * w + x) * 4;
+            rgba[i] < 200
+        };
+        // A thin line, lighter than solid ink at this scale, darker than the header shade.
+        assert!(
+            (39..43).any(|y| dark(300, y)),
+            "{degrees}° top line of the table"
+        );
+        assert!(
+            !(39..43).any(|y| dark(580, y)),
+            "{degrees}° nothing beyond the table"
+        );
+        // Cells fill like any field.
+        bytes = fill(&bytes, "Item 2", "Paper");
+        bytes = fill(&bytes, "Status 2", "Done");
+        assert_eq!(value(&bytes, "Item 2"), "Paper");
+        assert_eq!(value(&bytes, "Status 2"), "Done");
+        // A second table gets fresh names.
+        let (again, _) = mypdf_milestone0::form_layout::insert(
+            &bytes,
+            0,
+            [40., 570., 520., 590.],
+            &Layout::Table {
+                columns: vec![mypdf_milestone0::form_layout::Column::new(
+                    "Item",
+                    CellKind::Text,
+                    1.,
+                )],
+                rows: 1,
+                header: false,
+                lines: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            form_design::describe(&again)
+                .unwrap()
+                .iter()
+                .any(|f| f.name == "Item 1 2")
+        );
+    }
+}

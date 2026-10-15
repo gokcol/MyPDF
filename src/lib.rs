@@ -6,6 +6,7 @@ pub mod document;
 pub mod form_data;
 pub mod form_design;
 pub mod form_detect;
+pub mod form_layout;
 pub mod forms;
 pub mod header_footer;
 pub mod home;

@@ -129,6 +129,11 @@ pub(super) enum Edit {
         data: Vec<u8>,
         format: mypdf_milestone0::form_data::DataFormat,
     },
+    InsertLayout {
+        page: usize,
+        rect: [f32; 4],
+        layout: mypdf_milestone0::form_layout::Layout,
+    },
 }
 pub(super) enum AfterText {
     Save(u64),
@@ -620,6 +625,16 @@ impl Viewer {
                                 }
                             ));
                             form_design::set_tab_order(&bytes, order)?
+                        }
+                        Edit::InsertLayout { page, rect, layout } => {
+                            let (bytes, n) =
+                                mypdf_milestone0::form_layout::insert(&bytes, page, rect, &layout)?;
+                            note = Some(format!(
+                                "{} added with {n} field{} • Undo removes it",
+                                layout.title(),
+                                if n == 1 { "" } else { "s" }
+                            ));
+                            bytes
                         }
                         Edit::ImportFormData { data, format } => {
                             let (bytes, report) =
