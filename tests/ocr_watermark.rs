@@ -1,4 +1,4 @@
-use mypdf_milestone0::{convert, document, header_footer, ocr, redact, viewer, watermark};
+use mypdf_milestone0::{convert, document, header_footer, ocr, viewer, watermark};
 
 fn page_text(bytes: &[u8], page: usize) -> viewer::PageText {
     let pdf = hayro::hayro_syntax::Pdf::new(bytes.to_vec()).unwrap();
@@ -152,7 +152,7 @@ fn scanned_pages_become_searchable() {
         "pages with text are left alone"
     );
     // Flattening turns the pages into pictures, as a scanner would.
-    let (scanned, _) = redact::flatten_document(&original, 200.).unwrap();
+    let (scanned, _) = mypdf_milestone0::redact::flatten_document(&original, 200.).unwrap();
     assert!(page_text(&scanned, 0).text.trim().is_empty());
     let seen = std::sync::Mutex::new(vec![]);
     let (searchable, report) = ocr::recognize(&scanned, &|done, total| {
