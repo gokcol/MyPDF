@@ -25,8 +25,13 @@ jobs:
       - run: cargo build --locked --release --bin mypdf
       - name: Pack
         shell: pwsh
+        env:
+          RELEASE: ${{ inputs.release }}
         run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          # Named like the release (v0.95 → MyPDF-0.95-…), or by the crate version.
+          $version = if ($env:RELEASE) { $env:RELEASE.TrimStart('v') } else {
+            (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          }
           $name = "MyPDF-$version-windows-x64"
           New-Item -ItemType Directory -Path "pack\MyPDF" | Out-Null
           Copy-Item target\release\mypdf.exe pack\MyPDF\MyPDF.exe
