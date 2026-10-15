@@ -659,3 +659,54 @@ fn signature_text_shrinks_to_fit_the_smallest_box() {
         assert!(png.is_ok(), "{layout:?} {rect:?}: {:?}", png.err());
     }
 }
+
+#[tokio::test]
+async fn a_form_signature_field_is_signed_in_place() {
+    use mypdf_milestone0::{convert, form_design, forms};
+    let signer = identity::FileSigner::load(&id().pkcs12, PASSWORD, None).unwrap();
+    let blank = convert::blank(595., 842.).unwrap();
+    let mut properties =
+        form_design::Properties::new(form_design::FieldType::Signature, "Applicant signature");
+    properties.tooltip = "Sign here".into();
+    let (form, field) = form_design::add(
+        &blank,
+        0,
+        [300., 600., 500., 660.],
+        form_design::FieldType::Signature,
+        &properties,
+    )
+    .unwrap();
+    assert_eq!(
+        signing::empty_signature_field(&form, "Applicant signature"),
+        Some(field)
+    );
+    let request = signing::DesktopSigningRequest {
+        field: "Applicant signature".into(),
+        rect: Some([300., 600., 500., 660.]),
+        name: "Applicant".into(),
+        ..Default::default()
+    };
+    let signed = signing::sign_custom(&form, &signer, &request)
+        .await
+        .unwrap();
+    let report = signing::verify(&signed, None).unwrap();
+    assert_eq!(report.len(), 1);
+    assert_eq!(report[0].field, "Applicant signature");
+    assert!(report[0].crypto_valid && report[0].digest_matches && report[0].covers_current_file);
+    // Still one field, now holding the signature, with the tooltip it was given.
+    let fields = forms::fields(&signed).unwrap();
+    assert_eq!(fields.len(), 1);
+    assert!(matches!(
+        fields[0].kind,
+        forms::FieldKind::Signature { signed: true }
+    ));
+    let doc = lopdf::Document::load_mem(&signed).unwrap();
+    assert!(doc.get_dictionary(field).unwrap().get(b"TU").is_ok());
+    // A signed field is not signed again.
+    assert!(signing::empty_signature_field(&signed, "Applicant signature").is_none());
+    assert!(
+        signing::sign_custom(&signed, &signer, &request)
+            .await
+            .is_err()
+    );
+}

@@ -2,6 +2,7 @@ mod clipboard;
 mod content;
 mod digital;
 mod editing;
+mod form_tools;
 mod header_footer;
 mod home;
 pub mod icon;
@@ -296,6 +297,7 @@ pub struct Viewer {
     signature_rx: mpsc::Receiver<signatures::SignatureJob>,
     header_footer: header_footer::HeaderFooterState,
     redaction: redaction::Redaction,
+    forms: form_tools::FormState,
 }
 impl Viewer {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> Self {
@@ -335,6 +337,7 @@ impl Viewer {
             signature_rx,
             header_footer: header_footer::HeaderFooterState::new(),
             redaction: redaction::Redaction::new(),
+            forms: form_tools::FormState::new(),
         };
         for path in paths {
             app.open(path, &cc.egui_ctx);
@@ -589,6 +592,11 @@ impl Viewer {
             "hf_remove_numbers" => self.request_remove_page_numbers(),
             "redact" => self.start_redaction(),
             "flatten" => self.request_flatten(),
+            "form_detect" | "form_clear" | "form_tab_rows" | "form_tab_columns"
+            | "form_flatten" | "form_import" | "form_export" => {
+                self.inspector = true;
+                self.form_command(action, ctx);
+            }
             "hf_remove_all" => {
                 self.remove_header_footer(ctx, mypdf_milestone0::header_footer::Kind::ALL.to_vec())
             }
@@ -1615,7 +1623,14 @@ impl Viewer {
                             &mut self.status,
                         );
                         self.content.paused = self.redaction.active && self.editor.mode == editing::Mode::Edit;
-                        content::overlay(&mut self.content,self.editor.mode,tab,ui,page,page_rect,scale);
+                        if self.editor.mode == editing::Mode::Forms {
+                            let editable = !self.content.busy
+                                && !self.organizer.busy
+                                && tab.session.as_ref().is_some_and(|s| s.editable);
+                            form_tools::overlay(&mut self.forms, self.content.inspection.as_ref(), tab, editable, ui, page, page_rect, scale);
+                        } else {
+                            content::overlay(&mut self.content,self.editor.mode,tab,ui,page,page_rect,scale);
+                        }
                         if self.content.paused {
                             redaction::overlay(&mut self.redaction, tab, ui, page, page_rect, scale);
                         }
@@ -1683,6 +1698,7 @@ impl eframe::App for Viewer {
             self.editor_tools(ctx);
             self.page_tools(ctx);
             self.content_tools(ctx);
+            self.form_ribbon(ctx);
             self.signature_bar(ctx);
         }
         if let Some((status, true)) = &self.status {
@@ -1715,6 +1731,8 @@ impl eframe::App for Viewer {
             } else if self.inspector {
                 if self.editor.mode == editing::Mode::Edit && self.redaction.active {
                     self.redaction_panel(ctx);
+                } else if self.editor.mode == editing::Mode::Forms {
+                    self.form_panel(ctx);
                 } else if matches!(
                     self.editor.mode,
                     editing::Mode::Edit | editing::Mode::Forms | editing::Mode::Convert
@@ -1730,6 +1748,8 @@ impl eframe::App for Viewer {
             self.document(ctx);
         }
         self.finish_new_text(ctx);
+        self.form_events(ctx);
+        self.form_dialogs(ctx);
         self.page_dialogs(ctx);
         self.digital_events(ctx);
         self.editor_windows(ctx);

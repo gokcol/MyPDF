@@ -4,7 +4,7 @@ Version 0.6.0 adds a Home workspace, local autosave and crash recovery, icon-led
 
 - **Home:** Open/drop PDFs, create a blank PDF, launch common tools, and browse local Recents and Favorites with page previews.
 - **Edit:** type directly on blank or existing pages; click existing text to edit it in place; drag a rectangular selection to reflow several lines together; replace, reposition, resize and delete existing page-level images.
-- **Forms:** fill text, checkboxes, radio groups and single-select choices, with saved appearances.
+- **Forms:** build forms with text, check box, radio, dropdown, list box, button, image, date and signature fields; detect fields on paper-style forms; fill, clear, flatten, set tab order, and import or export data as FDF, XFDF or CSV.
 - **Export:** PNG/JPEG ↔ PDF; PDF ↔ Markdown, text and Word `.docx` using text-oriented conversion.
 - **SVG:** Annotate → Saved → SVG code; paste code, preview, save and place. Select placed artwork to move, resize, rotate, recolor or edit its SVG source.
 - **Blank PDF:** File → New Blank PDF (⌘N/Ctrl+N). **Blank page:** Pages → Blank Page.
@@ -96,6 +96,19 @@ Toggle the left and right panels independently using the two top-right panel ico
 - **Saving:** Save a Copy writes a fresh file without the removed objects, and Undo works until you save.
 - **Signed PDFs** can't be redacted, because their signed revision would still hold the original.
 - **Limits:** vector drawings under a box are covered rather than removed, and metadata and bookmarks are not changed.
+
+**Forms** builds and fills PDF forms, like PDF Expert's form editor:
+
+- **Add fields:** the toolbar has a tool for each kind: *Text field*, *Check box*, *Radio button*, *Dropdown*, *List box*, *Button*, *Image*, *Date* and *Signature*. Choose one and drag on the page, or click to place it at its standard size. Fields are named as Acrobat names them (*Text1*, *Check Box1*, …). With a radio button selected, the radio tool (or **Add a button**) adds another choice to the same group.
+- **Arrange:** click a field to select it, drag it to move, drag a corner handle to resize, Delete/⌫ removes it, and Esc deselects. Each change is one Undo step.
+- **Fill:** the right panel shows the selected field's **Value**. Type text, pick a date (written in the field's format, with a **Today** button), choose from a dropdown or list, tick a check box, pick a radio choice, or **Choose a picture…** for an image field. **Sign here** on an empty signature field signs it in place with your starred signature from *My Signatures* and saves a signed copy.
+- **Properties:** name, tooltip, required and read-only; for text, several lines, a character limit and default text; for dates, the format (*dd.mm.yyyy*, *mm/dd/yyyy*, *yyyy-mm-dd*, *d mmmm yyyy*, …); for check boxes and radio buttons, the export value, default state and mark (check, cross, circle or square); for dropdowns and list boxes, the choices, their order, a default and whether people may type their own value; for buttons, the caption and what clicking does (clear the form, print, or open a web page). Text size, alignment, text, border and fill colors complete the look. **Apply changes** applies them together.
+- **Detect fields** finds where a paper-style form expects answers: blanks of underscores or dots, lines to write on, empty boxes and text areas, and box characters such as ☐. Each field is named after its label, and labels such as *Date*, *Tarih* or *Signature*, *İmza* make date and signature fields.
+- **Tab order** sorts each page's fields by rows or by columns. **Show tab order numbers** labels each field with its position.
+- **Form data:** **Export data…** saves the values as FDF (Acrobat's format), XFDF or CSV (field names in the first row; spreadsheets open it directly). **Import data…** fills the form from any of them, matching fields by name, accepting choice labels and *yes/true/1* for check boxes, and reports names the form doesn't have and values a field refused.
+- **Clear** returns every field to its default; **Flatten** draws the fields into the page and removes them, keeping empty signature fields so the PDF can still be signed there. Both ask first.
+
+These are also in **Edit PDF → Form**. Fields are standard AcroForm fields with their appearances drawn in, so Acrobat, Preview and browsers show them as designed. Date fields carry Acrobat's date formatting and image fields Acrobat's picture chooser; MyPDF reads them but never runs scripts. XFA forms are not supported.
 
 **Flatten PDF…** (Export panel, or **Edit PDF → Flatten PDF…**) turns every page into an image at 150, 200 or 300 dpi. Annotations, pasted images and form fields are burned in, and document scripts and form definitions are removed, so nothing can be edited or selected any more. Page sizes and rotation are kept, and the flattened PDF can still be **digitally signed**. Already-signed PDFs are not flattened, since that would break their signatures; flatten first, then sign.
 

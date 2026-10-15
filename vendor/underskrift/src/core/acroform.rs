@@ -57,6 +57,41 @@ pub fn ensure_acroform(
     Ok(())
 }
 
+/// MyPDF patch: mark the form as holding signatures, for a signature placed
+/// in a field the form already has.
+pub fn set_sig_flags(doc: &mut Document) -> Result<(), CoreError> {
+    let catalog_id = doc
+        .trailer
+        .get(b"Root")
+        .and_then(Object::as_reference)
+        .map_err(|_| CoreError::InvalidStructure("trailer missing /Root reference".into()))?;
+    let form = doc
+        .get_object(catalog_id)
+        .and_then(Object::as_dict)
+        .and_then(|c| c.get(b"AcroForm"))
+        .cloned()
+        .map_err(|_| CoreError::AcroForm("the document has no form".into()))?;
+    match form {
+        Object::Reference(id) => {
+            let form = doc
+                .get_object_mut(id)
+                .and_then(Object::as_dict_mut)
+                .map_err(|e| CoreError::AcroForm(format!("AcroForm is not a dictionary: {e}")))?;
+            form.set("SigFlags", Object::Integer(SIG_FLAGS));
+        }
+        Object::Dictionary(mut form) => {
+            form.set("SigFlags", Object::Integer(SIG_FLAGS));
+            let id = doc.add_object(Object::Dictionary(form));
+            doc.get_object_mut(catalog_id)
+                .and_then(Object::as_dict_mut)
+                .map_err(|e| CoreError::AcroForm(format!("catalog is not a dictionary: {e}")))?
+                .set("AcroForm", Object::Reference(id));
+        }
+        _ => return Err(CoreError::AcroForm("AcroForm is not a dictionary".into())),
+    }
+    Ok(())
+}
+
 /// Adds the signature field to the AcroForm's /Fields array and sets SigFlags.
 ///
 /// If the catalog doesn't have an /AcroForm yet, creates one as a new indirect

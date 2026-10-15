@@ -112,6 +112,25 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
     let Ok(header_footer) = header_footer else {
         return (None, rx);
     };
+    let form = Submenu::with_items(
+        "Form",
+        true,
+        &[
+            &MenuItem::with_id("form_detect", "Detect Form Fields", true, None),
+            &P::separator(),
+            &MenuItem::with_id("form_tab_rows", "Tab Order by Rows", true, None),
+            &MenuItem::with_id("form_tab_columns", "Tab Order by Columns", true, None),
+            &P::separator(),
+            &MenuItem::with_id("form_import", "Import Form Data…", true, None),
+            &MenuItem::with_id("form_export", "Export Form Data…", true, None),
+            &P::separator(),
+            &MenuItem::with_id("form_clear", "Clear Form…", true, None),
+            &MenuItem::with_id("form_flatten", "Flatten Form Fields…", true, None),
+        ],
+    );
+    let Ok(form) = form else {
+        return (None, rx);
+    };
     let edit_pdf = Submenu::with_items(
         "Edit PDF",
         true,
@@ -121,6 +140,7 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             &MenuItem::with_id("add_image", "Add Image…", true, None),
             &MenuItem::with_id("redact", "Redact", true, None),
             &header_footer,
+            &form,
             &P::separator(),
             &MenuItem::with_id("flatten", "Flatten PDF…", true, None),
         ],

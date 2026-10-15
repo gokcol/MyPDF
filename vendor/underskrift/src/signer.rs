@@ -114,6 +114,9 @@ pub struct SigningOptions {
     ///
     /// Defaults to `SigningTimePlacement::Signed`.
     pub signing_time_placement: SigningTimePlacement,
+    /// MyPDF patch: sign into this existing, unsigned signature field (a
+    /// combined field and widget) instead of adding a new field.
+    pub existing_field: Option<lopdf::ObjectId>,
 }
 
 impl Default for SigningOptions {
@@ -136,6 +139,7 @@ impl Default for SigningOptions {
             visible_signature: None,
             cms_signing_time: None,
             signing_time_placement: SigningTimePlacement::default(),
+            existing_field: None,
         }
     }
 }
@@ -548,10 +552,46 @@ impl PdfSigner {
             sig_field_dict.set("AP", Object::Dictionary(ap_dict));
         }
 
-        let sig_field_id = doc.add_object(Object::Dictionary(sig_field_dict));
-
-        // Step 6: Update AcroForm and page annotations
-        acroform::ensure_acroform(&mut doc, sig_field_id, self.options.page)?;
+        let sig_field_id = match self.options.existing_field {
+            // MyPDF patch: fill the form's own signature field in place.
+            Some(existing) => {
+                let mut field = doc
+                    .get_object(existing)
+                    .and_then(Object::as_dict)
+                    .map_err(|_| CoreError::InvalidStructure("signature field not found".into()))?
+                    .clone();
+                let unsigned_widget = field
+                    .get(b"FT")
+                    .and_then(Object::as_name)
+                    .map_or(false, |t| t == b"Sig")
+                    && field
+                        .get(b"Subtype")
+                        .and_then(Object::as_name)
+                        .map_or(false, |t| t == b"Widget")
+                    && field.get(b"V").is_err();
+                if !unsigned_widget {
+                    return Err(CoreError::InvalidStructure(
+                        "the field is not an empty signature field".into(),
+                    )
+                    .into());
+                }
+                field.set("V", Object::Reference(sig_dict_id));
+                if let Ok(ap) = sig_field_dict.get(b"AP") {
+                    field.set("AP", ap.clone());
+                }
+                let flags = field.get(b"F").and_then(Object::as_i64).unwrap_or(0);
+                field.set("F", Object::Integer(flags | 4 | 128));
+                doc.objects.insert(existing, Object::Dictionary(field));
+                acroform::set_sig_flags(&mut doc)?;
+                existing
+            }
+            None => {
+                let id = doc.add_object(Object::Dictionary(sig_field_dict));
+                // Step 6: Update AcroForm and page annotations
+                acroform::ensure_acroform(&mut doc, id, self.options.page)?;
+                id
+            }
+        };
 
         // Step 7: Build the incremental update
         // We need to collect all new/modified objects to write.
