@@ -1191,7 +1191,7 @@ impl Viewer {
                     ui::segment_track(ui, |ui| {
                         for (mode, icon, label) in MODES {
                             if mode == editing::Mode::Sign {
-                                self.sign_menu(ui, compact, true);
+                                self.sign_menu(ui, compact);
                                 continue;
                             }
                             let button = ActionButton::new(icon, label)
@@ -2455,7 +2455,7 @@ mod tests {
     }
     #[test]
     fn sign_ribbon_menu_routes_visual_and_certificate_signatures() {
-        for (main_ribbon, digital) in [(true, false), (true, true), (false, false), (false, true)] {
+        for digital in [false, true] {
             let ctx = egui::Context::default();
             ctx.enable_accesskit();
             let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
@@ -2504,7 +2504,27 @@ mod tests {
             for _ in 0..3 {
                 frame(&mut app, &ctx, vec![]);
             }
-            let sign = bounds(&mut app, "Sign", !main_ribbon);
+            // One Sign menu, in the main toolbar; Annotate and Draw have none of their own.
+            for mode in [editing::Mode::Draw, editing::Mode::Annotate] {
+                app.editor.mode = mode;
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1100., 760.))),
+                        ..Default::default()
+                    },
+                    |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+                );
+                let signs = output
+                    .platform_output
+                    .accesskit_update
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .filter(|(_, n)| n.label() == Some("Sign"))
+                    .count();
+                assert_eq!(signs, 1, "{mode:?}");
+            }
+            let sign = bounds(&mut app, "Sign", false);
             click(&mut app, sign);
             for _ in 0..3 {
                 frame(&mut app, &ctx, vec![]);

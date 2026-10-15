@@ -1526,11 +1526,12 @@ pub(super) fn hit_annotation(
 }
 
 impl Viewer {
-    pub(super) fn sign_menu(&mut self, ui: &mut egui::Ui, compact: bool, main_ribbon: bool) {
-        let mut button = ActionButton::new(Icon::Sign, "Sign").dropdown();
-        if main_ribbon {
-            button = button.tab().selected(self.editor.mode == Mode::Sign);
-        }
+    /// The Sign tab of the main toolbar, with its menu of ways to sign.
+    pub(super) fn sign_menu(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let mut button = ActionButton::new(Icon::Sign, "Sign")
+            .dropdown()
+            .tab()
+            .selected(self.editor.mode == Mode::Sign);
         if compact {
             button = button.compact();
         }
@@ -1760,9 +1761,12 @@ impl Viewer {
             )
             .show(ctx, |ui| {
                 egui::ScrollArea::horizontal().show(ui, |ui| {
-                    let inset = ((ui.available_width() - 790.) / 2.).max(0.);
+                    // Centered on the width this mode's tools took last frame.
+                    let measured = egui::Id::new(("ribbon_width", format!("{:?}", self.editor.mode)));
+                    let width = ctx.data(|d| d.get_temp::<f32>(measured)).unwrap_or(790.);
+                    let inset = ((ui.available_width() - width) / 2.).max(0.);
                     let compact = ui.available_width() < 930.;
-                    ui.horizontal(|ui| {
+                    let row = ui.horizontal(|ui| {
                         ui.add_space(inset);
                         if matches!(self.editor.mode, Mode::Annotate | Mode::Draw) {
                             let editable = self
@@ -1855,7 +1859,6 @@ impl Viewer {
                                         self.editor.library_open = true;
                                     }
                                 }
-                                self.sign_menu(ui, compact, false);
                                 ui.separator();
                                 ui::color_swatch(
                                     ui,
@@ -1896,6 +1899,11 @@ impl Viewer {
                             );
                         }
                     });
+                    let used = row.response.rect.width() - inset;
+                    if (used - width).abs() > 0.5 {
+                        ctx.data_mut(|d| d.insert_temp(measured, used));
+                        ctx.request_repaint();
+                    }
                     if self.editor.tool == Tool::SignArea {
                         ui.label(RichText::new("Drag a box where your signature goes, or click to place it · Esc cancels").small().color(theme::muted()));
                     }
