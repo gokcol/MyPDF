@@ -18,4 +18,3 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       # Every test file runs, so one failure does not hide the others.
       - run: cargo test --locked --no-fail-fast
-      - run: cargo build --locked --release --bin mypdf
