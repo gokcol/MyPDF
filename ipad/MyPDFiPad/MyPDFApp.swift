@@ -25,6 +25,7 @@ struct ContentView: View {
   @State private var drawing = false
   @State private var signing = false
   @State private var objectList = false
+  @State private var pageOrganizer = false
   @State private var image: ImageImport?
   @State private var selected: PDFObject?
   @State private var deleteCandidate: PDFObject?
@@ -61,6 +62,11 @@ struct ContentView: View {
                 objectList = true
               } label: {
                 Label("Objects", systemImage: "square.on.circle")
+              }
+              Button {
+                pageOrganizer = true
+              } label: {
+                Label("Pages", systemImage: "square.grid.2x2")
               }
               Spacer()
               Button {
@@ -215,6 +221,7 @@ struct ContentView: View {
         }
       }
     }
+    .sheet(isPresented: $pageOrganizer) { PagesSheet() }
     .sheet(item: $selected) { object in ObjectSheet(object: object) }
     .alert(
       "MyPDF",

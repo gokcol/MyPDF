@@ -267,6 +267,7 @@ fn native_visual_preview() {
         "SheetLayout",
         "SignatureImage",
         "TransparentImage",
+        "ImageEffects",
         "AddText",
         "Prompt",
         "Confirmation",
@@ -364,6 +365,43 @@ fn native_visual_preview() {
                 .as_mut()
                 .unwrap()
                 .commit(vec![a])
+                .unwrap();
+        }
+        if collection == "ImageEffects" {
+            use mypdf_milestone0::annotations::{Annotation, Kind, StrokeStyle, Style};
+            let image = image::RgbaImage::from_fn(320, 200, |x, y| {
+                let inside =
+                    (x as f32 - 160.).powi(2) + (y as f32 - 100.).powi(2) < 70.0_f32.powi(2);
+                if inside {
+                    image::Rgba([35, 130, 190, 255])
+                } else {
+                    image::Rgba([0, 0, 0, 0])
+                }
+            });
+            let mut png = std::io::Cursor::new(Vec::new());
+            image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+            let mark = Annotation::new(
+                0,
+                [150., 330., 470., 530.],
+                Kind::Image {
+                    png: Arc::new(png.into_inner()),
+                },
+                Style {
+                    image_blur: 3.,
+                    image_border: true,
+                    width: 3.,
+                    stroke: StrokeStyle::Dashed,
+                    opacity: 0.85,
+                    ..Default::default()
+                },
+            );
+            app.editor.mode = editing::Mode::Draw;
+            app.tabs[0].selected_annotation = Some(mark.id.clone());
+            app.tabs[0]
+                .session
+                .as_mut()
+                .unwrap()
+                .commit(vec![mark])
                 .unwrap();
         }
         if matches!(collection, "Group" | "Lasso") {

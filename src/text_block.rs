@@ -126,7 +126,14 @@ pub fn replace(bytes: &[u8], page: u32, block: &Replacement) -> Result<Vec<u8>> 
         return Ok(stripped);
     }
     if !block.spans.is_empty() {
-        return crate::rich_text::add(&stripped, page, &block.text, block.rect, &block.spans);
+        return crate::rich_text::add_aligned(
+            &stripped,
+            page,
+            &block.text,
+            block.rect,
+            &block.spans,
+            block.format.alignment,
+        );
     }
     crate::content::add_text_styled(
         &stripped,

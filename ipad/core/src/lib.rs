@@ -7,6 +7,7 @@ use std::{
     path::Path,
     sync::Arc,
 };
+mod page_commands;
 
 fn path<'a>(v: &'a Value, key: &str) -> Result<&'a Path> {
     Ok(Path::new(
@@ -49,6 +50,9 @@ fn perform(v: Value) -> Result<Value> {
         return Ok(json!({}));
     }
     let bytes = mypdf_milestone0::convert::read_bounded(path(&v, "input")?, 256 * 1024 * 1024)?;
+    if command == "pages" {
+        return page_commands::perform(&bytes, &v);
+    }
     let document = lopdf::Document::load_mem(&bytes)?;
     let mut marks = ann::load(&document);
     if command == "annotations" {

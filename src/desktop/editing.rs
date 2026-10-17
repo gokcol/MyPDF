@@ -538,6 +538,9 @@ pub(super) fn color_palette(ui: &mut egui::Ui, current: &mut [f32; 3]) -> bool {
             ("Gold", [0.95, 0.68, 0.15]),
         ] {
             let (r, response) = ui.allocate_exact_size(vec2(24., 28.), egui::Sense::click());
+            #[cfg(test)]
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(egui::Id::new(("color_swatch", name)), r));
             let selected = *current == rgb;
             let swatch = color(rgb, 1.);
             ui.painter().circle_filled(
@@ -2558,9 +2561,19 @@ impl Viewer {
                             }
                             let mut opacity = a.style.opacity * 100.;
                             property_focus =
-                                property_slider(ui, "Opacity", &mut opacity, 5.0..=100.0, "%")
+                                property_slider(ui, "Opacity", &mut opacity, if image { 0.0..=100.0 } else { 5.0..=100.0 }, "%")
                                     .or(property_focus);
                             a.style.opacity = opacity / 100.;
+                            if image {
+                                property_focus = property_slider(ui, "Blur", &mut a.style.image_blur, 0.0..=32.0, " px").or(property_focus);
+                                ui.checkbox(&mut a.style.image_border, "Border");
+                                if a.style.image_border {
+                                    color_palette(ui, &mut a.style.color);
+                                    property_focus = property_slider(ui, "Border width", &mut a.style.width, 0.5..=20.0, " pt").or(property_focus);
+                                    stroke_styles(ui, &mut a.style.stroke);
+                                }
+                                ui.label(RichText::new("Blur keeps the original image. Set it to 0 to restore detail.").small().color(theme::muted()));
+                            }
                             if !matches!(
                                 a.kind,
                                 Kind::Svg { .. } | Kind::Image { .. } | Kind::Text { .. }

@@ -12,7 +12,7 @@ The intended iPad product has the desktop editor's functionality. The first inst
 | Stamps / assets | Reusable drawn signature and image import | Standard/custom library, SVG import/source edit/prompt workflow, recolor, folders/favorites and portable library import/export | `assets`, `svg` |
 | Sign | Visual ink/image signatures | PKCS#12 import/create, identity defaults, iPad Keychain adapter, certificate validation/trust, signature appearances and signed-document workflows | `identity`, `signing`, `signature_edit`, `trust` |
 | Forms | Reader displays existing PDF forms | Reliable edit/save, field creation and layout, detection, profiles and data import/export | `forms`, `form_design`, `form_detect`, `form_layout`, `form_profile`, `form_data` |
-| Pages | Viewer navigation only | Insert/reorder/delete/extract/merge/split/rotate/crop, headers/footers, watermark and N-up layouts | `pages`, `header_footer`, `watermark`, `nup` |
+| Pages | Native thumbnail organizer; reorder, blank/PDF insertion, delete, extract, merge, rotate and crop through shared Rust commands | Split, headers/footers, watermark, N-up layouts, device interaction and accessibility validation | `pages`, `header_footer`, `watermark`, `nup` |
 | Export | Save PDF copy to Files | All desktop image/text/MD/DOCX conversions, compression, password protection and native printing | `convert`, `compress`, `security` |
 | Recovery / performance | Applied edits persist as new files; local library; session undo | Persisted recovery/undo policy, storage pruning, background memory limits, large/scanned document tests and accessibility audit | `recovery`, `annotations::Session` |
 | OCR | Not exposed | Native Vision integration and desktop-equivalent invisible text layer | `ocr` plus iOS adapter |
@@ -25,4 +25,10 @@ Use the same synthetic PDFs on Mac, Windows and iPad. Each editing feature must 
 
 ## Current device result
 
-Build 1 passed two native device tests but hands-on testing exposed that SwiftUI's automatic List-row button behavior could invoke both Edit and Delete. Build 2 uses separate borderless actions, requires delete confirmation, stops a failed editor preview from showing an endless spinner, and recovers retained drawing revisions into separate library entries. Physical editing validation is still required after installing that correction.
+Build 1 passed two native device tests but hands-on testing exposed that SwiftUI's automatic List-row button behavior could invoke both Edit and Delete. Build 2 uses separate borderless actions, requires delete confirmation, stops a failed editor preview from showing an endless spinner, and recovers retained drawing revisions into separate library entries. On 17 October 2026, the user confirmed on the physical iPad that a recovered drawing remains visible in Objects → Edit and moves with its selection border. This verifies that correction; the feature-parity delivery gates above remain open.
+
+## Next parity increment
+
+Build 3 adds a native page organizer backed by `pages::apply` and `pages::extract`, including safe fresh-file output and the same signed-document guards as desktop. It is development work, not a declaration of full parity. On 17 October 2026, all three native tests passed on the connected iPad, including a bridge regression that exercises drawing preservation through insertion, rotation, reordering, cropping, extraction and merging, plus failure without overwriting an existing file. The build was launched on the device; hands-on testing of the new page controls remains open.
+
+The desktop UI currently lives in the application binary and is coupled to desktop menus, file dialogs and window lifecycle. The next increment reuses its Rust document operations through explicit bridge commands and adds native iPad touch controls; it does not duplicate PDF mutation logic in Swift. Existing-content editing and the shared stamp library are the next gaps after page organization. All delivery gates above still apply.

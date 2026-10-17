@@ -2,17 +2,18 @@
 
 This is a standalone iPad application. SwiftUI, PDFKit and PencilKit provide native iPad controls; PDF changes use the shared Rust engine through a small C/JSON bridge. There is no web view and no connection to a running desktop app.
 
-Implemented in the first device build:
+Implemented in the development preview:
 
 - Local document library, blank A4 PDF, Files import, text search, native pinch zoom and page navigation.
 - Pencil/finger drawing and drawn signatures saved as editable PDF ink objects. Finger drawing is an explicit toggle; Pencil-only input uses PencilKit's input handling.
 - Reusable drawn signature, PNG/JPEG signature or image import, white-background removal with a preview and adjustable tolerance.
+- Native page organizer with thumbnails, drag reordering, blank/PDF insertion, deletion, extraction into a new library document, merging, rotation, and crop margins. Page changes use the desktop Rust engine and share document Undo/Redo.
 - Objects list, live move/resize with the selection border attached, deletion, undo/redo, and export a PDF copy to Files.
 - Every applied edit writes a new working revision before updating the local library. Sources opened through Files are copied and never edited in place. Library entries survive app termination. Undo history is currently session-only; working revisions are retained locally.
 
 ## Limits of this preview
 
-This is the first iPad build, not desktop feature parity. Existing PDF text/image editing, forms, page management, certificate signing, custom stamp synchronization and desktop conversions are not exposed yet. Password-protected PDFs must be unlocked elsewhere. Signed/certified PDFs remain read-only unless previously explicitly unlocked by MyPDF desktop.
+This is the first iPad build, not desktop feature parity. Existing PDF text/image editing, forms, advanced page export (split/N-up/headers/watermarks), certificate signing, custom stamp synchronization and desktop conversions are not exposed yet. Password-protected PDFs must be unlocked elsewhere. Signed/certified PDFs remain read-only unless previously explicitly unlocked by MyPDF desktop.
 
 PencilKit captures the live drawing. Export currently stores centerlines with a uniform stroke width and one color per drawing, rather than reproducing pressure/tilt and mixed brush effects. Keep one pen color and width per drawing for the closest match. Add separate drawing objects for different styles. The iPad object editor moves/resizes unrotated MyPDF ink and image objects; other annotation types remain in the PDF but are not editable there. Background removal targets white/solid paper, not arbitrary photographic subjects.
 
@@ -41,3 +42,5 @@ xcodebuild test -project ipad/MyPDFiPad.xcodeproj -scheme MyPDFiPad \
 ```
 
 On 17 October 2026, the app was development-signed, installed and launched on an iPad Air 13-inch (M2). Both native tests passed on the device: Pencil canvas coordinate stability through resizing, and Rust blank PDF → ink → move → transparent image → saved PDF roundtrip, including refusing to overwrite an existing output. Physical Pencil feel and visual layout require hands-on testing; automated tests do not establish those.
+
+The initial build's Objects list could invoke Delete when Edit was tapped. Build 2 separates those actions and confirms deletion, and recovered the retained drawing revisions. The user verified on the physical iPad that recovered drawings now remain visible during editing and move with their selection border. Full desktop functionality is still tracked as unfinished in [PARITY.md](PARITY.md).

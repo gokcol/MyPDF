@@ -1,6 +1,6 @@
 # MyPDF — native Rust desktop PDF editor
 
-Version 1.1 adds multiple-pages-per-sheet PDF export with margins, headers, footers and watermarks; object rotation and flipping in the right-hand inspector; and signature import from images. It also adds Microsoft Store MSIX packaging. Native Rust, local files, no WebViews. **Mac app for Apple Silicon** and **Windows x64 installer** downloads are available from [Releases](https://github.com/gokcol/MyPDF/releases).
+Version 1.11 adds selected-character text formatting, a single right-hand text inspector, local image background removal, and image opacity, blur and border controls. It includes multiple-pages-per-sheet export, object transforms, signature image import and Microsoft Store MSIX packaging. Native Rust, local files, no WebViews. **Mac app for Apple Silicon** and **Windows x64 installer** downloads are available from [Releases](https://github.com/gokcol/MyPDF/releases).
 
 > MyPDF was built with the help of Claude, Anthropic's AI assistant, to make everyday business paperwork easier. It is provided as is, without warranty of any kind: keep copies of important documents and use it at your own risk.
 
@@ -59,13 +59,15 @@ The redesigned interface follows PDF Expert’s compact toolbar and panel layout
 
 In **Pages**, click a thumbnail, use ⌘/Ctrl-click or Shift-click for multiple pages, or enter a range such as `1, 3-5`. Drag to the left/right half of a thumbnail to insert the selection before/after it, or use **Move before page**. **Insert** accepts a blank page or PDF files at a chosen position; **Merge** appends PDFs. **Copy pages** (⌘C) copies the selected pages, with their annotations. Switch to any other open PDF and choose **Paste pages** (⌘V) to insert them after its selected page (or at the end); the pasted pages become the selection, and Undo removes them. You can copy from a signed or read-only PDF too; the copies are not signed, so signature fields are left behind. **Extract** saves selected pages. **Split** exports the whole document into a fresh folder, using the interval in the right panel. **Crop** previews displayed-page margins in points and applies them to the selected pages.
 
-## Development updates after 1.1
+## Version 1.11 updates
 
-The current source adds local background removal for placed images, imported signature images, and saved digital-signature artwork. A transparency preview offers background color, tolerance, soft edges and optional edge-connected removal. PDF edits support Undo; signature-library changes retain the original artwork. This is intended for paper/solid backgrounds, not arbitrary photographic subject extraction.
+Version 1.11 adds local background removal for placed images, imported signature images, and saved digital-signature artwork. A transparency preview offers background color, tolerance, soft edges and optional edge-connected removal. PDF edits support Undo; signature-library changes retain the original artwork. This is intended for paper/solid backgrounds, not arbitrary photographic subject extraction.
 
-Existing-text editing has a richer inspector (font, style, alignment, color, position and width); the floating toolbar leaves clearance around the text and falls back to the inspector when space is tight. Pen/signature input preserves intermediate pointer samples delivered in a single frame, and multi-touch navigation cancels pending page strokes.
+New and existing text blocks share the right-hand inspector (font, style, size, alignment, color, position and width). Selected characters receive font/style/size/color changes; surrounding text keeps its formatting. With no character selection, formatting applies to the block. Alignment remains a block setting. The redundant floating text toolbar has been removed. Mixed formatting survives alignment changes and PDF saving. For placed images and image signatures, the inspector offers live opacity, reversible blur, border color/width/style, rotation and flipping. Original image pixels are retained in MyPDF metadata; blur is a visual effect, **not redaction**. Existing embedded PDF images have an appearance preview for opacity, blur and a solid border, applied to a new image with document Undo support.
 
-A standalone **native iPad development preview** is in [ipad/README.md](ipad/README.md). It shares the Rust engine and uses SwiftUI/PDFKit/PencilKit for the device interface. It is not yet feature-equivalent to the desktop application or part of the published 1.1 downloads.
+Pen/signature input preserves intermediate pointer samples delivered in a single frame, and multi-touch navigation cancels pending page strokes.
+
+A standalone **native iPad development preview** is in [ipad/README.md](ipad/README.md). It shares the Rust engine and uses SwiftUI/PDFKit/PencilKit for the device interface. It is not yet feature-equivalent to the desktop application or included in the desktop release downloads. Full parity remains the required goal in [ipad/PARITY.md](ipad/PARITY.md).
 
 ## Run the desktop viewer
 

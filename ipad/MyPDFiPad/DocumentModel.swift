@@ -234,6 +234,20 @@ enum RustPDF {
       }
     } catch { self.error = error.localizedDescription }
   }
+  func extractPages(_ pages: [Int]) async {
+    guard !busy, let source = url, !pages.isEmpty else { return }
+    busy = true
+    defer { busy = false }
+    do {
+      let output = fresh()
+      let name = title + " — extracted pages"
+      _ = try await RustPDF.run([
+        "command": "pages", "action": "extract", "input": source.path, "output": output.path,
+        "pages": pages,
+      ])
+      try await addToLibrary(output, name: name)
+    } catch { self.error = error.localizedDescription }
+  }
   func prepareObject(_ object: PDFObject) async throws -> UIImage {
     guard let input = url else { throw RustPDF.failure("Open a PDF") }
     let preview = fresh()
