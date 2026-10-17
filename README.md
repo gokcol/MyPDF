@@ -69,6 +69,12 @@ Pen/signature input preserves intermediate pointer samples delivered in a single
 
 A standalone **native iPad development preview** is in [ipad/README.md](ipad/README.md). It shares the Rust engine and uses SwiftUI/PDFKit/PencilKit for the device interface. It is not yet feature-equivalent to the desktop application or included in the desktop release downloads. Full parity remains the required goal in [ipad/PARITY.md](ipad/PARITY.md).
 
+## Copy artwork that is not a separate PDF image
+
+In **Edit → Images → Copy region**, drag around a logo, illustration or scanned detail, preview the result and choose **Add image layer**. The copy opens in the drawing inspector with movement, resizing, rotation, flipping, background removal, opacity, blur and border controls. Everything inside the rectangle, including any text, becomes a raster image; the rest of the PDF is unchanged. Choose 150, 200 or 300 DPI (large regions are bounded to the artwork pixel limit).
+
+**Cover the original area** optionally adds a separate colored rectangle behind the image. The cover stays in its original position when the copy moves; delete the cover to reveal the original. This is a removable visual cover, not redaction: the original content remains in the PDF. Copy and cover are created in one undoable edit. Read-only/signed-document editing protections still apply.
+
 ## Run the desktop viewer
 
 ```sh

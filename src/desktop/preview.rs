@@ -268,6 +268,7 @@ fn native_visual_preview() {
         "SignatureImage",
         "TransparentImage",
         "ImageEffects",
+        "RegionCopy",
         "AddText",
         "Prompt",
         "Confirmation",
@@ -832,6 +833,15 @@ fn native_visual_preview() {
                 preview.capture(&mut app, &ctx);
             }
             while !app.content.erased_ready() {
+                assert!(std::time::Instant::now() < deadline);
+                preview.capture(&mut app, &ctx);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        if collection == "RegionCopy" {
+            app.region_preview();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !app.region_preview_ready() {
                 assert!(std::time::Instant::now() < deadline);
                 preview.capture(&mut app, &ctx);
                 std::thread::sleep(std::time::Duration::from_millis(10));
