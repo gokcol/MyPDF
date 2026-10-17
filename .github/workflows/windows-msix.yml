@@ -1,0 +1,84 @@
+name: Microsoft Store MSIX
+on:
+  push:
+    paths:
+      - '.github/workflows/windows-msix.yml'
+      - 'packaging/windows/msix/**'
+      - 'scripts/*msix*'
+      - 'examples/msix_assets.rs'
+      - 'src/desktop/icon.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    paths:
+      - '.github/workflows/windows-msix.yml'
+      - 'packaging/windows/msix/**'
+      - 'scripts/*msix*'
+      - 'examples/msix_assets.rs'
+      - 'src/desktop/icon.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or full commit SHA to package
+        default: main
+        required: true
+      mode:
+        description: Store requires the three MSIX identity repository variables
+        type: choice
+        options: [test, store]
+        default: test
+      package_version:
+        description: Optional four-part Store version (last part must be 0)
+        default: ''
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build desktop app and Store artwork
+        run: cargo build --locked --release --bin mypdf --example msix_assets
+      - name: Package and validate
+        shell: pwsh
+        env:
+          MODE: ${{ inputs.mode || 'test' }}
+          PACKAGE_VERSION: ${{ inputs.package_version }}
+          STORE_IDENTITY_NAME: ${{ vars.MSIX_IDENTITY_NAME }}
+          STORE_PUBLISHER: ${{ vars.MSIX_PUBLISHER }}
+          STORE_PUBLISHER_DISPLAY_NAME: ${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}
+        run: |
+          $packageArgs = @{ SkipBuild = $true; OutputDirectory = 'dist/msix' }
+          if ($env:PACKAGE_VERSION) { $packageArgs.PackageVersion = $env:PACKAGE_VERSION }
+          if ($env:MODE -eq 'store') {
+            $packageArgs.IdentityName = $env:STORE_IDENTITY_NAME
+            $packageArgs.Publisher = $env:STORE_PUBLISHER
+            $packageArgs.PublisherDisplayName = $env:STORE_PUBLISHER_DISPLAY_NAME
+          } else {
+            $packageArgs.TestIdentity = $true
+          }
+          ./scripts/package-msix.ps1 @packageArgs
+      - name: Validate packaging boundaries
+        shell: pwsh
+        run: ./scripts/test-msix.ps1
+      - name: Install and uninstall the test package
+        if: ${{ inputs.mode != 'store' }}
+        shell: powershell
+        run: ./scripts/test-msix-install.ps1
+      - uses: actions/upload-artifact@v6
+        with:
+          name: MyPDF-msix-${{ inputs.mode || 'test' }}-x64
+          if-no-files-found: error
+          path: |
+            dist/msix/*.msix
+            dist/msix/*.sha256
+            dist/msix/*.json
+      # Deliberately no release-upload or Partner Center submission step.
+      # Store signing happens after submission/certification, not in this job.

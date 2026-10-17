@@ -297,12 +297,14 @@ The PKCS#12 adapter uses `p12-keystore` for modern AES-encrypted PKCS#12 and aut
 
 ## Code signing policy
 
-Windows releases are to be signed through SignPath's free program for open-source projects (applied for; until it is approved, Windows builds are unsigned). Once approved: free code signing provided by [SignPath.io](https://signpath.io), certificate by [SignPath Foundation](https://signpath.org). The Mac app is signed with the maintainer's Apple Developer ID and notarized by Apple.
+The Windows app and installer are currently unsigned; no Windows code-signing provider is configured. Release downloads include SHA-256 checksum files for integrity verification. These checksums do not authenticate the publisher or replace code signing. The Mac app is signed with the maintainer's Apple Developer ID and notarized by Apple.
+
+Microsoft Store packaging is available through the **Microsoft Store MSIX** workflow. It packages the same native desktop app, with PDF Open With registration and shared settings/stamp storage. Store mode requires the real Partner Center product identity; test mode uses a clearly marked validation identity. The unsigned `.msix` is a submission artifact, not a signed GitHub installer. Microsoft signs Store-distributed packages after certification. See [Windows Store packaging](packaging/windows/msix/README.md) for setup, validation and submission steps. MyPDF is not yet published in the Microsoft Store.
 
 - **Committers and reviewers:** [gokcol](https://github.com/gokcol)
 - **Approvers:** [gokcol](https://github.com/gokcol)
 
-Every Windows release is built from this repository by the GitHub Actions workflow in `.github/workflows/windows-build.yml`, and each signing request is approved by hand.
+Every Windows release is built from this repository by the GitHub Actions workflow in `.github/workflows/windows-build.yml`. Releases are approved by the maintainer before publication. The Windows build workflow does not currently perform code signing.
 
 **Privacy:** This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
 
