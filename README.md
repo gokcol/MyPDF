@@ -59,6 +59,14 @@ The redesigned interface follows PDF Expert’s compact toolbar and panel layout
 
 In **Pages**, click a thumbnail, use ⌘/Ctrl-click or Shift-click for multiple pages, or enter a range such as `1, 3-5`. Drag to the left/right half of a thumbnail to insert the selection before/after it, or use **Move before page**. **Insert** accepts a blank page or PDF files at a chosen position; **Merge** appends PDFs. **Copy pages** (⌘C) copies the selected pages, with their annotations. Switch to any other open PDF and choose **Paste pages** (⌘V) to insert them after its selected page (or at the end); the pasted pages become the selection, and Undo removes them. You can copy from a signed or read-only PDF too; the copies are not signed, so signature fields are left behind. **Extract** saves selected pages. **Split** exports the whole document into a fresh folder, using the interval in the right panel. **Crop** previews displayed-page margins in points and applies them to the selected pages.
 
+## Development updates after 1.1
+
+The current source adds local background removal for placed images, imported signature images, and saved digital-signature artwork. A transparency preview offers background color, tolerance, soft edges and optional edge-connected removal. PDF edits support Undo; signature-library changes retain the original artwork. This is intended for paper/solid backgrounds, not arbitrary photographic subject extraction.
+
+Existing-text editing has a richer inspector (font, style, alignment, color, position and width); the floating toolbar leaves clearance around the text and falls back to the inspector when space is tight. Pen/signature input preserves intermediate pointer samples delivered in a single frame, and multi-touch navigation cancels pending page strokes.
+
+A standalone **native iPad development preview** is in [ipad/README.md](ipad/README.md). It shares the Rust engine and uses SwiftUI/PDFKit/PencilKit for the device interface. It is not yet feature-equivalent to the desktop application or part of the published 1.1 downloads.
+
 ## Run the desktop viewer
 
 ```sh

@@ -336,6 +336,84 @@ pub fn images(bytes: &[u8], page: u32) -> Result<Vec<ImageObject>> {
     Ok(result)
 }
 
+/// Extract a page-level RGB or grayscale image, preserving its transparency.
+pub fn image_png(bytes: &[u8], page: u32, index: usize) -> Result<Vec<u8>> {
+    let selected = images(bytes, page)?
+        .into_iter()
+        .find(|i| i.index == index)
+        .context("Image no longer exists")?;
+    let doc = Document::load_mem(bytes)?;
+    let id = *doc.get_pages().get(&page).context("Page not found")?;
+    let resources = resources(&doc, id)?;
+    let objects = doc.dereference(resources.get(b"XObject")?)?.1.as_dict()?;
+    let stream = doc
+        .dereference(objects.get(selected.name.as_bytes())?)?
+        .1
+        .as_stream()?;
+    let decode = |stream: &Stream| -> Result<image::RgbaImage> {
+        let w = stream.dict.get(b"Width")?.as_i64()?;
+        let h = stream.dict.get(b"Height")?.as_i64()?;
+        ensure!(
+            w > 0 && h > 0 && w <= 4096 && h <= 4096,
+            "Background removal supports images up to 4096 × 4096 pixels"
+        );
+        if stream
+            .filters()
+            .is_ok_and(|f| f == vec![b"DCTDecode".as_slice()])
+        {
+            return decode_image(&stream.content);
+        }
+        ensure!(
+            !stream.dict.has(b"Decode"),
+            "This image uses custom color mapping; export and reimport it as PNG first"
+        );
+        ensure!(
+            stream.dict.get(b"BitsPerComponent")?.as_i64()? == 8,
+            "This image format cannot be processed directly"
+        );
+        let color = stream.dict.get(b"ColorSpace")?.as_name()?;
+        let channels = match color {
+            b"DeviceRGB" => 3,
+            b"DeviceGray" => 1,
+            _ => anyhow::bail!(
+                "This image uses a special color space; export and reimport it as PNG first"
+            ),
+        };
+        let count = (w * h) as usize;
+        let raw = stream.get_plain_content_with_limit(count * channels)?;
+        ensure!(raw.len() == count * channels, "Invalid image data");
+        let rgba = raw
+            .chunks_exact(channels)
+            .flat_map(|p| {
+                if channels == 3 {
+                    [p[0], p[1], p[2], 255]
+                } else {
+                    [p[0], p[0], p[0], 255]
+                }
+            })
+            .collect();
+        image::RgbaImage::from_raw(w as u32, h as u32, rgba).context("Invalid image dimensions")
+    };
+    ensure!(
+        !stream.dict.has(b"Mask"),
+        "This image uses a color mask; export and reimport it as PNG first"
+    );
+    let mut image = decode(stream)?;
+    if let Ok(mask) = stream.dict.get(b"SMask") {
+        let mask = decode(doc.dereference(mask)?.1.as_stream()?)?;
+        ensure!(
+            mask.dimensions() == image.dimensions(),
+            "Image mask dimensions differ"
+        );
+        for (p, m) in image.pixels_mut().zip(mask.pixels()) {
+            p[3] = m[0];
+        }
+    }
+    let mut output = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut output, image::ImageFormat::Png)?;
+    Ok(output.into_inner())
+}
+
 /// Decode bounded PNG/JPEG artwork without external resources.
 pub fn decode_image(bytes: &[u8]) -> Result<image::RgbaImage> {
     ensure!(bytes.len() <= 32 * 1024 * 1024, "Image exceeds 32 MB");

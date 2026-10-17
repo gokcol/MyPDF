@@ -381,7 +381,10 @@ fn detail_of(text: &str) -> Option<(Detail, usize)> {
 
 /// Today's date here, as (year, month, day).
 pub fn today() -> (i32, u32, u32) {
+    #[cfg(not(target_os = "ios"))]
     let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    #[cfg(target_os = "ios")]
+    let now = time::OffsetDateTime::now_utc();
     (now.year(), u8::from(now.month()) as u32, now.day() as u32)
 }
 

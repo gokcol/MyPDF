@@ -266,6 +266,7 @@ fn native_visual_preview() {
         "Inspector",
         "SheetLayout",
         "SignatureImage",
+        "TransparentImage",
         "AddText",
         "Prompt",
         "Confirmation",
@@ -796,6 +797,15 @@ fn native_visual_preview() {
                 assert!(std::time::Instant::now() < deadline);
                 preview.capture(&mut app, &ctx);
                 std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        if collection == "TransparentImage" {
+            app.background_preview();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !app.background_preview_ready() {
+                assert!(std::time::Instant::now() < deadline);
+                preview.capture(&mut app, &ctx);
+                std::thread::sleep(std::time::Duration::from_millis(15));
             }
         }
         // A lasso is drawn only while the mouse button is held, here on the gray canvas.

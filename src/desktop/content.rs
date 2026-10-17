@@ -21,8 +21,10 @@ struct BlockDraft {
     spans: Vec<mypdf_milestone0::rich_text::Span>,
     styled_text: String,
     font: usize,
+    alignment: Alignment,
     /// Font, size, color and right edge when the block opened.
     initial: (usize, f32, [f32; 3], f32),
+    initial_origin: [f32; 2],
 }
 #[derive(Clone)]
 struct InlineText {
@@ -42,7 +44,9 @@ impl InlineText {
     fn changed(&self) -> bool {
         self.text != self.original
             || matches!(&self.target, InlineTarget::Block(b)
-                if (b.font, self.size, self.color, self.rect[2]) != b.initial)
+                if (b.font, self.size, self.color, self.rect[2]) != b.initial
+                    || [self.rect[0], self.rect[1]] != b.initial_origin
+                    || b.alignment != Alignment::Left)
     }
 }
 
@@ -863,6 +867,7 @@ impl Viewer {
         let page = self.tabs.get(self.active).map_or(0, |t| t.page);
         let mut change = None;
         let mut replace = None;
+        let mut remove_background = None;
         egui::SidePanel::right("content_inspector").exact_width(310.).resizable(false).frame(egui::Frame::new().fill(theme::paper()).inner_margin(18.)).show(ctx,|ui|{
             ui.heading("Edit PDF");ui.label(RichText::new(format!("Page {}",page+1)).small().color(theme::muted()));ui.add_space(12.);
             if self.content.loading{ui.spinner();ui.label("Inspecting page…");return;}
@@ -880,6 +885,7 @@ impl Viewer {
                             ui.add_enabled_ui(editable,|ui|{egui::Grid::new("image_dimensions").num_columns(2).spacing([12.,10.]).show(ui,|ui|{for(label,v)in ["X","Y","Width","Height"].into_iter().zip(&mut self.content.rect){ui.label(label);ui.add(egui::DragValue::new(v).speed(1.).range(-99_999.0..=99_999.0));ui.end_row();}});ui.add_space(8.);
                                 if ui.add(ActionButton::new(Icon::Select,"Apply position & size").primary()).clicked(){let [x,y,w,h]=self.content.rect;change=Some(Edit::Image{page:page as u32+1,index:image.index,edit:content::ImageEdit::Place([x,y,x+w,y+h])});}
                                 if ui.add(ActionButton::new(Icon::Import,"Replace image…")).clicked(){replace=Some(image.index);}
+                                if ui.add(ActionButton::new(Icon::FieldImage,"Remove background…")).clicked(){remove_background=Some(image.index);}
                                 if ui.add(ActionButton::new(Icon::Trash,"Delete image")).clicked(){change=Some(Edit::Image{page:page as u32+1,index:image.index,edit:content::ImageEdit::Delete});}
                             });
                         }
@@ -890,6 +896,9 @@ impl Viewer {
                 }
             }
         });
+        if let Some(index) = remove_background {
+            self.remove_content_image_background(index);
+        }
         if let Some(index) = replace
             && let Some(path) = self.native_pick(
                 rfd::FileDialog::new()
@@ -1453,8 +1462,9 @@ impl Viewer {
                         Edit::Block {
                             page: draft.key.2 as u32 + 1,
                             block: text_block::Replacement {
-                                spans: if (block.font, draft.size, draft.color)
-                                    == (block.initial.0, block.initial.1, block.initial.2)
+                                spans: if block.alignment == Alignment::Left
+                                    && (block.font, draft.size, draft.color)
+                                        == (block.initial.0, block.initial.1, block.initial.2)
                                 {
                                     mypdf_milestone0::rich_text::edited(
                                         &block.styled_text,
@@ -1478,7 +1488,7 @@ impl Viewer {
                                     font: text_style::fonts()
                                         .get(block.font)
                                         .map(|f| f.path.clone()),
-                                    alignment: Alignment::Left,
+                                    alignment: block.alignment,
                                 },
                             },
                         },
@@ -1564,58 +1574,122 @@ impl Viewer {
     }
     fn existing_text_panel(&mut self, ctx: &egui::Context) {
         let current = self.tabs.get(self.active).map(|t| (t.id, t.page));
-        egui::SidePanel::right("content_inspector").exact_width(290.).resizable(false)
+        let page_size = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.pages.get(t.page))
+            .copied();
+        let mut cancel = false;
+        egui::SidePanel::right("content_inspector").default_width(290.).width_range(270.0..=380.0).resizable(true)
             .frame(egui::Frame::new().fill(theme::paper()).inner_margin(18.))
             .show(ctx, |ui| {
-                ui.heading("Text");
-                ui.add_space(16.);
-                if let Some(draft) = &mut self.content.existing && current == Some((draft.key.0, draft.key.2)) {
-                    ui.label(RichText::new("Editing on the page").family(ui::semibold()));
-                    ui.add_space(10.);
-                    if let InlineTarget::Block(block) = &mut draft.target {
-                        ui.label(RichText::new(format!("{} text objects selected", block.selection.runs.len()+block.selection.annotations.len())).color(theme::muted()));
-                        ui.add_space(10.);
-                        ui.add_enabled_ui(!self.content.busy, |ui| {
-                            let fonts = text_style::fonts();
-                            let name = fonts.get(block.font).map(|f|format!("{} · {}",f.family,f.style())).unwrap_or_else(||"Default".into());
-                            egui::ComboBox::from_id_salt("block_font").width(ui.available_width()).selected_text(name).show_ui(ui, |ui| {
-                                for (index,font) in fonts.iter().enumerate() {
-                                    ui.selectable_value(&mut block.font,index,format!("{} · {}",font.family,font.style()));
-                                }
-                            });
-                            ui.add(egui::DragValue::new(&mut draft.size).range(4.0..=144.0).suffix(" pt")).on_hover_text("Block font size");
-                            editing::color_palette(ui, &mut draft.color);
-                            ui.add_space(8.);
-                            ui.label(RichText::new("Mixed formatting is preserved while typing. Choosing a font, size or color styles the whole block. Drag the corner to reflow.").small().color(theme::muted()));
-                        });
-                    } else {
-                        ui.label(RichText::new(&draft.font).color(theme::muted()));
-                        ui.label(RichText::new(format!("{:.1} pt", draft.size)).color(theme::muted()));
-                    }
-                    ui.add_space(18.);
-                    ui.add_enabled_ui(!self.content.busy, |ui| {
-                        if ui.add(ActionButton::new(Icon::Check,"Done").primary()).clicked() { self.content.new_commit = true; }
-                        if ui.add(ActionButton::new(Icon::Left,"Cancel")).clicked() {
-                            self.content.existing = None;
-                            self.content.next_existing = None;
-                            self.content.after_text = None;
-                            self.content.add_after_existing = None;
-                        }
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Text").size(18.).family(ui::semibold()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(ActionButton::new(Icon::Close, "Hide text panel").compact()).clicked() { self.inspector = false; }
                     });
-                    ui.add_space(14.);
-                    ui.label(RichText::new("Type directly in the text area on the page. Click outside or press ⌘Return to finish. Esc cancels.").size(13.).color(theme::muted()));
-                } else {
-                    ui.label(RichText::new(if self.content.area_mode { "Drag a rectangle around the text you want to edit together." } else { "Click text on the page to edit it." }).size(15.).color(theme::ink()));
+                });
+                egui::ScrollArea::vertical().id_salt("text_inspector_scroll").show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = vec2(8., 10.);
                     ui.add_space(12.);
-                    ui.label(RichText::new(if self.content.area_mode { "Included text highlights as you drag. Release to open a multiline text area. Esc cancels." } else { "Drag across the page, or use Select area, to edit several lines together. Add text starts a new block." }).color(theme::muted()));
-                    if let Some(hint) = &self.content.selection_hint { ui.add_space(12.); ui.label(RichText::new(hint).color(theme::muted())); }
-                    if self.content.loading { ui.add_space(12.); ui.spinner(); }
-                    if let Some(info) = &self.content.inspection && let Err(e) = &info.text {
-                        ui.add_space(12.); ui.label(RichText::new(e).small().color(theme::muted()));
+                    if let Some(draft) = &mut self.content.existing && current == Some((draft.key.0, draft.key.2)) {
+                        ui.label(RichText::new(format!("{} words · {} characters", draft.text.split_whitespace().count(), draft.text.chars().count())).small().color(theme::muted()));
+                        if let InlineTarget::Block(block) = &mut draft.target {
+                            ui.add_space(12.);
+                            ui.add_enabled_ui(!self.content.busy, |ui| {
+                                ui::caption(ui, "Font");
+                                let fonts = text_style::fonts();
+                                let name = fonts.get(block.font).map(|f| f.family.as_str()).unwrap_or("Default");
+                                egui::ComboBox::from_id_salt("block_font").width(ui.available_width()).selected_text(name).show_ui(ui, |ui| {
+                                    for (index, font) in fonts.iter().enumerate().filter(|(_, f)| !f.bold && !f.italic) {
+                                        if ui.selectable_label(name == font.family, &font.family).clicked() {
+                                            let current = fonts.get(block.font);
+                                            block.font = fonts.iter().position(|f| f.family == font.family && current.is_some_and(|c| f.bold == c.bold && f.italic == c.italic)).unwrap_or(index);
+                                        }
+                                    }
+                                });
+                                if let Some(current) = fonts.get(block.font) {
+                                    ui.horizontal(|ui| {
+                                        egui::ComboBox::from_id_salt("block_font_style").width((ui.available_width()-90.).max(90.)).selected_text(current.style()).show_ui(ui, |ui| {
+                                            for (index, font) in fonts.iter().enumerate().filter(|(_,f)| f.family == current.family) {
+                                                ui.selectable_value(&mut block.font, index, font.style());
+                                            }
+                                        });
+                                        ui.add(egui::DragValue::new(&mut draft.size).range(4.0..=144.).suffix(" pt")).on_hover_text("Font size");
+                                    });
+                                    ui.horizontal(|ui| {
+                                        for (icon,label,bold,italic,selected) in [(Icon::Bold,"Bold",!current.bold,current.italic,current.bold),(Icon::Italic,"Italic",current.bold,!current.italic,current.italic)] {
+                                            let target = fonts.iter().position(|f| f.family == current.family && f.bold == bold && f.italic == italic);
+                                            if ui.add_enabled(target.is_some(), ActionButton::new(icon,label).compact().selected(selected)).clicked() { block.font = target.unwrap(); }
+                                        }
+                                    });
+                                }
+                                ui.add_space(8.);
+                                ui::caption(ui, "Alignment");
+                                ui.horizontal(|ui| {
+                                    for (value,icon,label) in [(Alignment::Left,Icon::AlignLeft,"Align left"),(Alignment::Center,Icon::AlignCenter,"Align center"),(Alignment::Right,Icon::AlignRight,"Align right"),(Alignment::Justified,Icon::AlignJustify,"Justify")] {
+                                        if ui.add(ActionButton::new(icon,label).compact().selected(block.alignment == value)).clicked() { block.alignment = value; }
+                                    }
+                                });
+                                ui.add_space(8.);
+                                ui::caption(ui, "Color");
+                                editing::color_palette(ui, &mut draft.color);
+                                ui.add_space(8.);
+                                ui.separator();
+                                ui::caption(ui, "Position & size");
+                                if let Some(page) = page_size {
+                                    let mut x = draft.rect[0];
+                                    let mut y = draft.rect[1];
+                                    let mut width = draft.rect[2] - x;
+                                    let height = draft.rect[3] - y;
+                                    let mut changed = false;
+                                    egui::Grid::new("block_text_dimensions").num_columns(2).spacing(vec2(16.,10.)).show(ui, |ui| {
+                                        for (label, value, maximum) in [("Left", &mut x, (page.width-width).max(0.)), ("Top", &mut y, (page.height-height).max(0.)), ("Width", &mut width, (page.width-draft.rect[0]).max(1.))] {
+                                            let minimum = if label == "Width" {1.} else {0.};
+                                            let label = ui.label(label);
+                                            changed |= ui.add(egui::DragValue::new(value).speed(0.5).range(minimum..=maximum).suffix(" pt")).labelled_by(label.id).changed();
+                                            ui.end_row();
+                                        }
+                                        ui.label("Height");
+                                        ui.label(RichText::new(format!("{height:.1} pt · Auto")).color(theme::muted()));
+                                        ui.end_row();
+                                    });
+                                    if changed { draft.rect = [x, y, (x+width).min(page.width), (y+height).min(page.height)]; }
+                                }
+                                ui.label(RichText::new("Width reflows the text. Height grows as you type.").small().color(theme::muted()));
+                                ui.add_space(8.);
+                                ui.label(RichText::new("Typing preserves mixed formatting. Font, color or alignment changes style the whole block.").small().color(theme::muted()));
+                            });
+                        } else {
+                            ui.label(RichText::new(&draft.font).color(theme::muted()));
+                            ui.label(RichText::new(format!("{:.1} pt", draft.size)).color(theme::muted()));
+                        }
+                        ui.add_space(18.);
+                        ui.add_enabled_ui(!self.content.busy, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.add(ActionButton::new(Icon::Check,"Done").primary()).clicked() { self.content.new_commit = true; }
+                                cancel = ui.add(ActionButton::new(Icon::Left,"Cancel")).clicked();
+                            });
+                        });
+                        ui.add_space(14.);
+                        ui.label(RichText::new("Type on the page. Click outside or press ⌘Return to finish. Esc cancels.").size(12.).color(theme::muted()));
+                    } else {
+                        ui.label(RichText::new(if self.content.area_mode { "Drag a rectangle around the text you want to edit together." } else { "Click text on the page to edit it." }).size(15.).color(theme::ink()));
+                        ui.add_space(12.);
+                        ui.label(RichText::new("Drag across several lines to edit a block. Add text starts a new block.").color(theme::muted()));
+                        if let Some(hint) = &self.content.selection_hint { ui.add_space(12.); ui.label(RichText::new(hint).color(theme::muted())); }
+                        if self.content.loading { ui.add_space(12.); ui.spinner(); }
+                        if let Some(info) = &self.content.inspection && let Err(e) = &info.text { ui.add_space(12.); ui.label(RichText::new(e).small().color(theme::muted())); }
                     }
-                }
-                if self.content.busy { ui.spinner(); ui.label("Applying text…"); }
+                    if self.content.busy { ui.spinner(); ui.label("Applying text…"); }
+                });
             });
+        if cancel {
+            self.content.existing = None;
+            self.content.next_existing = None;
+            self.content.after_text = None;
+            self.content.add_after_existing = None;
+        }
     }
 }
 
@@ -1647,18 +1721,18 @@ impl Viewer {
                 let point = view.min - offset
                     + page_rect.min.to_vec2()
                     + vec2(self.content.new_rect[0], self.content.new_rect[1]) * tab.scale;
-                let pos = pos2(
-                    point.x.clamp(
-                        view.left() + 8.,
-                        (view.right() - 370.).max(view.left() + 8.),
-                    ),
-                    (point.y - 64.).max(view.top() + 8.),
-                );
+                let text_rect = Rect::from_min_size(
+                    point,
+                    vec2(self.content.new_rect[2], self.content.new_rect[3]) * tab.scale,
+                )
+                .expand(6.);
                 let mut cancel = false;
-                egui::Area::new(egui::Id::new("new_text_context_toolbar"))
-                    .order(egui::Order::Foreground)
-                    .fixed_pos(pos)
-                    .show(ctx, |ui| {
+                text_toolbar(
+                    ctx,
+                    egui::Id::new("new_text_context_toolbar"),
+                    view,
+                    text_rect,
+                    |ui| {
                         egui::Frame::popup(ui.style())
                             .corner_radius(12)
                             .inner_margin(8.)
@@ -1706,7 +1780,8 @@ impl Viewer {
                                         .clicked();
                                 });
                             });
-                    });
+                    },
+                );
                 if cancel {
                     self.content.add_target = None;
                     self.content.new_text.clear();
@@ -1727,19 +1802,19 @@ impl Viewer {
         };
         let origin = view.min - offset + page.min.to_vec2();
         let point = origin + vec2(draft.rect[0], draft.rect[1]) * tab.scale;
-        let pos = pos2(
-            point.x.clamp(
-                view.left() + 8.,
-                (view.right() - 370.).max(view.left() + 8.),
-            ),
-            (point.y - 48.).max(view.top() + 8.),
-        );
+        let text_rect = Rect::from_min_max(
+            point - vec2(0., draft.size * 0.2 * tab.scale),
+            origin + vec2(draft.rect[2], draft.rect[3]) * tab.scale,
+        )
+        .expand(6.);
         let mut done = false;
         let mut cancel = false;
-        egui::Area::new(egui::Id::new("text_context_toolbar"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(pos)
-            .show(ctx, |ui| {
+        text_toolbar(
+            ctx,
+            egui::Id::new("text_context_toolbar"),
+            view,
+            text_rect,
+            |ui| {
                 egui::Frame::popup(ui.style())
                     .corner_radius(12)
                     .inner_margin(8.)
@@ -1784,7 +1859,8 @@ impl Viewer {
                                 .clicked();
                         });
                     });
-            });
+            },
+        );
         if done {
             self.content.new_commit = true;
         }
@@ -1793,6 +1869,56 @@ impl Viewer {
             self.content.next_existing = None;
             self.content.after_text = None;
         }
+    }
+}
+
+/// Keep the entire toolbar, including a clear shadow gap, outside the edited text.
+/// If the text fills the viewport, the inspector remains available instead.
+fn text_toolbar_position(view: Rect, text: Rect, size: egui::Vec2) -> Option<egui::Pos2> {
+    let bounds = view.shrink(8.);
+    if size.x > bounds.width() || size.y > bounds.height() || !text.intersects(view) {
+        return None;
+    }
+    let gap = 18.;
+    let x = text.left().clamp(bounds.left(), bounds.right() - size.x);
+    let y = text.top().clamp(bounds.top(), bounds.bottom() - size.y);
+    [
+        pos2(x, text.top() - size.y - gap),
+        pos2(x, text.bottom() + gap),
+        pos2(text.right() + gap, y),
+        pos2(text.left() - size.x - gap, y),
+    ]
+    .into_iter()
+    .find(|p| {
+        let rect = Rect::from_min_size(*p, size);
+        bounds.contains_rect(rect) && !rect.intersects(text.expand(gap - 1.))
+    })
+}
+
+fn text_toolbar(
+    ctx: &egui::Context,
+    id: egui::Id,
+    view: Rect,
+    text: Rect,
+    contents: impl FnOnce(&mut egui::Ui),
+) {
+    let size_id = id.with("measured_size");
+    let measured = ctx.data(|d| d.get_temp::<egui::Vec2>(size_id));
+    let size = measured.unwrap_or(vec2(420., 72.));
+    let Some(position) = text_toolbar_position(view, text, size) else {
+        return;
+    };
+    let response = egui::Area::new(id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(position)
+        .constrain(false)
+        .sizing_pass(measured.is_none())
+        .show(ctx, contents)
+        .response;
+    let actual = response.rect.size();
+    if measured != Some(actual) {
+        ctx.data_mut(|d| d.insert_temp(size_id, actual));
+        ctx.request_repaint();
     }
 }
 
@@ -1982,7 +2108,9 @@ fn selected_block(
             spans,
             styled_text: text.clone(),
             font,
+            alignment: Alignment::Left,
             initial: (font, size, first.color, right),
+            initial_origin: [x, y],
         }),
         original: text.clone(),
         text,
@@ -2352,7 +2480,8 @@ fn existing_overlay(
         }
     }
     let rich = if let InlineTarget::Block(b) = &draft.target {
-        ((b.font, draft.size, draft.color) == (b.initial.0, b.initial.1, b.initial.2))
+        (b.alignment == Alignment::Left
+            && (b.font, draft.size, draft.color) == (b.initial.0, b.initial.1, b.initial.2))
             .then(|| b.spans.clone())
     } else {
         None
@@ -2361,6 +2490,11 @@ fn existing_overlay(
         b.styled_text.clone()
     } else {
         draft.original.clone()
+    };
+    let alignment = if let InlineTarget::Block(b) = &draft.target {
+        b.alignment
+    } else {
+        Alignment::Left
     };
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
         ui.set_clip_rect(page_rect.intersect(ui.clip_rect()));
@@ -2373,6 +2507,12 @@ fn existing_overlay(
                     color,
                     width,
                 );
+                job.halign = match alignment {
+                    Alignment::Center => egui::Align::Center,
+                    Alignment::Right => egui::Align::RIGHT,
+                    _ => egui::Align::LEFT,
+                };
+                job.justify = alignment == Alignment::Justified;
                 if let Some(spans) = &rich {
                     job.sections.clear();
                     for span in
@@ -2718,6 +2858,85 @@ pub(super) fn overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn text_toolbar_keeps_clearance_and_stays_in_the_document_view() {
+        let view = Rect::from_min_max(pos2(100., 100.), pos2(900., 750.));
+        let size = vec2(410., 66.);
+        for text in [
+            Rect::from_min_max(pos2(240., 300.), pos2(600., 410.)),
+            Rect::from_min_max(pos2(180., 110.), pos2(650., 210.)),
+            Rect::from_min_max(pos2(750., 500.), pos2(895., 710.)),
+        ] {
+            let p = text_toolbar_position(view, text, size).unwrap();
+            let toolbar = Rect::from_min_size(p, size);
+            assert!(view.contains_rect(toolbar));
+            assert!(!toolbar.intersects(text.expand(17.)));
+        }
+        assert!(text_toolbar_position(view, view, size).is_none());
+        assert!(text_toolbar_position(view, view.translate(vec2(1000., 0.)), size).is_none());
+    }
+
+    #[test]
+    fn block_alignment_and_position_are_saved_without_changing_words() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        let source = content::add_text(
+            &convert::blank(595., 842.).unwrap(),
+            1,
+            "Keep these words",
+            [50., 70., 400., 100.],
+            18.,
+            [0.; 3],
+        )
+        .unwrap();
+        app.open_memory(PathBuf::from("Text layout.pdf"), source.clone(), &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let run = mypdf_milestone0::text_geometry::runs(&source, 1)
+            .unwrap()
+            .remove(0);
+        let item = InlineText {
+            key: (app.tabs[0].id, 0, 0),
+            target: InlineTarget::Run(0),
+            original: run.text.clone(),
+            text: run.text,
+            rect: run.rect.unwrap(),
+            size: run.size,
+            color: run.color,
+            font: run.base_font,
+            focus: false,
+        };
+        let mut draft =
+            selected_block(vec![item], [50., 70., 450., 170.], app.tabs[0].pages[0]).unwrap();
+        assert!(!draft.changed());
+        draft.rect = [80., 200., 480., 300.];
+        let InlineTarget::Block(block) = &mut draft.target else {
+            panic!()
+        };
+        block.alignment = Alignment::Right;
+        assert!(draft.changed());
+        app.content.existing = Some(draft);
+        app.finish_existing_text(&ctx);
+        while app.content.busy {
+            app.content_events(&ctx);
+            assert!(std::time::Instant::now() < deadline, "{:?}", app.status);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let bytes = &app.tabs[0].session.as_ref().unwrap().source;
+        let runs = mypdf_milestone0::text_geometry::runs(bytes, 1).unwrap();
+        let run = runs.iter().find(|r| r.text == "Keep these words").unwrap();
+        let rect = run.rect.unwrap();
+        assert!(
+            rect[0] > 250. && rect[1] > 195. && rect[2] < 482.,
+            "{rect:?}"
+        );
+        assert!(app.content.existing.is_none());
+    }
+
     #[test]
     fn clicking_any_paragraph_fragment_preserves_styles_and_excludes_other_columns() {
         let item = |index, text: &str, rect, font: &str, color| InlineText {

@@ -851,6 +851,19 @@ impl DigitalState {
                         self.manager.adopt_into = Some(id.clone());
                         *action = Some(Action::ImportArtwork);
                     }
+                    if let Some(asset) = assets
+                        .iter()
+                        .find(|a| Some(&a.id) == signature.asset_id.as_ref())
+                        && matches!(
+                            asset.kind,
+                            mypdf_milestone0::annotations::Kind::Image { .. }
+                        )
+                        && ui
+                            .add(ActionButton::new(Icon::FieldImage, "Remove background…"))
+                            .clicked()
+                    {
+                        *action = Some(Action::RemoveArtworkBackground(id.clone(), asset.clone()));
+                    }
                 });
             });
             ui::field(ui, "Background", |ui| {
