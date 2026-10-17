@@ -33,7 +33,7 @@ On GitHub, run **Actions → Microsoft Store MSIX → Run workflow**:
 
 - `ref`: the release tag or full commit SHA to package.
 - `mode`: `store` after configuring the three variables; `test` otherwise.
-- `package_version`: usually blank, which maps Cargo `1.0.0` to MSIX `1.0.0.0`.
+- `package_version`: usually blank, which maps Cargo `1.1.0` to MSIX `1.1.0.0`.
   The fourth field is reserved by Microsoft and must remain zero. Increment
   the package version for subsequent Store updates.
 
