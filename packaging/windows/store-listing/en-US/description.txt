@@ -1,0 +1,21 @@
+MyPDF (OG) is a native desktop PDF reader and editor for everyday document work. Read, annotate, edit, organize, fill, and sign PDFs in one focused workspace. Your documents are processed on your computer, with no account or cloud upload required.
+
+READ COMFORTABLY
+Open documents in tabs, navigate with thumbnails and outlines, search text, and choose the zoom and reading layout that suits your screen. Start a blank PDF whenever you need a fresh page.
+
+EDIT AND ANNOTATE
+Add text directly on the page and edit supported existing text and images. Highlight passages, add notes, draw shapes and arrows, and use standard stamps or your own SVG and image artwork. Move, resize, recolor, rotate, and flip supported objects.
+
+SIGN AND FILL
+Create a visual signature by drawing, typing, or importing an image. Add certificate-based digital signatures using a P12/PFX file or a supported Windows certificate-store identity. Fill PDF forms, create form fields, and import or export form data.
+
+ORGANIZE YOUR PAGES
+Reorder, insert, delete, extract, merge, split, rotate, and crop pages. Export multiple PDF pages onto each sheet using preset or custom grids, with adjustable margins, headers, footers, and watermarks.
+
+CONVERT AND KEEP WORK MOVING
+Convert images to PDF, export pages as PNG or JPEG, and work with plain text, Markdown, and DOCX conversions. Use undo, safe saving, and local recovery copies while you work.
+
+LOCAL BY DESIGN
+MyPDF has no advertising, usage analytics, or automatic document uploads. Settings, custom stamps, signatures, and recovery data stay in local application storage. You choose where to save and share your files.
+
+Text editing depends on the PDF's structure and fonts. Markdown and Word conversions focus on text and may not preserve complex layouts. Certificate trust depends on the recipient's PDF viewer and trust settings. OCR is not included in the Windows version.

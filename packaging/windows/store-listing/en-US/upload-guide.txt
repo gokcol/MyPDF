@@ -1,0 +1,14 @@
+MyPDF (OG) 1.1 — Microsoft Store, English (United States)
+
+Description: paste description.txt as plain text.
+Screenshots: upload screenshots/01-read.png first, followed by the other three.
+Screenshot captions: use the corresponding entries from captions.txt.
+Optional Store logos: upload each PNG to its matching 300 x 300, 150 x 150, or 71 x 71 field.
+Optional keywords: enter each line of keywords.txt as a separate keyword phrase.
+Privacy policy: https://github.com/gokcol/MyPDF/blob/main/PRIVACY.md
+Support website: https://github.com/gokcol/MyPDF/issues
+Product website: https://github.com/gokcol/MyPDF
+
+All screenshot documents are fictional. The screenshots come from the native Windows application renderer, without desktop chrome or added marketing artwork. provenance.json records the build source and capture method.
+
+Listing content is prepared for manual review and upload. Nothing in this folder submits the app for certification.

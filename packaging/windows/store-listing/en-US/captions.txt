@@ -1,0 +1,11 @@
+01-read.png
+Read PDFs in a native workspace with tabs, page thumbnails, text search, and flexible zoom.
+
+02-stamps.png
+Annotate documents with standard stamps, custom artwork, notes, and drawing tools.
+
+03-forms.png
+Fill and create PDF forms, with tools for fields and reusable form layouts.
+
+04-page-layout.png
+Save multiple pages on each sheet with custom grids, margins, headers, footers, and watermarks.

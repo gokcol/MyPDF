@@ -133,6 +133,87 @@ impl TriangleVertices for [u32] {
 
 const PREVIEW_AGREEMENT: &str = "# Service Agreement\n\nThis agreement is made between Northwind Ltd and the Client.\n\n## 1. Services\n\nNorthwind delivers the monthly report by the fifth working day.\n\n## 2. Payment\n\nPayment is due within thirty days of the invoice date.\n\nLate payments carry a fee of 2% per month.\n\n## 3. Term\n\nThis agreement lasts for twelve months and renews automatically.\n\n## 4. Disputes\n\nDisputes are settled by the courts of Ankara.";
 
+/// Capture the unmodified application UI with fictional, public sample documents.
+/// Run on Windows for the Store listing; no window decorations or marketing overlays.
+#[test]
+#[ignore = "Manual Store artwork; requires explicit output, sample and isolated data folders"]
+fn store_listing_preview() {
+    let root = PathBuf::from(std::env::var_os("MYPDF_PREVIEW_DIR").expect("Set MYPDF_PREVIEW_DIR"));
+    let samples =
+        PathBuf::from(std::env::var_os("MYPDF_SAMPLE_DIR").expect("Set MYPDF_SAMPLE_DIR"));
+    assert!(
+        std::env::var_os("MYPDF_DATA_DIR").is_some(),
+        "Use an isolated MYPDF_DATA_DIR"
+    );
+    std::fs::create_dir_all(&root).unwrap();
+    for (scene, active) in [
+        ("01-read", 0),
+        ("02-stamps", 0),
+        ("03-forms", 1),
+        ("04-page-layout", 0),
+    ] {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(2.0);
+        ctx.set_theme(egui::Theme::Light);
+        let mut app = Viewer::new(
+            &eframe::CreationContext::_new_kittest(ctx.clone()),
+            [
+                "Quarterly Report.pdf",
+                "Supplier Registration.pdf",
+                "Service Agreement v1.pdf",
+            ]
+            .map(|name| samples.join(name))
+            .to_vec(),
+        );
+        ctx.set_theme(egui::Theme::Light);
+        app.home.visible = false;
+        app.active = active;
+        for tab in &mut app.tabs {
+            tab.zoom = Zoom::Page;
+        }
+        app.editor.mode = match scene {
+            "02-stamps" => editing::Mode::Annotate,
+            "03-forms" => editing::Mode::Forms,
+            _ => editing::Mode::Read,
+        };
+        app.editor.library_open = scene == "02-stamps";
+        app.editor.library_tab = "Stamps".into();
+        let mut preview = Preview::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            preview.capture(&mut app, &ctx);
+            if app.tabs[active].index_done
+                && app.tabs[active].rasters.keys().any(|key| !key.thumbnail)
+                && app.tabs[active].pending.is_empty()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Scene {scene} did not load"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if scene == "04-page-layout" {
+            app.editor.mode = editing::Mode::Pages;
+            app.preview_nup();
+        }
+        for _ in 0..16 {
+            preview.capture(&mut app, &ctx);
+        }
+        while app.nup_preview_pending() || !app.tabs[active].pending.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Scene {scene} did not settle"
+            );
+            preview.capture(&mut app, &ctx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = preview.capture(&mut app, &ctx);
+        preview.save(&ctx, output, &root.join(format!("{scene}.png")));
+    }
+}
+
 #[test]
 #[ignore = "Manual visual QA; writes only to the explicitly selected preview directory"]
 fn native_visual_preview() {
