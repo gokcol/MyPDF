@@ -16,6 +16,7 @@ pub mod home;
 pub mod identity;
 pub mod image_background;
 pub mod image_effects;
+pub mod image_region;
 #[cfg(target_os = "macos")]
 pub mod keychain;
 pub mod navigation;

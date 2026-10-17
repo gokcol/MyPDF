@@ -11,6 +11,8 @@ use mypdf_milestone0::{
 mod formatting;
 #[path = "image_effects.rs"]
 mod image_effects;
+#[path = "image_region.rs"]
+mod region;
 
 type Key = (u64, u64, usize);
 #[derive(Clone, PartialEq, Debug)]
@@ -192,6 +194,7 @@ pub(super) struct ContentState {
     pub(super) inspection: Option<Inspection>,
     selected: Option<usize>,
     image_effects: Option<image_effects::EmbeddedEffects>,
+    region: region::State,
     pub image_mode: bool,
     /// Another tool (Redact) owns the page overlay.
     pub(super) paused: bool,
@@ -394,6 +397,7 @@ impl ContentState {
             inspection: None,
             selected: None,
             image_effects: None,
+            region: region::State::default(),
             image_mode: false,
             paused: false,
             rect: [0.; 4],
@@ -918,7 +922,10 @@ impl Viewer {
             &self.content.inspection,
             self.content.selected,
             self.tabs.get(self.active).and_then(|t| t.session.as_ref()),
-        ) {
+        ) && let Ok(images) = &info.images
+            && let Some(image) = images.get(index)
+        {
+            let index = image.index;
             let key = (info.key, index);
             if self
                 .content
@@ -935,6 +942,14 @@ impl Viewer {
         egui::SidePanel::right("content_inspector").default_width(310.).width_range(280.0..=380.0).resizable(true).frame(egui::Frame::new().fill(theme::paper()).inner_margin(18.)).show(ctx,|ui|{
             egui::ScrollArea::vertical().id_salt("content_image_scroll").show(ui,|ui|{
             ui.heading("Edit PDF");ui.label(RichText::new(format!("Page {}",page+1)).small().color(theme::muted()));ui.add_space(12.);
+            if ui.add_enabled(editable && !self.content.busy, ActionButton::new(Icon::Crop, "Copy region").selected(self.content.region.active)).on_hover_text("Draw a rectangle around any artwork, logo or scanned content to copy it into an editable image layer").clicked() {
+                self.content.region.active = !self.content.region.active;
+                self.content.region.drag = None;
+                self.content.selected = None;
+                self.content.region.key = self.tabs.get(self.active).and_then(|t| t.session.as_ref().map(|s| (t.id, s.revision(), t.page)));
+            }
+            if self.content.region.active { ui.label("Drag around the artwork on the page. Esc cancels."); }
+            ui.add_space(8.);
             if self.content.loading{ui.spinner();ui.label("Inspecting page…");return;}
             let Some(info)=&self.content.inspection else{ui.label("Open a PDF to begin.");return};
             if !editable{ui.label(RichText::new(if self.content.busy{"Applying changes…"}else{"This document is read-only."}).color(theme::muted()));}
@@ -944,7 +959,7 @@ impl Viewer {
                     match &info.images{Err(e)=>{ui.label(e);},Ok(images)=>{
                         ui.label(RichText::new("Select an image here or on the page.").small().color(theme::muted()));
                         egui::ScrollArea::vertical().id_salt("image_objects").max_height(205.).show(ui,|ui|{for (i,image) in images.iter().enumerate(){if ui.selectable_label(self.content.selected==Some(i),format!("{}  ·  {} × {} px",image.name,image.pixels[0],image.pixels[1])).clicked(){self.content.selected=Some(i);self.content.rect=[image.rect[0],image.rect[1],image.rect[2]-image.rect[0],image.rect[3]-image.rect[1]];}}});
-                        if images.is_empty(){ui.label("No directly editable image objects on this page.");}
+                        if images.is_empty(){ui.label("No separate image objects found. Use Copy region for logos, grouped artwork or scanned page details.");}
                         if let Some(image)=self.content.selected.and_then(|i|images.get(i)){
                             ui.separator();ui.label("Position & size · points");
                             ui.add_enabled_ui(editable,|ui|{egui::Grid::new("image_dimensions").num_columns(2).spacing([12.,10.]).show(ui,|ui|{for(label,v)in ["X","Y","Width","Height"].into_iter().zip(&mut self.content.rect){ui.label(label);ui.add(egui::DragValue::new(v).speed(1.).range(-99_999.0..=99_999.0));ui.end_row();}});ui.add_space(8.);
@@ -2369,6 +2384,10 @@ pub(super) fn overlay(
     scale: f32,
 ) {
     if mode != editing::Mode::Edit || state.paused {
+        return;
+    }
+    if state.image_mode && state.region.active {
+        region::overlay(&mut state.region, tab, ui, page, page_rect, scale);
         return;
     }
     if state.add_target.is_some() && !state.busy && tab.session.as_ref().is_some_and(|s| s.editable)

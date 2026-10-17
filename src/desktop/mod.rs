@@ -1951,6 +1951,7 @@ impl eframe::App for Viewer {
         self.editor_windows(ctx);
         self.digital_window(ctx);
         self.background_window(ctx);
+        self.image_region_window(ctx);
         self.header_footer_window(ctx);
         self.redaction_dialogs(ctx);
         self.signature_dialogs(ctx);
