@@ -108,6 +108,12 @@ try {
         [xml]$roundTrip = Get-Content (Join-Path $unpacked 'AppxManifest.xml') -Raw
         if ($roundTrip.Package.Identity.Name -ne $IdentityName -or $roundTrip.Package.Identity.Publisher -ne $Publisher -or
             $roundTrip.Package.Identity.Version -ne $PackageVersion) { throw 'Packaged identity does not match the requested identity.' }
+        $roundTripVisual = $roundTrip.GetElementsByTagName('VisualElements', 'http://schemas.microsoft.com/appx/manifest/uap/windows10')[0]
+        if ($roundTrip.Package.Properties.DisplayName -cne $DisplayName -or
+            $roundTrip.Package.Properties.PublisherDisplayName -cne $PublisherDisplayName -or
+            $roundTripVisual.GetAttribute('DisplayName') -cne $DisplayName) {
+            throw 'Packaged display names do not match the requested Store names.'
+        }
         if (Test-Path (Join-Path $unpacked 'AppxSignature.p7x')) { throw 'The Store submission artifact should be unsigned.' }
         $digest = (Get-FileHash $package -Algorithm SHA256).Hash.ToLowerInvariant()
         "$digest  $name" | Set-Content "$package.sha256" -Encoding ascii
