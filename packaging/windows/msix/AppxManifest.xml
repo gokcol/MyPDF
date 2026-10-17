@@ -9,7 +9,7 @@
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   IgnorableNamespaces="uap uap3 uap10 desktop6 virtualization rescap">
   <!-- The packaging script replaces these values; this template is not a Store identity. -->
-  <Identity Name="MyPDF.Placeholder" Publisher="CN=Placeholder" Version="1.0.0.0" ProcessorArchitecture="x64" />
+  <Identity Name="MyPDF.Placeholder" Publisher="CN=Placeholder" Version="1.1.0.0" ProcessorArchitecture="x64" />
   <Properties>
     <DisplayName>MyPDF</DisplayName>
     <PublisherDisplayName>Placeholder</PublisherDisplayName>
