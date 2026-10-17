@@ -14,6 +14,15 @@ pub(super) struct Arrivals {
     pub paths: Vec<PathBuf>,
     pub focus: bool,
 }
+impl Arrivals {
+    pub fn activate(&self, ctx: &egui::Context) {
+        if self.focus {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+}
 static WAITING: Mutex<Arrivals> = Mutex::new(Arrivals {
     paths: Vec::new(),
     focus: false,
@@ -27,7 +36,7 @@ fn deliver(paths: Vec<PathBuf>, focus: bool) {
     {
         let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
         waiting.paths.extend(paths);
-        waiting.focus |= focus;
+        waiting.focus |= focus || !waiting.paths.is_empty();
     }
     if let Some(ctx) = WAKE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         ctx.request_repaint();
@@ -211,7 +220,7 @@ mod mac {
             #[unsafe(method(openDocuments:withReply:))]
             fn open_documents(&self, event: *mut AnyObject, _: *mut AnyObject) {
                 // SAFETY: AppKit passes the open-documents Apple event.
-                super::deliver(unsafe { paths(event) }, false);
+                super::deliver(unsafe { paths(event) }, true);
             }
         }
     );
@@ -302,7 +311,6 @@ mod tests {
             vec![PathBuf::from("/tmp/a.pdf"), PathBuf::from("/tmp/b.pdf")],
             false,
         );
-        deliver(vec![], true);
         assert_eq!(
             take(&ctx),
             Arrivals {
@@ -311,6 +319,39 @@ mod tests {
             }
         );
         assert_eq!(take(&ctx), Arrivals::default(), "each file is opened once");
+        deliver(vec![], true);
+        assert!(
+            take(&ctx).focus,
+            "a reopen request also activates the window"
+        );
+    }
+
+    #[test]
+    fn external_open_restores_and_raises_once() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(Default::default(), |ctx| {
+            Arrivals {
+                paths: vec![],
+                focus: true,
+            }
+            .activate(ctx);
+        });
+        let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert_eq!(
+            commands,
+            &[
+                egui::ViewportCommand::Minimized(false),
+                egui::ViewportCommand::Visible(true),
+                egui::ViewportCommand::Focus,
+            ]
+        );
+        let output = ctx.run(Default::default(), |ctx| Arrivals::default().activate(ctx));
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .is_empty(),
+            "ordinary frames must not steal focus"
+        );
     }
 
     #[test]

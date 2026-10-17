@@ -46,17 +46,27 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+}
+
 impl PageText {
     /// Map Unicode lowercase expansions back to original UTF-8 character spans.
     pub fn find(&self, query: &str, page: usize) -> Vec<SearchHit> {
+        self.find_with(query, page, SearchOptions::default())
+    }
+    pub fn find_with(&self, query: &str, page: usize, options: SearchOptions) -> Vec<SearchHit> {
         if query.trim().is_empty() {
             return vec![];
         }
-        let needle = query
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase();
+        let needle = query.split_whitespace().collect::<Vec<_>>().join(" ");
+        let needle = if options.case_sensitive {
+            needle
+        } else {
+            needle.to_lowercase()
+        };
         let mut folded = String::new();
         let mut mapping = Vec::new();
         for (start, c) in self.text.char_indices() {
@@ -67,7 +77,12 @@ impl PageText {
                 }
                 continue;
             }
-            for lower in c.to_lowercase() {
+            let chars = if options.case_sensitive {
+                c.to_string()
+            } else {
+                c.to_lowercase().collect()
+            };
+            for lower in chars.chars() {
                 for _ in 0..lower.len_utf8() {
                     mapping.push(start..start + c.len_utf8());
                 }
@@ -77,6 +92,18 @@ impl PageText {
         let chars: Vec<_> = self.text.char_indices().collect();
         folded
             .match_indices(&needle)
+            .filter(|(start, matched)| {
+                if !options.whole_word {
+                    return true;
+                }
+                let word = |c: char| {
+                    c.is_alphanumeric() || c == '_' || ('\u{300}'..='\u{36f}').contains(&c)
+                };
+                let a = mapping[*start].start;
+                let b = mapping[*start + matched.len() - 1].end;
+                !self.text[..a].chars().next_back().is_some_and(word)
+                    && !self.text[b..].chars().next().is_some_and(word)
+            })
             .take(1000)
             .map(|(start, matched)| {
                 let range = mapping[start].start..mapping[start + matched.len() - 1].end;
@@ -112,6 +139,7 @@ struct SearchRequest {
     generation: u64,
     pages: Vec<Option<Arc<PageText>>>,
     query: String,
+    options: SearchOptions,
 }
 /// One bounded, cancellable search queue per tab. No PDF or platform objects cross threads.
 pub struct SearchWorker {
@@ -146,7 +174,7 @@ impl SearchWorker {
                         break;
                     }
                     if let Some(text) = text {
-                        hits.extend(text.find(&request.query, page));
+                        hits.extend(text.find_with(&request.query, page, request.options));
                     }
                     if hits.len() >= 10_000 {
                         hits.truncate(10_000);
@@ -175,12 +203,21 @@ impl SearchWorker {
         self.generation.load(Ordering::Relaxed)
     }
     pub fn request(&self, pages: Vec<Option<Arc<PageText>>>, query: String) -> bool {
+        self.request_with(pages, query, SearchOptions::default())
+    }
+    pub fn request_with(
+        &self,
+        pages: Vec<Option<Arc<PageText>>>,
+        query: String,
+        options: SearchOptions,
+    ) -> bool {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.requests
             .try_send(SearchRequest {
                 generation,
                 pages,
                 query,
+                options,
             })
             .is_ok()
     }

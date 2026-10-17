@@ -129,6 +129,10 @@ impl Viewer {
                 .show(ui, |ui| ui.horizontal(|ui| add(ui)));
         };
         let mut leave = false;
+        let mut turn = None;
+        let at_bottom = ctx
+            .pointer_hover_pos()
+            .is_some_and(|p| p.y > ctx.content_rect().bottom() - 70.);
         if bar > 0. {
             egui::Area::new(egui::Id::new("zen_exit"))
                 .order(egui::Order::Foreground)
@@ -155,7 +159,42 @@ impl Viewer {
                     });
                 });
         }
-        if number > 0. && !bar_visible {
+        if at_bottom || welcome {
+            egui::Area::new(egui::Id::new("zen_navigation"))
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_BOTTOM, vec2(0., -18.))
+                .show(ctx, |ui| {
+                    card(ui, &mut |ui| {
+                        if ui
+                            .add_enabled(
+                                page > 0,
+                                ActionButton::new(Icon::Left, "Previous page").compact(),
+                            )
+                            .clicked()
+                        {
+                            turn = Some(page.saturating_sub(1));
+                        }
+                        ui.label(format!("{} / {pages}", page + 1));
+                        if ui
+                            .add_enabled(
+                                page + 1 < pages,
+                                ActionButton::new(Icon::Right, "Next page").compact(),
+                            )
+                            .clicked()
+                        {
+                            turn = Some(page + 1);
+                        }
+                        ui.separator();
+                        if ui
+                            .add(ActionButton::new(Icon::Close, "Leave Zen mode").compact())
+                            .clicked()
+                        {
+                            leave = true;
+                        }
+                    });
+                });
+        }
+        if number > 0. && !bar_visible && !at_bottom {
             egui::Area::new(egui::Id::new("zen_page_number"))
                 .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_BOTTOM, vec2(0., -22.))
@@ -170,6 +209,9 @@ impl Viewer {
                         );
                     });
                 });
+        }
+        if let Some(page) = turn {
+            self.tabs[self.active].jump(page);
         }
         if leave {
             self.toggle_zen(ctx);

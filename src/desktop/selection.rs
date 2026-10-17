@@ -29,6 +29,8 @@ pub(super) struct GroupGesture {
     start: [f32; 2],
     drag: Drag,
     originals: Vec<Annotation>,
+    duplicate: bool,
+    guides: manipulation::Guides,
     preview: Vec<Annotation>,
 }
 
@@ -372,7 +374,7 @@ pub(super) fn begin(
     page: usize,
     p: [f32; 2],
     scale: f32,
-    additive: bool,
+    modifiers: egui::Modifiers,
 ) -> bool {
     if !matches!(editor.mode, Mode::Annotate | Mode::Draw)
         || !matches!(editor.tool, Tool::Select | Tool::Lasso)
@@ -389,6 +391,8 @@ pub(super) fn begin(
             drag,
             preview: originals.clone(),
             originals,
+            duplicate: modifiers.alt && matches!(drag, Drag::Move),
+            guides: Default::default(),
         });
         return true;
     }
@@ -396,7 +400,10 @@ pub(super) fn begin(
         let on_handle = tab.selected_annotation.as_ref().is_some_and(|id| {
             tab.session.as_ref().is_some_and(|s| {
                 s.annotations.iter().any(|a| {
-                    &a.id == id && a.page == page && editing::corner_at(a, p, scale).is_some()
+                    &a.id == id
+                        && a.page == page
+                        && (editing::corner_at(a, p, scale).is_some()
+                            || manipulation::endpoint_at(a, p, scale).is_some())
                 })
             })
         });
@@ -409,12 +416,13 @@ pub(super) fn begin(
         page,
         points: vec![p],
         lasso: editor.tool == Tool::Lasso,
-        additive,
+        additive: modifiers.shift,
     });
     true
 }
 
 /// Follow the pointer during a marquee or group drag; finish on release.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn update(
     editor: &mut EditorState,
     tab: &mut Tab,
@@ -422,6 +430,7 @@ pub(super) fn update(
     pointer: Option<[f32; 2]>,
     released: bool,
     scale: f32,
+    modifiers: egui::Modifiers,
     status: &mut Option<(String, bool)>,
 ) {
     if let Some(mut m) = editor.marquee.take() {
@@ -462,7 +471,29 @@ pub(super) fn update(
             && let Some(size) = tab.pages.get(page).copied()
         {
             g.preview = match g.drag {
-                Drag::Move => moved(&g.originals, [p[0] - g.start[0], p[1] - g.start[1]], size),
+                Drag::Move => {
+                    let mut delta = [p[0] - g.start[0], p[1] - g.start[1]];
+                    if modifiers.shift {
+                        if delta[0].abs() > delta[1].abs() {
+                            delta[1] = 0.;
+                        } else {
+                            delta[0] = 0.;
+                        }
+                    }
+                    let moved = moved(&g.originals, delta, size);
+                    let ids = g.originals.iter().map(|a| a.id.clone()).collect::<Vec<_>>();
+                    let (delta, guides) = if editor.snapping
+                        && !modifiers.command
+                        && !modifiers.ctrl
+                        && !modifiers.shift
+                    {
+                        manipulation::snap(tab, page, union_bounds(moved.iter()), &ids, scale)
+                    } else {
+                        ([0., 0.], Default::default())
+                    };
+                    g.guides = guides;
+                    self::moved(&moved, delta, size)
+                }
                 Drag::Scale { anchor, corner } => {
                     let s = scale_factor(&g.originals, anchor, corner, p, size);
                     scaled(&g.originals, anchor, s)
@@ -470,7 +501,25 @@ pub(super) fn update(
             };
         }
         if released {
-            if g.preview != g.originals {
+            if g.duplicate {
+                let copies: Vec<_> = g
+                    .preview
+                    .into_iter()
+                    .map(|mut a| {
+                        a.id = format!("{:032x}", rand::random::<u128>());
+                        a
+                    })
+                    .collect();
+                let ids = copies.iter().map(|a| a.id.clone()).collect();
+                if let Some(s) = &mut tab.session {
+                    let mut entries = s.annotations.clone();
+                    entries.extend(copies);
+                    match s.commit(entries) {
+                        Ok(()) => set(tab, editor, ids),
+                        Err(e) => *status = Some((format!("{e:#}"), true)),
+                    }
+                }
+            } else if g.preview != g.originals {
                 commit(tab, &g.preview, None, status);
             }
         } else {
@@ -479,6 +528,22 @@ pub(super) fn update(
     }
 }
 
+pub(super) fn duplicates(editor: &EditorState, tab: u64, page: usize) -> Vec<Annotation> {
+    editor
+        .group_gesture
+        .as_ref()
+        .filter(|g| g.tab == tab && g.page == page && g.duplicate)
+        .map(|g| g.preview.clone())
+        .unwrap_or_default()
+}
+pub(super) fn guides(editor: &EditorState, tab: u64, page: usize) -> manipulation::Guides {
+    editor
+        .group_gesture
+        .as_ref()
+        .filter(|g| g.tab == tab && g.page == page)
+        .map(|g| g.guides)
+        .unwrap_or_default()
+}
 /// The in-flight preview of a mark being moved or scaled with its group.
 pub(super) fn preview<'a>(
     editor: &'a EditorState,
@@ -489,7 +554,7 @@ pub(super) fn preview<'a>(
     editor
         .group_gesture
         .as_ref()
-        .filter(|g| g.tab == tab && g.page == page)
+        .filter(|g| g.tab == tab && g.page == page && !g.duplicate)
         .and_then(|g| g.preview.iter().find(|a| a.id == id))
 }
 
@@ -648,6 +713,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         app.editor.mode = Mode::Draw;
+        app.editor.snapping = false;
         app.inspector = true;
         let marks = vec![
             Annotation::new(
@@ -802,6 +868,7 @@ mod tests {
             "the group stays selected after moving"
         );
         app.editor_undo(false);
+        frame(&mut app, &ctx, vec![], egui::Modifiers::NONE);
         assert_eq!(rect_of(&app, &marks[0].id), marks[0].rect);
         assert_eq!(rect_of(&app, &marks[1].id), marks[1].rect);
         assert_eq!(
@@ -952,5 +1019,67 @@ mod tests {
         let middle = aligned(&marks, Align::Middle);
         let center_y = |a: &Annotation| (a.bounds()[1] + a.bounds()[3]) / 2.;
         assert!((center_y(&middle[0]) - center_y(&middle[1])).abs() < 0.01);
+    }
+    #[test]
+    fn option_drag_duplicates_single_and_group_with_one_undo_and_snapping_matches_edges() {
+        let (ctx, mut app, marks) = setup();
+        set(&mut app.tabs[0], &mut app.editor, vec![marks[0].id.clone()]);
+        let rev = app.tabs[0].session.as_ref().unwrap().revision();
+        drag(
+            &mut app,
+            &ctx,
+            &[[130., 130.], [180., 210.]],
+            egui::Modifiers::ALT,
+        );
+        let s = app.tabs[0].session.as_mut().unwrap();
+        assert_eq!(s.annotations.len(), 4);
+        assert_eq!(s.annotations[0], marks[0]);
+        assert_eq!(s.revision(), rev + 1);
+        assert!(
+            s.annotations
+                .iter()
+                .any(|a| a.id != marks[0].id && close(a.rect, [150., 180., 210., 240.]))
+        );
+        s.undo();
+        assert_eq!(s.annotations.len(), 3);
+        set(
+            &mut app.tabs[0],
+            &mut app.editor,
+            vec![marks[0].id.clone(), marks[1].id.clone()],
+        );
+        drag(
+            &mut app,
+            &ctx,
+            &[[130., 130.], [170., 170.]],
+            egui::Modifiers::ALT,
+        );
+        let s = app.tabs[0].session.as_mut().unwrap();
+        assert_eq!(s.annotations.len(), 5);
+        assert_eq!(s.annotations[0], marks[0]);
+        assert_eq!(s.annotations[1], marks[1]);
+        s.undo();
+        assert_eq!(s.annotations.len(), 3);
+        set(&mut app.tabs[0], &mut app.editor, vec![marks[0].id.clone()]);
+        frame(&mut app, &ctx, vec![], egui::Modifiers::NONE);
+        app.editor.snapping = true;
+        drag(
+            &mut app,
+            &ctx,
+            &[[130., 130.], [229., 130.]],
+            egui::Modifiers::NONE,
+        );
+        assert!(
+            (rect_of(&app, &marks[0].id)[0] - 200.).abs() < 0.1,
+            "nearby left edges snap together: {:?}",
+            rect_of(&app, &marks[0].id)
+        );
+        let bytes = app.tabs[0]
+            .session
+            .as_ref()
+            .unwrap()
+            .snapshot_bytes()
+            .unwrap();
+        let pdf = lopdf::Document::load_mem(&bytes).unwrap();
+        assert_eq!(ann::load(&pdf).len(), 3, "saved PDF retains all marks");
     }
 }

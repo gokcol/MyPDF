@@ -62,3 +62,5 @@ pub fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     })?;
     Ok(())
 }
+
+pub mod rich_text;

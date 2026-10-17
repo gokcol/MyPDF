@@ -13,6 +13,7 @@ pub struct Selection {
 #[derive(Clone, Debug)]
 pub struct Replacement {
     pub selection: Selection,
+    pub spans: Vec<crate::rich_text::Span>,
     pub text: String,
     /// Displayed page coordinates: left, top, width, height.
     pub rect: [f32; 4],
@@ -123,6 +124,9 @@ pub fn replace(bytes: &[u8], page: u32, block: &Replacement) -> Result<Vec<u8>> 
     }
     if block.text.trim().is_empty() {
         return Ok(stripped);
+    }
+    if !block.spans.is_empty() {
+        return crate::rich_text::add(&stripped, page, &block.text, block.rect, &block.spans);
     }
     crate::content::add_text_styled(
         &stripped,

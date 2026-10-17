@@ -1443,6 +1443,8 @@ impl Viewer {
                                         ))
                                         .color(theme::muted()),
                                     );
+                                    ui.label(RichText::new(format!("Certificate expires {}",entry.info.not_after)).small().color(theme::muted()));
+                                    ui.label(RichText::new(format!("Certificate ID: {}…",entry.info.sha256.chars().take(16).collect::<String>())).small().color(theme::muted())).on_hover_text(&entry.info.sha256);
                                     if matches!(entry.source, Source::File { .. }) {
                                         let r = ui::field(ui, "Passphrase of the digital ID file", |ui| {
                                             ui.add(
@@ -1607,7 +1609,7 @@ impl Viewer {
                             }
                         }
                         ui.label(
-                            RichText::new("New approval signature • offline verification • local signing time only. Save to a new filename.")
+                            RichText::new("This signature covers the document as it is now. Later edits are saved as changes after signing; recipients can see that the document was modified. Signing saves a new copy.")
                                 .small()
                                 .color(theme::muted()),
                         );
@@ -3337,7 +3339,9 @@ mod tests {
             .read_response(egui::Id::new((app.tabs[0].id, 0_usize, "page_actions")))
             .unwrap()
             .rect;
-        let at = page.min + vec2(300., 400.) * app.tabs[0].scale;
+        // Keep the click visible at first-page Fit Width, which is larger
+        // than fitting to this fixture's wider, rotated second page.
+        let at = page.min + vec2(300., 250.) * app.tabs[0].scale;
         for pressed in [true, false] {
             frame(
                 &mut app,
@@ -3356,7 +3360,7 @@ mod tests {
         let r = app.digital.request.rect.unwrap();
         assert!((r[2] - r[0] - 240.).abs() < 0.01 && (r[3] - r[1] - 72.).abs() < 0.01);
         assert!(
-            ((r[0] + r[2]) / 2. - 300.).abs() < 0.5 && ((r[1] + r[3]) / 2. - 400.).abs() < 0.5,
+            ((r[0] + r[2]) / 2. - 300.).abs() < 0.5 && ((r[1] + r[3]) / 2. - 250.).abs() < 0.5,
             "{r:?} page {page:?} scale {}",
             app.tabs[0].scale
         );

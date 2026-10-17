@@ -123,6 +123,14 @@ pub struct Asset {
     pub aspect: f32,
     #[serde(default)]
     pub stamp: bool,
+    #[serde(default)]
+    pub favorite: bool,
+    #[serde(default)]
+    pub folder: String,
+    #[serde(default)]
+    pub tags: String,
+    #[serde(default)]
+    pub last_used: i64,
 }
 impl Asset {
     pub fn new(name: &str, kind: Kind, style: Style, aspect: f32) -> Self {
@@ -133,6 +141,10 @@ impl Asset {
             style,
             aspect,
             stamp: false,
+            favorite: false,
+            folder: String::new(),
+            tags: String::new(),
+            last_used: 0,
         }
     }
     pub fn validate(&self) -> Result<()> {
@@ -144,6 +156,10 @@ impl Asset {
                 && self.aspect.is_finite()
                 && (0.02..=50.0).contains(&self.aspect),
             "Invalid asset details"
+        );
+        ensure!(
+            self.folder.len() <= 100 && self.tags.len() <= 400,
+            "Folder or tags are too long"
         );
         self.kind.validate()?;
         crate::annotations::Annotation::new(
@@ -444,7 +460,120 @@ pub fn builtin_assets() -> Vec<BuiltinAsset> {
             asset,
         });
     }
+    // Consistent rounded labels, drawn as editable vectors instead of bitmaps.
+    let navy = "#192d70";
+    let green = "#3d6c25";
+    let red = "#a82018";
+    for b in out.iter_mut().filter(|b| b.category == "Stamps") {
+        let color = if b.asset.name == "Approved" {
+            green
+        } else {
+            navy
+        };
+        b.asset.kind = label_stamp(&b.asset.name.to_uppercase(), color, false);
+        b.asset.aspect = stamp_width(&b.asset.name.to_uppercase()) / 64.;
+        b.asset.stamp = true;
+    }
+    for (label, color, pointer) in [
+        ("NOT APPROVED", red, false),
+        ("FINAL", green, false),
+        ("VOID", red, false),
+        ("FOR COMMENT", navy, false),
+        ("COMPLETED", green, false),
+        ("FOR PUBLIC RELEASE", navy, false),
+        ("NOT FOR PUBLIC RELEASE", navy, false),
+        ("PRELIMINARY RESULTS", navy, false),
+        ("INFORMATION ONLY", navy, false),
+        ("REVISED", navy, false),
+        ("RECEIVED", navy, false),
+        ("PAID", green, false),
+        ("PENDING", "#98670d", false),
+        ("REJECTED", red, false),
+        ("COPY", navy, false),
+        ("WITNESS", "#9a7000", true),
+        ("INITIAL HERE", "#594091", true),
+        ("SIGN HERE", red, true),
+    ] {
+        let mut asset = Asset::new(
+            label,
+            label_stamp(label, color, pointer),
+            Style::default(),
+            stamp_width(label) / 64.,
+        );
+        asset.id = format!("b27a{:028x}", out.len());
+        asset.stamp = true;
+        out.push(BuiltinAsset {
+            category: "Stamps",
+            asset,
+        });
+    }
+    for (label, body) in [
+        (
+            "Approved check",
+            r##"<path d="M13 50 L38 76 L88 17 L75 8 L37 53 L25 38 Z" fill="#7fa84b" stroke="#356720" stroke-width="4"/>"##,
+        ),
+        (
+            "Rejected cross",
+            r##"<path d="M22 12 L50 40 L78 12 L88 22 L60 50 L88 78 L78 88 L50 60 L22 88 L12 78 L40 50 L12 22 Z" fill="#ef584a" stroke="#a82018" stroke-width="4"/>"##,
+        ),
+        (
+            "Black check",
+            r##"<path d="M16 51 Q18 88 35 70 L84 19" fill="none" stroke="#202124" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>"##,
+        ),
+        (
+            "Black cross",
+            r##"<path d="M20 20 L80 80 M80 20 L20 80" stroke="#202124" stroke-width="9"/>"##,
+        ),
+    ] {
+        let source = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100">{body}</svg>"#
+        );
+        let mut asset = Asset::new(
+            label,
+            Kind::Svg {
+                source,
+                tint: false,
+            },
+            Style::default(),
+            1.,
+        );
+        asset.id = format!("b27a{:028x}", out.len());
+        asset.stamp = true;
+        out.push(BuiltinAsset {
+            category: "Stamps",
+            asset,
+        });
+    }
     out
+}
+fn stamp_width(text: &str) -> f32 {
+    (text.len() as f32 * 19. + 32.).max(150.)
+}
+fn label_stamp(text: &str, color: &str, pointer: bool) -> Kind {
+    let width = stamp_width(text);
+    let shape = if pointer {
+        format!(
+            r#"<path d="M2 32 L28 3 H{} Q{} 3 {} 15 V49 Q{} 61 {} 61 H28 Z"/>"#,
+            width - 15.,
+            width - 3.,
+            width - 3.,
+            width - 3.,
+            width - 15.
+        )
+    } else {
+        format!(
+            r#"<rect x="2" y="3" width="{}" height="58" rx="12"/>"#,
+            width - 4.
+        )
+    };
+    let source = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="64" viewBox="0 0 {width} 64"><g fill="{color}" fill-opacity="0.12" stroke="{color}" stroke-width="2">{shape}</g><text x="{}" y="43" text-anchor="middle" font-family="Arial,Helvetica,sans-serif" font-weight="700" font-size="28" fill="{color}">{text}</text></svg>"#,
+        width / 2. + if pointer { 8. } else { 0. }
+    );
+    Kind::Svg {
+        source,
+        tint: false,
+    }
 }
 pub struct Library {
     pub entries: Vec<Asset>,
