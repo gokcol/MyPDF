@@ -243,6 +243,10 @@ pub struct Annotation {
     pub page: usize,
     pub rect: Box2,
     pub rotation: f32,
+    #[serde(default)]
+    pub flip_x: bool,
+    #[serde(default)]
+    pub flip_y: bool,
     pub kind: Kind,
     pub style: Style,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -255,6 +259,8 @@ impl Annotation {
             page,
             rect,
             rotation: 0.0,
+            flip_x: false,
+            flip_y: false,
             kind,
             style,
             asset_id: None,
@@ -297,7 +303,36 @@ impl Annotation {
         ]
     }
     pub fn rotated(&self, p: Point2) -> Point2 {
-        rotate(p, self.rect, self.rotation)
+        rotate(self.reflected(p), self.rect, self.rotation)
+    }
+    fn reflected(&self, p: Point2) -> Point2 {
+        [
+            if self.flip_x {
+                self.rect[0] + self.rect[2] - p[0]
+            } else {
+                p[0]
+            },
+            if self.flip_y {
+                self.rect[1] + self.rect[3] - p[1]
+            } else {
+                p[1]
+            },
+        ]
+    }
+    fn untransformed(&self, p: Point2) -> Point2 {
+        self.reflected(rotate(p, self.rect, -self.rotation))
+    }
+    pub fn rotate_by(&mut self, degrees: f32) {
+        self.rotation = (self.rotation + degrees + 180.).rem_euclid(360.) - 180.;
+    }
+    /// Reflect in page coordinates, including objects that are already rotated.
+    pub fn flip_horizontal(&mut self) {
+        self.flip_x = !self.flip_x;
+        self.rotation = -self.rotation;
+    }
+    pub fn flip_vertical(&mut self) {
+        self.flip_y = !self.flip_y;
+        self.rotation = -self.rotation;
     }
     pub fn bounds(&self) -> Box2 {
         let mut points = vec![
@@ -321,13 +356,13 @@ impl Annotation {
         )
     }
     pub fn contains(&self, p: Point2) -> bool {
-        let p = rotate(p, self.rect, -self.rotation);
+        let p = self.untransformed(p);
         p[0] >= self.rect[0] && p[0] <= self.rect[2] && p[1] >= self.rect[1] && p[1] <= self.rect[3]
     }
     /// Hit the drawing itself rather than the empty corners of a diagonal line's box.
     /// Tolerance is supplied in page points, so the UI can keep a constant screen target.
     pub fn hit_test(&self, p: Point2, tolerance: f32) -> bool {
-        let p = rotate(p, self.rect, -self.rotation);
+        let p = self.untransformed(p);
         let tolerance = tolerance + self.style.width / 2.;
         let paths = if self.style.stroke == StrokeStyle::Wave {
             primitives(self)
@@ -1099,6 +1134,10 @@ pub fn appearance(
         (a.rect[0] + a.rect[2]) as f64 / 2.0,
         (a.rect[1] + a.rect[3]) as f64 / 2.0,
     )) * Affine::rotate(a.rotation.to_radians() as f64)
+        * Affine::scale_non_uniform(
+            if a.flip_x { -1. } else { 1. },
+            if a.flip_y { -1. } else { 1. },
+        )
         * Affine::translate((
             -(a.rect[0] + a.rect[2]) as f64 / 2.0,
             -(a.rect[1] + a.rect[3]) as f64 / 2.0,

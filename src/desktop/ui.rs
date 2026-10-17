@@ -290,6 +290,10 @@ pub(super) enum Icon {
     Library,
     Undo,
     Redo,
+    RotateLeft,
+    RotateRight,
+    FlipHorizontal,
+    FlipVertical,
     Reload,
     Select,
     Highlight,
@@ -831,6 +835,36 @@ pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: 
                 box_at([x, y], [x + 0.34, y + 0.34], 0.07);
             }
             fill_box([0.56, 0.56], [0.9, 0.9], 0.07, soft);
+        }
+        Icon::FlipHorizontal | Icon::FlipVertical => {
+            let orient = |v: [f32; 2]| {
+                if matches!(icon, Icon::FlipVertical) {
+                    [v[1], v[0]]
+                } else {
+                    v
+                }
+            };
+            for y in [0.1, 0.4, 0.7] {
+                line(&[orient([0.5, y]), orient([0.5, y + 0.16])]);
+            }
+            line(&[[0.12, 0.76], [0.36, 0.24], [0.36, 0.76], [0.12, 0.76]].map(orient));
+            line(&[[0.88, 0.76], [0.64, 0.24], [0.64, 0.76], [0.88, 0.76]].map(orient));
+        }
+        Icon::RotateLeft | Icon::RotateRight => {
+            let flip = |v: [f32; 2]| {
+                if matches!(icon, Icon::RotateRight) {
+                    [1. - v[0], v[1]]
+                } else {
+                    v
+                }
+            };
+            line(
+                &arc([0.5, 0.5], 0.32, -150., 140.)
+                    .into_iter()
+                    .map(flip)
+                    .collect::<Vec<_>>(),
+            );
+            line(&[[0.14, 0.12], [0.2, 0.36], [0.43, 0.29]].map(flip));
         }
         Icon::Undo | Icon::Redo => {
             let flip = |v: [f32; 2]| {

@@ -5,6 +5,63 @@ use super::*;
 use editing::{EditorState, Mode, Tool};
 use mypdf_milestone0::annotations::{self as ann, Annotation, Box2, Kind};
 
+#[derive(Clone, Copy)]
+pub(super) enum Transform {
+    Rotate(f32),
+    FlipHorizontal,
+    FlipVertical,
+}
+
+/// Transform around the selection center, preserving spacing within a group.
+pub(super) fn transformed(marks: &[Annotation], transform: Transform) -> Vec<Annotation> {
+    if marks.is_empty() {
+        return vec![];
+    }
+    // The centroid stays fixed as the angle changes; a newly measured axis-aligned
+    // bounding box can shift its center after each small rotation of a group.
+    let center = marks
+        .iter()
+        .fold([0., 0.], |c, a| {
+            [
+                c[0] + (a.rect[0] + a.rect[2]) / 2.,
+                c[1] + (a.rect[1] + a.rect[3]) / 2.,
+            ]
+        })
+        .map(|v| v / marks.len() as f32);
+    marks
+        .iter()
+        .map(|a| {
+            let mut out = a.clone();
+            let p = [(a.rect[0] + a.rect[2]) / 2., (a.rect[1] + a.rect[3]) / 2.];
+            // A single object's own center is stable even when its artwork overhangs.
+            let center = if marks.len() == 1 { p } else { center };
+            let d = [p[0] - center[0], p[1] - center[1]];
+            let target = match transform {
+                Transform::Rotate(angle) => {
+                    out.rotate_by(angle);
+                    let (sin, cos) = angle.to_radians().sin_cos();
+                    [
+                        center[0] + d[0] * cos - d[1] * sin,
+                        center[1] + d[0] * sin + d[1] * cos,
+                    ]
+                }
+                Transform::FlipHorizontal => {
+                    out.flip_horizontal();
+                    [center[0] - d[0], p[1]]
+                }
+                Transform::FlipVertical => {
+                    out.flip_vertical();
+                    [p[0], center[1] - d[1]]
+                }
+            };
+            for i in 0..4 {
+                out.rect[i] += target[i % 2] - p[i % 2];
+            }
+            out
+        })
+        .collect()
+}
+
 /// A rectangle marquee or freeform lasso being dragged on one page.
 pub(super) struct Marquee {
     tab: u64,
@@ -830,6 +887,42 @@ mod tests {
         a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.05)
     }
 
+    #[test]
+    fn group_transforms_preserve_relative_geometry_and_are_reversible() {
+        let a = Annotation::new(
+            0,
+            [10., 20., 80., 50.],
+            Kind::Rectangle,
+            ann::Style::default(),
+        );
+        let mut b = Annotation::new(
+            0,
+            [120., 100., 180., 160.],
+            Kind::Ellipse,
+            ann::Style::default(),
+        );
+        b.rotate_by(25.);
+        let original = vec![a, b];
+        for (operation, inverse) in [
+            (Transform::Rotate(90.), Transform::Rotate(-90.)),
+            (Transform::Rotate(37.), Transform::Rotate(-37.)),
+            (Transform::FlipHorizontal, Transform::FlipHorizontal),
+            (Transform::FlipVertical, Transform::FlipVertical),
+        ] {
+            let changed = transformed(&original, operation);
+            assert_ne!(changed, original);
+            let restored = transformed(&changed, inverse);
+            for (a, b) in original.iter().zip(&restored) {
+                for i in 0..4 {
+                    assert!((a.rect[i] - b.rect[i]).abs() < 0.001);
+                }
+                assert_eq!(
+                    (a.rotation, a.flip_x, a.flip_y),
+                    (b.rotation, b.flip_x, b.flip_y)
+                );
+            }
+        }
+    }
     #[test]
     fn marquee_selects_by_center_then_group_moves_and_scales_as_one_undo_step() {
         let (ctx, mut app, marks) = setup();

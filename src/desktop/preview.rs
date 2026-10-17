@@ -183,6 +183,8 @@ fn native_visual_preview() {
         "Convert",
         "Draw",
         "Inspector",
+        "SheetLayout",
+        "SignatureImage",
         "AddText",
         "Prompt",
         "Confirmation",
@@ -634,6 +636,12 @@ fn native_visual_preview() {
             app.tabs[0].session.as_mut().unwrap().mark_unsaved();
             app.close_intent = Some(Some(app.tabs[0].id));
         }
+        if collection == "SheetLayout" {
+            app.preview_nup();
+        }
+        if collection == "SignatureImage" {
+            app.preview_signature_image();
+        }
         app.organizer.crop = collection == "Crop";
         app.editor.library_open = matches!(collection, "Arrows" | "Symbols" | "Stamps");
         app.editor.library_tab = collection.into();
@@ -643,6 +651,7 @@ fn native_visual_preview() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while !app.tabs[0].pending.is_empty()
             || app.content.loading
+            || app.nup_preview_pending()
             || (app.home.visible && app.home.preview_pending())
         {
             assert!(std::time::Instant::now() < deadline);

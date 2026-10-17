@@ -100,6 +100,8 @@ pub(super) fn move_endpoint(
     let h = (points[0][1] - points[1][1]).abs().max(1.);
     out.rect = [x, y, x + w, y + h];
     out.rotation = 0.;
+    out.flip_x = false;
+    out.flip_y = false;
     let local = points.map(|p| [(p[0] - x) / w, (p[1] - y) / h]);
     match &mut out.kind {
         Kind::Line { start, end, .. } | Kind::DoubleArrow { start, end } => {
@@ -127,6 +129,7 @@ mod tests {
             Style::default(),
         );
         a.rotation = 30.;
+        a.flip_horizontal();
         let before = endpoints(&a).unwrap();
         let b = move_endpoint(&a, 1, [300., 320.], false);
         assert_eq!(endpoints(&b).unwrap(), [before[0], [300., 320.]]);

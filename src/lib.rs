@@ -17,6 +17,7 @@ pub mod identity;
 #[cfg(target_os = "macos")]
 pub mod keychain;
 pub mod navigation;
+pub mod nup;
 pub mod ocr;
 pub mod pages;
 pub mod pdf_font;

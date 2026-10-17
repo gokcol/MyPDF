@@ -78,6 +78,7 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             &item("save", "Save As…", Code::KeyS, Modifiers::SHIFT),
             &P::separator(),
             &item("print", "Print…", Code::KeyP, Modifiers::empty()),
+            &MenuItem::with_id("nup", "Multiple Pages per Sheet…", true, None),
             &MenuItem::with_id("compare", "Compare Documents…", true, None),
             &P::separator(),
             &MenuItem::with_id("protect", "Protect with Password…", true, None),

@@ -133,6 +133,19 @@ pub struct Asset {
     pub last_used: i64,
 }
 impl Asset {
+    /// Normalize a local signature/artwork image, preserving alpha and aspect ratio.
+    pub fn from_image(path: &Path) -> Result<Self> {
+        let png = import_artwork(path)?;
+        let image = decode_png(&png)?;
+        let asset = Self::new(
+            &path.file_stem().unwrap_or_default().to_string_lossy(),
+            Kind::Image { png },
+            Style::default(),
+            image.width() as f32 / image.height() as f32,
+        );
+        asset.validate()?;
+        Ok(asset)
+    }
     pub fn new(name: &str, kind: Kind, style: Style, aspect: f32) -> Self {
         Self {
             id: format!("{:032x}", rand::random::<u128>()),

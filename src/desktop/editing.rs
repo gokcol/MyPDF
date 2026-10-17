@@ -227,6 +227,13 @@ impl Default for SvgEditor {
         }
     }
 }
+#[derive(Clone, Copy, PartialEq)]
+enum SignatureInput {
+    Draw,
+    Type,
+    Image,
+}
+
 pub(super) struct EditorState {
     svg: SvgEditor,
     pub mode: Mode,
@@ -266,7 +273,12 @@ pub(super) struct EditorState {
     builtins: Vec<assets::BuiltinAsset>,
     signature_name: String,
     signature_typed: String,
-    signature_is_typed: bool,
+    signature_input: SignatureInput,
+    signature_image: Option<Asset>,
+    signature_error: Option<String>,
+    signature_tx: mpsc::Sender<Result<Asset, String>>,
+    signature_rx: mpsc::Receiver<Result<Asset, String>>,
+    signature_busy: bool,
     signature_strokes: Vec<Vec<[f32; 2]>>,
     signature_pressed: Option<[f32; 2]>,
     signature_active: bool,
@@ -287,6 +299,7 @@ impl EditorState {
             Err(e) => (None, Some(format!("{e:#}"))),
         };
         let (import_tx, import_rx) = mpsc::channel();
+        let (signature_tx, signature_rx) = mpsc::channel();
         Self {
             svg: SvgEditor::default(),
             mode: Mode::Read,
@@ -323,7 +336,12 @@ impl EditorState {
             builtins: assets::builtin_assets(),
             signature_name: "My handwritten signature".into(),
             signature_typed: String::new(),
-            signature_is_typed: false,
+            signature_input: SignatureInput::Draw,
+            signature_image: None,
+            signature_error: None,
+            signature_tx,
+            signature_rx,
+            signature_busy: false,
             signature_strokes: vec![],
             signature_pressed: None,
             signature_active: false,
@@ -730,6 +748,51 @@ fn color(rgb: [f32; 3], opacity: f32) -> Color32 {
         (opacity * 255.0) as u8,
     )
 }
+fn transform_controls(
+    ui: &mut egui::Ui,
+    a: &Annotation,
+    angle: bool,
+) -> Option<selection::Transform> {
+    use selection::Transform;
+    let mut action = None;
+    for (icon, label, transform) in [
+        (Icon::RotateLeft, "Rotate −90°", Transform::Rotate(-90.)),
+        (Icon::RotateRight, "Rotate 90°", Transform::Rotate(90.)),
+        (
+            Icon::FlipHorizontal,
+            "Flip horizontal",
+            Transform::FlipHorizontal,
+        ),
+        (Icon::FlipVertical, "Flip vertical", Transform::FlipVertical),
+    ] {
+        if ui.add(ActionButton::new(icon, label).compact()).clicked() {
+            action = Some(transform);
+        }
+    }
+    if angle {
+        let mut degrees = a.rotation;
+        let response = ui
+            .add(
+                egui::DragValue::new(&mut degrees)
+                    .range(-180.0..=180.0)
+                    .speed(0.5)
+                    .suffix("°"),
+            )
+            .on_hover_text("Rotation angle — type a value or drag");
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::DragValue,
+                ui.is_enabled(),
+                "Rotation angle",
+            )
+        });
+        if response.changed() {
+            action = Some(Transform::Rotate(degrees - a.rotation));
+        }
+    }
+    action
+}
+
 pub(super) fn paint_annotation(
     editor: &mut EditorState,
     ctx: &egui::Context,
@@ -806,10 +869,25 @@ pub(super) fn paint_annotation(
                         (rect[1] + rect[3]) / 2.0 - galley.size().y / scale / 2.0,
                     ];
                 }
-                painter.add(
-                    egui::epaint::TextShape::new(point(p), galley, c)
-                        .with_angle(a.rotation.to_radians()),
-                );
+                if a.flip_x || a.flip_y {
+                    // Transform glyph vertices as well as the text origin: mirrored
+                    // text must match its saved PDF appearance, not just move sides.
+                    for row in &galley.rows {
+                        let mut mesh = row.visuals.mesh.clone();
+                        for v in &mut mesh.vertices {
+                            v.pos = point([
+                                p[0] + (row.pos.x + v.pos.x) / scale,
+                                p[1] + (row.pos.y + v.pos.y) / scale,
+                            ]);
+                        }
+                        painter.add(egui::Shape::mesh(mesh));
+                    }
+                } else {
+                    painter.add(
+                        egui::epaint::TextShape::new(point(p), galley, c)
+                            .with_angle(a.rotation.to_radians()),
+                    );
+                }
             }
             Primitive::Image { png, rect } => {
                 let key = mypdf_milestone0::identity::fingerprint(&png);
@@ -1838,6 +1916,17 @@ impl Viewer {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             selection::normalize(tab, &mut self.editor);
         }
+        for result in self.editor.signature_rx.try_iter().collect::<Vec<_>>() {
+            self.editor.signature_busy = false;
+            match result {
+                Ok(asset) => {
+                    self.editor.signature_name = asset.name.clone();
+                    self.editor.signature_image = Some(asset);
+                    self.editor.signature_error = None;
+                }
+                Err(e) => self.editor.signature_error = Some(e),
+            }
+        }
         for result in self.editor.import_rx.try_iter().collect::<Vec<_>>() {
             self.editor.asset_busy = false;
             match result {
@@ -2437,6 +2526,13 @@ impl Viewer {
                                 )
                                 .or(property_focus);
                             }
+                            ui.separator();
+                            ui::caption(ui, "Rotate & flip");
+                            ui.horizontal(|ui| {
+                                if let Some(transform) = transform_controls(ui, a, false) {
+                                    *a = selection::transformed(std::slice::from_ref(a), transform).remove(0);
+                                }
+                            });
                             ui.separator();
                             egui::CollapsingHeader::new("Position & size").show(ui, |ui| {
                                 property_focus = property_slider(
@@ -3060,14 +3156,7 @@ impl Viewer {
                             tree.size().width() / tree.size().height(),
                         ));
                     }
-                    let png = assets::import_artwork(&path)?;
-                    let image = assets::decode_png(&png)?;
-                    Ok(Asset::new(
-                        &path.file_stem().unwrap_or_default().to_string_lossy(),
-                        Kind::Image { png },
-                        Style::default(),
-                        image.width() as f32 / image.height() as f32,
-                    ))
+                    Asset::from_image(&path)
                 })()
                 .map(|mut asset| {
                     asset.stamp = stamp;
@@ -3084,60 +3173,134 @@ impl Viewer {
             });
         }
     }
+    #[cfg(test)]
+    pub(super) fn preview_signature_image(&mut self) {
+        let source = "<svg xmlns='http://www.w3.org/2000/svg' width='320' height='100'><path d='M20 70 Q60 0 50 70 Q90 20 70 70 Q120 35 100 65 Q130 30 120 70 L180 50 Q200 30 195 65 Q230 20 215 60 L280 50 M35 85 L270 78' fill='none' stroke='#20334c' stroke-width='3' stroke-linecap='round'/></svg>";
+        let png = mypdf_milestone0::svg::preview(source, None).unwrap();
+        self.editor.signature_input = SignatureInput::Image;
+        self.editor.signature_image = Some(Asset::new(
+            "My signature",
+            Kind::Image { png },
+            Style::default(),
+            3.2,
+        ));
+        self.editor.signature_name = "My signature".into();
+        self.editor.signature_open = true;
+    }
     pub(super) fn editor_windows(&mut self, ctx: &egui::Context) {
         self.asset_details_window(ctx);
         self.svg_window(ctx);
         if self.editor.signature_open {
             let mut open = true;
             let mut save = false;
-            egui::Window::new("Handwritten signature").collapsible(false).open(&mut open).default_width(480.0).show(ctx, |ui| {
-                ui.label(if self.digital.adopt_asset {
-                    "Draw or type your signature. It becomes the image in your digital signatures."
-                } else {
-                    "This places a visual annotation. For certificate-based signing, choose Sign → Digital Signature."
+            let mut choose = false;
+            let mut cancel = false;
+            egui::Window::new("Handwritten signature")
+                .collapsible(false).open(&mut open).default_width(480.0)
+                .show(ctx, |ui| {
+                    ui.label(if self.digital.adopt_asset {
+                        "Draw, type, or import the image for your digital signature."
+                    } else {
+                        "Add a handwritten signature to your document."
+                    });
+                    ui.horizontal(|ui| {
+                        for (mode, label) in [(SignatureInput::Draw, "Draw"), (SignatureInput::Type, "Type"), (SignatureInput::Image, "Image")] {
+                            ui.selectable_value(&mut self.editor.signature_input, mode, label);
+                        }
+                    });
+                    ui.add_space(8.);
+                    match self.editor.signature_input {
+                        SignatureInput::Type => {
+                            let r = ui.add(egui::TextEdit::singleline(&mut self.editor.signature_typed)
+                                .margin(ui::FIELD_MARGIN).hint_text("Signature text").char_limit(200));
+                            self.editor.text_editing |= r.has_focus();
+                        }
+                        SignatureInput::Draw => { draw_signature_pad(ui, &mut self.editor); },
+                        SignatureInput::Image => {
+                            if let Some(asset) = self.editor.signature_image.clone() {
+                                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 150.), egui::Sense::hover());
+                                ui.painter().rect_filled(rect, 10., Color32::WHITE);
+                                paint_asset(&mut self.editor, ctx, ui.painter(), rect.shrink(16.), &asset);
+                            }
+                            choose = ui.add_enabled(!self.editor.signature_busy, ActionButton::new(Icon::Import, "Choose image…")).clicked();
+                            ui.weak("PNG or JPEG · Transparent PNG keeps the page visible behind your signature.");
+                            if self.editor.signature_busy { ui.spinner(); }
+                            if let Some(error) = &self.editor.signature_error { ui.colored_label(theme::danger(), error); }
+                        }
+                    }
+                    ui.add_space(10.);
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.editor.signature_name)
+                        .margin(ui::FIELD_MARGIN).hint_text("Library name").char_limit(200));
+                    self.editor.text_editing |= r.has_focus();
+                    ui.add_space(8.);
+                    ui.horizontal(|ui| {
+                        save = ui.add_enabled(!self.editor.signature_busy && (self.editor.signature_input != SignatureInput::Image || self.editor.signature_image.is_some()),
+                            ActionButton::new(Icon::Save, "Save signature").primary()).clicked();
+                        if ui.add(ActionButton::new(Icon::Close, "Cancel")).clicked() { cancel = true; }
+                    });
                 });
-                ui.horizontal(|ui| { ui.selectable_value(&mut self.editor.signature_is_typed, false, "Draw");
- ui.selectable_value(&mut self.editor.signature_is_typed, true, "Type"); });
-                if self.editor.signature_is_typed { let r = ui.add(egui::TextEdit::singleline(&mut self.editor.signature_typed).margin(ui::FIELD_MARGIN).hint_text("Signature text").char_limit(200)); self.editor.text_editing |= r.has_focus(); }
-                else { draw_signature_pad(ui, &mut self.editor); }
-                let r = ui.add(egui::TextEdit::singleline(&mut self.editor.signature_name).margin(ui::FIELD_MARGIN).hint_text("Library name").char_limit(200)); self.editor.text_editing |= r.has_focus();
-                save = ui.button("Save signature to library").clicked();
-            });
-            self.editor.signature_open = open;
+            self.editor.signature_open = open && !cancel;
+            if choose
+                && let Some(path) = self.native_pick(
+                    rfd::FileDialog::new()
+                        .set_title("Choose signature image")
+                        .add_filter("Signature image", &["png", "jpg", "jpeg"]),
+                )
+            {
+                self.editor.signature_busy = true;
+                self.editor.signature_error = None;
+                let tx = self.editor.signature_tx.clone();
+                let wake = ctx.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(Asset::from_image(&path).map_err(|e| format!("{e:#}")));
+                    wake.request_repaint();
+                });
+            }
             if save {
-                let kind = if self.editor.signature_is_typed {
-                    Kind::Text {
-                        text: self.editor.signature_typed.clone(),
+                let asset = match self.editor.signature_input {
+                    SignatureInput::Image => {
+                        self.editor.signature_image.clone().map(|mut asset| {
+                            asset.id = format!("{:032x}", rand::random::<u128>());
+                            asset.name = self.editor.signature_name.clone();
+                            asset
+                        })
                     }
-                } else {
-                    Kind::Ink {
-                        strokes: self
-                            .editor
-                            .signature_strokes
-                            .iter()
-                            .filter(|s| s.len() > 1)
-                            .cloned()
-                            .collect(),
+                    mode => {
+                        let kind = if mode == SignatureInput::Type {
+                            Kind::Text {
+                                text: self.editor.signature_typed.clone(),
+                            }
+                        } else {
+                            Kind::Ink {
+                                strokes: self
+                                    .editor
+                                    .signature_strokes
+                                    .iter()
+                                    .filter(|s| s.len() > 1)
+                                    .cloned()
+                                    .collect(),
+                            }
+                        };
+                        let empty = match &kind {
+                            Kind::Text { text } => text.trim().is_empty(),
+                            Kind::Ink { strokes } => strokes.is_empty(),
+                            _ => false,
+                        };
+                        (!empty).then(|| {
+                            Asset::new(
+                                &self.editor.signature_name,
+                                kind,
+                                Style {
+                                    font_size: 24.,
+                                    color: [0.1, 0.14, 0.18],
+                                    ..Default::default()
+                                },
+                                3.,
+                            )
+                        })
                     }
                 };
-                let empty = match &kind {
-                    Kind::Text { text } => text.trim().is_empty(),
-                    Kind::Ink { strokes } => strokes.is_empty(),
-                    _ => false,
-                };
-                if empty {
-                    self.status = Some(("Draw or type a signature first".into(), true));
-                } else {
-                    let asset = Asset::new(
-                        &self.editor.signature_name,
-                        kind,
-                        Style {
-                            font_size: 24.0,
-                            color: [0.1, 0.14, 0.18],
-                            ..Default::default()
-                        },
-                        3.0,
-                    );
+                if let Some(asset) = asset {
                     match self.editor.add_asset(asset.clone()) {
                         Ok(()) if self.digital.adopt_asset => {
                             // digital_events adopts it as the signature appearance.
@@ -3154,6 +3317,9 @@ impl Viewer {
                         }
                         Err(e) => self.status = Some((e, true)),
                     }
+                } else {
+                    self.status =
+                        Some(("Draw, type, or choose a signature image first".into(), true));
                 }
             }
         }
@@ -3622,8 +3788,6 @@ impl Viewer {
             || self.editor.library_open
             || ctx.memory(|m| m.top_modal_layer().is_some())
             || self.digital.open
-            || self.editor.gesture.is_some()
-            || self.editor.group_gesture.is_some()
             || !matches!(self.editor.mode, Mode::Draw | Mode::Annotate)
         {
             return;
@@ -3641,134 +3805,134 @@ impl Viewer {
             .filter(|a| ids.contains(&a.id))
             .cloned()
             .collect();
+        let panel = || {
+            egui::TopBottomPanel::top("selection_context_toolbar")
+                .exact_height(42.)
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::surface())
+                        .inner_margin(egui::Margin::symmetric(16, 4)),
+                )
+        };
         let Some(first) = marks.first() else {
+            panel().show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.weak("Select an object to change its appearance, rotation, or size.");
+                });
+            });
             return;
         };
         let standard_asset = first
             .asset_id
             .as_ref()
             .is_some_and(|id| self.editor.builtins.iter().any(|b| &b.asset.id == id));
-        let Some((view, offset, _)) = tab.document_view else {
-            return;
-        };
-        let Some(page) = tab
-            .document_layout
-            .as_ref()
-            .and_then(|l| l.rects.get(first.page))
-            .filter(|r| r.is_positive())
-        else {
-            return;
-        };
-        let bounds = selection::union_bounds(marks.iter());
-        let origin = view.min - offset + page.min.to_vec2();
-        let box_rect = Rect::from_min_max(
-            origin + vec2(bounds[0], bounds[1]) * tab.scale,
-            origin + vec2(bounds[2], bounds[3]) * tab.scale,
-        );
-        if !view.intersects(box_rect) {
-            return;
-        }
-        let pos = pos2(
-            (box_rect.center().x - 170.).clamp(
-                view.left() + 8.,
-                (view.right() - 350.).max(view.left() + 8.),
-            ),
-            (box_rect.top() - 50.).max(view.top() + 8.),
-        );
         let mut style = first.style.clone();
         let mut duplicate = false;
         let mut delete = false;
         let mut align = None;
         let mut update_library = false;
-        egui::Area::new(egui::Id::new("selection_context_toolbar"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(pos)
-            .show(ctx, |ui| {
-                egui::Frame::popup(ui.style())
-                    .corner_radius(12)
-                    .inner_margin(8.)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.menu_button("Color", |ui| {
-                                color_palette(ui, &mut style.color);
-                            });
-                            if matches!(first.kind, Kind::Text { .. }) {
-                                ui.add(
-                                    egui::DragValue::new(&mut style.font_size)
-                                        .range(6.0..=144.0)
-                                        .suffix(" pt"),
-                                )
-                                .on_hover_text("Font size");
-                            } else {
-                                ui.add(
-                                    egui::DragValue::new(&mut style.width)
-                                        .range(0.1..=30.0)
-                                        .suffix(" pt"),
-                                )
-                                .on_hover_text("Stroke width");
-                                ui.menu_button(style.stroke.label(), |ui| {
-                                    for value in StrokeStyle::ALL {
-                                        if ui
-                                            .selectable_value(
-                                                &mut style.stroke,
-                                                value,
-                                                value.label(),
-                                            )
-                                            .clicked()
-                                        {
-                                            ui.close();
-                                        }
-                                    }
+        let mut transform = None;
+        // Reserve the same height with or without a selection, including during
+        // a drag: selecting an object must not shift the page under the pointer.
+        panel().show(ctx, |ui| {
+            egui::ScrollArea::horizontal()
+                .id_salt("selection_properties_scroll")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(
+                            self.editor.gesture.is_none() && self.editor.group_gesture.is_none(),
+                            |ui| {
+                                ui.menu_button("Color", |ui| {
+                                    color_palette(ui, &mut style.color);
                                 });
-                                if matches!(
-                                    first.kind,
-                                    Kind::Rectangle | Kind::Ellipse | Kind::Polygon { .. }
-                                ) {
-                                    ui.menu_button("Fill", |ui| {
-                                        let mut filled = style.fill.is_some();
-                                        if ui.checkbox(&mut filled, "Fill shape").changed() {
-                                            style.fill = filled.then_some(style.color);
+                                if matches!(first.kind, Kind::Text { .. }) {
+                                    ui.add(
+                                        egui::DragValue::new(&mut style.font_size)
+                                            .range(6.0..=144.0)
+                                            .suffix(" pt"),
+                                    )
+                                    .on_hover_text("Font size");
+                                } else {
+                                    ui.add(
+                                        egui::DragValue::new(&mut style.width)
+                                            .range(0.1..=30.0)
+                                            .suffix(" pt"),
+                                    )
+                                    .on_hover_text("Stroke width");
+                                    ui.menu_button(style.stroke.label(), |ui| {
+                                        for value in StrokeStyle::ALL {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut style.stroke,
+                                                    value,
+                                                    value.label(),
+                                                )
+                                                .clicked()
+                                            {
+                                                ui.close();
+                                            }
                                         }
-                                        if let Some(c) = &mut style.fill {
-                                            color_palette(ui, c);
+                                    });
+                                    if matches!(
+                                        first.kind,
+                                        Kind::Rectangle | Kind::Ellipse | Kind::Polygon { .. }
+                                    ) {
+                                        ui.menu_button("Fill", |ui| {
+                                            let mut filled = style.fill.is_some();
+                                            if ui.checkbox(&mut filled, "Fill shape").changed() {
+                                                style.fill = filled.then_some(style.color);
+                                            }
+                                            if let Some(c) = &mut style.fill {
+                                                color_palette(ui, c);
+                                            }
+                                        });
+                                    }
+                                }
+                                if marks.len() > 1 {
+                                    ui.menu_button("Align", |ui| {
+                                        for (value, icon, label) in selection::Align::ALL {
+                                            if ui.add(ActionButton::new(icon, label)).clicked() {
+                                                align = Some(value);
+                                                ui.close();
+                                            }
                                         }
                                     });
                                 }
-                            }
-                            if marks.len() > 1 {
-                                ui.menu_button("Align", |ui| {
-                                    for (value, icon, label) in selection::Align::ALL {
-                                        if ui.add(ActionButton::new(icon, label)).clicked() {
-                                            align = Some(value);
-                                            ui.close();
-                                        }
-                                    }
-                                });
-                            }
-                            duplicate = ui
-                                .add(ActionButton::new(Icon::Copy, "Duplicate selection").compact())
-                                .clicked();
-                            delete = ui
-                                .add(ActionButton::new(Icon::Trash, "Delete selection").compact())
-                                .clicked();
-                            if marks.len() == 1 && first.asset_id.is_some() {
-                                ui.menu_button("Library", |ui| {
-                                    ui.label("Changes on this page affect only this copy.");
-                                    update_library = ui
-                                        .add(ActionButton::new(
-                                            Icon::Library,
-                                            if standard_asset {
-                                                "Save as custom asset"
-                                            } else {
-                                                "Update library asset"
-                                            },
-                                        ))
-                                        .clicked();
-                                });
-                            }
-                        });
+                                ui.separator();
+                                transform = transform_controls(ui, first, true);
+                                ui.separator();
+                                duplicate = ui
+                                    .add(
+                                        ActionButton::new(Icon::Copy, "Duplicate selection")
+                                            .compact(),
+                                    )
+                                    .clicked();
+                                delete = ui
+                                    .add(
+                                        ActionButton::new(Icon::Trash, "Delete selection")
+                                            .compact(),
+                                    )
+                                    .clicked();
+                                if marks.len() == 1 && first.asset_id.is_some() {
+                                    ui.menu_button("Library", |ui| {
+                                        ui.label("Changes on this page affect only this copy.");
+                                        update_library = ui
+                                            .add(ActionButton::new(
+                                                Icon::Library,
+                                                if standard_asset {
+                                                    "Save as custom asset"
+                                                } else {
+                                                    "Update library asset"
+                                                },
+                                            ))
+                                            .clicked();
+                                    });
+                                }
+                            },
+                        );
                     });
-            });
+                });
+        });
         let mut edited = marks.clone();
         if style != first.style {
             for a in &mut edited {
@@ -3791,6 +3955,9 @@ impl Viewer {
                     a.style.font_size = style.font_size;
                 }
             }
+        }
+        if let Some(transform) = transform {
+            edited = selection::transformed(&edited, transform);
         }
         if let Some(align) = align {
             edited = selection::aligned(&edited, align);
@@ -3875,6 +4042,141 @@ impl Viewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_frame(
+        app: &mut Viewer,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        use eframe::App;
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1200., 820.))),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+        )
+    }
+    fn test_click(app: &mut Viewer, ctx: &egui::Context, label: &str) -> Rect {
+        let output = test_frame(app, ctx, vec![]);
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let b = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some(label))
+            .unwrap_or_else(|| panic!("Missing {label}"))
+            .1
+            .bounds()
+            .unwrap();
+        let rect = Rect::from_min_max(
+            pos2(b.x0 as f32, b.y0 as f32),
+            pos2(b.x1 as f32, b.y1 as f32),
+        );
+        for pressed in [true, false] {
+            test_frame(
+                app,
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(rect.center()),
+                    egui::Event::PointerButton {
+                        pos: rect.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        rect
+    }
+    #[test]
+    fn selection_properties_reserve_space_and_transform_buttons_commit_immediately() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.tabs[0].session.is_none() {
+            test_frame(&mut app, &ctx, vec![]);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        app.editor.mode = Mode::Draw;
+        app.inspector = false;
+        test_frame(&mut app, &ctx, vec![]);
+        test_frame(&mut app, &ctx, vec![]);
+        let top = app.tabs[0].document_view.unwrap().0.top();
+        let a = Annotation::new(
+            0,
+            [10., 10., 400., 400.],
+            Kind::Polygon {
+                points: vec![[0., 0.], [1., 0.3], [0.2, 1.]],
+                closed: true,
+            },
+            Style::default(),
+        );
+        app.tabs[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .commit(vec![a.clone()])
+            .unwrap();
+        selection::set(&mut app.tabs[0], &mut app.editor, vec![a.id]);
+        for (label, rotation, flip_x, flip_y) in [
+            ("Rotate 90°", 90., false, false),
+            ("Rotate −90°", 0., false, false),
+            ("Flip horizontal", 0., true, false),
+            ("Flip vertical", 0., true, true),
+        ] {
+            let rect = test_click(&mut app, &ctx, label);
+            let view = app.tabs[0].document_view.unwrap().0;
+            assert!(
+                rect.bottom() <= view.top(),
+                "properties cannot cover the page"
+            );
+            assert_eq!(
+                view.top(),
+                top,
+                "selection must not move the page under the pointer"
+            );
+            let a = &app.tabs[0].session.as_ref().unwrap().annotations[0];
+            assert_eq!((a.rotation, a.flip_x, a.flip_y), (rotation, flip_x, flip_y));
+        }
+        let s = app.tabs[0].session.as_mut().unwrap();
+        s.undo();
+        assert!(!s.annotations[0].flip_y);
+        s.redo();
+        assert!(s.annotations[0].flip_y);
+    }
+    #[test]
+    fn signature_image_is_previewed_then_saved_only_on_confirmation() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Signature.png");
+        image::RgbaImage::from_pixel(200, 80, image::Rgba([0, 0, 0, 128]))
+            .save(&path)
+            .unwrap();
+        let asset = Asset::from_image(&path).unwrap();
+        let before = app.editor.library.as_ref().unwrap().entries.len();
+        app.editor.signature_input = SignatureInput::Image;
+        app.editor.signature_open = true;
+        app.editor.signature_tx.send(Ok(asset.clone())).unwrap();
+        app.editor_events();
+        assert_eq!(app.editor.library.as_ref().unwrap().entries.len(), before);
+        for _ in 0..3 {
+            test_frame(&mut app, &ctx, vec![]);
+        }
+        test_click(&mut app, &ctx, "Save signature");
+        assert!(!app.editor.signature_open);
+        let saved = app.editor.library.as_ref().unwrap().entries.last().unwrap();
+        assert_eq!(saved.kind, asset.kind);
+        assert_eq!(saved.aspect, 2.5);
+        assert_eq!(
+            app.editor.library.as_ref().unwrap().entries.len(),
+            before + 1
+        );
+    }
     #[test]
     fn selection_border_and_handle_follow_each_drag_frame() {
         let ctx = egui::Context::default();
