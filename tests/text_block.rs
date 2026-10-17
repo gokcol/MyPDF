@@ -9,6 +9,7 @@ use mypdf_milestone0::{
 
 fn block(runs: Vec<(usize, String)>) -> Replacement {
     Replacement {
+        spans: vec![],
         selection: Selection {
             runs,
             annotations: vec![],

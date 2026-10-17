@@ -29,7 +29,10 @@ fn repeated_exports_prune_superseded_appearances() {
 #[test]
 fn builtin_artwork_exports_as_editable_vector_annotations_without_library_writes() {
     let library = assets::builtin_assets();
-    assert_eq!(library.len(), 33);
+    assert_eq!(
+        library.iter().filter(|a| a.category == "Stamps").count(),
+        26
+    );
     let ids: std::collections::HashSet<_> = library.iter().map(|b| &b.asset.id).collect();
     assert_eq!(ids.len(), library.len());
     assert_eq!(assets::builtin_assets()[0].asset.id, library[0].asset.id);
@@ -41,12 +44,14 @@ fn builtin_artwork_exports_as_editable_vector_annotations_without_library_writes
             let y = 24.0;
             let width = 240.0 * builtin.asset.aspect.min(1.0);
             let height = width / builtin.asset.aspect;
-            Annotation::new(
+            let mut annotation = Annotation::new(
                 0,
                 [x, y, x + width, y + height],
                 builtin.asset.kind.clone(),
                 builtin.asset.style.clone(),
-            )
+            );
+            annotation.asset_id = Some(builtin.asset.id.clone());
+            annotation
         })
         .collect();
     let original = source();

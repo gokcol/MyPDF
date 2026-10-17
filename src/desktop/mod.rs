@@ -8,6 +8,7 @@ mod form_tools;
 mod header_footer;
 mod home;
 pub mod icon;
+mod manipulation;
 mod menu;
 mod navigate;
 pub mod open_with;
@@ -16,6 +17,7 @@ mod organize;
 mod preview;
 mod print;
 mod protect;
+mod reading;
 mod recognize;
 mod recovery;
 mod redaction;
@@ -44,34 +46,6 @@ enum Zoom {
     Page,
     Scale(f32),
 }
-// Preserve the PDF point under the gesture while page gaps and centering stay fixed.
-fn pinch_scroll_offset(
-    pages: &[PageSize],
-    old: f32,
-    new: f32,
-    old_width: f32,
-    new_width: f32,
-    offset: egui::Vec2,
-    pointer: egui::Vec2,
-) -> egui::Vec2 {
-    let content = offset + pointer;
-    let mut old_top = 24.;
-    let mut new_top = 24.;
-    for (index, page) in pages.iter().enumerate() {
-        if content.y <= old_top + page.height * old + 12. || index + 1 == pages.len() {
-            let x = (content.x - (old_width - page.width * old) / 2.) / old;
-            let y = (content.y - old_top) / old;
-            return vec2(
-                ((new_width - page.width * new) / 2. + x * new - pointer.x).max(0.),
-                (new_top + y * new - pointer.y).max(0.),
-            );
-        }
-        old_top += page.height * old + 24.;
-        new_top += page.height * new + 24.;
-    }
-    offset
-}
-
 struct Raster {
     texture: TextureHandle,
     bytes: usize,
@@ -102,13 +76,20 @@ struct Tab {
     scale: f32,
     jump: Option<(usize, Option<f32>)>,
     document_view: Option<(Rect, egui::Vec2, f32)>,
+    document_layout: Option<reading::Layout>,
     last_pinch: Option<std::time::Instant>,
+    page_layout: reading::PageLayout,
+    view_preferences: mypdf_milestone0::home::ReadingState,
+    restore_view: bool,
+    back: Vec<(usize, f32)>,
+    forward: Vec<(usize, f32)>,
     text: Vec<Option<Arc<PageText>>>,
     search_worker: viewer::SearchWorker,
     search_at: Option<std::time::Instant>,
     searching: bool,
     jump_to_first_hit: bool,
     query: String,
+    search_options: viewer::SearchOptions,
     hits: Vec<SearchHit>,
     hit: usize,
     indexed: usize,
@@ -139,6 +120,9 @@ impl Tab {
     }
     fn jump(&mut self, page: usize) {
         if !self.pages.is_empty() {
+            if self.page != page.min(self.pages.len() - 1) {
+                self.push_history();
+            }
             self.page = page.min(self.pages.len() - 1);
             self.page_input = (self.page + 1).to_string();
             self.jump = Some((self.page, None));
@@ -148,6 +132,7 @@ impl Tab {
         if self.hits.is_empty() {
             return;
         }
+        self.push_history();
         self.hit = hit % self.hits.len();
         let found = &self.hits[self.hit];
         let y = found.rects.first().map(|r| r[1]);
@@ -189,9 +174,11 @@ impl Tab {
         }
         let at = self.search_at.get_or_insert_with(std::time::Instant::now);
         if at.elapsed() >= std::time::Duration::from_millis(150)
-            && self
-                .search_worker
-                .request(self.text.clone(), self.query.clone())
+            && self.search_worker.request_with(
+                self.text.clone(),
+                self.query.clone(),
+                self.search_options,
+            )
         {
             self.search_dirty = false;
             self.search_at = None;
@@ -343,6 +330,7 @@ pub struct Viewer {
     /// Zen mode: only the pages, full screen.
     zen: Option<zen::Zen>,
     details: details::DetailsState,
+    reading_memory: reading::Memory,
 }
 impl Viewer {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> Self {
@@ -396,6 +384,7 @@ impl Viewer {
             comparison: None,
             zen: None,
             details: details::DetailsState::new(),
+            reading_memory: Default::default(),
         };
         for path in paths {
             app.open(path, &cc.egui_ctx);
@@ -424,6 +413,9 @@ impl Viewer {
         let worker = Worker::open(path.clone(), move || wake.request_repaint());
         let wake = ctx.clone();
         let search_worker = viewer::SearchWorker::new(move || wake.request_repaint());
+        let saved_view = self.home.reading(&path);
+        let restore_view = saved_view.is_some();
+        let view_preferences = saved_view.unwrap_or_default();
         self.tabs.push(Tab {
             id: self.next_id,
             path,
@@ -444,7 +436,13 @@ impl Viewer {
             page: 0,
             page_input: "1".into(),
             document_view: None,
+            document_layout: None,
             last_pinch: None,
+            page_layout: reading::PageLayout::from_code(view_preferences.layout),
+            restore_view,
+            view_preferences,
+            back: vec![],
+            forward: vec![],
             zoom: Zoom::Width,
             scale: 1.0,
             jump: Some((0, None)),
@@ -454,6 +452,7 @@ impl Viewer {
             searching: false,
             jump_to_first_hit: false,
             query: String::new(),
+            search_options: Default::default(),
             hits: vec![],
             hit: 0,
             indexed: 0,
@@ -799,7 +798,22 @@ impl Viewer {
                             }
                             tab.unsaved_on_load = false;
                         }
-                        tab.jump(tab.page.min(tab.pages.len().saturating_sub(1)));
+                        if std::mem::take(&mut tab.restore_view) {
+                            let v = &tab.view_preferences;
+                            tab.zoom = v
+                                .scale
+                                .filter(|v| v.is_finite())
+                                .map(|v| Zoom::Scale(v.clamp(0.1, 6.)))
+                                .unwrap_or(if v.fit_page { Zoom::Page } else { Zoom::Width });
+                            tab.page = v.page.min(tab.pages.len().saturating_sub(1));
+                            tab.page_input = (tab.page + 1).to_string();
+                            tab.jump = Some((
+                                tab.page,
+                                Some(v.top.max(0.).min(tab.pages[tab.page].height)),
+                            ));
+                        } else {
+                            tab.jump(tab.page.min(tab.pages.len().saturating_sub(1)));
+                        }
                         tab.bytes = Some(bytes);
                         if let Some(session) = &mut tab.session {
                             session.editable =
@@ -1032,24 +1046,9 @@ impl Viewer {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.search = false;
         }
-        if !self.home.visible
-            && !ctx.wants_keyboard_input()
-            && let Some(tab) = self.tabs.get_mut(self.active)
-        {
-            if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) {
-                tab.jump(tab.page + 1);
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::PageUp)) {
-                tab.jump(tab.page.saturating_sub(1));
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
-                tab.jump(0);
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::End)) {
-                tab.jump(tab.pages.len().saturating_sub(1));
-            }
-        }
+        self.reading_keys(ctx);
     }
+
     fn toolbar(&mut self, ctx: &egui::Context) {
         if self.zen.is_some() {
             return;
@@ -1294,6 +1293,16 @@ impl Viewer {
                         {
                             action = Some("zoom_in");
                         }
+                        ui.menu_button(tab.page_layout.label(), |ui| {
+                            for mode in [reading::PageLayout::Continuous, reading::PageLayout::Single, reading::PageLayout::Facing] {
+                                if ui.selectable_value(&mut tab.page_layout, mode, mode.label()).changed() {
+                                    tab.jump = Some((tab.page, None)); ui.close();
+                                }
+                            }
+                        });
+                        ui.separator();
+                        if ui.add_enabled(!tab.back.is_empty(), ActionButton::new(Icon::Undo, "Back to previous view").compact()).clicked() { tab.history_step(false); }
+                        if ui.add_enabled(!tab.forward.is_empty(), ActionButton::new(Icon::Redo, "Forward to next view").compact()).clicked() { tab.history_step(true); }
                         ui.separator();
                         if ui
                             .add_enabled(
@@ -1357,20 +1366,19 @@ impl Viewer {
                     }
                     if let Some(tab) = self.tabs.get(self.active)
                         && let Some(s) = &tab.session
-                        && s.dirty()
                     {
-                        let label = self.recovery.label(tab.id, s.revision());
+                        let label = if self.saving { "Saving…" } else if s.dirty() { self.recovery.label(tab.id, s.revision()) } else { "Saved" };
                         let (dot, _) = ui.allocate_exact_size(vec2(8., 8.), egui::Sense::hover());
                         ui.painter().circle_filled(
                             dot.center(),
                             3.5,
-                            if label.contains("up to date") {
+                            if label == "Saved" || label.contains("copy saved") {
                                 theme::success()
                             } else {
                                 theme::warning()
                             },
                         );
-                        ui.label(RichText::new(label).size(11.5).color(theme::muted()));
+                        ui.label(RichText::new(label).size(11.5).color(theme::muted())).on_hover_text(if s.dirty() { "Your PDF has unsaved changes. Recovery copies are local backups; Save a Copy writes a PDF you can keep or share." } else { "No unsaved document changes." });
                     }
                     if let Some(tab) = self.tabs.get_mut(self.active) {
                         if tab.signed_original.is_some() {
@@ -1483,7 +1491,12 @@ impl Viewer {
                 let response = ui.add(egui::TextEdit::singleline(&mut tab.query).margin(ui::FIELD_MARGIN).hint_text("Find in document…").margin(vec2(10., 7.)).desired_width(f32::INFINITY));
                 self.editor.text_editing |= response.has_focus();
                 if self.focus_search { response.request_focus(); self.focus_search = false; }
-                if response.changed() { tab.search_worker.invalidate(); tab.search_dirty = true; tab.search_at = Some(std::time::Instant::now()); tab.hits.clear(); tab.hit = 0; tab.jump_to_first_hit = true; tab.search(ctx); }
+                let mut options_changed = false;
+                ui.horizontal(|ui| {
+                    options_changed |= ui.toggle_value(&mut tab.search_options.case_sensitive, "Aa").on_hover_text("Match case").changed();
+                    options_changed |= ui.checkbox(&mut tab.search_options.whole_word, "Whole words").changed();
+                });
+                if response.changed() || options_changed { tab.search_worker.invalidate(); tab.search_dirty = true; tab.search_at = Some(std::time::Instant::now()); tab.hits.clear(); tab.hit = 0; tab.jump_to_first_hit = true; tab.search(ctx); }
                 if (response.has_focus() || response.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter)) { let next = if ui.input(|i| i.modifiers.shift) { tab.hit + tab.hits.len().saturating_sub(1) } else { tab.hit + 1 }; tab.select_hit(next); response.request_focus(); }
                 ui.horizontal(|ui| {
                     let message = if tab.hits.is_empty() { "0 matches".into() } else { format!("{} of {}", tab.hit + 1, tab.hits.len()) };
@@ -1598,50 +1611,38 @@ impl Viewer {
                     });
                     return;
                 }
-                let available = ui.available_size();
-                let widest = tab.pages.iter().map(|p| p.width).fold(1.0, f32::max);
-                let tallest = tab.pages.iter().map(|p| p.height).fold(1.0, f32::max);
-                let mut pinch_offset = None;
+                // Reserve only the scrollbar's actual layout width. The old
+                // canvas was wider than the viewport even in Fit Width.
+                let available = ui.available_size() - vec2(ui.spacing().scroll.allocated_width(), 0.);
+                let mut layout = reading::Layout::arrange(&tab.pages, tab.zoom, available, tab.page_layout, tab.page);
+                let mut anchor_offset = None;
                 let delta = ctx.input(|i| i.zoom_delta());
                 if delta.is_finite() && (delta - 1.).abs() > 0.0001
-                    && let Some((view, offset, old_width)) = tab.document_view
+                    && let Some((view, offset, _)) = tab.document_view
+                    && let Some(old) = &tab.document_layout
                     && let Some(pointer) = ctx.pointer_hover_pos()
                     && view.contains(pointer) && ctx.layer_id_at(pointer) == Some(ui.layer_id())
                 {
-                    let next = (tab.scale * delta).clamp(0.1, 6.);
-                    let new_width = (widest * next).max(available.x - 16.) + 32.;
-                    pinch_offset = Some(pinch_scroll_offset(&tab.pages, tab.scale, next, old_width, new_width, offset, pointer - view.min));
+                    let pointer = pointer - view.min;
+                    let next = (old.scale * delta).clamp(0.1, 6.);
                     tab.zoom = Zoom::Scale(next);
+                    layout = reading::Layout::arrange(&tab.pages, tab.zoom, available, tab.page_layout, tab.page);
+                    anchor_offset = Some(old.anchored_offset(&layout, offset, pointer));
                     tab.last_pinch=Some(std::time::Instant::now());
                     tab.jump = None;
                 }
-                let next_scale = match tab.zoom {
-                    Zoom::Width => (available.x - 64.0) / widest,
-                    Zoom::Page => {
-                        ((available.x - 64.0) / widest).min((available.y - 48.0) / tallest)
-                    }
-                    Zoom::Scale(s) => s,
+                // Resizing the window or toggling panels keeps your reading
+                // position instead of jumping back to the top of the page.
+                if anchor_offset.is_none() && tab.jump.is_none()
+                    && let Some((view, offset, _)) = tab.document_view
+                    && let Some(old) = &tab.document_layout
+                    && old.rects.len() == layout.rects.len() && *old != layout
+                {
+                    let mut next = old.anchored_offset(&layout, offset, vec2(view.width() / 2., 0.));
+                    next.x = (next.x + (view.width() - available.x) / 2.).max(0.);
+                    anchor_offset = Some(next);
                 }
-                .clamp(0.1, 6.0);
-                if (tab.scale - next_scale).abs() > 0.005 {
-                    tab.scale = next_scale;
-                    if tab.jump.is_none() && pinch_offset.is_none() {
-                        tab.jump = Some((tab.page, None));
-                    }
-                }
-                let scale = tab.scale;
-                let max_width = tab
-                    .pages
-                    .iter()
-                    .map(|p| p.width * scale)
-                    .fold(available.x - 16.0, f32::max)
-                    + 32.0;
-                let mut tops = Vec::with_capacity(tab.pages.len());
-                let mut height = 24.0;
-                for page in &tab.pages {
-                    tops.push(height);
-                    height += page.height * scale + 24.0;
-                }
+                let max_width = layout.size.x;
                 let mut scroll = egui::ScrollArea::both()
                     .scroll_source(egui::scroll_area::ScrollSource {
                         drag: self.editor.mode == editing::Mode::Read,
@@ -1649,26 +1650,30 @@ impl Viewer {
                     })
                     .id_salt((tab.id, "document"))
                     .auto_shrink([false, false]);
-                if let Some(offset) = pinch_offset {
+                if let Some(offset) = anchor_offset {
                     scroll = scroll.scroll_offset(offset);
                 }
                 if let Some((page, y)) = tab.jump.take() {
                     scroll = scroll.vertical_scroll_offset(
-                        (tops[page] + y.unwrap_or(0.0) * scale - 24.0).max(0.0),
+                        (layout.rects[page].top() + y.unwrap_or(0.0) * layout.scale - reading::GAP).max(0.0),
                     );
+                    if matches!(tab.zoom, Zoom::Width | Zoom::Page) {
+                        // Wider later pages may need horizontal scrolling,
+                        // but the reference page opens centered and fills
+                        // the viewport, rather than being pushed to its side.
+                        scroll = scroll.horizontal_scroll_offset(((max_width - available.x) / 2.).max(0.));
+                    }
                 }
                 let mut visible_page = tab.page;
                 let mut follow = None;
                 tab.navigation(ctx);
                 let output = scroll.show_viewport(ui, |ui, viewport| {
                     let (canvas, canvas_response) =
-                        ui.allocate_exact_size(vec2(max_width, height), egui::Sense::click());
+                        ui.allocate_exact_size(layout.size, egui::Sense::click());
                     if canvas_response.clicked()
                         && matches!(self.editor.mode, editing::Mode::Read | editing::Mode::Draw | editing::Mode::Annotate)
                         && let Some(pointer) = canvas_response.interact_pointer_pos()
-                        && !tab.pages.iter().enumerate().any(|(page, size)| {
-                            Rect::from_min_size(canvas.min + vec2((max_width - size.width * scale) / 2., tops[page]), vec2(size.width * scale, size.height * scale)).contains(pointer)
-                        })
+                        && !layout.rects.iter().any(|rect| rect.translate(canvas.min.to_vec2()).contains(pointer))
                     {
                         tab.selected_annotation = None;
                         tab.group.clear();
@@ -1678,24 +1683,22 @@ impl Viewer {
                     if canvas_response.clicked() && self.editor.mode == editing::Mode::Edit {
                         self.content.click_outside(tab.id);
                     }
-                    let center = viewport.center().y;
-                    for (page, size) in tab.pages.iter().copied().enumerate() {
-                        let top = tops[page];
-                        let bottom = top + size.height * scale;
-                        if top <= center && bottom + 24.0 >= center {
+                    let mut most_visible = 0.;
+                    for (page, rect) in layout.rects.iter().enumerate().filter(|(_, r)| r.is_positive()) {
+                        let overlap = (rect.bottom().min(viewport.bottom()) - rect.top().max(viewport.top())).max(0.);
+                        if overlap > most_visible {
+                            most_visible = overlap;
                             visible_page = page;
                         }
                     }
-                    for (page, top) in tops.iter().copied().enumerate() {
+                    if tab.page_layout==reading::PageLayout::Facing && layout.rects.get(tab.page).is_some_and(|r|r.is_positive() && r.bottom()>viewport.top() && r.top()<viewport.bottom()) { visible_page=tab.page; }
+                    for (page, rect) in layout.rects.iter().enumerate().filter(|(_, r)| r.is_positive()) {
                         let size = tab.pages[page];
-                        let bottom = top + size.height * scale;
-                        if bottom < viewport.min.y - 300.0 || top > viewport.max.y + 300.0 {
+                        let scale = layout.scale;
+                        if rect.bottom() < viewport.min.y - 300.0 || rect.top() > viewport.max.y + 300.0 {
                             continue;
                         }
-                        let page_rect = Rect::from_min_size(
-                            canvas.min + vec2((max_width - size.width * scale) / 2.0, top),
-                            vec2(size.width * scale, size.height * scale),
-                        );
+                        let page_rect = rect.translate(canvas.min.to_vec2());
                         ui::shadow(ui.painter(), page_rect, 1, 2);
                         ui.painter().rect_filled(page_rect, 0.0, Color32::WHITE);
                         let key =
@@ -1808,6 +1811,8 @@ impl Viewer {
                     }
                 });
                 tab.document_view = Some((output.inner_rect, output.state.offset, max_width));
+                tab.scale = layout.scale;
+                tab.document_layout = Some(layout);
                 match follow {
                     Some(navigation::Target::Page(page)) => tab.jump(page),
                     Some(navigation::Target::Uri(uri)) => self.link_confirm = Some(uri),
@@ -1851,10 +1856,7 @@ impl eframe::App for Viewer {
         theme::sync(ctx.theme());
         self.tick += 1;
         let arrivals = open_with::take(ctx);
-        if arrivals.focus {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        }
+        arrivals.activate(ctx);
         for path in arrivals.paths {
             self.open(path, ctx);
         }
@@ -1869,6 +1871,7 @@ impl eframe::App for Viewer {
         self.compare_tick(ctx);
         self.editor.text_editing = false;
         self.toolbar(ctx);
+        self.restore_reading_panels();
         if !self.home.visible && self.comparison.is_none() && self.zen.is_none() {
             self.editor_tools(ctx);
             self.page_tools(ctx);
@@ -1927,6 +1930,8 @@ impl eframe::App for Viewer {
             }
             self.document(ctx);
         }
+        self.selection_toolbar(ctx);
+        self.text_context_toolbar(ctx);
         self.finish_new_text(ctx);
         self.form_events(ctx);
         self.form_dialogs(ctx);
@@ -1988,6 +1993,7 @@ impl eframe::App for Viewer {
                     }
                 });
         }
+        self.remember_reading(ctx, self.exit_approved);
         self.trim_cache();
         if !ctx.input(|i| i.raw.hovered_files.is_empty()) {
             let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop"));
@@ -2164,7 +2170,7 @@ mod tests {
                 app.tabs[0].selected_annotation.as_deref(),
                 Some(line.id.as_str())
             );
-            let gray = rect.min + vec2(-16., 70.);
+            let gray = rect.min + vec2(-reading::GUTTER / 2., 70.);
             click(&mut app, gray);
             assert!(
                 app.tabs[0].selected_annotation.is_none(),

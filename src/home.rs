@@ -10,11 +10,37 @@ const MAX_BYTES: usize = 1024 * 1024;
 const MAX_RECENTS: usize = 50;
 const MAX_FAVORITES: usize = 100;
 
+/// Local view preferences; they never alter a PDF's opening instructions.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ReadingState {
+    pub page: usize,
+    pub top: f32,
+    pub scale: Option<f32>,
+    pub fit_page: bool,
+    pub layout: u8,
+    pub sidebar: bool,
+    pub inspector: bool,
+}
+impl Default for ReadingState {
+    fn default() -> Self {
+        Self {
+            page: 0,
+            top: 0.,
+            scale: None,
+            fit_page: false,
+            layout: 0,
+            sidebar: true,
+            inspector: true,
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry {
     pub path: PathBuf,
     pub opened: i64,
     pub favorite: bool,
+    #[serde(default)]
+    pub reading: Option<ReadingState>,
 }
 impl Entry {
     pub fn name(&self) -> String {
@@ -129,7 +155,31 @@ impl History {
                     path,
                     opened,
                     favorite: false,
+                    reading: None,
                 });
+            }
+        })
+    }
+    pub fn reading(&self, path: &Path) -> Option<ReadingState> {
+        self.entries
+            .iter()
+            .find(|e| e.path == path)
+            .and_then(|e| e.reading.clone())
+    }
+    pub fn save_reading(&mut self, states: &[(PathBuf, ReadingState)]) -> Result<()> {
+        ensure!(
+            states.iter().all(|(_, s)| s.top.is_finite()
+                && s.top >= 0.
+                && s.scale
+                    .is_none_or(|v| v.is_finite() && (0.1..=6.).contains(&v))
+                && s.layout <= 2),
+            "Invalid reading position"
+        );
+        self.change(|entries| {
+            for (path, state) in states {
+                if let Some(e) = entries.iter_mut().find(|e| &e.path == path) {
+                    e.reading = Some(state.clone());
+                }
             }
         })
     }

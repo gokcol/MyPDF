@@ -18,6 +18,8 @@ enum InlineTarget {
 struct BlockDraft {
     selection: text_block::Selection,
     masks: Vec<[f32; 4]>,
+    spans: Vec<mypdf_milestone0::rich_text::Span>,
+    styled_text: String,
     font: usize,
     /// Font, size, color and right edge when the block opened.
     initial: (usize, f32, [f32; 3], f32),
@@ -1447,6 +1449,17 @@ impl Viewer {
                         Edit::Block {
                             page: draft.key.2 as u32 + 1,
                             block: text_block::Replacement {
+                                spans: if (block.font, draft.size, draft.color)
+                                    == (block.initial.0, block.initial.1, block.initial.2)
+                                {
+                                    mypdf_milestone0::rich_text::edited(
+                                        &block.styled_text,
+                                        &draft.text,
+                                        &block.spans,
+                                    )
+                                } else {
+                                    vec![]
+                                },
                                 selection: block.selection,
                                 text: draft.text,
                                 rect: [
@@ -1569,7 +1582,7 @@ impl Viewer {
                             ui.add(egui::DragValue::new(&mut draft.size).range(4.0..=144.0).suffix(" pt")).on_hover_text("Block font size");
                             editing::color_palette(ui, &mut draft.color);
                             ui.add_space(8.);
-                            ui.label(RichText::new("The selection becomes one block with this font and color. Drag the corner to resize.").small().color(theme::muted()));
+                            ui.label(RichText::new("Mixed formatting is preserved while typing. Choosing a font, size or color styles the whole block. Drag the corner to reflow.").small().color(theme::muted()));
                         });
                     } else {
                         ui.label(RichText::new(&draft.font).color(theme::muted()));
@@ -1602,6 +1615,183 @@ impl Viewer {
     }
 }
 
+impl Viewer {
+    pub(super) fn text_context_toolbar(&mut self, ctx: &egui::Context) {
+        if self.editor.mode != editing::Mode::Edit
+            || self.home.visible
+            || self.content.busy
+            || self.content.paused
+        {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Some((view, offset, _)) = tab.document_view else {
+            return;
+        };
+        if self.content.add_target.is_some_and(|(id, _)| id == tab.id)
+            && self.content.existing.is_none()
+        {
+            let (_, page) = self.content.add_target.unwrap();
+            if let Some(page_rect) = tab
+                .document_layout
+                .as_ref()
+                .and_then(|l| l.rects.get(page))
+                .filter(|r| r.is_positive())
+            {
+                let point = view.min - offset
+                    + page_rect.min.to_vec2()
+                    + vec2(self.content.new_rect[0], self.content.new_rect[1]) * tab.scale;
+                let pos = pos2(
+                    point.x.clamp(
+                        view.left() + 8.,
+                        (view.right() - 370.).max(view.left() + 8.),
+                    ),
+                    (point.y - 64.).max(view.top() + 8.),
+                );
+                let mut cancel = false;
+                egui::Area::new(egui::Id::new("new_text_context_toolbar"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(pos)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style())
+                            .corner_radius(12)
+                            .inner_margin(8.)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let fonts = text_style::fonts();
+                                    egui::ComboBox::from_id_salt("new_context_font")
+                                        .width(130.)
+                                        .selected_text(
+                                            fonts
+                                                .get(self.content.new_font)
+                                                .map_or("Font", |f| f.family.as_str()),
+                                        )
+                                        .show_ui(ui, |ui| {
+                                            for (i, f) in fonts.iter().enumerate() {
+                                                ui.selectable_value(
+                                                    &mut self.content.new_font,
+                                                    i,
+                                                    format!("{} {}", f.family, f.style()),
+                                                );
+                                            }
+                                        });
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.content.new_size)
+                                            .range(4.0..=144.)
+                                            .suffix(" pt"),
+                                    );
+                                    ui.menu_button("Color", |ui| {
+                                        editing::color_palette(ui, &mut self.content.new_color);
+                                    });
+                                    if ui
+                                        .add(
+                                            ActionButton::new(Icon::Check, "Finish text editing")
+                                                .compact(),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.content.new_commit = true;
+                                    }
+                                    cancel = ui
+                                        .add(
+                                            ActionButton::new(Icon::Close, "Cancel text editing")
+                                                .compact(),
+                                        )
+                                        .clicked();
+                                });
+                            });
+                    });
+                if cancel {
+                    self.content.add_target = None;
+                    self.content.new_text.clear();
+                }
+            }
+            return;
+        }
+        let Some(draft) = self.content.existing.as_mut().filter(|d| d.key.0 == tab.id) else {
+            return;
+        };
+        let Some(page) = tab
+            .document_layout
+            .as_ref()
+            .and_then(|l| l.rects.get(draft.key.2))
+            .filter(|r| r.is_positive())
+        else {
+            return;
+        };
+        let origin = view.min - offset + page.min.to_vec2();
+        let point = origin + vec2(draft.rect[0], draft.rect[1]) * tab.scale;
+        let pos = pos2(
+            point.x.clamp(
+                view.left() + 8.,
+                (view.right() - 370.).max(view.left() + 8.),
+            ),
+            (point.y - 48.).max(view.top() + 8.),
+        );
+        let mut done = false;
+        let mut cancel = false;
+        egui::Area::new(egui::Id::new("text_context_toolbar"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .corner_radius(12)
+                    .inner_margin(8.)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if let InlineTarget::Block(block) = &mut draft.target {
+                                let fonts = text_style::fonts();
+                                egui::ComboBox::from_id_salt("context_font")
+                                    .width(120.)
+                                    .selected_text(
+                                        fonts.get(block.font).map_or("Font", |f| f.family.as_str()),
+                                    )
+                                    .show_ui(ui, |ui| {
+                                        for (i, f) in fonts.iter().enumerate() {
+                                            ui.selectable_value(
+                                                &mut block.font,
+                                                i,
+                                                format!("{} {}", f.family, f.style()),
+                                            );
+                                        }
+                                    });
+                                ui.add(
+                                    egui::DragValue::new(&mut draft.size)
+                                        .range(4.0..=144.)
+                                        .suffix(" pt"),
+                                );
+                                ui.menu_button("Color", |ui| {
+                                    editing::color_palette(ui, &mut draft.color);
+                                });
+                            } else {
+                                ui.label("Edit text in place");
+                            }
+                            done = ui
+                                .add(
+                                    ActionButton::new(Icon::Check, "Finish text editing").compact(),
+                                )
+                                .clicked();
+                            cancel = ui
+                                .add(
+                                    ActionButton::new(Icon::Close, "Cancel text editing").compact(),
+                                )
+                                .clicked();
+                        });
+                    });
+            });
+        if done {
+            self.content.new_commit = true;
+        }
+        if cancel {
+            self.content.existing = None;
+            self.content.next_existing = None;
+            self.content.after_text = None;
+        }
+    }
+}
+
 fn pdf_preview_font(name: &str) -> egui::FontFamily {
     let name = name.to_ascii_lowercase().replace([' ', '-'], "");
     let bold = name.contains("bold");
@@ -1620,6 +1810,61 @@ fn pdf_preview_font(name: &str) -> egui::FontFamily {
         .or_else(|| text_style::fonts().first())
         .map(|f| egui::FontFamily::Name(f.ui_name().into()))
         .unwrap_or(egui::FontFamily::Proportional)
+}
+
+/// Grow only along the same column, stopping at paragraph-sized gaps and headings.
+fn paragraph_at(clicked: InlineText, candidates: &[InlineText], page: PageSize) -> InlineText {
+    if !matches!(clicked.target, InlineTarget::Run(_)) {
+        return clicked;
+    }
+    let mut selected = vec![clicked.clone()];
+    loop {
+        let next = candidates
+            .iter()
+            .find(|c| {
+                matches!(c.target, InlineTarget::Run(_))
+                    && !selected.iter().any(|a| a.target == c.target)
+                    && selected.iter().any(|a| {
+                        let gap = (c.rect[1] - a.rect[3]).max(a.rect[1] - c.rect[3]);
+                        let overlap = a.rect[0].max(c.rect[0]) < a.rect[2].min(c.rect[2]);
+                        let same_line = (a.rect[1] - c.rect[1]).abs() < a.size * 0.4
+                            && (a.rect[2] - c.rect[0])
+                                .abs()
+                                .min((c.rect[2] - a.rect[0]).abs())
+                                < a.size;
+                        (same_line
+                            || gap >= -a.size * 0.3
+                                && gap < a.size * 0.9
+                                && overlap
+                                && (a.rect[0] - c.rect[0]).abs() < a.size * 2.)
+                            && (c.size / a.size - 1.).abs() < 0.35
+                    })
+            })
+            .cloned();
+        let Some(next) = next else { break };
+        selected.push(next);
+        if selected.len() >= 200 {
+            break;
+        }
+    }
+    if selected.len() < 2 {
+        return clicked;
+    }
+    let right = selected.iter().map(|a| a.rect[2]).fold(0., f32::max);
+    let mut paragraph = selected_block(
+        selected,
+        [clicked.rect[0], clicked.rect[1], right, clicked.rect[3]],
+        page,
+    )
+    .unwrap_or(clicked);
+    // Line breaks inferred from PDF positioning are soft wraps, not paragraph
+    // breaks. A one-byte space preserves the captured style-range offsets.
+    paragraph.text = paragraph.text.replace('\n', " ");
+    paragraph.original = paragraph.text.clone();
+    if let InlineTarget::Block(block) = &mut paragraph.target {
+        block.styled_text = paragraph.text.clone();
+    }
+    paragraph
 }
 
 fn selected_block(
@@ -1659,6 +1904,8 @@ fn selected_block(
     };
     let mut masks = Vec::new();
     let mut paragraphs = Vec::new();
+    let mut spans = Vec::new();
+    let mut byte_offset = 0;
     for line in lines {
         let mut text = String::new();
         let mut previous: Option<&InlineText> = None;
@@ -1670,7 +1917,25 @@ fn selected_block(
             {
                 text.push(' ');
             }
+            let start = byte_offset + text.len();
+            let font = text_style::fonts()
+                .iter()
+                .find(|f| {
+                    pdf_preview_font(&item.font) == egui::FontFamily::Name(f.ui_name().into())
+                })
+                .map(|f| f.path.clone());
+            // Spaces between fragments inherit the preceding face.
+            if let Some(previous) = spans.last_mut() {
+                let previous: &mut mypdf_milestone0::rich_text::Span = previous;
+                previous.range.end = start;
+            }
             text.push_str(&item.text);
+            spans.push(mypdf_milestone0::rich_text::Span {
+                range: start..byte_offset + text.len(),
+                font,
+                size: item.size.clamp(4., 144.),
+                color: item.color,
+            });
             match &item.target {
                 InlineTarget::Run(i) => selection.runs.push((*i, item.original.clone())),
                 InlineTarget::Annotation(id) => selection
@@ -1681,6 +1946,7 @@ fn selected_block(
             masks.push(item.rect);
             previous = Some(item);
         }
+        byte_offset += text.len() + 1;
         paragraphs.push(text);
     }
     let text = paragraphs.join("\n");
@@ -1709,6 +1975,8 @@ fn selected_block(
         target: InlineTarget::Block(BlockDraft {
             selection,
             masks,
+            spans,
+            styled_text: text.clone(),
             font,
             initial: (font, size, first.color, right),
         }),
@@ -1743,6 +2011,7 @@ fn erased_page(
         std::thread::spawn(move || {
             let image = std::panic::catch_unwind(|| {
                 let replacement = text_block::Replacement {
+                    spans: vec![],
                     selection,
                     text: String::new(),
                     rect: [0., 0., 1., 1.],
@@ -1922,7 +2191,7 @@ fn existing_overlay(
         .as_ref()
         .is_some_and(|e| matches!(e.target, InlineTarget::Block(_)));
     let mut clicked = None;
-    for (i, draft) in candidates.into_iter().enumerate() {
+    for (i, draft) in candidates.iter().cloned().enumerate() {
         if block_active {
             break;
         }
@@ -1963,7 +2232,7 @@ fn existing_overlay(
             );
         }
         if response.clicked() && !state.busy {
-            clicked = Some(draft);
+            clicked = Some(paragraph_at(draft, &candidates, tab.pages[page]));
         }
     }
     if let Some(draft) = clicked {
@@ -2078,6 +2347,17 @@ fn existing_overlay(
             painter.circle_stroke(center, 4.5, Stroke::new(1.5, theme::accent()));
         }
     }
+    let rich = if let InlineTarget::Block(b) = &draft.target {
+        ((b.font, draft.size, draft.color) == (b.initial.0, b.initial.1, b.initial.2))
+            .then(|| b.spans.clone())
+    } else {
+        None
+    };
+    let source_text = if let InlineTarget::Block(b) = &draft.target {
+        b.styled_text.clone()
+    } else {
+        draft.original.clone()
+    };
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
         ui.set_clip_rect(page_rect.intersect(ui.clip_rect()));
         ui.add_enabled_ui(!state.busy, |ui| {
@@ -2089,7 +2369,33 @@ fn existing_overlay(
                     color,
                     width,
                 );
-                if block {
+                if let Some(spans) = &rich {
+                    job.sections.clear();
+                    for span in
+                        mypdf_milestone0::rich_text::edited(&source_text, text.as_str(), spans)
+                    {
+                        let family = text_style::fonts()
+                            .iter()
+                            .find(|f| Some(&f.path) == span.font.as_ref())
+                            .map(|f| egui::FontFamily::Name(f.ui_name().into()))
+                            .unwrap_or(font.family.clone());
+                        job.sections.push(egui::text::LayoutSection {
+                            leading_space: 0.,
+                            byte_range: span.range,
+                            format: egui::TextFormat {
+                                font_id: FontId::new(span.size * scale, family),
+                                color: Color32::from_rgb(
+                                    (span.color[0] * 255.) as u8,
+                                    (span.color[1] * 255.) as u8,
+                                    (span.color[2] * 255.) as u8,
+                                ),
+                                line_height: Some(span.size * scale * 1.3),
+                                ..Default::default()
+                            },
+                        });
+                    }
+                }
+                if block && rich.is_none() {
                     for section in &mut job.sections {
                         section.format.line_height = Some(draft.size * scale * 1.3);
                     }
@@ -2113,6 +2419,13 @@ fn existing_overlay(
                 .layouter(&mut layouter)
                 .show(ui);
             let response = output.response;
+            if response.changed()
+                && let InlineTarget::Block(b) = &mut draft.target
+            {
+                b.spans =
+                    mypdf_milestone0::rich_text::edited(&b.styled_text, &draft.text, &b.spans);
+                b.styled_text = draft.text.clone();
+            }
             if block {
                 draft.rect[3] = draft.rect[3]
                     .max(draft.rect[1] + output.galley.size().y / scale + draft.size * 0.3)
@@ -2402,6 +2715,58 @@ pub(super) fn overlay(
 mod tests {
     use super::*;
     #[test]
+    fn clicking_any_paragraph_fragment_preserves_styles_and_excludes_other_columns() {
+        let item = |index, text: &str, rect, font: &str, color| InlineText {
+            key: (1, 0, 0),
+            target: InlineTarget::Run(index),
+            original: text.into(),
+            text: text.into(),
+            rect,
+            size: 14.,
+            color,
+            font: font.into(),
+            focus: true,
+        };
+        let candidates = vec![
+            item(0, "Regular", [50., 70., 100., 84.], "Arial", [0.; 3]),
+            item(
+                1,
+                "bold",
+                [104., 70., 140., 84.],
+                "Arial-Bold",
+                [0.8, 0., 0.],
+            ),
+            item(2, "next line", [50., 89., 180., 103.], "Arial", [0.; 3]),
+            item(3, "Other column", [300., 70., 430., 84.], "Arial", [0.; 3]),
+            item(
+                4,
+                "Next paragraph",
+                [50., 140., 220., 154.],
+                "Arial",
+                [0.; 3],
+            ),
+        ];
+        for i in 0..3 {
+            let paragraph = paragraph_at(
+                candidates[i].clone(),
+                &candidates,
+                PageSize {
+                    width: 595.,
+                    height: 842.,
+                },
+            );
+            assert_eq!(paragraph.text, "Regular bold next line");
+            assert!(!paragraph.changed(), "Opening text must not rewrite it");
+            let InlineTarget::Block(block) = paragraph.target else {
+                panic!("expected paragraph")
+            };
+            assert_eq!(block.selection.runs.len(), 3);
+            assert_eq!(&paragraph.text[block.spans[1].range.clone()], "bold ");
+            assert_eq!(block.spans[1].color, [0.8, 0., 0.]);
+            assert_ne!(block.spans[0].font, block.spans[1].font);
+        }
+    }
+    #[test]
     fn rectangular_selection_types_reflows_cancels_and_saves_in_place() {
         use eframe::App;
         let ctx = egui::Context::default();
@@ -2681,7 +3046,10 @@ mod tests {
         );
 
         // A click on the gray surround or on empty page space closes an untouched block.
-        click(&mut app, page.min + vec2(-16., 300.));
+        click(
+            &mut app,
+            page.min + vec2(-super::reading::GUTTER / 2., 300.),
+        );
         assert!(app.content.existing.is_none());
         drag(&mut app, start, end);
         assert!(app.content.existing.is_some());

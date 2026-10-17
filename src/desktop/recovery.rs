@@ -157,9 +157,9 @@ impl Recovery {
             .get(&id)
             .is_some_and(|t| t.written == Some(revision))
         {
-            "Recovery copy up to date"
+            "Recovery copy saved"
         } else {
-            "Autosave pending…"
+            "Unsaved changes"
         }
     }
 }
@@ -470,8 +470,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(app.tabs[0].session.as_ref().unwrap().dirty());
-        assert_eq!(app.recovery.label(id, 0), "Recovery copy up to date");
-        assert_eq!(app.recovery.label(id, 1), "Autosave pending…");
+        assert_eq!(app.recovery.label(id, 0), "Recovery copy saved");
+        assert_eq!(app.recovery.label(id, 1), "Unsaved changes");
         app.tabs[0].session.as_mut().unwrap().mark_saved(0);
         app.recovery_tick(&ctx);
         assert!(!app.recovery.tracking.contains_key(&id));

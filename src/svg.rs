@@ -215,7 +215,13 @@ pub fn preview(source: &str, color: Option<[f32; 3]>) -> Result<Arc<Vec<u8>>> {
     );
     let png = Arc::new(pix.encode_png()?);
     let mut cache = CACHE.get().unwrap().lock().unwrap();
-    if cache.len() >= 16 {
+    // A standard stamp gallery already has more than 16 entries. Bound both
+    // count and encoded bytes without thrashing when many stamps share a page.
+    while !cache.is_empty()
+        && (cache.len() >= 128
+            || cache.iter().map(|(_, image)| image.len()).sum::<usize>() + png.len()
+                > 16 * 1024 * 1024)
+    {
         cache.remove(0);
     }
     cache.push((key, png.clone()));

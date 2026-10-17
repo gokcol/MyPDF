@@ -245,6 +245,8 @@ pub struct Annotation {
     pub rotation: f32,
     pub kind: Kind,
     pub style: Style,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_id: Option<String>,
 }
 impl Annotation {
     pub fn new(page: usize, rect: Box2, kind: Kind, style: Style) -> Self {
@@ -255,6 +257,7 @@ impl Annotation {
             rotation: 0.0,
             kind,
             style,
+            asset_id: None,
         }
     }
     pub fn validate(&self) -> Result<()> {

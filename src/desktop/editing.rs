@@ -98,6 +98,9 @@ struct Gesture {
     original: Option<Annotation>,
     /// The corner being dragged (top-left, top-right, bottom-right, bottom-left).
     resize: Option<usize>,
+    endpoint: Option<usize>,
+    duplicate: bool,
+    guides: manipulation::Guides,
     preview: Option<Annotation>,
 }
 
@@ -230,6 +233,7 @@ pub(super) struct EditorState {
     pub(super) tool: Tool,
     pub(super) style: Style,
     pub text_editing: bool,
+    pub(super) snapping: bool,
     pub library_open: bool,
     pub signature_open: bool,
     pub asset_busy: bool,
@@ -257,6 +261,8 @@ pub(super) struct EditorState {
     removed_asset: Option<Asset>,
     pub(super) library_tab: String,
     library_query: String,
+    stamp_source: usize,
+    library_folder: String,
     builtins: Vec<assets::BuiltinAsset>,
     signature_name: String,
     signature_typed: String,
@@ -287,6 +293,7 @@ impl EditorState {
             tool: Tool::Select,
             style: Style::default(),
             text_editing: false,
+            snapping: true,
             library_open: false,
             signature_open: false,
             asset_busy: false,
@@ -311,6 +318,8 @@ impl EditorState {
             removed_asset: None,
             library_tab: "Arrows".into(),
             library_query: String::new(),
+            stamp_source: 0,
+            library_folder: String::new(),
             builtins: assets::builtin_assets(),
             signature_name: "My handwritten signature".into(),
             signature_typed: String::new(),
@@ -348,6 +357,10 @@ impl EditorState {
         let id = asset.id.clone();
         library.put(asset).map_err(|e| format!("{e:#}"))?;
         self.last_added = Some(id);
+        if stamp {
+            self.stamp_source = 1;
+            self.library_folder.clear();
+        }
         self.library_tab = if stamp { "Stamps" } else { "Saved" }.into();
         Ok(())
     }
@@ -478,7 +491,11 @@ impl EditorState {
             }
             _ => Kind::Rectangle,
         };
-        Annotation::new(page, r, kind, style)
+        let mut a = Annotation::new(page, r, kind, style);
+        if self.tool == Tool::Asset {
+            a.asset_id = self.placed.as_ref().map(|a| a.id.clone());
+        }
+        a
     }
 }
 
@@ -1138,7 +1155,7 @@ pub(super) fn page_interaction(
             page,
             p,
             scale,
-            ctx.input(|i| i.modifiers.shift),
+            ctx.input(|i| i.modifiers),
         )
     {
         let original = if editor.tool == Tool::Select {
@@ -1150,13 +1167,21 @@ pub(super) fn page_interaction(
                         .as_ref()?
                         .annotations
                         .iter()
-                        .find(|a| &a.id == id && a.page == page && corner_at(a, p, scale).is_some())
+                        .find(|a| {
+                            &a.id == id
+                                && a.page == page
+                                && (corner_at(a, p, scale).is_some()
+                                    || manipulation::endpoint_at(a, p, scale).is_some())
+                        })
                         .cloned()
                 })
                 .or_else(|| hit_annotation(tab, page, p, scale))
         } else {
             None
         };
+        let endpoint = original
+            .as_ref()
+            .and_then(|a| manipulation::endpoint_at(a, p, scale));
         let resize = original
             .as_ref()
             .filter(|a| Some(&a.id) == tab.selected_annotation.as_ref())
@@ -1173,6 +1198,9 @@ pub(super) fn page_interaction(
                 points: vec![p],
                 original,
                 resize,
+                endpoint,
+                duplicate: ctx.input(|i| i.modifiers.alt) && endpoint.is_none() && resize.is_none(),
+                guides: Default::default(),
                 preview: None,
             });
         }
@@ -1197,18 +1225,48 @@ pub(super) fn page_interaction(
             }
             let mut preview = if let Some(original) = &gesture.original {
                 let mut next = original.clone();
-                if let Some(corner) = gesture.resize {
+                if let Some(end) = gesture.endpoint {
+                    next = manipulation::move_endpoint(
+                        original,
+                        end,
+                        p,
+                        ctx.input(|i| i.modifiers.shift),
+                    );
+                } else if let Some(corner) = gesture.resize {
                     let proportional =
                         keeps_proportions(&original.kind) || ctx.input(|i| i.modifiers.shift);
                     next.rect = resized(original.rect, corner, p, proportional);
                 } else {
                     let w = next.rect[2] - next.rect[0];
                     let h = next.rect[3] - next.rect[1];
-                    let x = (original.rect[0] + p[0] - gesture.start[0])
+                    let mut delta = [p[0] - gesture.start[0], p[1] - gesture.start[1]];
+                    if ctx.input(|i| i.modifiers.shift) {
+                        if delta[0].abs() > delta[1].abs() {
+                            delta[1] = 0.;
+                        } else {
+                            delta[0] = 0.;
+                        }
+                    }
+                    let x = (original.rect[0] + delta[0])
                         .clamp(0.0, (tab.pages[page].width - w).max(0.0));
-                    let y = (original.rect[1] + p[1] - gesture.start[1])
+                    let y = (original.rect[1] + delta[1])
                         .clamp(0.0, (tab.pages[page].height - h).max(0.0));
                     next.rect = [x, y, x + w, y + h];
+                    gesture.guides = Default::default();
+                    if editor.snapping
+                        && !ctx
+                            .input(|i| i.modifiers.command || i.modifiers.ctrl || i.modifiers.shift)
+                    {
+                        let (d, guides) = manipulation::snap(
+                            tab,
+                            page,
+                            next.bounds(),
+                            std::slice::from_ref(&original.id),
+                            scale,
+                        );
+                        next = selection::moved(&[next], d, page_size).remove(0);
+                        gesture.guides = guides;
+                    }
                 }
                 next
             } else {
@@ -1242,6 +1300,10 @@ pub(super) fn page_interaction(
                 if editor.tool == Tool::SignArea {
                     editor.pending_sign_rect = Some((tab.id, page, a.rect));
                     editor.tool = Tool::Select;
+                } else if gesture.duplicate && gesture.original.is_some() {
+                    let mut copy = a.clone();
+                    copy.id = format!("{:032x}", rand::random::<u128>());
+                    commit_new(editor, tab, copy, status);
                 } else if gesture.original.is_some() {
                     if let Some(s) = &mut tab.session {
                         let mut entries = s.annotations.clone();
@@ -1272,7 +1334,16 @@ pub(super) fn page_interaction(
             .map(normal);
         let released =
             response.drag_stopped() || quick_release || !ctx.input(|i| i.pointer.primary_down());
-        selection::update(editor, tab, page, pointer, released, scale, status);
+        selection::update(
+            editor,
+            tab,
+            page,
+            pointer,
+            released,
+            scale,
+            ctx.input(|i| i.modifiers),
+            status,
+        );
     }
     let painter = ui
         .painter()
@@ -1284,7 +1355,7 @@ pub(super) fn page_interaction(
             let preview = editor
                 .gesture
                 .as_ref()
-                .filter(|g| g.tab == tab.id && g.page == page)
+                .filter(|g| g.tab == tab.id && g.page == page && !g.duplicate)
                 .and_then(|g| g.preview.as_ref())
                 .filter(|p| p.id == a.id);
             let actual = selection::preview(editor, tab.id, page, &a.id)
@@ -1297,11 +1368,21 @@ pub(super) fn page_interaction(
     if let Some(a) = editor
         .gesture
         .as_ref()
-        .filter(|g| g.tab == tab.id && g.page == page && g.original.is_none())
+        .filter(|g| g.tab == tab.id && g.page == page && (g.original.is_none() || g.duplicate))
         .and_then(|g| g.preview.clone())
     {
         paint_annotation(editor, ctx, &painter, page_rect, scale, &a);
     }
+    if let Some(g) = &editor.gesture
+        && g.tab == tab.id
+        && g.page == page
+    {
+        g.guides.paint(&painter, page_rect, scale);
+    }
+    for copy in selection::duplicates(editor, tab.id, page) {
+        paint_annotation(editor, ctx, &painter, page_rect, scale, &copy);
+    }
+    selection::guides(editor, tab.id, page).paint(&painter, page_rect, scale);
     // The outline and handle must follow the same preview as the artwork in
     // this frame, including a drag that picks up a different selected object.
     let single = editor
@@ -1317,6 +1398,13 @@ pub(super) fn page_interaction(
             })
         });
     if let Some(a) = single {
+        if let Some(points) = manipulation::endpoints(a) {
+            for point in points {
+                let p = page_rect.min + vec2(point[0], point[1]) * scale;
+                painter.circle_filled(p, 5., Color32::WHITE);
+                painter.circle_stroke(p, 5., Stroke::new(1.8, theme::accent()));
+            }
+        }
         let b = a.bounds();
         let r = Rect::from_min_max(
             page_rect.min + vec2(b[0], b[1]) * scale,
@@ -1501,6 +1589,28 @@ fn commit_new(
             Ok(()) => {
                 tab.group.clear();
                 tab.selected_annotation = Some(a.id.clone());
+                if let Some(id) = &a.asset_id {
+                    let base = editor
+                        .library
+                        .as_ref()
+                        .and_then(|l| l.entries.iter().find(|a| &a.id == id))
+                        .cloned()
+                        .or_else(|| {
+                            editor
+                                .builtins
+                                .iter()
+                                .find(|b| &b.asset.id == id)
+                                .map(|b| b.asset.clone())
+                        });
+                    if let Some(mut asset) = base {
+                        asset.last_used = time::OffsetDateTime::now_utc().unix_timestamp();
+                        if let Some(l) = &mut editor.library
+                            && let Err(e) = l.put(asset)
+                        {
+                            editor.library_error = Some(format!("{e:#}"));
+                        }
+                    }
+                }
                 editor.draft = Some(a);
                 *status = None;
             }
@@ -1748,7 +1858,7 @@ impl Viewer {
     pub(super) fn editor_tools(&mut self, ctx: &egui::Context) {
         if matches!(
             self.editor.mode,
-            Mode::Pages | Mode::Edit | Mode::Forms | Mode::Convert
+            Mode::Read | Mode::Pages | Mode::Edit | Mode::Forms | Mode::Convert
         ) {
             return;
         }
@@ -1860,6 +1970,7 @@ impl Viewer {
                                     }
                                 }
                                 ui.separator();
+                                if ui.add(ActionButton::new(Icon::AlignObjectsCenter,"Snap to objects").compact().selected(self.editor.snapping)).on_hover_text("Snap edges and centers · ⌘ bypasses snapping while dragging").clicked() { self.editor.snapping = !self.editor.snapping; }
                                 ui::color_swatch(
                                     ui,
                                     &mut self.editor.style.color,
@@ -2541,31 +2652,6 @@ impl Viewer {
                             .color(theme::muted()),
                     );
                     ui.add_space(6.0);
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.add(ActionButton::new(Icon::Text, "SVG code…")).clicked() {
-                            self.editor.svg = SvgEditor::default();
-                            self.editor.svg.open = true;
-                            self.editor.svg.stamp = self.editor.library_tab == "Stamps";
-                        }
-                        if ui
-                            .add(ActionButton::new(Icon::Sparkle, "Create with prompt…"))
-                            .clicked()
-                        {
-                            self.editor.create_stamp_prompt();
-                        }
-                        import = ui
-                            .add_enabled(
-                                !self.editor.asset_busy,
-                                ActionButton::new(Icon::Import, "Import image / SVG…"),
-                            )
-                            .clicked();
-                        if ui
-                            .add(ActionButton::new(Icon::Sign, "Signature…"))
-                            .clicked()
-                        {
-                            self.editor.signature_open = true;
-                        }
-                    });
                     if self.editor.removed_asset.is_some()
                         && ui
                             .add(ActionButton::new(Icon::Undo, "Undo removal"))
@@ -2596,6 +2682,39 @@ impl Viewer {
                                 self.editor.library_tab = label.into();
                             }
                         }
+                        let add = ui.add(ActionButton::new(
+                            Icon::Plus,
+                            if self.editor.library_tab == "Stamps" { "Add stamp" } else { "Add artwork" },
+                        ).compact());
+                        egui::Popup::menu(&add).show(|ui| {
+                        if ui.add(ActionButton::new(Icon::Text, "SVG code…")).clicked() {
+                            self.editor.svg = SvgEditor::default();
+                            self.editor.svg.open = true;
+                            self.editor.svg.stamp = self.editor.library_tab == "Stamps";
+                            ui.close();
+                        }
+                        if ui
+                            .add(ActionButton::new(Icon::Sparkle, "Create with prompt…"))
+                            .clicked()
+                        {
+                            self.editor.create_stamp_prompt();
+                            ui.close();
+                        }
+                        import = ui
+                            .add_enabled(
+                                !self.editor.asset_busy,
+                                ActionButton::new(Icon::Import, "Import image / SVG…"),
+                            )
+                            .clicked();
+                        if import { ui.close(); }
+                        if ui
+                            .add(ActionButton::new(Icon::Sign, "Signature…"))
+                            .clicked()
+                        {
+                            self.editor.signature_open = true;
+                            ui.close();
+                        }
+                    });
                     });
                     let search = ui.add(
                         egui::TextEdit::singleline(&mut self.editor.library_query)
@@ -2615,47 +2734,36 @@ impl Viewer {
                         ui.colored_label(theme::danger(), error);
                     }
                     let query = self.editor.library_query.to_lowercase();
-                    let mut entries: Vec<(Option<usize>, Asset)> =
-                        if self.editor.library_tab == "Saved" {
-                            self.editor
-                                .library
-                                .as_ref()
-                                .map(|l| {
-                                    l.entries
-                                        .iter()
-                                        .enumerate()
-                                        .filter(|(_, a)| a.name.to_lowercase().contains(&query))
-                                        .map(|(i, a)| (Some(i), a.clone()))
-                                        .collect()
-                                })
-                                .unwrap_or_default()
-                        } else {
-                            self.editor
-                                .builtins
-                                .iter()
-                                .filter(|b| {
-                                    b.category == self.editor.library_tab
-                                        && b.asset.name.to_lowercase().contains(&query)
-                                })
-                                .map(|b| (None, b.asset.clone()))
-                                .collect()
-                        };
-                    if self.editor.library_tab == "Stamps"
-                        && let Some(library) = &self.editor.library
-                    {
-                        entries.splice(
-                            0..0,
-                            library
-                                .entries
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, a)| {
-                                    (a.stamp || matches!(a.kind, Kind::Stamp { .. }))
-                                        && a.name.to_lowercase().contains(&query)
-                                })
-                                .map(|(i, a)| (Some(i), a.clone())),
-                        );
+                    if self.editor.library_tab == "Stamps" {
+                        if let Some(i)=ui::segmented(ui,&["Standard","Custom"],self.editor.stamp_source) { self.editor.stamp_source=i;self.editor.library_folder.clear(); }
+                        ui.horizontal(|ui| { ui.selectable_value(&mut self.editor.stamp_source,2,"★ Favorites"); ui.selectable_value(&mut self.editor.stamp_source,3,"Recent"); });
                     }
+                    let mut all: Vec<(Option<usize>,Asset)> = self.editor.builtins.iter().map(|b|(None,b.asset.clone())).collect();
+                    if let Some(library)=&self.editor.library {
+                        for (i,a) in library.entries.iter().enumerate() {
+                            if let Some(existing)=all.iter_mut().find(|(_,b)| b.id==a.id) { *existing=(Some(i),a.clone()); }
+                            else { all.push((Some(i),a.clone())); }
+                        }
+                    }
+                    let mut folders: Vec<_> = all.iter().map(|(_,a)|a.folder.clone()).filter(|f|!f.is_empty()).collect();
+                    folders.sort(); folders.dedup();
+                    if matches!(self.editor.library_tab.as_str(),"Stamps"|"Saved") && !folders.is_empty() {
+                        egui::ComboBox::from_id_salt("asset_folder").selected_text(if self.editor.library_folder.is_empty(){"All folders"}else{&self.editor.library_folder}).show_ui(ui,|ui|{
+                            ui.selectable_value(&mut self.editor.library_folder,String::new(),"All folders");
+                            for folder in folders { ui.selectable_value(&mut self.editor.library_folder,folder.clone(),folder); }
+                        });
+                    }
+                    let mut entries: Vec<_> = all.into_iter().filter(|(index,a)| {
+                        let builtin=self.editor.builtins.iter().find(|b|b.asset.id==a.id);
+                        let collection=match self.editor.library_tab.as_str() {
+                            "Saved" => index.is_some() && builtin.is_none(),
+                            "Stamps" => a.stamp && match self.editor.stamp_source { 0=>builtin.is_some(),1=>builtin.is_none(),2=>a.favorite,_=>a.last_used>0 },
+                            other => builtin.is_some_and(|b|b.category==other),
+                        };
+                        collection && format!("{} {} {}",a.name,a.tags,a.folder).to_lowercase().contains(&query)
+                            && (self.editor.library_folder.is_empty() || a.folder==self.editor.library_folder || !matches!(self.editor.library_tab.as_str(),"Stamps"|"Saved"))
+                    }).collect();
+                    if self.editor.library_tab=="Stamps" && self.editor.stamp_source==3 { entries.sort_by_key(|(_,a)|std::cmp::Reverse(a.last_used)); }
                     ui.add_space(4.0);
                     egui::ScrollArea::vertical()
                         .id_salt("asset_gallery")
@@ -2672,10 +2780,16 @@ impl Viewer {
                             }
                             let columns =
                                 ((ui.available_width() + 8.0) / 110.0).floor().max(1.0) as usize;
-                            let width = ((ui.available_width() - (columns - 1) as f32 * 8.0)
-                                / columns as f32)
-                                .max(100.0);
-                            for row in entries.chunks(columns) {
+                            let full_width=ui.available_width();
+                            let mut rows: Vec<Vec<&(Option<usize>,Asset)>>=vec![];
+                            for entry in &entries {
+                                let wide=entry.1.stamp && entry.1.aspect>4.5;
+                                if wide || rows.last().is_none_or(|row| row.len()>=columns || row[0].1.stamp && row[0].1.aspect>4.5) { rows.push(vec![]); }
+                                rows.last_mut().unwrap().push(entry);
+                            }
+                            for row in rows {
+                                let wide=row.len()==1 && row[0].1.stamp && row[0].1.aspect>4.5;
+                                let width=if wide {full_width} else {((full_width-(columns-1)as f32*8.)/columns as f32).max(100.)};
                                 ui.horizontal_top(|ui| {
                                     for (index, asset) in row {
                                         ui.push_id(&asset.id, |ui| {
@@ -2731,7 +2845,7 @@ impl Viewer {
                                                 );
                                                 let base = vec2(240.0, 240.0 / asset.aspect);
                                                 let scale =
-                                                    ((width - 30.0) / base.x).min(50.0 / base.y);
+                                                    ((width - 18.0) / base.x).min(50.0 / base.y);
                                                 let origin = pos2(
                                                     rect.center().x - base.x * scale / 2.0,
                                                     rect.top()
@@ -2748,14 +2862,16 @@ impl Viewer {
                                                     (1.8 / scale).max(preview.style.width);
                                                 let painter =
                                                     ui.painter().with_clip_rect(rect.shrink(5.0));
-                                                paint_annotation(
-                                                    &mut self.editor,
-                                                    ctx,
-                                                    &painter,
-                                                    Rect::from_min_size(origin, base * scale),
-                                                    scale,
-                                                    &preview,
-                                                );
+                                                if ui.is_rect_visible(rect) {
+                                                    paint_annotation(
+                                                        &mut self.editor,
+                                                        ctx,
+                                                        &painter,
+                                                        Rect::from_min_size(origin, base * scale),
+                                                        scale,
+                                                        &preview,
+                                                    );
+                                                }
                                                 let label = if asset.name.chars().count() > 18 {
                                                     format!(
                                                         "{}…",
@@ -2775,6 +2891,13 @@ impl Viewer {
                                                     FontId::proportional(12.0),
                                                     theme::ink(),
                                                 );
+                                                response.context_menu(|ui|{
+                                                    if ui.add(ActionButton::new(Icon::Copy,"Create custom variant")).clicked() {
+                                                        let mut copy=asset.clone();copy.id=format!("{:032x}",rand::random::<u128>());copy.name=format!("{} copy",asset.name.chars().take(190).collect::<String>());copy.last_used=0;
+                                                        if let Err(e)=self.editor.add_asset(copy.clone()){self.editor.library_error=Some(e);}else{self.editor.asset_details=Some(copy);}
+                                                        ui.close();
+                                                    }
+                                                });
                                                 if response
                                                     .on_hover_text(format!(
                                                         "Click, then click the page to place {} · or drag it onto the page",
@@ -2785,7 +2908,15 @@ impl Viewer {
                                                 {
                                                     place = Some(asset.clone());
                                                 }
-                                                if let Some(index) = index {
+                                                let star_rect=Rect::from_center_size(rect.right_top()+vec2(-12.,12.),vec2(20.,20.));
+                                                let star=ui.interact(star_rect,ui.id().with("favorite"),egui::Sense::click());
+                                                star.widget_info(||egui::WidgetInfo::selected(egui::WidgetType::Button,true,asset.favorite,"Favorite stamp"));
+                                                if hover || star.hovered() || asset.favorite { ui::draw_icon(ui.painter(),star_rect.shrink(3.),Icon::Star,if asset.favorite {theme::accent()}else{theme::muted()}); }
+                                                if star.on_hover_text(if asset.favorite {"Remove from favorites"}else{"Add to favorites"}).clicked() {
+                                                    let mut next=asset.clone(); next.favorite = !next.favorite;
+                                                    if let Some(l)=&mut self.editor.library && let Err(e)=l.put(next) { self.editor.library_error=Some(format!("{e:#}")); }
+                                                }
+                                                if let Some(index) = index && !self.editor.builtins.iter().any(|b|b.asset.id==asset.id) {
                                                     ui.horizontal(|ui| {
                                                         if ui
                                                             .add(
@@ -2851,7 +2982,9 @@ impl Viewer {
                         });
                     ui.separator();
                     ui.label(
-                        RichText::new(if self.editor.library_tab == "Saved" {
+                        RichText::new(if self.editor.library_tab == "Saved"
+                            || (self.editor.library_tab == "Stamps" && self.editor.stamp_source == 1)
+                        {
                             "Stored on this computer • click a card to place"
                         } else {
                             "Built-in vector artwork • resize and recolor after placing"
@@ -3060,6 +3193,7 @@ impl Viewer {
         false
     }
     pub(super) fn request_close(&mut self, id: Option<u64>, ctx: &egui::Context) {
+        self.remember_reading(ctx, true);
         if self
             .content
             .pending_text()
@@ -3190,6 +3324,9 @@ impl Viewer {
             let r = ui.add(egui::TextEdit::singleline(&mut asset.name).margin(ui::FIELD_MARGIN).char_limit(200).desired_width(f32::INFINITY));
             self.editor.text_editing |= r.has_focus();
             ui.checkbox(&mut asset.stamp,"Include in Stamps collection");
+            ui.checkbox(&mut asset.favorite,"Favorite");
+            ui.label("Folder"); ui.add(egui::TextEdit::singleline(&mut asset.folder).char_limit(100).hint_text("e.g. Review, Finance"));
+            ui.label("Tags"); ui.add(egui::TextEdit::singleline(&mut asset.tags).char_limit(400).hint_text("Comma-separated keywords"));
             ui.add_space(8.);
             ui.horizontal(|ui| {
                 if matches!(asset.kind, Kind::Svg { .. }) { edit=ui.add(ActionButton::new(Icon::Text,"Edit SVG…")).clicked(); }
@@ -3383,7 +3520,7 @@ impl Viewer {
                             ActionButton::new(
                                 Icon::Library,
                                 if self.editor.svg.target.is_some() {
-                                    "Apply SVG changes"
+                                    "Change this placed copy"
                                 } else if self.editor.svg.library_target.is_some() {
                                     "Update library asset"
                                 } else {
@@ -3420,6 +3557,17 @@ impl Viewer {
                     asset.stamp = self.editor.svg.stamp;
                     if let Some(id) = &self.editor.svg.library_target {
                         asset.id = id.clone();
+                        if let Some(old) = self
+                            .editor
+                            .library
+                            .as_ref()
+                            .and_then(|l| l.entries.iter().find(|a| &a.id == id))
+                        {
+                            asset.favorite = old.favorite;
+                            asset.folder = old.folder.clone();
+                            asset.tags = old.tags.clone();
+                            asset.last_used = old.last_used;
+                        }
                     }
                     if let Some((tab_id, id)) = self.editor.svg.target.clone() {
                         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id)
@@ -3466,6 +3614,264 @@ impl Viewer {
     }
 }
 
+impl Viewer {
+    pub(super) fn selection_toolbar(&mut self, ctx: &egui::Context) {
+        if self.home.visible
+            || self.zen.is_some()
+            || self.comparison.is_some()
+            || self.editor.library_open
+            || ctx.memory(|m| m.top_modal_layer().is_some())
+            || self.digital.open
+            || self.editor.gesture.is_some()
+            || self.editor.group_gesture.is_some()
+            || !matches!(self.editor.mode, Mode::Draw | Mode::Annotate)
+        {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let ids = selection::selected_ids(tab);
+        let Some(session) = tab.session.as_ref().filter(|s| s.editable) else {
+            return;
+        };
+        let marks: Vec<_> = session
+            .annotations
+            .iter()
+            .filter(|a| ids.contains(&a.id))
+            .cloned()
+            .collect();
+        let Some(first) = marks.first() else {
+            return;
+        };
+        let standard_asset = first
+            .asset_id
+            .as_ref()
+            .is_some_and(|id| self.editor.builtins.iter().any(|b| &b.asset.id == id));
+        let Some((view, offset, _)) = tab.document_view else {
+            return;
+        };
+        let Some(page) = tab
+            .document_layout
+            .as_ref()
+            .and_then(|l| l.rects.get(first.page))
+            .filter(|r| r.is_positive())
+        else {
+            return;
+        };
+        let bounds = selection::union_bounds(marks.iter());
+        let origin = view.min - offset + page.min.to_vec2();
+        let box_rect = Rect::from_min_max(
+            origin + vec2(bounds[0], bounds[1]) * tab.scale,
+            origin + vec2(bounds[2], bounds[3]) * tab.scale,
+        );
+        if !view.intersects(box_rect) {
+            return;
+        }
+        let pos = pos2(
+            (box_rect.center().x - 170.).clamp(
+                view.left() + 8.,
+                (view.right() - 350.).max(view.left() + 8.),
+            ),
+            (box_rect.top() - 50.).max(view.top() + 8.),
+        );
+        let mut style = first.style.clone();
+        let mut duplicate = false;
+        let mut delete = false;
+        let mut align = None;
+        let mut update_library = false;
+        egui::Area::new(egui::Id::new("selection_context_toolbar"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .corner_radius(12)
+                    .inner_margin(8.)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.menu_button("Color", |ui| {
+                                color_palette(ui, &mut style.color);
+                            });
+                            if matches!(first.kind, Kind::Text { .. }) {
+                                ui.add(
+                                    egui::DragValue::new(&mut style.font_size)
+                                        .range(6.0..=144.0)
+                                        .suffix(" pt"),
+                                )
+                                .on_hover_text("Font size");
+                            } else {
+                                ui.add(
+                                    egui::DragValue::new(&mut style.width)
+                                        .range(0.1..=30.0)
+                                        .suffix(" pt"),
+                                )
+                                .on_hover_text("Stroke width");
+                                ui.menu_button(style.stroke.label(), |ui| {
+                                    for value in StrokeStyle::ALL {
+                                        if ui
+                                            .selectable_value(
+                                                &mut style.stroke,
+                                                value,
+                                                value.label(),
+                                            )
+                                            .clicked()
+                                        {
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                                if matches!(
+                                    first.kind,
+                                    Kind::Rectangle | Kind::Ellipse | Kind::Polygon { .. }
+                                ) {
+                                    ui.menu_button("Fill", |ui| {
+                                        let mut filled = style.fill.is_some();
+                                        if ui.checkbox(&mut filled, "Fill shape").changed() {
+                                            style.fill = filled.then_some(style.color);
+                                        }
+                                        if let Some(c) = &mut style.fill {
+                                            color_palette(ui, c);
+                                        }
+                                    });
+                                }
+                            }
+                            if marks.len() > 1 {
+                                ui.menu_button("Align", |ui| {
+                                    for (value, icon, label) in selection::Align::ALL {
+                                        if ui.add(ActionButton::new(icon, label)).clicked() {
+                                            align = Some(value);
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            }
+                            duplicate = ui
+                                .add(ActionButton::new(Icon::Copy, "Duplicate selection").compact())
+                                .clicked();
+                            delete = ui
+                                .add(ActionButton::new(Icon::Trash, "Delete selection").compact())
+                                .clicked();
+                            if marks.len() == 1 && first.asset_id.is_some() {
+                                ui.menu_button("Library", |ui| {
+                                    ui.label("Changes on this page affect only this copy.");
+                                    update_library = ui
+                                        .add(ActionButton::new(
+                                            Icon::Library,
+                                            if standard_asset {
+                                                "Save as custom asset"
+                                            } else {
+                                                "Update library asset"
+                                            },
+                                        ))
+                                        .clicked();
+                                });
+                            }
+                        });
+                    });
+            });
+        let mut edited = marks.clone();
+        if style != first.style {
+            for a in &mut edited {
+                if style.color != first.style.color {
+                    a.style.color = style.color;
+                    if let Kind::Svg { tint, .. } = &mut a.kind {
+                        *tint = true;
+                    }
+                }
+                if style.fill != first.style.fill {
+                    a.style.fill = style.fill;
+                }
+                if style.width != first.style.width {
+                    a.style.width = style.width;
+                }
+                if style.stroke != first.style.stroke {
+                    a.style.stroke = style.stroke;
+                }
+                if style.font_size != first.style.font_size {
+                    a.style.font_size = style.font_size;
+                }
+            }
+        }
+        if let Some(align) = align {
+            edited = selection::aligned(&edited, align);
+        }
+        if edited != marks {
+            let previous = self
+                .editor
+                .group_edit
+                .filter(|(id, _)| *id == tab.id)
+                .map(|(_, r)| r);
+            if let Some(revision) = selection::commit(tab, &edited, previous, &mut self.status) {
+                self.editor.group_edit = Some((tab.id, revision));
+            }
+            if edited.len() == 1 {
+                self.editor.draft = Some(edited[0].clone());
+            }
+        }
+        if !ctx.input(|i| i.pointer.any_down()) && !ctx.wants_keyboard_input() {
+            self.editor.group_edit = None;
+        }
+        if update_library && let Some(id) = &first.asset_id {
+            let base = self
+                .editor
+                .library
+                .as_ref()
+                .and_then(|l| l.entries.iter().find(|a| &a.id == id))
+                .cloned()
+                .or_else(|| {
+                    self.editor
+                        .builtins
+                        .iter()
+                        .find(|b| &b.asset.id == id)
+                        .map(|b| b.asset.clone())
+                });
+            if let Some(mut asset) = base {
+                if standard_asset {
+                    asset.id = format!("{:032x}", rand::random::<u128>());
+                    asset.name = format!("{} custom", asset.name);
+                }
+                asset.kind = first.kind.clone();
+                asset.style = first.style.clone();
+                asset.aspect = (first.rect[2] - first.rect[0]) / (first.rect[3] - first.rect[1]);
+                let asset_id = asset.id.clone();
+                match self.editor.add_asset(asset) {
+                    Ok(()) => {
+                        if standard_asset {
+                            let mut linked = first.clone();
+                            linked.asset_id = Some(asset_id);
+                            selection::commit(
+                                tab,
+                                std::slice::from_ref(&linked),
+                                None,
+                                &mut self.status,
+                            );
+                            self.editor.draft = Some(linked);
+                        }
+                        self.status = Some((
+                            "Library updated. Other placed copies keep their artwork.".into(),
+                            false,
+                        ))
+                    }
+                    Err(e) => self.status = Some((e, true)),
+                }
+            }
+        }
+        if duplicate && let Some(s) = &mut tab.session {
+            let copies: Vec<_> = marks.iter().map(Annotation::duplicate).collect();
+            let ids = copies.iter().map(|a| a.id.clone()).collect();
+            let mut entries = s.annotations.clone();
+            entries.extend(copies);
+            match s.commit(entries) {
+                Ok(()) => selection::set(tab, &mut self.editor, ids),
+                Err(e) => self.status = Some((format!("{e:#}"), true)),
+            }
+        }
+        if delete {
+            self.editor_delete();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3481,6 +3887,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         app.editor.mode = Mode::Draw;
+        app.editor.snapping = false;
         app.editor.tool = Tool::Select;
         for (rotation, scale, previously_selected_other) in
             [(0., 1., false), (30., 1.5, false), (25., 0.8, true)]
@@ -3823,6 +4230,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         app.editor.mode = Mode::Draw;
+        app.editor.snapping = false;
         for (tool, closed) in [(Tool::Polyline, false), (Tool::Polygon, true)] {
             app.editor.select_tool(tool);
             input(&mut app, &ctx, vec![]);
@@ -3916,6 +4324,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         app.editor.mode = Mode::Annotate;
+        app.editor.snapping = false;
         app.editor.tool = Tool::Select;
         input(&mut app, &ctx, vec![]);
         pointer(&mut app, &ctx, [150.0, 300.0], Some(true));

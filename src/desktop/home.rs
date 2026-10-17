@@ -80,6 +80,15 @@ impl Home {
         }
         self.previews.clear();
     }
+    pub(super) fn reading(&self, path: &Path) -> Option<mypdf_milestone0::home::ReadingState> {
+        self.history.as_ref().and_then(|h| h.reading(path))
+    }
+    pub(super) fn save_reading(
+        &mut self,
+        states: &[(PathBuf, mypdf_milestone0::home::ReadingState)],
+    ) {
+        self.change(|h| h.save_reading(states));
+    }
     pub fn remember(&mut self, path: &Path) {
         self.change(|h| h.record(path));
         self.previews
