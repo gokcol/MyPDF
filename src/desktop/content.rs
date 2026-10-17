@@ -7,6 +7,11 @@ use mypdf_milestone0::{
     text_style::{self, Alignment, TextFormat},
 };
 
+#[path = "text_formatting.rs"]
+mod formatting;
+#[path = "image_effects.rs"]
+mod image_effects;
+
 type Key = (u64, u64, usize);
 #[derive(Clone, PartialEq, Debug)]
 enum InlineTarget {
@@ -20,6 +25,8 @@ struct BlockDraft {
     masks: Vec<[f32; 4]>,
     spans: Vec<mypdf_milestone0::rich_text::Span>,
     styled_text: String,
+    selected_chars: Option<std::ops::Range<usize>>,
+    initial_spans: Vec<mypdf_milestone0::rich_text::Span>,
     font: usize,
     alignment: Alignment,
     /// Font, size, color and right edge when the block opened.
@@ -44,7 +51,8 @@ impl InlineText {
     fn changed(&self) -> bool {
         self.text != self.original
             || matches!(&self.target, InlineTarget::Block(b)
-                if (b.font, self.size, self.color, self.rect[2]) != b.initial
+                if self.rect[2] != b.initial.3
+                    || b.spans != b.initial_spans
                     || [self.rect[0], self.rect[1]] != b.initial_origin
                     || b.alignment != Alignment::Left)
     }
@@ -64,6 +72,7 @@ type Output = Result<(String, Option<PathBuf>), String>;
 #[derive(Clone)]
 pub(super) enum Edit {
     AddText {
+        spans: Vec<mypdf_milestone0::rich_text::Span>,
         page: u32,
         text: String,
         rect: [f32; 4],
@@ -163,6 +172,10 @@ pub(super) struct ContentState {
     key: Option<Key>,
     pub add_target: Option<(u64, usize)>,
     new_text: String,
+    new_styled_text: String,
+    new_spans: Vec<mypdf_milestone0::rich_text::Span>,
+    new_selection: Option<std::ops::Range<usize>>,
+    show_text_inspector: bool,
     focus_new_text: bool,
     new_rect: [f32; 4],
     new_drag: Option<[f32; 4]>,
@@ -178,6 +191,7 @@ pub(super) struct ContentState {
     pub(super) loading: bool,
     pub(super) inspection: Option<Inspection>,
     selected: Option<usize>,
+    image_effects: Option<image_effects::EmbeddedEffects>,
     pub image_mode: bool,
     /// Another tool (Redact) owns the page overlay.
     pub(super) paused: bool,
@@ -203,6 +217,26 @@ struct Erased {
     texture: Option<TextureHandle>,
 }
 impl ContentState {
+    fn clear_new_text(&mut self) {
+        self.new_text.clear();
+        self.new_styled_text.clear();
+        self.new_spans.clear();
+        self.new_selection = None;
+    }
+    fn sync_new_styles(&mut self) {
+        let fallback = formatting::span(
+            self.new_font,
+            self.new_size,
+            self.new_color,
+            self.new_text.len(),
+        );
+        formatting::sync(
+            &self.new_text,
+            &mut self.new_styled_text,
+            &mut self.new_spans,
+            fallback,
+        );
+    }
     fn text_font(&self, size: f32) -> FontId {
         FontId::new(
             size,
@@ -226,12 +260,13 @@ impl ContentState {
     fn place_text(&mut self, id: u64, page: usize, point: [f32; 2], size: PageSize) {
         self.add_target = Some((id, page));
         self.new_placed = true;
-        self.new_text.clear();
+        self.clear_new_text();
         let x = point[0].clamp(0., (size.width - 10.).max(0.));
         let w = 240_f32.min(size.width - x);
         let h = (self.new_size * 2.6).min(size.height);
         self.new_rect = [x, point[1].clamp(0., (size.height - h).max(0.)), w, h];
         self.focus_new_text = true;
+        self.show_text_inspector = true;
     }
     #[cfg(test)]
     pub(super) fn existing_preview(&mut self, id: u64) {
@@ -339,6 +374,10 @@ impl ContentState {
             key: None,
             add_target: None,
             new_text: String::new(),
+            new_styled_text: String::new(),
+            new_spans: Vec::new(),
+            new_selection: None,
+            show_text_inspector: false,
             focus_new_text: false,
             new_rect: [48., 48., 300., 120.],
             new_drag: None,
@@ -354,6 +393,7 @@ impl ContentState {
             loading: false,
             inspection: None,
             selected: None,
+            image_effects: None,
             image_mode: false,
             paused: false,
             rect: [0.; 4],
@@ -373,6 +413,9 @@ impl ContentState {
 }
 impl Viewer {
     pub(super) fn content_events(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.content.show_text_inspector) {
+            self.inspector = true;
+        }
         let mut after_text = None;
         let changes: Vec<_> = self.content.rx.try_iter().collect();
         for result in changes {
@@ -412,7 +455,7 @@ impl Viewer {
                                 } else if self.content.inserting_text {
                                     self.content.inserting_text = false;
                                     after_text = self.content.after_text.take();
-                                    self.content.new_text.clear();
+                                    self.content.clear_new_text();
                                     self.content.new_placed = false;
                                     if self.content.exit_text_tool {
                                         self.content.add_target = None;
@@ -534,15 +577,18 @@ impl Viewer {
                     let mut note = None;
                     let result = match edit {
                         Edit::AddText {
+                            spans,
                             page,
                             text,
                             rect,
                             size,
                             color,
                             format,
-                        } => content::add_text_styled(
-                            &bytes, page, &text, rect, size, color, &format,
-                        )?,
+                        } => if spans.is_empty() {
+                            content::add_text_styled(&bytes, page, &text, rect, size, color, &format)?
+                        } else {
+                            mypdf_milestone0::rich_text::add_aligned(&bytes, page, &text, rect, &spans, format.alignment)?
+                        },
                         Edit::Text {
                             page,
                             ordinal,
@@ -868,7 +914,26 @@ impl Viewer {
         let mut change = None;
         let mut replace = None;
         let mut remove_background = None;
-        egui::SidePanel::right("content_inspector").exact_width(310.).resizable(false).frame(egui::Frame::new().fill(theme::paper()).inner_margin(18.)).show(ctx,|ui|{
+        if let (Some(info), Some(index), Some(session)) = (
+            &self.content.inspection,
+            self.content.selected,
+            self.tabs.get(self.active).and_then(|t| t.session.as_ref()),
+        ) {
+            let key = (info.key, index);
+            if self
+                .content
+                .image_effects
+                .as_ref()
+                .is_none_or(|e| e.key != key)
+            {
+                let source = content::image_png(&session.source, page as u32 + 1, index)
+                    .map_err(|e| e.to_string());
+                self.content.image_effects = Some(image_effects::EmbeddedEffects::new(key, source));
+            }
+        }
+
+        egui::SidePanel::right("content_inspector").default_width(310.).width_range(280.0..=380.0).resizable(true).frame(egui::Frame::new().fill(theme::paper()).inner_margin(18.)).show(ctx,|ui|{
+            egui::ScrollArea::vertical().id_salt("content_image_scroll").show(ui,|ui|{
             ui.heading("Edit PDF");ui.label(RichText::new(format!("Page {}",page+1)).small().color(theme::muted()));ui.add_space(12.);
             if self.content.loading{ui.spinner();ui.label("Inspecting page…");return;}
             let Some(info)=&self.content.inspection else{ui.label("Open a PDF to begin.");return};
@@ -886,6 +951,10 @@ impl Viewer {
                                 if ui.add(ActionButton::new(Icon::Select,"Apply position & size").primary()).clicked(){let [x,y,w,h]=self.content.rect;change=Some(Edit::Image{page:page as u32+1,index:image.index,edit:content::ImageEdit::Place([x,y,x+w,y+h])});}
                                 if ui.add(ActionButton::new(Icon::Import,"Replace image…")).clicked(){replace=Some(image.index);}
                                 if ui.add(ActionButton::new(Icon::FieldImage,"Remove background…")).clicked(){remove_background=Some(image.index);}
+                                if let Some(effects) = &mut self.content.image_effects && effects.key == (info.key, image.index) {
+                                    ui.separator();
+                                    if let Some(png) = effects.panel(ui) { change=Some(Edit::Image{page:page as u32+1,index:image.index,edit:content::ImageEdit::Replace(png)}); }
+                                }
                                 if ui.add(ActionButton::new(Icon::Trash,"Delete image")).clicked(){change=Some(Edit::Image{page:page as u32+1,index:image.index,edit:content::ImageEdit::Delete});}
                             });
                         }
@@ -895,6 +964,7 @@ impl Viewer {
                     ui.label("Click text on the page to edit it.");
                 }
             }
+        });
         });
         if let Some(index) = remove_background {
             self.remove_content_image_background(index);
@@ -992,7 +1062,7 @@ impl Viewer {
                         } else if self.content.pending_text().is_none() {
                             self.content.add_target = Some((t.id, t.page));
                             self.content.new_placed = false;
-                            self.content.new_text.clear();
+                            self.content.clear_new_text();
                         }
                         self.inspector = true;
                     }
@@ -1103,7 +1173,7 @@ impl Viewer {
             });
     }
     fn new_text_panel(&mut self, ctx: &egui::Context) {
-        let fonts = text_style::fonts();
+        self.content.sync_new_styles();
         let editable = !self.content.busy
             && !self.organizer.busy
             && self
@@ -1125,37 +1195,8 @@ impl Viewer {
             ui.painter().text(sample.center(),egui::Align2::CENTER_CENTER,"Sample",self.content.text_font(self.content.new_size.clamp(18.,32.)),color);
             ui.add_space(10.);
             ui.add_enabled_ui(editable,|ui| {
-                ui::caption(ui, "Font");
-                if let Some(current)=fonts.get(self.content.new_font) {
-                    egui::ComboBox::from_id_salt("text_font_family").width(ui.available_width()).selected_text(&current.family).show_ui(ui,|ui| {
-                        for (index,font) in fonts.iter().enumerate().filter(|(_,f)|!f.bold&&!f.italic) {
-                            if ui.selectable_label(font.family==current.family,&font.family).clicked() {
-                                self.content.new_font=fonts.iter().position(|f|f.family==font.family && f.bold==current.bold && f.italic==current.italic).unwrap_or(index);
-                            }
-                        }
-                    });
-                    let current=&fonts[self.content.new_font];
-                    ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt("text_font_style").width((ui.available_width()-86.).max(90.)).selected_text(current.style()).show_ui(ui,|ui| {
-                            for (index,font) in fonts.iter().enumerate().filter(|(_,f)|f.family==current.family) { ui.selectable_value(&mut self.content.new_font,index,font.style()); }
-                        });
-                        ui.add(egui::DragValue::new(&mut self.content.new_size).range(4.0..=144.0).suffix(" pt")).on_hover_text("Font size");
-                    });
-                    ui.horizontal(|ui| {
-                        let current=&fonts[self.content.new_font];
-                        for (icon,label,bold,italic,selected) in [(Icon::Bold,"Bold",!current.bold,current.italic,current.bold),(Icon::Italic,"Italic",current.bold,!current.italic,current.italic)] {
-                            let target=fonts.iter().position(|f|f.family==current.family && f.bold==bold && f.italic==italic);
-                            if ui.add_enabled(target.is_some(),ActionButton::new(icon,label).compact().selected(selected)).clicked() { self.content.new_font=target.unwrap(); }
-                        }
-                    });
-                }
-                ui.horizontal(|ui| {
-                    for (value,icon,label) in [(Alignment::Left,Icon::AlignLeft,"Align left"),(Alignment::Center,Icon::AlignCenter,"Align center"),(Alignment::Justified,Icon::AlignJustify,"Justify"),(Alignment::Right,Icon::AlignRight,"Align right")] {
-                        if ui.add(ActionButton::new(icon,label).compact().selected(self.content.new_alignment==value)).clicked() { self.content.new_alignment=value; }
-                    }
-                });
-                ui.add_space(8.); ui::caption(ui, "Color");
-                editing::color_palette(ui,&mut self.content.new_color);
+                formatting::panel(ui, &self.content.new_text, &mut self.content.new_spans, &self.content.new_selection,
+                    &mut self.content.new_font, &mut self.content.new_size, &mut self.content.new_color, &mut self.content.new_alignment);
                 ui.add_space(8.);
                 if self.content.new_placed {
                     egui::CollapsingHeader::new("Position & size").show(ui,|ui| {
@@ -1167,7 +1208,7 @@ impl Viewer {
                     });
                     ui.horizontal(|ui| {
                         if ui.add_enabled(!self.content.new_text.trim().is_empty(),ActionButton::new(Icon::Check,"Done").primary()).clicked() { self.content.new_commit=true; }
-                        if ui.add(ActionButton::new(Icon::Left,"Cancel")).clicked() { self.content.new_text.clear(); self.content.new_placed=false; self.content.next_text=None; }
+                        if ui.add(ActionButton::new(Icon::Left,"Cancel")).clicked() { self.content.clear_new_text(); self.content.new_placed=false; self.content.next_text=None; }
                     });
                 }
             });
@@ -1193,7 +1234,9 @@ impl Viewer {
         let Some(index) = self.tabs.iter().position(|t| t.id == id) else {
             return;
         };
+        self.content.sync_new_styles();
         let edit = Edit::AddText {
+            spans: self.content.new_spans.clone(),
             page: page as u32 + 1,
             text: self.content.new_text.clone(),
             rect: self.content.new_rect,
@@ -1429,7 +1472,7 @@ impl Viewer {
         if let Some(target) = self.content.add_after_existing.take() {
             self.content.add_target = Some(target);
             self.content.new_placed = false;
-            self.content.new_text.clear();
+            self.content.clear_new_text();
         }
     }
     fn finish_existing_text(&mut self, ctx: &egui::Context) {
@@ -1462,18 +1505,11 @@ impl Viewer {
                         Edit::Block {
                             page: draft.key.2 as u32 + 1,
                             block: text_block::Replacement {
-                                spans: if block.alignment == Alignment::Left
-                                    && (block.font, draft.size, draft.color)
-                                        == (block.initial.0, block.initial.1, block.initial.2)
-                                {
-                                    mypdf_milestone0::rich_text::edited(
-                                        &block.styled_text,
-                                        &draft.text,
-                                        &block.spans,
-                                    )
-                                } else {
-                                    vec![]
-                                },
+                                spans: mypdf_milestone0::rich_text::edited(
+                                    &block.styled_text,
+                                    &draft.text,
+                                    &block.spans,
+                                ),
                                 selection: block.selection,
                                 text: draft.text,
                                 rect: [
@@ -1597,43 +1633,8 @@ impl Viewer {
                         if let InlineTarget::Block(block) = &mut draft.target {
                             ui.add_space(12.);
                             ui.add_enabled_ui(!self.content.busy, |ui| {
-                                ui::caption(ui, "Font");
-                                let fonts = text_style::fonts();
-                                let name = fonts.get(block.font).map(|f| f.family.as_str()).unwrap_or("Default");
-                                egui::ComboBox::from_id_salt("block_font").width(ui.available_width()).selected_text(name).show_ui(ui, |ui| {
-                                    for (index, font) in fonts.iter().enumerate().filter(|(_, f)| !f.bold && !f.italic) {
-                                        if ui.selectable_label(name == font.family, &font.family).clicked() {
-                                            let current = fonts.get(block.font);
-                                            block.font = fonts.iter().position(|f| f.family == font.family && current.is_some_and(|c| f.bold == c.bold && f.italic == c.italic)).unwrap_or(index);
-                                        }
-                                    }
-                                });
-                                if let Some(current) = fonts.get(block.font) {
-                                    ui.horizontal(|ui| {
-                                        egui::ComboBox::from_id_salt("block_font_style").width((ui.available_width()-90.).max(90.)).selected_text(current.style()).show_ui(ui, |ui| {
-                                            for (index, font) in fonts.iter().enumerate().filter(|(_,f)| f.family == current.family) {
-                                                ui.selectable_value(&mut block.font, index, font.style());
-                                            }
-                                        });
-                                        ui.add(egui::DragValue::new(&mut draft.size).range(4.0..=144.).suffix(" pt")).on_hover_text("Font size");
-                                    });
-                                    ui.horizontal(|ui| {
-                                        for (icon,label,bold,italic,selected) in [(Icon::Bold,"Bold",!current.bold,current.italic,current.bold),(Icon::Italic,"Italic",current.bold,!current.italic,current.italic)] {
-                                            let target = fonts.iter().position(|f| f.family == current.family && f.bold == bold && f.italic == italic);
-                                            if ui.add_enabled(target.is_some(), ActionButton::new(icon,label).compact().selected(selected)).clicked() { block.font = target.unwrap(); }
-                                        }
-                                    });
-                                }
-                                ui.add_space(8.);
-                                ui::caption(ui, "Alignment");
-                                ui.horizontal(|ui| {
-                                    for (value,icon,label) in [(Alignment::Left,Icon::AlignLeft,"Align left"),(Alignment::Center,Icon::AlignCenter,"Align center"),(Alignment::Right,Icon::AlignRight,"Align right"),(Alignment::Justified,Icon::AlignJustify,"Justify")] {
-                                        if ui.add(ActionButton::new(icon,label).compact().selected(block.alignment == value)).clicked() { block.alignment = value; }
-                                    }
-                                });
-                                ui.add_space(8.);
-                                ui::caption(ui, "Color");
-                                editing::color_palette(ui, &mut draft.color);
+                                formatting::panel(ui, &draft.text, &mut block.spans, &block.selected_chars,
+                                    &mut block.font, &mut draft.size, &mut draft.color, &mut block.alignment);
                                 ui.add_space(8.);
                                 ui.separator();
                                 ui::caption(ui, "Position & size");
@@ -1658,7 +1659,7 @@ impl Viewer {
                                 }
                                 ui.label(RichText::new("Width reflows the text. Height grows as you type.").small().color(theme::muted()));
                                 ui.add_space(8.);
-                                ui.label(RichText::new("Typing preserves mixed formatting. Font, color or alignment changes style the whole block.").small().color(theme::muted()));
+
                             });
                         } else {
                             ui.label(RichText::new(&draft.font).color(theme::muted()));
@@ -1690,235 +1691,6 @@ impl Viewer {
             self.content.after_text = None;
             self.content.add_after_existing = None;
         }
-    }
-}
-
-impl Viewer {
-    pub(super) fn text_context_toolbar(&mut self, ctx: &egui::Context) {
-        if self.editor.mode != editing::Mode::Edit
-            || self.home.visible
-            || self.content.busy
-            || self.content.paused
-        {
-            return;
-        }
-        let Some(tab) = self.tabs.get(self.active) else {
-            return;
-        };
-        let Some((view, offset, _)) = tab.document_view else {
-            return;
-        };
-        if self.content.add_target.is_some_and(|(id, _)| id == tab.id)
-            && self.content.existing.is_none()
-        {
-            let (_, page) = self.content.add_target.unwrap();
-            if let Some(page_rect) = tab
-                .document_layout
-                .as_ref()
-                .and_then(|l| l.rects.get(page))
-                .filter(|r| r.is_positive())
-            {
-                let point = view.min - offset
-                    + page_rect.min.to_vec2()
-                    + vec2(self.content.new_rect[0], self.content.new_rect[1]) * tab.scale;
-                let text_rect = Rect::from_min_size(
-                    point,
-                    vec2(self.content.new_rect[2], self.content.new_rect[3]) * tab.scale,
-                )
-                .expand(6.);
-                let mut cancel = false;
-                text_toolbar(
-                    ctx,
-                    egui::Id::new("new_text_context_toolbar"),
-                    view,
-                    text_rect,
-                    |ui| {
-                        egui::Frame::popup(ui.style())
-                            .corner_radius(12)
-                            .inner_margin(8.)
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    let fonts = text_style::fonts();
-                                    egui::ComboBox::from_id_salt("new_context_font")
-                                        .width(130.)
-                                        .selected_text(
-                                            fonts
-                                                .get(self.content.new_font)
-                                                .map_or("Font", |f| f.family.as_str()),
-                                        )
-                                        .show_ui(ui, |ui| {
-                                            for (i, f) in fonts.iter().enumerate() {
-                                                ui.selectable_value(
-                                                    &mut self.content.new_font,
-                                                    i,
-                                                    format!("{} {}", f.family, f.style()),
-                                                );
-                                            }
-                                        });
-                                    ui.add(
-                                        egui::DragValue::new(&mut self.content.new_size)
-                                            .range(4.0..=144.)
-                                            .suffix(" pt"),
-                                    );
-                                    ui.menu_button("Color", |ui| {
-                                        editing::color_palette(ui, &mut self.content.new_color);
-                                    });
-                                    if ui
-                                        .add(
-                                            ActionButton::new(Icon::Check, "Finish text editing")
-                                                .compact(),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.content.new_commit = true;
-                                    }
-                                    cancel = ui
-                                        .add(
-                                            ActionButton::new(Icon::Close, "Cancel text editing")
-                                                .compact(),
-                                        )
-                                        .clicked();
-                                });
-                            });
-                    },
-                );
-                if cancel {
-                    self.content.add_target = None;
-                    self.content.new_text.clear();
-                }
-            }
-            return;
-        }
-        let Some(draft) = self.content.existing.as_mut().filter(|d| d.key.0 == tab.id) else {
-            return;
-        };
-        let Some(page) = tab
-            .document_layout
-            .as_ref()
-            .and_then(|l| l.rects.get(draft.key.2))
-            .filter(|r| r.is_positive())
-        else {
-            return;
-        };
-        let origin = view.min - offset + page.min.to_vec2();
-        let point = origin + vec2(draft.rect[0], draft.rect[1]) * tab.scale;
-        let text_rect = Rect::from_min_max(
-            point - vec2(0., draft.size * 0.2 * tab.scale),
-            origin + vec2(draft.rect[2], draft.rect[3]) * tab.scale,
-        )
-        .expand(6.);
-        let mut done = false;
-        let mut cancel = false;
-        text_toolbar(
-            ctx,
-            egui::Id::new("text_context_toolbar"),
-            view,
-            text_rect,
-            |ui| {
-                egui::Frame::popup(ui.style())
-                    .corner_radius(12)
-                    .inner_margin(8.)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if let InlineTarget::Block(block) = &mut draft.target {
-                                let fonts = text_style::fonts();
-                                egui::ComboBox::from_id_salt("context_font")
-                                    .width(120.)
-                                    .selected_text(
-                                        fonts.get(block.font).map_or("Font", |f| f.family.as_str()),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        for (i, f) in fonts.iter().enumerate() {
-                                            ui.selectable_value(
-                                                &mut block.font,
-                                                i,
-                                                format!("{} {}", f.family, f.style()),
-                                            );
-                                        }
-                                    });
-                                ui.add(
-                                    egui::DragValue::new(&mut draft.size)
-                                        .range(4.0..=144.)
-                                        .suffix(" pt"),
-                                );
-                                ui.menu_button("Color", |ui| {
-                                    editing::color_palette(ui, &mut draft.color);
-                                });
-                            } else {
-                                ui.label("Edit text in place");
-                            }
-                            done = ui
-                                .add(
-                                    ActionButton::new(Icon::Check, "Finish text editing").compact(),
-                                )
-                                .clicked();
-                            cancel = ui
-                                .add(
-                                    ActionButton::new(Icon::Close, "Cancel text editing").compact(),
-                                )
-                                .clicked();
-                        });
-                    });
-            },
-        );
-        if done {
-            self.content.new_commit = true;
-        }
-        if cancel {
-            self.content.existing = None;
-            self.content.next_existing = None;
-            self.content.after_text = None;
-        }
-    }
-}
-
-/// Keep the entire toolbar, including a clear shadow gap, outside the edited text.
-/// If the text fills the viewport, the inspector remains available instead.
-fn text_toolbar_position(view: Rect, text: Rect, size: egui::Vec2) -> Option<egui::Pos2> {
-    let bounds = view.shrink(8.);
-    if size.x > bounds.width() || size.y > bounds.height() || !text.intersects(view) {
-        return None;
-    }
-    let gap = 18.;
-    let x = text.left().clamp(bounds.left(), bounds.right() - size.x);
-    let y = text.top().clamp(bounds.top(), bounds.bottom() - size.y);
-    [
-        pos2(x, text.top() - size.y - gap),
-        pos2(x, text.bottom() + gap),
-        pos2(text.right() + gap, y),
-        pos2(text.left() - size.x - gap, y),
-    ]
-    .into_iter()
-    .find(|p| {
-        let rect = Rect::from_min_size(*p, size);
-        bounds.contains_rect(rect) && !rect.intersects(text.expand(gap - 1.))
-    })
-}
-
-fn text_toolbar(
-    ctx: &egui::Context,
-    id: egui::Id,
-    view: Rect,
-    text: Rect,
-    contents: impl FnOnce(&mut egui::Ui),
-) {
-    let size_id = id.with("measured_size");
-    let measured = ctx.data(|d| d.get_temp::<egui::Vec2>(size_id));
-    let size = measured.unwrap_or(vec2(420., 72.));
-    let Some(position) = text_toolbar_position(view, text, size) else {
-        return;
-    };
-    let response = egui::Area::new(id)
-        .order(egui::Order::Foreground)
-        .fixed_pos(position)
-        .constrain(false)
-        .sizing_pass(measured.is_none())
-        .show(ctx, contents)
-        .response;
-    let actual = response.rect.size();
-    if measured != Some(actual) {
-        ctx.data_mut(|d| d.insert_temp(size_id, actual));
-        ctx.request_repaint();
     }
 }
 
@@ -2105,8 +1877,10 @@ fn selected_block(
         target: InlineTarget::Block(BlockDraft {
             selection,
             masks,
+            initial_spans: spans.clone(),
             spans,
             styled_text: text.clone(),
+            selected_chars: None,
             font,
             alignment: Alignment::Left,
             initial: (font, size, first.color, right),
@@ -2373,6 +2147,7 @@ fn existing_overlay(
             state.next_existing = Some(draft);
         } else {
             state.existing = Some(draft);
+            state.show_text_inspector = true;
         }
     } else if background.clicked() {
         state.click_outside(tab.id);
@@ -2480,9 +2255,7 @@ fn existing_overlay(
         }
     }
     let rich = if let InlineTarget::Block(b) = &draft.target {
-        (b.alignment == Alignment::Left
-            && (b.font, draft.size, draft.color) == (b.initial.0, b.initial.1, b.initial.2))
-            .then(|| b.spans.clone())
+        Some(b.spans.clone())
     } else {
         None
     };
@@ -2501,50 +2274,17 @@ fn existing_overlay(
         ui.add_enabled_ui(!state.busy, |ui| {
             let font = FontId::new((draft.size * scale).clamp(4., 800.), family);
             let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, width: f32| {
-                let mut job = egui::text::LayoutJob::simple(
-                    text.as_str().to_owned(),
+                formatting::layout(
+                    ui,
+                    text.as_str(),
+                    &source_text,
+                    rich.as_deref().unwrap_or(&[]),
                     font.clone(),
                     color,
                     width,
-                );
-                job.halign = match alignment {
-                    Alignment::Center => egui::Align::Center,
-                    Alignment::Right => egui::Align::RIGHT,
-                    _ => egui::Align::LEFT,
-                };
-                job.justify = alignment == Alignment::Justified;
-                if let Some(spans) = &rich {
-                    job.sections.clear();
-                    for span in
-                        mypdf_milestone0::rich_text::edited(&source_text, text.as_str(), spans)
-                    {
-                        let family = text_style::fonts()
-                            .iter()
-                            .find(|f| Some(&f.path) == span.font.as_ref())
-                            .map(|f| egui::FontFamily::Name(f.ui_name().into()))
-                            .unwrap_or(font.family.clone());
-                        job.sections.push(egui::text::LayoutSection {
-                            leading_space: 0.,
-                            byte_range: span.range,
-                            format: egui::TextFormat {
-                                font_id: FontId::new(span.size * scale, family),
-                                color: Color32::from_rgb(
-                                    (span.color[0] * 255.) as u8,
-                                    (span.color[1] * 255.) as u8,
-                                    (span.color[2] * 255.) as u8,
-                                ),
-                                line_height: Some(span.size * scale * 1.3),
-                                ..Default::default()
-                            },
-                        });
-                    }
-                }
-                if block && rich.is_none() {
-                    for section in &mut job.sections {
-                        section.format.line_height = Some(draft.size * scale * 1.3);
-                    }
-                }
-                ui.fonts_mut(|f| f.layout_job(job))
+                    scale,
+                    alignment,
+                )
             };
             let edit = if annotation || block {
                 egui::TextEdit::multiline(&mut draft.text).margin(ui::FIELD_MARGIN)
@@ -2562,6 +2302,9 @@ fn existing_overlay(
                 .char_limit(32768)
                 .layouter(&mut layouter)
                 .show(ui);
+            if let InlineTarget::Block(b) = &mut draft.target {
+                formatting::capture(&draft.text, &mut b.selected_chars, output.cursor_range);
+            }
             let response = output.response;
             if response.changed()
                 && let InlineTarget::Block(b) = &mut draft.target
@@ -2653,7 +2396,7 @@ pub(super) fn overlay(
                 state.new_commit = true;
             }
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-                state.new_text.clear();
+                state.clear_new_text();
                 state.new_placed = false;
                 state.next_text = None;
                 return;
@@ -2705,26 +2448,21 @@ pub(super) fn overlay(
                 (rgb[2] * 255.) as u8,
             );
             let font = state.text_font(state.new_size * scale);
-            let align = match state.new_alignment {
-                Alignment::Center => egui::Align::Center,
-                Alignment::Right => egui::Align::RIGHT,
-                _ => egui::Align::LEFT,
-            };
-            let justify = state.new_alignment == Alignment::Justified;
-            let line_height = state.new_size * scale * 1.3;
+            state.sync_new_styles();
+            let spans = state.new_spans.clone();
+            let source_text = state.new_styled_text.clone();
             let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, width: f32| {
-                let mut job = egui::text::LayoutJob::simple(
-                    text.as_str().to_owned(),
+                formatting::layout(
+                    ui,
+                    text.as_str(),
+                    &source_text,
+                    &spans,
                     font.clone(),
                     color,
                     width,
-                );
-                job.halign = align;
-                job.justify = justify;
-                for section in &mut job.sections {
-                    section.format.line_height = Some(line_height);
-                }
-                ui.fonts_mut(|f| f.layout_job(job))
+                    scale,
+                    state.new_alignment,
+                )
             };
             ui.scope_builder(egui::UiBuilder::new().max_rect(r), |ui| {
                 ui.set_clip_rect(r.intersect(page_rect).intersect(ui.clip_rect()));
@@ -2741,6 +2479,21 @@ pub(super) fn overlay(
                     .hint_text("Type here")
                     .layouter(&mut layouter)
                     .show(ui);
+                formatting::capture(&state.new_text, &mut state.new_selection, edit.cursor_range);
+                if edit.response.changed() {
+                    let fallback = formatting::span(
+                        state.new_font,
+                        state.new_size,
+                        state.new_color,
+                        state.new_text.len(),
+                    );
+                    formatting::sync(
+                        &state.new_text,
+                        &mut state.new_styled_text,
+                        &mut state.new_spans,
+                        fallback,
+                    );
+                }
                 if state.focus_new_text {
                     edit.response.request_focus();
                     state.focus_new_text = false;
@@ -2859,24 +2612,6 @@ pub(super) fn overlay(
 mod tests {
     use super::*;
     #[test]
-    fn text_toolbar_keeps_clearance_and_stays_in_the_document_view() {
-        let view = Rect::from_min_max(pos2(100., 100.), pos2(900., 750.));
-        let size = vec2(410., 66.);
-        for text in [
-            Rect::from_min_max(pos2(240., 300.), pos2(600., 410.)),
-            Rect::from_min_max(pos2(180., 110.), pos2(650., 210.)),
-            Rect::from_min_max(pos2(750., 500.), pos2(895., 710.)),
-        ] {
-            let p = text_toolbar_position(view, text, size).unwrap();
-            let toolbar = Rect::from_min_size(p, size);
-            assert!(view.contains_rect(toolbar));
-            assert!(!toolbar.intersects(text.expand(17.)));
-        }
-        assert!(text_toolbar_position(view, view, size).is_none());
-        assert!(text_toolbar_position(view, view.translate(vec2(1000., 0.)), size).is_none());
-    }
-
-    #[test]
     fn block_alignment_and_position_are_saved_without_changing_words() {
         let ctx = egui::Context::default();
         let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
@@ -2935,6 +2670,90 @@ mod tests {
             "{rect:?}"
         );
         assert!(app.content.existing.is_none());
+    }
+
+    #[test]
+    fn formatting_only_existing_block_commits_and_undo_restores_original() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        let source = content::add_text(
+            &convert::blank(595., 842.).unwrap(),
+            1,
+            "Plain selected end",
+            [50., 70., 400., 100.],
+            18.,
+            [0.; 3],
+        )
+        .unwrap();
+        app.open_memory(PathBuf::from("Selection.pdf"), source.clone(), &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let run = mypdf_milestone0::text_geometry::runs(&source, 1)
+            .unwrap()
+            .remove(0);
+        let item = InlineText {
+            key: (app.tabs[0].id, 0, 0),
+            target: InlineTarget::Run(0),
+            original: run.text.clone(),
+            text: run.text,
+            rect: run.rect.unwrap(),
+            size: run.size,
+            color: run.color,
+            font: run.base_font,
+            focus: false,
+        };
+        let mut draft =
+            selected_block(vec![item], [50., 70., 450., 170.], app.tabs[0].pages[0]).unwrap();
+        let InlineTarget::Block(block) = &mut draft.target else {
+            panic!()
+        };
+        block.selected_chars = Some(6..14);
+        formatting::apply(
+            &draft.text,
+            &mut block.spans,
+            &block.selected_chars,
+            formatting::Change::Italic(true),
+        );
+        formatting::apply(
+            &draft.text,
+            &mut block.spans,
+            &block.selected_chars,
+            formatting::Change::Color([0.8, 0.1, 0.2]),
+        );
+        assert!(
+            draft.changed(),
+            "Formatting without typing is a real document change"
+        );
+        app.content.existing = Some(draft);
+        app.finish_existing_text(&ctx);
+        while app.content.busy {
+            app.content_events(&ctx);
+            assert!(std::time::Instant::now() < deadline, "{:?}", app.status);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let session = app.tabs[0].session.as_mut().unwrap();
+        let pdf = session.snapshot_bytes().unwrap();
+        let runs = mypdf_milestone0::text_geometry::runs(&pdf, 1).unwrap();
+        let selected = runs.iter().find(|r| r.text.contains("selected")).unwrap();
+        assert!((selected.color[0] - 0.8).abs() < 0.001);
+        assert!(
+            selected.base_font.to_lowercase().contains("italic")
+                || selected.base_font.to_lowercase().contains("oblique")
+        );
+        for other in runs
+            .iter()
+            .filter(|r| r.text.contains("Plain") || r.text.contains("end"))
+        {
+            assert_eq!(other.color, [0.; 3]);
+        }
+        session.undo();
+        assert_eq!(&*session.source, &source);
+        session.redo();
+        assert_eq!(session.snapshot_bytes().unwrap(), pdf);
     }
 
     #[test]

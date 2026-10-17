@@ -1934,7 +1934,6 @@ impl eframe::App for Viewer {
             }
             self.document(ctx);
         }
-        self.text_context_toolbar(ctx);
         self.finish_new_text(ctx);
         self.form_events(ctx);
         self.form_dialogs(ctx);

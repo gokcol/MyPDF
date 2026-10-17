@@ -224,6 +224,10 @@ pub struct Style {
     #[serde(default)]
     pub stroke: StrokeStyle,
     pub font_size: f32,
+    #[serde(default)]
+    pub image_blur: f32,
+    #[serde(default)]
+    pub image_border: bool,
 }
 impl Default for Style {
     fn default() -> Self {
@@ -234,6 +238,8 @@ impl Default for Style {
             width: 2.0,
             stroke: StrokeStyle::Solid,
             font_size: 14.0,
+            image_blur: 0.,
+            image_border: false,
         }
     }
 }
@@ -289,12 +295,23 @@ impl Annotation {
                 .iter()
                 .chain(self.style.fill.iter().flatten())
                 .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
-                && (0.01..=1.0).contains(&self.style.opacity)
+                && (if matches!(self.kind, Kind::Image { .. }) {
+                    0.0
+                } else {
+                    0.01
+                }..=1.0)
+                    .contains(&self.style.opacity)
+                && self.style.image_blur.is_finite()
+                && (0.0..=32.).contains(&self.style.image_blur)
                 && (0.1..=30.0).contains(&self.style.width)
                 && (1.0..=144.0).contains(&self.style.font_size),
             "Invalid annotation style"
         );
-        self.kind.validate()
+        self.kind.validate()?;
+        if let Kind::Image { png } = &self.kind {
+            crate::image_effects::blurred(png, self.style.image_blur)?;
+        }
+        Ok(())
     }
     pub fn local(&self, p: Point2) -> Point2 {
         [
@@ -1073,10 +1090,23 @@ fn raw_primitives(a: &Annotation) -> Vec<Primitive> {
         Kind::Svg { source, tint } => crate::svg::preview(source, tint.then_some(a.style.color))
             .map(|png| vec![Primitive::Image { png, rect: r }])
             .unwrap_or_default(),
-        Kind::Image { png } => vec![Primitive::Image {
-            png: png.clone(),
-            rect: r,
-        }],
+        Kind::Image { png } => {
+            let mut result = vec![Primitive::Image {
+                png: crate::image_effects::blurred(png, a.style.image_blur)
+                    .unwrap_or_else(|_| png.clone()),
+                rect: r,
+            }];
+            if a.style.image_border {
+                let inset = (a.style.width / 2.)
+                    .min((r[2] - r[0]) / 2.)
+                    .min((r[3] - r[1]) / 2.);
+                result.push(box_path(
+                    [r[0] + inset, r[1] + inset, r[2] - inset, r[3] - inset],
+                    false,
+                ));
+            }
+            result
+        }
     }
 }
 

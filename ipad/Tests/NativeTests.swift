@@ -64,6 +64,48 @@ final class NativeTests: XCTestCase {
     XCTAssertThrowsError(try RustPDF.call(["command": "blank", "output": blank.path]))
     XCTAssertEqual(try Data(contentsOf: blank), original)
   }
+  func testPageOrganizerUsesDesktopEngineAndPreservesDrawing() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    func file(_ name: String) -> String { root.appendingPathComponent(name + ".pdf").path }
+    _ = try RustPDF.call(["command": "blank", "output": file("blank")])
+    _ = try RustPDF.call([
+      "command": "ink", "input": file("blank"), "output": file("drawing"), "page": 0,
+      "color": [0.1, 0.2, 0.5], "width": 2.0, "strokes": [[[30, 40], [90, 100], [130, 45]]],
+    ])
+    let original = try Data(contentsOf: URL(fileURLWithPath: file("drawing")))
+    func pages(_ input: String, _ output: String, _ action: String, _ params: [String: Any]) throws
+    {
+      var args = params
+      args["command"] = "pages"
+      args["input"] = file(input)
+      args["output"] = file(output)
+      args["action"] = action
+      _ = try RustPDF.call(args)
+    }
+    try pages("drawing", "inserted", "blank", ["at": 1, "size": [595, 842]])
+    try pages("inserted", "rotated", "rotate", ["pages": [0], "clockwise": true])
+    try pages("rotated", "reordered", "reorder", ["order": [1, 0]])
+    let info = try RustPDF.call(["command": "annotations", "input": file("reordered")])
+    let marks = try XCTUnwrap(info["annotations"] as? [[String: Any]])
+    XCTAssertEqual(marks.count, 1)
+    XCTAssertEqual(PDFObject(raw: marks[0]).page, 1)
+    let sizes = try XCTUnwrap(info["pages"] as? [[Double]])
+    XCTAssertEqual(sizes[1], [842, 595])
+    try pages("reordered", "cropped", "crop", ["pages": [1], "margins": [10, 10, 10, 10]])
+    try pages("cropped", "extracted", "extract", ["pages": [1]])
+    XCTAssertEqual(PDFDocument(url: URL(fileURLWithPath: file("extracted")))?.pageCount, 1)
+    let extracted = try RustPDF.call(["command": "annotations", "input": file("extracted")])
+    XCTAssertEqual((extracted["annotations"] as? [[String: Any]])?.count, 1)
+    try pages("cropped", "deleted", "delete", ["pages": [0]])
+    try pages("deleted", "merged", "insert", ["at": 1, "addition": file("blank")])
+    XCTAssertEqual(PDFDocument(url: URL(fileURLWithPath: file("merged")))?.pageCount, 2)
+    XCTAssertThrowsError(try pages("merged", "invalid", "delete", ["pages": [0, 1]]))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: file("invalid")))
+    XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: file("drawing"))), original)
+    XCTAssertThrowsError(try pages("merged", "drawing", "extract", ["pages": [0]]))
+  }
   @MainActor func testPencilCoordinatesSurviveCanvasResize() {
     let canvas = PaperCanvas(frame: CGRect(x: 0, y: 0, width: 300, height: 400))
     canvas.paperSize = CGSize(width: 600, height: 800)

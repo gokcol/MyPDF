@@ -19,6 +19,49 @@ impl Span {
         self.font == b.font && self.size == b.size && self.color == b.color
     }
 }
+/// Change only a byte range, keeping every other attribute and range intact.
+/// Callers convert character selections to UTF-8 boundaries before applying.
+pub fn restyle(
+    spans: &[Span],
+    range: Range<usize>,
+    mut change: impl FnMut(&mut Span),
+) -> Vec<Span> {
+    let mut out: Vec<Span> = Vec::new();
+    for span in spans {
+        let start = span.range.start.max(range.start);
+        let end = span.range.end.min(range.end);
+        let mut pieces = Vec::new();
+        if start < end {
+            if span.range.start < start {
+                let mut prefix = span.clone();
+                prefix.range.end = start;
+                pieces.push(prefix);
+            }
+            let mut selected = span.clone();
+            selected.range = start..end;
+            change(&mut selected);
+            pieces.push(selected);
+            if end < span.range.end {
+                let mut suffix = span.clone();
+                suffix.range.start = end;
+                pieces.push(suffix);
+            }
+        } else {
+            pieces.push(span.clone());
+        }
+        for piece in pieces {
+            if let Some(last) = out.last_mut()
+                && last.range.end == piece.range.start
+                && last.same_style(&piece)
+            {
+                last.range.end = piece.range.end;
+            } else {
+                out.push(piece);
+            }
+        }
+    }
+    out
+}
 /// A contiguous replacement inherits the style at its insertion point. Untouched
 /// prefixes/suffixes retain their ranges, even with multi-byte characters.
 pub fn edited(before: &str, after: &str, spans: &[Span]) -> Vec<Span> {
@@ -76,6 +119,25 @@ struct Piece {
     width: f32,
 }
 pub fn add(bytes: &[u8], page: u32, text: &str, rect: [f32; 4], spans: &[Span]) -> Result<Vec<u8>> {
+    add_aligned(
+        bytes,
+        page,
+        text,
+        rect,
+        spans,
+        crate::text_style::Alignment::Left,
+    )
+}
+
+pub fn add_aligned(
+    bytes: &[u8],
+    page: u32,
+    text: &str,
+    rect: [f32; 4],
+    spans: &[Span],
+    alignment: crate::text_style::Alignment,
+) -> Result<Vec<u8>> {
+    use crate::text_style::Alignment;
     ensure!(
         text.len() <= 32768 && !spans.is_empty() && spans.len() <= 4096,
         "Text block exceeds its style limit"
@@ -117,6 +179,7 @@ pub fn add(bytes: &[u8], page: u32, text: &str, rect: [f32; 4], spans: &[Span]) 
     let mut styles: Vec<Span> = vec![];
     let mut writers = vec![];
     let mut rows: Vec<Vec<Piece>> = vec![vec![]];
+    let mut paragraph_ends = std::collections::HashSet::new();
     let mut used = 0.;
     for span in spans {
         let style = if let Some(i) = styles.iter().position(|s| s.same_style(span)) {
@@ -166,6 +229,7 @@ pub fn add(bytes: &[u8], page: u32, text: &str, rect: [f32; 4], spans: &[Span]) 
                 }
             }
             if newline {
+                paragraph_ends.insert(rows.len() - 1);
                 rows.push(vec![]);
                 used = 0.;
             }
@@ -173,7 +237,8 @@ pub fn add(bytes: &[u8], page: u32, text: &str, rect: [f32; 4], spans: &[Span]) 
     }
     let mut shaped = vec![];
     let mut top = y;
-    for row in rows {
+    paragraph_ends.insert(rows.len() - 1);
+    for (row_index, row) in rows.into_iter().enumerate() {
         let height = row
             .iter()
             .map(|p| styles[p.style].size)
@@ -182,7 +247,6 @@ pub fn add(bytes: &[u8], page: u32, text: &str, rect: [f32; 4], spans: &[Span]) 
             top - y + height * 1.3 <= h + 0.1,
             "Text does not fit. Enlarge the block or use a smaller font."
         );
-        let mut left = x;
         // Merge adjacent pieces of a face before shaping to preserve kerning.
         let mut merged: Vec<Piece> = vec![];
         for p in row {
@@ -195,11 +259,31 @@ pub fn add(bytes: &[u8], page: u32, text: &str, rect: [f32; 4], spans: &[Span]) 
                 merged.push(p);
             }
         }
+        let mut lines = Vec::new();
         for p in merged {
             let line = writers[p.style].shape(&p.text)?;
             let width = line.width(styles[p.style].size);
-            shaped.push((p.style, line, left, top + height));
-            left += width;
+            let spaces = p.text.chars().filter(|c| *c == ' ').count();
+            lines.push((p.style, line, width, spaces));
+        }
+        let width = lines.iter().map(|p| p.2).sum::<f32>();
+        let spaces = lines.iter().map(|p| p.3).sum::<usize>();
+        let mut left = x + match alignment {
+            Alignment::Center => (w - width).max(0.) / 2.,
+            Alignment::Right => (w - width).max(0.),
+            _ => 0.,
+        };
+        let gap = if alignment == Alignment::Justified
+            && !paragraph_ends.contains(&row_index)
+            && spaces > 0
+        {
+            (w - width).max(0.) / spaces as f32
+        } else {
+            0.
+        };
+        for (style, line, width, spaces) in lines {
+            shaped.push((style, line, left, top + height, gap));
+            left += width + gap * spaces as f32;
         }
         top += height * 1.3;
     }
@@ -264,7 +348,7 @@ pub fn add(bytes: &[u8], page: u32, text: &str, rect: [f32; 4], spans: &[Span]) 
         transform.iter().map(|v| Object::Real(*v as f32)).collect(),
     ));
     ops.push(Operation::new("BT", vec![]));
-    for (style, line, x, y) in shaped {
+    for (style, line, x, y, gap) in shaped {
         let style_data = &styles[style];
         ops.push(Operation::new(
             "rg",
@@ -281,7 +365,7 @@ pub fn add(bytes: &[u8], page: u32, text: &str, rect: [f32; 4], spans: &[Span]) 
                 y.into(),
             ],
         ));
-        ops.extend(writers[style].operations(&line, &names[style], style_data.size, 0., 0.)?);
+        ops.extend(writers[style].operations(&line, &names[style], style_data.size, gap, 0.)?);
     }
     ops.push(Operation::new("ET", vec![]));
     ops.push(Operation::new("Q", vec![]));
