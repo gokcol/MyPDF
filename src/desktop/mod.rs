@@ -1878,7 +1878,6 @@ impl eframe::App for Viewer {
         self.restore_reading_panels();
         if !self.home.visible && self.comparison.is_none() && self.zen.is_none() {
             self.editor_tools(ctx);
-            self.selection_toolbar(ctx);
             self.page_tools(ctx);
             self.content_tools(ctx);
             self.form_ribbon(ctx);
