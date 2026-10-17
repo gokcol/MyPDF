@@ -1225,6 +1225,9 @@ impl Viewer {
                     if matches!(self.content.format,Format::Png|Format::Jpeg){ui.horizontal(|ui|{ui.label("Resolution");ui.add(egui::DragValue::new(&mut self.content.dpi).range(72.0..=300.0).suffix(" DPI"));});}
                     ui.add_space(12.);if ui.add(ActionButton::new(Icon::Extract,"Export…").primary()).clicked(){action="export";}
                 });
+                ui.add_space(18.);ui.separator();ui.add_space(12.);
+                if ui.add_enabled(ready,ActionButton::new(Icon::Library,"Multiple pages per sheet…")).clicked(){action="nup";}
+                ui.label(RichText::new("Arrange smaller pages on new sheets, with margins, headers, and a watermark.").small().color(theme::muted()));
                 ui.add_space(18.);ui.separator();ui.add_space(12.);ui.label(RichText::new("Flatten").family(ui::semibold()));
                 ui.label(RichText::new("Turn every page into an image so nothing on it can be edited. Annotations and form fields are burned in; the result can still be signed.").small().color(theme::muted()));
                 if ui.add_enabled(ready,ActionButton::new(Icon::Document,"Flatten PDF…")).clicked(){action="flatten";}
@@ -1243,6 +1246,7 @@ impl Viewer {
             "blank" => self.new_blank(ctx),
             "images" | "document" => self.import_conversion(ctx, action == "images"),
             "export" => self.export_conversion(ctx),
+            "nup" => self.open_nup(),
             "flatten" => self.request_flatten(),
             _ => {}
         }

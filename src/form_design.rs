@@ -2214,7 +2214,7 @@ pub fn flatten(bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
     Ok((content::serialize(&mut doc)?, count))
 }
 /// Paint appearance streams into a page at their widget rectangles.
-fn draw_into_page(
+pub(crate) fn draw_into_page(
     doc: &mut Document,
     page: ObjectId,
     drawn: &[(ObjectId, [f32; 4])],

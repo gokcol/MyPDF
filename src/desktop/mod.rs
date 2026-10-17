@@ -11,6 +11,7 @@ pub mod icon;
 mod manipulation;
 mod menu;
 mod navigate;
+mod nup;
 pub mod open_with;
 mod organize;
 #[cfg(test)]
@@ -308,6 +309,7 @@ pub struct Viewer {
     /// Reduce File Size is open, with this quality chosen.
     shrink: Option<mypdf_milestone0::compress::Level>,
     watermark: Option<watermark::Draft>,
+    nup: Option<nup::Draft>,
     ocr_confirm: bool,
     ocr_progress: Option<Arc<recognize::Progress>>,
     save_events: mpsc::Receiver<Result<(PathBuf, u64, u64), String>>,
@@ -361,6 +363,7 @@ impl Viewer {
             unprotect: false,
             shrink: None,
             watermark: None,
+            nup: None,
             ocr_confirm: false,
             ocr_progress: None,
             focus_search: false,
@@ -650,6 +653,7 @@ impl Viewer {
             "new" => self.new_blank(ctx),
             "open" => self.open_dialog(ctx),
             "save" => self.save_dialog(ctx),
+            "nup" => self.open_nup(),
             "close" => self.request_close(self.tabs.get(self.active).map(|t| t.id), ctx),
             "quit" => self.request_close(None, ctx),
             "identities" => {
@@ -1874,6 +1878,7 @@ impl eframe::App for Viewer {
         self.restore_reading_panels();
         if !self.home.visible && self.comparison.is_none() && self.zen.is_none() {
             self.editor_tools(ctx);
+            self.selection_toolbar(ctx);
             self.page_tools(ctx);
             self.content_tools(ctx);
             self.form_ribbon(ctx);
@@ -1930,7 +1935,6 @@ impl eframe::App for Viewer {
             }
             self.document(ctx);
         }
-        self.selection_toolbar(ctx);
         self.text_context_toolbar(ctx);
         self.finish_new_text(ctx);
         self.form_events(ctx);
@@ -1940,6 +1944,7 @@ impl eframe::App for Viewer {
         self.shrink_dialog(ctx);
         self.link_dialog(ctx);
         self.watermark_dialog(ctx);
+        self.nup_dialog(ctx);
         self.ocr_dialogs(ctx);
         self.compare_dialog(ctx);
         self.details_dialogs(ctx);

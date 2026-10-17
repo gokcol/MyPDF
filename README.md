@@ -36,7 +36,11 @@ Taken from the running app on macOS, with made-up sample documents (`cargo run -
 - **SVG:** Annotate → Saved → SVG code; paste code, preview, save and place. Select placed artwork to move, resize, rotate, recolor or edit its SVG source.
 - **Blank PDF:** File → New Blank PDF (⌘N/Ctrl+N). **Blank page:** Pages → Blank Page.
 
-Every edit is undoable. **Save a Copy** preserves the original and refuses to overwrite an existing file. Word/Markdown conversion does not reconstruct complex layouts, and existing-text editing has font/object compatibility limits. See [milestone 6 results](MILESTONE6_RESULTS.md) and [milestone 5 compatibility limits](MILESTONE5_RESULTS.md).
+Every edit is undoable. Selected drawing properties occupy a compact row below the ribbon, keeping the page and selection handles unobstructed. Rotate by **±90°**, enter an arbitrary angle, or **flip horizontally/vertically**; changes apply immediately, support Undo/Redo, and survive saving. **Sign → Signature → Image** accepts a PNG or JPEG, previews it before saving to the library, and preserves PNG transparency.
+
+**Export → Multiple pages per sheet…** (also in the macOS File menu) creates a fresh PDF with grid presets from 1×1 through 4×4, or custom grids up to 8×8. Set the sheet size/orientation, four margins, spacing, optional source-edge trimming, headers/footers with `{page}` and `{pages}` sheet numbers, and a text watermark with angle and opacity. The preview shows each output sheet. Text and drawings stay vector-based; annotation and form appearances become page content, and digital signatures remain only in the original. Unsupported annotations without saved appearances are reported instead of silently omitted. Source trimming clips content, so it is not redaction. Existing files are never replaced.
+
+**Save a Copy** preserves the original and refuses to overwrite an existing file. Word/Markdown conversion does not reconstruct complex layouts, and existing-text editing has font/object compatibility limits. See [milestone 6 results](MILESTONE6_RESULTS.md) and [milestone 5 compatibility limits](MILESTONE5_RESULTS.md).
 
 
 A native Rust desktop PDF viewer and annotation/signing editor, macOS first and portable to Windows. The interface uses egui/eframe and winit, with Metal on macOS and DirectX 12 on Windows. It contains no WebView, HTML interface, browser renderer, or JavaScript application runtime.
