@@ -21,11 +21,14 @@ exactly into GitHub repository **Settings → Secrets and variables → Actions 
 | `MSIX_IDENTITY_NAME` | Package/Identity/Name |
 | `MSIX_PUBLISHER` | Package/Identity/Publisher (the complete `CN=…` value) |
 | `MSIX_PUBLISHER_DISPLAY_NAME` | Package/Properties/PublisherDisplayName |
+| `MSIX_DISPLAY_NAME` | Exact reserved app name, currently `MyPDF (OG)` |
 
 These are public identity values, not credentials. Do not generate a replacement
-publisher or use the test identity for a Store submission. The package display
-name is MyPDF; if the reserved product has a different name, pass `-DisplayName`
-to the script and update the workflow before submission.
+publisher or use the test identity for a Store submission. The workflow passes
+`MSIX_DISPLAY_NAME` to the script's `-DisplayName` argument; without that optional
+variable, the default is `MyPDF`. This repository's Store product is reserved as
+**MyPDF (OG)**, so its Store workflow uses that exact display name. The Mac app
+and direct Windows installer retain the name MyPDF.
 
 ## Build
 

@@ -1,6 +1,6 @@
 # MyPDF — native Rust desktop PDF editor
 
-Version 1.1 adds multiple-pages-per-sheet PDF export with margins, headers, footers and watermarks; object rotation and flipping in the right-hand inspector; and signature import from images. It also prepares Microsoft Store MSIX packaging. Native Rust, local files, no WebViews. Published **Mac app for Apple Silicon** and **Windows x64 installer** downloads are available from [Releases](https://github.com/gokcol/MyPDF/releases); the 1.1 release will follow Store MSIX preparation.
+Version 1.1 adds multiple-pages-per-sheet PDF export with margins, headers, footers and watermarks; object rotation and flipping in the right-hand inspector; and signature import from images. It also adds Microsoft Store MSIX packaging. Native Rust, local files, no WebViews. **Mac app for Apple Silicon** and **Windows x64 installer** downloads are available from [Releases](https://github.com/gokcol/MyPDF/releases).
 
 > MyPDF was built with the help of Claude, Anthropic's AI assistant, to make everyday business paperwork easier. It is provided as is, without warranty of any kind: keep copies of important documents and use it at your own risk.
 
@@ -303,7 +303,7 @@ The PKCS#12 adapter uses `p12-keystore` for modern AES-encrypted PKCS#12 and aut
 
 The Windows app and installer are currently unsigned; no Windows code-signing provider is configured. Release downloads include SHA-256 checksum files for integrity verification. These checksums do not authenticate the publisher or replace code signing. The Mac app is signed with the maintainer's Apple Developer ID and notarized by Apple.
 
-Microsoft Store packaging is available through the **Microsoft Store MSIX** workflow. It packages the same native desktop app, with PDF Open With registration and shared settings/stamp storage. Store mode requires the real Partner Center product identity; test mode uses a clearly marked validation identity. The unsigned `.msix` is a submission artifact, not a signed GitHub installer. Microsoft signs Store-distributed packages after certification. See [Windows Store packaging](packaging/windows/msix/README.md) for setup, validation and submission steps. MyPDF is not yet published in the Microsoft Store.
+Microsoft Store packaging is available through the **Microsoft Store MSIX** workflow, under the reserved Store name **MyPDF (OG)**. It packages the same native desktop app, with PDF Open With registration and shared settings/stamp storage. Store mode requires the real Partner Center product identity; test mode uses a clearly marked validation identity. The unsigned `.msix` is a submission artifact, not a signed GitHub installer. Microsoft signs Store-distributed packages after certification. See [Windows Store packaging](packaging/windows/msix/README.md) for setup, validation and submission steps. MyPDF is not yet published in the Microsoft Store.
 
 - **Committers and reviewers:** [gokcol](https://github.com/gokcol)
 - **Approvers:** [gokcol](https://github.com/gokcol)

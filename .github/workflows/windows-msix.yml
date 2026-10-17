@@ -54,6 +54,7 @@ jobs:
           STORE_IDENTITY_NAME: ${{ vars.MSIX_IDENTITY_NAME }}
           STORE_PUBLISHER: ${{ vars.MSIX_PUBLISHER }}
           STORE_PUBLISHER_DISPLAY_NAME: ${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}
+          STORE_DISPLAY_NAME: ${{ vars.MSIX_DISPLAY_NAME }}
         run: |
           $packageArgs = @{ SkipBuild = $true; OutputDirectory = 'dist/msix' }
           if ($env:PACKAGE_VERSION) { $packageArgs.PackageVersion = $env:PACKAGE_VERSION }
@@ -61,6 +62,7 @@ jobs:
             $packageArgs.IdentityName = $env:STORE_IDENTITY_NAME
             $packageArgs.Publisher = $env:STORE_PUBLISHER
             $packageArgs.PublisherDisplayName = $env:STORE_PUBLISHER_DISPLAY_NAME
+            if ($env:STORE_DISPLAY_NAME) { $packageArgs.DisplayName = $env:STORE_DISPLAY_NAME }
           } else {
             $packageArgs.TestIdentity = $true
           }

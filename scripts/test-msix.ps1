@@ -25,11 +25,11 @@ foreach ($version in @('1.0.0.1', '0.1.0.0', '65536.0.0.0', '1.0.0-beta.0')) {
 $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('mypdf-msix-qa-' + [guid]::NewGuid().ToString('N'))
 try {
     & $packager -SkipBuild -IdentityName 'MyPDF.XmlEscapingQA' -Publisher 'CN=MyPDF QA, O=QA & Co' `
-        -PublisherDisplayName 'QA & Co' -DisplayName 'MyPDF <QA>' -OutputDirectory $scratch
+        -PublisherDisplayName 'QA Gökçöl & Co' -DisplayName 'MyPDF (QA) <Test>' -OutputDirectory $scratch
     $package = Get-ChildItem $scratch -Filter '*.msix' | Select-Object -First 1
     if (-not $package) { throw 'XML escaping validation did not produce a package.' }
     $info = Get-Content ($package.FullName + '.json') -Raw | ConvertFrom-Json
-    if ($info.displayName -ne 'MyPDF <QA>' -or $info.publisherDisplayName -ne 'QA & Co') { throw 'Display-name escaping did not round-trip.' }
+    if ($info.displayName -cne 'MyPDF (QA) <Test>' -or $info.publisherDisplayName -cne 'QA Gökçöl & Co') { throw 'Display-name escaping did not round-trip.' }
     Expect-Rejection @{ IdentityName = 'MyPDF.XmlEscapingQA'; Publisher = 'CN=MyPDF QA, O=QA & Co'; PublisherDisplayName = 'QA & Co'; OutputDirectory = $scratch } 'Output already exists'
     Write-Host 'PASS XML identity escaping, validated package round trip and safe output handling.'
 } finally {
