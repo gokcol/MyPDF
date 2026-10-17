@@ -14,6 +14,7 @@ pub mod forms;
 pub mod header_footer;
 pub mod home;
 pub mod identity;
+pub mod image_background;
 #[cfg(target_os = "macos")]
 pub mod keychain;
 pub mod navigation;

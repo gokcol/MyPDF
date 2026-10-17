@@ -551,3 +551,62 @@ fn images_are_added_as_page_content_where_they_are_displayed() {
     assert!(content::add_image(&source, 1, [0., 0., 0.5, 10.], &png).is_err());
     assert!(content::add_image(&source, 1, [0., 0., 50., 50.], b"not an image").is_err());
 }
+
+#[test]
+fn removed_image_background_survives_pdf_save_and_undo_restores_original() {
+    use mypdf_milestone0::image_background::{self, Options};
+    let mut png = vec![];
+    image::RgbaImage::from_fn(20, 20, |x, y| {
+        if x == y || x == 19 - y {
+            image::Rgba([20, 30, 70, 255])
+        } else {
+            image::Rgba([255, 255, 255, 255])
+        }
+    })
+    .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+    .unwrap();
+    let blank = convert::blank(200., 200.).unwrap();
+    let original = content::add_image(&blank, 1, [20., 20., 180., 180.], &png).unwrap();
+    let index = content::images(&original, 1).unwrap()[0].index;
+    let extracted = content::image_png(&original, 1, index).unwrap();
+    let clear = image_background::remove(&extracted, Options::default()).unwrap();
+    let edited = content::edit_image(
+        &original,
+        1,
+        index,
+        &content::ImageEdit::Replace(clear.clone()),
+    )
+    .unwrap();
+    let index = content::images(&edited, 1).unwrap()[0].index;
+    let saved = content::decode_image(&content::image_png(&edited, 1, index).unwrap()).unwrap();
+    assert_eq!(saved.get_pixel(0, 1)[3], 0);
+    assert_eq!(saved.get_pixel(0, 0)[3], 255);
+    assert_eq!(saved.get_pixel(0, 0)[0], 20);
+    let mut session = ann::Session::new(original.clone().into(), vec![], true);
+    session.commit_document(edited.clone()).unwrap();
+    session.undo();
+    assert_eq!(&*session.source, &original);
+    session.redo();
+    assert_eq!(&*session.source, &edited);
+    // Signature/artwork annotations keep alpha and the original is one Undo away.
+    let mark = ann::Annotation::new(
+        0,
+        [20., 20., 180., 180.],
+        ann::Kind::Image { png: Arc::new(png) },
+        ann::Style::default(),
+    );
+    let mut session = ann::Session::new(blank.into(), vec![mark.clone()], true);
+    let mut next = mark.clone();
+    next.kind = ann::Kind::Image {
+        png: Arc::new(clear),
+    };
+    session.commit(vec![next]).unwrap();
+    let bytes = ann::export(&session.source, &session.annotations).unwrap();
+    let marks = ann::load(&Document::load_mem(&bytes).unwrap());
+    let ann::Kind::Image { png } = &marks[0].kind else {
+        panic!("Image lost")
+    };
+    assert_eq!(content::decode_image(png).unwrap().get_pixel(0, 1)[3], 0);
+    session.undo();
+    assert_eq!(session.annotations, vec![mark]);
+}

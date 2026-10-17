@@ -1,4 +1,6 @@
 use super::*;
+#[path = "image_background.rs"]
+mod background;
 use mypdf_milestone0::{
     annotations::{
         self as ann, Annotation, Box2, Kind, Markup, Primitive, StrokeStyle, Style, Symbol,
@@ -235,6 +237,7 @@ enum SignatureInput {
 }
 
 pub(super) struct EditorState {
+    background: Option<background::Draft>,
     svg: SvgEditor,
     pub mode: Mode,
     pub(super) tool: Tool,
@@ -261,6 +264,7 @@ pub(super) struct EditorState {
     gesture: Option<Gesture>,
     vertices: Option<VertexPath>,
     pressed: Option<(u64, usize, [f32; 2])>,
+    touch_navigation: bool,
     pub pending_sign_rect: Option<(u64, usize, Box2)>,
     pub annotation_sidebar: bool,
     asset_name: String,
@@ -301,6 +305,7 @@ impl EditorState {
         let (import_tx, import_rx) = mpsc::channel();
         let (signature_tx, signature_rx) = mpsc::channel();
         Self {
+            background: None,
             svg: SvgEditor::default(),
             mode: Mode::Read,
             tool: Tool::Select,
@@ -324,6 +329,7 @@ impl EditorState {
             gesture: None,
             vertices: None,
             pressed: None,
+            touch_navigation: false,
             pending_sign_rect: None,
             annotation_sidebar: false,
             asset_name: "My asset".into(),
@@ -1115,6 +1121,18 @@ pub(super) fn page_interaction(
             painter.add(egui::Shape::line(points, Stroke::new(1.5, theme::accent())));
         }
     }
+    let multitouch = ctx.input(|i| i.multi_touch().is_some_and(|t| t.num_touches > 1));
+    if multitouch {
+        editor.touch_navigation = true;
+    }
+    let navigation = editor.touch_navigation;
+    if navigation {
+        editor.gesture = None;
+        editor.pressed = None;
+        if !multitouch && !ctx.input(|i| i.pointer.primary_down()) {
+            editor.touch_navigation = false;
+        }
+    }
     let first_press = ctx.input(|i| {
         i.events.iter().find_map(|event| {
             if let egui::Event::PointerButton {
@@ -1130,10 +1148,11 @@ pub(super) fn page_interaction(
             }
         })
     });
-    if (response.is_pointer_button_down_on()
-        || response.drag_started()
-        || response.drag_stopped()
-        || first_press.is_some_and(|p| page_rect.contains(p) && response.contains_pointer()))
+    if !navigation
+        && (response.is_pointer_button_down_on()
+            || response.drag_started()
+            || response.drag_stopped()
+            || first_press.is_some_and(|p| page_rect.contains(p) && response.contains_pointer()))
         && (first_press.is_some()
             || editor
                 .pressed
@@ -1178,7 +1197,8 @@ pub(super) fn page_interaction(
             selection::set(tab, editor, vec![]);
         }
     }
-    let quick_release = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary))
+    let quick_release = !navigation
+        && ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary))
         && editor
             .pressed
             .filter(|(id, p, _)| *id == tab.id && *p == page)
@@ -1189,7 +1209,7 @@ pub(super) fn page_interaction(
                 })
             });
     let selecting = editor.marquee.is_some() || editor.group_gesture.is_some();
-    if !vertex_tool
+    if !navigation && !vertex_tool
         && (response.drag_started()
             || (quick_release && editor.gesture.is_none() && !selecting))
         && let Some(p) = editor
@@ -1268,6 +1288,13 @@ pub(super) fn page_interaction(
             })
         {
             let p = normal(pointer);
+            if editor.tool == Tool::Pen && gesture.original.is_none() {
+                for point in stroke_events(ctx).into_iter().map(normal) {
+                    if gesture.points.len() < 100_000 && gesture.points.last() != Some(&point) {
+                        gesture.points.push(point);
+                    }
+                }
+            }
             if gesture.points.len() < 100_000
                 && gesture
                     .points
@@ -1539,6 +1566,42 @@ pub(super) fn page_interaction(
         response.on_hover_text("This signed PDF is protected. Choose “Edit anyway…” in the signature bar to annotate it; signatures stay valid for what they signed.");
     }
 }
+/// Preserve intermediate stylus/mouse samples delivered together in one frame.
+/// Hover movement before the press or after release never becomes ink.
+fn stroke_events(ctx: &egui::Context) -> Vec<egui::Pos2> {
+    ctx.input(|i| {
+        let mut active = !i.events.iter().any(|e| {
+            matches!(
+                e,
+                egui::Event::PointerButton {
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    ..
+                }
+            )
+        });
+        let mut points = Vec::new();
+        for event in &i.events {
+            match event {
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    ..
+                } => {
+                    if *pressed || active {
+                        points.push(*pos);
+                    }
+                    active = *pressed;
+                }
+                egui::Event::PointerMoved(pos) if active => points.push(*pos),
+                _ => {}
+            }
+        }
+        points
+    })
+}
+
 fn draw_signature_pad(ui: &mut egui::Ui, editor: &mut EditorState) -> Rect {
     let (rect, response) = ui.allocate_exact_size(
         vec2(ui.available_width().max(200.0), 170.0),
@@ -1591,9 +1654,18 @@ fn draw_signature_pad(ui: &mut egui::Ui, editor: &mut EditorState) -> Rect {
         && let Some(stroke) = editor.signature_strokes.last_mut()
         && stroke.len() < 10_000
     {
-        let p = normalize(p);
-        if stroke.last() != Some(&p) {
-            stroke.push(p);
+        let mut samples = stroke_events(ui.ctx());
+        if samples.is_empty() {
+            samples.push(p);
+        }
+        for p in samples
+            .into_iter()
+            .take((100_000 - count).min(10_000 - stroke.len()))
+        {
+            let p = normalize(p);
+            if stroke.last() != Some(&p) {
+                stroke.push(p);
+            }
         }
     }
     if released {
@@ -2446,6 +2518,12 @@ impl Viewer {
                                 }
                             }
                             let image = matches!(a.kind, Kind::Image { .. });
+                            if let Kind::Image { png } = &a.kind
+                                && ui.add(ActionButton::new(Icon::FieldImage, "Remove background…")).clicked()
+                            {
+                                self.editor.background = Some(background::Draft::new(
+                                    background::Target::Annotation { tab: tab.id, id: a.id.clone(), revision: tab.session.as_ref().unwrap().revision() }, png.clone()));
+                            }
                             if !image {
                                 ui::caption(ui, "Color");
                                 if color_palette(ui, &mut a.style.color)
@@ -3300,6 +3378,11 @@ impl Viewer {
                                 let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 150.), egui::Sense::hover());
                                 ui.painter().rect_filled(rect, 10., Color32::WHITE);
                                 paint_asset(&mut self.editor, ctx, ui.painter(), rect.shrink(16.), &asset);
+                                if let Kind::Image { png } = &asset.kind
+                                    && ui.add(ActionButton::new(Icon::FieldImage, "Remove background…")).clicked()
+                                {
+                                    self.editor.background = Some(background::Draft::new(background::Target::Signature, png.clone()));
+                                }
                             }
                             choose = ui.add_enabled(!self.editor.signature_busy, ActionButton::new(Icon::Import, "Choose image…")).clicked();
                             ui.weak("PNG or JPEG · Transparent PNG keeps the page visible behind your signature.");
@@ -4632,14 +4715,18 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
         };
         run(vec![
+            egui::Event::PointerMoved(rect.min),
             egui::Event::PointerMoved(start),
             button(start, true),
+            egui::Event::PointerMoved(rect.min + vec2(150.0, 20.0)),
+            egui::Event::PointerMoved(rect.min + vec2(200.0, 80.0)),
             egui::Event::PointerMoved(end),
             button(end, false),
         ]);
         assert_eq!(editor.signature_strokes.len(), 1);
-        assert_eq!(editor.signature_strokes[0].len(), 2);
+        assert_eq!(editor.signature_strokes[0].len(), 4);
         assert!((editor.signature_strokes[0][0][0] - 80.0 / rect.width()).abs() < 0.001);
-        assert!((editor.signature_strokes[0][1][1] - 100.0 / rect.height()).abs() < 0.001);
+        assert!((editor.signature_strokes[0][1][1] - 20.0 / rect.height()).abs() < 0.001);
+        assert!((editor.signature_strokes[0][3][1] - 100.0 / rect.height()).abs() < 0.001);
     }
 }

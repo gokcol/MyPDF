@@ -728,6 +728,7 @@ enum Action {
     Forget(String),
     /// Import an image or SVG and use it as the signature artwork.
     ImportArtwork,
+    RemoveArtworkBackground(String, mypdf_milestone0::assets::Asset),
     /// Draw or type a signature and use it as the signature artwork.
     DrawArtwork,
     /// Trust a certificate in MyPDF.
@@ -862,6 +863,52 @@ fn sign_using(
 }
 
 impl Viewer {
+    pub(super) fn use_transparent_signature_image(
+        &mut self,
+        id: &str,
+        asset: mypdf_milestone0::assets::Asset,
+        png: Arc<Vec<u8>>,
+    ) {
+        let Some(index) = self
+            .digital
+            .signatures
+            .iter()
+            .position(|s| s.id == id && s.asset_id.as_ref() == Some(&asset.id))
+        else {
+            self.status = Some((
+                "The signature changed. Select its image again.".into(),
+                true,
+            ));
+            return;
+        };
+        let next = mypdf_milestone0::assets::Asset::new(
+            &format!(
+                "Transparent {}",
+                asset.name.chars().take(40).collect::<String>()
+            ),
+            mypdf_milestone0::annotations::Kind::Image { png },
+            asset.style,
+            asset.aspect,
+        );
+        let next_id = next.id.clone();
+        let result = self
+            .editor
+            .library
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("The artwork library is unavailable"))
+            .and_then(|library| library.put(next));
+        match result {
+            Ok(()) => {
+                self.digital.signatures[index].asset_id = Some(next_id);
+                self.digital.commit_signatures();
+                self.status = Some((
+                    "Transparent signature image saved; the original stays in your library.".into(),
+                    false,
+                ));
+            }
+            Err(error) => self.status = Some((error.to_string(), true)),
+        }
+    }
     pub(super) fn digital_events(&mut self, ctx: &egui::Context) {
         #[cfg(all(not(test), any(target_os = "macos", target_os = "windows")))]
         if !self.digital.scan_started
@@ -2344,6 +2391,9 @@ impl Viewer {
                 self.digital.adopt_asset = true;
                 self.import_library_asset(ctx, None, false);
             }
+            Action::RemoveArtworkBackground(signature, asset) => {
+                self.remove_signature_image_background(signature, asset);
+            }
             Action::DrawArtwork => {
                 self.editor.last_added = None;
                 self.digital.adopt_asset = true;
@@ -2979,6 +3029,55 @@ fn trust_controls(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transparent_signature_keeps_original_artwork_and_persists_selection() {
+        use mypdf_milestone0::annotations::{Kind, Style};
+        let ctx = egui::Context::default();
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx), vec![]);
+        app.digital = DigitalState::at(temp.path().join("digital"));
+        app.editor.library =
+            Some(mypdf_milestone0::assets::Library::open(temp.path().join("artwork")).unwrap());
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(10, 10, image::Rgba([255, 255, 255, 255]))
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let asset = mypdf_milestone0::assets::Asset::new(
+            "Signature",
+            Kind::Image {
+                png: Arc::new(bytes.into_inner()),
+            },
+            Style::default(),
+            1.,
+        );
+        app.editor
+            .library
+            .as_mut()
+            .unwrap()
+            .put(asset.clone())
+            .unwrap();
+        let id = app.digital.add_signature(None);
+        app.digital.signatures[0].asset_id = Some(asset.id.clone());
+        let Kind::Image { png } = &asset.kind else {
+            unreachable!()
+        };
+        let clear =
+            Arc::new(mypdf_milestone0::image_background::remove(png, Default::default()).unwrap());
+        app.use_transparent_signature_image(&id, asset.clone(), clear);
+        let library = app.editor.library.as_ref().unwrap();
+        assert_eq!(library.entries.len(), 2);
+        assert_eq!(
+            library.entries.iter().find(|a| a.id == asset.id),
+            Some(&asset)
+        );
+        let new_id = app.digital.signatures[0].asset_id.clone();
+        assert_ne!(new_id, Some(asset.id));
+        assert_eq!(
+            DigitalState::at(temp.path().join("digital")).signatures[0].asset_id,
+            new_id
+        );
+    }
+
     #[test]
     fn default_certificate_persists_migrates_and_never_falls_back() {
         let temp = tempfile::tempdir().unwrap();
