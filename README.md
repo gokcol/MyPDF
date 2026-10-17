@@ -310,7 +310,7 @@ Microsoft Store packaging is available through the **Microsoft Store MSIX** work
 
 Every Windows release is built from this repository by the GitHub Actions workflow in `.github/workflows/windows-build.yml`. Releases are approved by the maintainer before publication. The Windows build workflow does not currently perform code signing.
 
-**Privacy:** This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
+**Privacy:** Documents are processed locally; the app has no advertising, usage analytics or automatic crash-report uploads. See the [MyPDF privacy policy](PRIVACY.md) for local storage, recovery copies, digital signatures, external services and deletion controls.
 
 ## License
 
