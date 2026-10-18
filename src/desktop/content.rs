@@ -37,11 +37,14 @@ struct BlockDraft {
     /// Font, size, color and right edge when the block opened.
     initial: (usize, f32, [f32; 3], f32),
     initial_origin: [f32; 2],
+    layout: Vec<mypdf_milestone0::rich_text::LineLayout>,
+    preserve_layout: bool,
 }
 #[derive(Clone)]
 struct InlineText {
     key: Key,
     target: InlineTarget,
+    geometry: Option<document::RunLayout>,
     original: String,
     text: String,
     rect: [f32; 4],
@@ -59,7 +62,8 @@ impl InlineText {
                 if self.rect[2] != b.initial.3
                     || b.spans != b.initial_spans
                     || [self.rect[0], self.rect[1]] != b.initial_origin
-                    || b.alignment != Alignment::Left)
+                    || b.alignment != Alignment::Left
+                    || b.preserve_layout != !b.layout.is_empty())
     }
 }
 
@@ -365,6 +369,7 @@ impl ContentState {
             self.existing = Some(InlineText {
                 key: (id, info.key.1, info.key.2),
                 target: InlineTarget::Run(ordinal),
+                geometry: run.layout.clone(),
                 original: run.text.clone(),
                 text: document::REPLACEMENT.into(),
                 rect,
@@ -390,6 +395,7 @@ impl ContentState {
                     Some(InlineText {
                         key: (id, info.key.1, info.key.2),
                         target: InlineTarget::Run(ordinal),
+                        geometry: run.layout.clone(),
                         original: run.text.clone(),
                         text: run.text.clone(),
                         rect: run.rect?,
@@ -1749,6 +1755,18 @@ impl Viewer {
                         Edit::Block {
                             page: draft.key.2 as u32 + 1,
                             block: text_block::Replacement {
+                                layout: if block.preserve_layout
+                                    && block.alignment == Alignment::Left
+                                {
+                                    mypdf_milestone0::rich_text::edited_layout(
+                                        &block.styled_text,
+                                        &draft.text,
+                                        &block.layout,
+                                        draft.size * 1.3,
+                                    )
+                                } else {
+                                    vec![]
+                                },
                                 spans: mypdf_milestone0::rich_text::edited(
                                     &block.styled_text,
                                     &draft.text,
@@ -1884,8 +1902,15 @@ impl Viewer {
                         if let InlineTarget::Block(block) = &mut draft.target {
                             ui.add_space(12.);
                             ui.add_enabled_ui(!self.content.busy, |ui| {
+                                let old_alignment = block.alignment;
                                 formatting::panel(ui, &draft.text, &mut block.spans, &block.selected_chars,
                                     &mut block.font, &mut draft.size, &mut draft.color, &mut block.alignment);
+                                if old_alignment != block.alignment { block.preserve_layout = false; }
+                                ui.add_space(8.);
+                                if ui.add_enabled(!block.layout.is_empty(), egui::Checkbox::new(&mut block.preserve_layout, "Preserve original line spacing")).changed() && block.preserve_layout {
+                                    block.alignment = Alignment::Left;
+                                }
+                                ui.label(RichText::new("Keeps line breaks, indentation and paragraph gaps. Turn off for evenly spaced lines.").small().color(theme::muted()));
                                 ui.add_space(8.);
                                 ui.separator();
                                 ui::caption(ui, "Position & size");
@@ -1908,7 +1933,7 @@ impl Viewer {
                                     });
                                     if changed { draft.rect = [x, y, (x+width).min(page.width), (y+height).min(page.height)]; }
                                 }
-                                ui.label(RichText::new("Width reflows the text. Height grows as you type.").small().color(theme::muted()));
+                                ui.label(RichText::new("Narrower widths wrap long lines. Height grows as you type.").small().color(theme::muted()));
                                 ui.add_space(8.);
 
                             });
@@ -1934,7 +1959,7 @@ impl Viewer {
                         } else {
                             ui.label(RichText::new(if self.content.area_mode { "Drag a rectangle around the text you want to edit together." } else { "Click text on the page to edit it." }).size(15.).color(theme::ink()));
                             ui.add_space(12.);
-                            ui.label(RichText::new("Drag across several lines to edit a block. Add text starts a new block.").color(theme::muted()));
+                            ui.label(RichText::new("Select area edits several lines together. Add text starts a new block.").color(theme::muted()));
                         }
                         if let Some(hint) = &self.content.selection_hint { ui.add_space(12.); ui.label(RichText::new(hint).color(theme::muted())); }
                         if self.content.loading { ui.add_space(12.); ui.spinner(); }
@@ -1981,13 +2006,19 @@ fn pdf_preview_font(name: &str) -> egui::FontFamily {
                 && f.bold == bold
                 && f.italic == italic
         })
+        .or_else(|| {
+            text_style::fonts()
+                .iter()
+                .find(|f| f.bold == bold && f.italic == italic)
+        })
         .or_else(|| text_style::fonts().first())
         .map(|f| egui::FontFamily::Name(f.ui_name().into()))
         .unwrap_or(egui::FontFamily::Proportional)
 }
 
-/// Grow only along the same column, stopping at paragraph-sized gaps and headings.
-fn paragraph_at(clicked: InlineText, candidates: &[InlineText], page: PageSize) -> InlineText {
+/// A click edits one visual line, including adjacent fragments with different
+/// styles. Other lines are included only by the explicit rectangular selection.
+fn line_at(clicked: InlineText, candidates: &[InlineText], page: PageSize) -> InlineText {
     if !matches!(clicked.target, InlineTarget::Run(_)) {
         return clicked;
     }
@@ -1995,23 +2026,16 @@ fn paragraph_at(clicked: InlineText, candidates: &[InlineText], page: PageSize) 
     loop {
         let next = candidates
             .iter()
-            .find(|c| {
-                matches!(c.target, InlineTarget::Run(_))
-                    && !selected.iter().any(|a| a.target == c.target)
+            .find(|candidate| {
+                matches!(candidate.target, InlineTarget::Run(_))
+                    && !selected.iter().any(|a| a.target == candidate.target)
+                    && clicked.geometry.is_some()
+                    && candidate.geometry.is_some()
+                    && same_text_baseline(&clicked, candidate)
                     && selected.iter().any(|a| {
-                        let gap = (c.rect[1] - a.rect[3]).max(a.rect[1] - c.rect[3]);
-                        let overlap = a.rect[0].max(c.rect[0]) < a.rect[2].min(c.rect[2]);
-                        let same_line = (a.rect[1] - c.rect[1]).abs() < a.size * 0.4
-                            && (a.rect[2] - c.rect[0])
-                                .abs()
-                                .min((c.rect[2] - a.rect[0]).abs())
-                                < a.size;
-                        (same_line
-                            || gap >= -a.size * 0.3
-                                && gap < a.size * 0.9
-                                && overlap
-                                && (a.rect[0] - c.rect[0]).abs() < a.size * 2.)
-                            && (c.size / a.size - 1.).abs() < 0.35
+                        let gap =
+                            (candidate.rect[0] - a.rect[2]).max(a.rect[0] - candidate.rect[2]);
+                        gap < a.size.max(candidate.size) * 1.5
                     })
             })
             .cloned();
@@ -2021,24 +2045,23 @@ fn paragraph_at(clicked: InlineText, candidates: &[InlineText], page: PageSize) 
             break;
         }
     }
-    if selected.len() < 2 {
-        return clicked;
+    let area = clicked.rect;
+    selected_block(selected, area, page).unwrap_or(clicked)
+}
+
+fn same_text_baseline(a: &InlineText, b: &InlineText) -> bool {
+    if let (Some(a_layout), Some(b_layout)) = (&a.geometry, &b.geometry) {
+        let direction = a_layout.direction;
+        let parallel = direction[0] * b_layout.direction[0] + direction[1] * b_layout.direction[1];
+        let dx = b_layout.origin[0] - a_layout.origin[0];
+        let dy = b_layout.origin[1] - a_layout.origin[1];
+        parallel > 0.99 && (dx * direction[1] - dy * direction[0]).abs() < a.size.min(b.size) * 0.25
+    } else {
+        // Missing font metrics: require strong vertical overlap, never infer a
+        // paragraph from similar font sizes or left edges.
+        let overlap = a.rect[3].min(b.rect[3]) - a.rect[1].max(b.rect[1]);
+        overlap > (a.rect[3] - a.rect[1]).min(b.rect[3] - b.rect[1]) * 0.6
     }
-    let right = selected.iter().map(|a| a.rect[2]).fold(0., f32::max);
-    let mut paragraph = selected_block(
-        selected,
-        [clicked.rect[0], clicked.rect[1], right, clicked.rect[3]],
-        page,
-    )
-    .unwrap_or(clicked);
-    // Line breaks inferred from PDF positioning are soft wraps, not paragraph
-    // breaks. A one-byte space preserves the captured style-range offsets.
-    paragraph.text = paragraph.text.replace('\n', " ");
-    paragraph.original = paragraph.text.clone();
-    if let InlineTarget::Block(block) = &mut paragraph.target {
-        block.styled_text = paragraph.text.clone();
-    }
-    paragraph
 }
 
 fn selected_block(
@@ -2046,22 +2069,33 @@ fn selected_block(
     area: [f32; 4],
     page_size: PageSize,
 ) -> Option<InlineText> {
-    if items.is_empty() {
+    if items.is_empty()
+        || items.iter().any(|item| {
+            item.geometry
+                .as_ref()
+                .is_some_and(|g| g.direction[0] < 0.999 || g.direction[1].abs() > 0.01)
+        })
+    {
+        // The positioned editor works in horizontal page coordinates. Keep
+        // affine text in its original PDF font/matrix through the run editor.
         return None;
     }
     items.sort_by(|a, b| {
-        a.rect[1]
-            .total_cmp(&b.rect[1])
+        a.geometry
+            .as_ref()
+            .map_or(a.rect[1] + a.size * 0.8, |g| g.origin[1])
+            .total_cmp(
+                &b.geometry
+                    .as_ref()
+                    .map_or(b.rect[1] + b.size * 0.8, |g| g.origin[1]),
+            )
             .then(a.rect[0].total_cmp(&b.rect[0]))
     });
     // Reassemble fragments from a visual line, then order lines top to bottom.
     let mut lines: Vec<Vec<InlineText>> = Vec::new();
     for item in items {
         if let Some(line) = lines.last_mut()
-            && line.iter().any(|a| {
-                let overlap = a.rect[3].min(item.rect[3]) - a.rect[1].max(item.rect[1]);
-                overlap > (a.rect[3] - a.rect[1]).min(item.rect[3] - item.rect[1]) * 0.5
-            })
+            && line.first().is_some_and(|a| same_text_baseline(a, &item))
         {
             line.push(item);
         } else {
@@ -2080,14 +2114,30 @@ fn selected_block(
     let mut paragraphs = Vec::new();
     let mut spans = Vec::new();
     let mut byte_offset = 0;
+    let mut layout = Vec::new();
     for line in lines {
+        let first = &line[0];
+        let origin = first
+            .geometry
+            .as_ref()
+            .map(|g| g.origin)
+            .unwrap_or([first.rect[0], first.rect[1] + first.size * 0.8]);
+        layout.push(mypdf_milestone0::rich_text::LineLayout {
+            start: byte_offset,
+            left: origin[0],
+            baseline: origin[1],
+        });
         let mut text = String::new();
         let mut previous: Option<&InlineText> = None;
         for item in &line {
             if let Some(prev) = previous
                 && !text.ends_with(char::is_whitespace)
                 && !item.text.starts_with(char::is_whitespace)
-                && item.rect[0] - prev.rect[2] > first.size * 0.12
+                && prev
+                    .geometry
+                    .as_ref()
+                    .zip(item.geometry.as_ref())
+                    .is_some_and(|(previous, next)| previous.needs_space_before(next))
             {
                 text.push(' ');
             }
@@ -2103,7 +2153,14 @@ fn selected_block(
                 let previous: &mut mypdf_milestone0::rich_text::Span = previous;
                 previous.range.end = start;
             }
-            text.push_str(&item.text);
+            let display_text = if item.text == item.original {
+                item.geometry
+                    .as_ref()
+                    .map_or(item.text.as_str(), |g| g.text.as_str())
+            } else {
+                item.text.as_str()
+            };
+            text.push_str(display_text);
             spans.push(mypdf_milestone0::rich_text::Span {
                 range: start..byte_offset + text.len(),
                 font,
@@ -2132,6 +2189,7 @@ fn selected_block(
     let x = masks
         .iter()
         .map(|r| r[0])
+        .chain(layout.iter().map(|line| line.left))
         .fold(f32::INFINITY, f32::min)
         .max(0.);
     let y = (masks.iter().map(|r| r[1]).fold(f32::INFINITY, f32::min) - size * 0.2).max(0.);
@@ -2142,10 +2200,26 @@ fn selected_block(
         .iter()
         .map(|r| r[3])
         .fold(area[3], f32::max)
-        .max(y + (text.lines().count() + 1) as f32 * size * 1.3)
+        .max(
+            layout
+                .iter()
+                .map(|line| line.baseline + size * 0.3)
+                .fold(y, f32::max),
+        )
         .min(page_size.height);
+    if layout.len() != text.split('\n').count() {
+        // A legacy multiline annotation already owns its wrapping. Retain its
+        // hard breaks through the normal editor rather than inventing origins.
+        layout.clear();
+    }
+    let preserve_layout = !layout.is_empty();
+    for line in &mut layout {
+        line.left -= x;
+        line.baseline -= y;
+    }
     Some(InlineText {
         key: first.key,
+        geometry: None,
         target: InlineTarget::Block(BlockDraft {
             selection,
             masks,
@@ -2157,6 +2231,8 @@ fn selected_block(
             alignment: Alignment::Left,
             initial: (font, size, first.color, right),
             initial_origin: [x, y],
+            layout,
+            preserve_layout,
         }),
         original: text.clone(),
         text,
@@ -2189,6 +2265,7 @@ fn erased_page(
         std::thread::spawn(move || {
             let image = std::panic::catch_unwind(|| {
                 let replacement = text_block::Replacement {
+                    layout: vec![],
                     spans: vec![],
                     selection,
                     text: String::new(),
@@ -2338,6 +2415,7 @@ fn existing_overlay(
                 candidates.push(InlineText {
                     key,
                     target: InlineTarget::Run(ordinal),
+                    geometry: run.layout.clone(),
                     original: run.text.clone(),
                     text: run.text.clone(),
                     rect,
@@ -2358,6 +2436,7 @@ fn existing_overlay(
             candidates.push(InlineText {
                 key,
                 target: InlineTarget::Annotation(a.id.clone()),
+                geometry: None,
                 original: text.clone(),
                 text: text.clone(),
                 rect: a.bounds(),
@@ -2442,7 +2521,7 @@ fn existing_overlay(
                     state.existing =
                         selected_block(selected, [a.x, a.y, b.x, b.y], tab.pages[page]);
                     if state.existing.is_none() {
-                        state.selection_hint = Some("No editable text in that area. Try a larger rectangle; scanned text needs OCR.".into());
+                        state.selection_hint = Some("No supported text block in that area. Select horizontal text; rotated text can be edited one run at a time. Scanned text needs OCR.".into());
                     }
                 }
                 state.marquee = None;
@@ -2452,14 +2531,22 @@ fn existing_overlay(
         // Render the new text area on the next frame, after releasing the drag.
         return;
     }
-    let block_active = state
-        .existing
-        .as_ref()
-        .is_some_and(|e| matches!(e.target, InlineTarget::Block(_)));
     let mut clicked = None;
     for (i, draft) in candidates.iter().cloned().enumerate() {
-        if block_active {
-            break;
+        if let Some(active) = state.existing.as_ref().filter(|e| e.key == key)
+            && let InlineTarget::Block(block) = &active.target
+            && (screen(active.rect).intersects(screen(draft.rect))
+                || match &draft.target {
+                    InlineTarget::Run(i) => {
+                        block.selection.runs.iter().any(|(ordinal, _)| ordinal == i)
+                    }
+                    InlineTarget::Annotation(id) => {
+                        block.selection.annotations.iter().any(|(key, _)| key == id)
+                    }
+                    InlineTarget::Block(_) => true,
+                })
+        {
+            continue;
         }
         let r = screen(draft.rect).expand(3.).intersect(page_rect);
         if !r.is_positive() {
@@ -2498,7 +2585,7 @@ fn existing_overlay(
             );
         }
         if response.clicked() && !state.busy {
-            clicked = Some(paragraph_at(draft, &candidates, tab.pages[page]));
+            clicked = Some(line_at(draft, &candidates, tab.pages[page]));
         }
     }
     if let Some(draft) = clicked {
@@ -2531,7 +2618,11 @@ fn existing_overlay(
     // Process placement before painting the text, selection outline and handle.
     // A single-run editor retains its existing-font replacement until it is
     // actually moved; moving requires the same safe block rewrite as area edits.
-    let movable = !matches!(draft.target, InlineTarget::Annotation(_));
+    let movable = !matches!(draft.target, InlineTarget::Annotation(_))
+        && !draft
+            .geometry
+            .as_ref()
+            .is_some_and(|g| g.direction[0] < 0.999 || g.direction[1].abs() > 0.01);
     if movable && !state.busy {
         let move_id = egui::Id::new((tab.id, page, "move_existing_block"));
         let moving = ui
@@ -2720,12 +2811,21 @@ fn existing_overlay(
     } else {
         Alignment::Left
     };
+    let line_layout = if let InlineTarget::Block(b) = &draft.target {
+        if b.preserve_layout && b.alignment == Alignment::Left {
+            b.layout.clone()
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
         ui.set_clip_rect(page_rect.intersect(ui.clip_rect()));
         ui.add_enabled_ui(!state.busy, |ui| {
-            let font = FontId::new((draft.size * scale).clamp(4., 800.), family);
+            let font = FontId::new(draft.size * scale, family);
             let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, width: f32| {
-                formatting::layout(
+                formatting::layout_positioned(
                     ui,
                     text.as_str(),
                     &source_text,
@@ -2735,6 +2835,7 @@ fn existing_overlay(
                     width,
                     scale,
                     alignment,
+                    &line_layout,
                 )
             };
             let edit = if annotation || block {
@@ -2770,6 +2871,12 @@ fn existing_overlay(
             if response.changed()
                 && let InlineTarget::Block(b) = &mut draft.target
             {
+                b.layout = mypdf_milestone0::rich_text::edited_layout(
+                    &b.styled_text,
+                    &draft.text,
+                    &b.layout,
+                    draft.size * 1.3,
+                );
                 b.spans =
                     mypdf_milestone0::rich_text::edited(&b.styled_text, &draft.text, &b.spans);
                 b.styled_text = draft.text.clone();
@@ -3083,6 +3190,7 @@ mod tests {
         content.existing = Some(InlineText {
             key: (11, 3, 2),
             target: InlineTarget::Run(0),
+            geometry: None,
             original: "First İstanbul last".into(),
             text: "First İstanbul last".into(),
             rect: [10., 10., 200., 40.],
@@ -3229,6 +3337,7 @@ mod tests {
         let item = InlineText {
             key: (app.tabs[0].id, 0, 0),
             target: InlineTarget::Run(0),
+            geometry: run.layout.clone(),
             original: run.text.clone(),
             text: run.text,
             rect: run.rect.unwrap(),
@@ -3312,6 +3421,7 @@ mod tests {
                 .map(|(ordinal, run)| InlineText {
                     key: (app.tabs[0].id, 0, 0),
                     target: InlineTarget::Run(ordinal),
+                    geometry: run.layout.clone(),
                     original: run.text.clone(),
                     text: run.text,
                     rect: run.rect.unwrap(),
@@ -3526,6 +3636,7 @@ mod tests {
                     app.content.existing = Some(InlineText {
                         key: (id, 0, 0),
                         target: InlineTarget::Run(0),
+                        geometry: None,
                         original: "Move text".into(),
                         text: "Move text".into(),
                         rect: [50., 70., 170., 90.],
@@ -3684,6 +3795,7 @@ mod tests {
         let original = InlineText {
             key: (id, 0, 0),
             target: InlineTarget::Run(0),
+            geometry: run.layout.clone(),
             original: run.text.clone(),
             text: run.text,
             rect: run.rect.unwrap(),
@@ -3813,6 +3925,7 @@ mod tests {
         let item = InlineText {
             key: (app.tabs[0].id, 0, 0),
             target: InlineTarget::Run(0),
+            geometry: run.layout.clone(),
             original: run.text.clone(),
             text: run.text,
             rect: run.rect.unwrap(),
@@ -3872,10 +3985,17 @@ mod tests {
     }
 
     #[test]
-    fn clicking_any_paragraph_fragment_preserves_styles_and_excludes_other_columns() {
-        let item = |index, text: &str, rect, font: &str, color| InlineText {
+    fn clicking_a_line_never_includes_neighboring_lines_or_columns() {
+        let item = |index, text: &str, rect: [f32; 4], font: &str, color| InlineText {
             key: (1, 0, 0),
             target: InlineTarget::Run(index),
+            geometry: Some(document::RunLayout {
+                text: text.into(),
+                origin: [rect[0], rect[3]],
+                end: [rect[2], rect[3]],
+                direction: [1., 0.],
+                space_width: 4.,
+            }),
             original: text.into(),
             text: text.into(),
             rect,
@@ -3885,44 +4005,247 @@ mod tests {
             focus: true,
         };
         let candidates = vec![
-            item(0, "Regular", [50., 70., 100., 84.], "Arial", [0.; 3]),
+            item(0, "MICROSOFT", [50., 70., 130., 84.], "Arial-Bold", [0.; 3]),
+            item(1, "STORE", [134., 70., 180., 84.], "Arial", [0.8, 0., 0.]),
             item(
-                1,
-                "bold",
-                [104., 70., 140., 84.],
+                2,
+                "Version 8.11",
+                [50., 89., 180., 103.],
                 "Arial-Bold",
-                [0.8, 0., 0.],
+                [0.; 3],
             ),
-            item(2, "next line", [50., 89., 180., 103.], "Arial", [0.; 3]),
             item(3, "Other column", [300., 70., 430., 84.], "Arial", [0.; 3]),
             item(
                 4,
-                "Next paragraph",
-                [50., 140., 220., 154.],
-                "Arial",
+                "Publish Date: March 17, 2026",
+                [50., 108., 280., 122.],
+                "Arial-Bold",
                 [0.; 3],
             ),
         ];
-        for i in 0..3 {
-            let paragraph = paragraph_at(
-                candidates[i].clone(),
-                &candidates,
-                PageSize {
-                    width: 595.,
-                    height: 842.,
-                },
-            );
-            assert_eq!(paragraph.text, "Regular bold next line");
-            assert!(!paragraph.changed(), "Opening text must not rewrite it");
-            let InlineTarget::Block(block) = paragraph.target else {
-                panic!("expected paragraph")
+        let page = PageSize {
+            width: 595.,
+            height: 842.,
+        };
+        for i in 0..2 {
+            let line = line_at(candidates[i].clone(), &candidates, page);
+            assert_eq!(line.text, "MICROSOFT STORE");
+            assert!(!line.changed(), "Selecting must not rewrite the source");
+            let InlineTarget::Block(block) = line.target else {
+                panic!("expected line")
             };
-            assert_eq!(block.selection.runs.len(), 3);
-            assert_eq!(&paragraph.text[block.spans[1].range.clone()], "bold ");
+            assert_eq!(block.selection.runs.len(), 2);
+            assert_eq!(&line.text[block.spans[1].range.clone()], "STORE");
             assert_eq!(block.spans[1].color, [0.8, 0., 0.]);
             assert_ne!(block.spans[0].font, block.spans[1].font);
         }
+        for i in 2..candidates.len() {
+            let line = line_at(candidates[i].clone(), &candidates, page);
+            assert_eq!(line.text, candidates[i].text);
+            let InlineTarget::Block(block) = line.target else {
+                panic!("expected line")
+            };
+            assert_eq!(block.selection.runs.len(), 1);
+        }
+        let mut rotated = candidates[0].clone();
+        rotated.geometry.as_mut().unwrap().direction = [0., 1.];
+        assert!(matches!(
+            line_at(rotated.clone(), &[rotated], page).target,
+            InlineTarget::Run(_)
+        ));
     }
+    #[test]
+    fn area_edit_preserves_baselines_indents_styles_and_neighboring_text() {
+        let mut source = convert::blank(595., 842.).unwrap();
+        for (text, rect, size, color) in [
+            ("MICROSOFT STORE", [50., 50., 480., 40.], 20., [0., 0., 0.]),
+            ("Version 8.11", [50., 82., 480., 30.], 12., [0., 0., 0.]),
+            (
+                "Publish Date: March 17, 2026",
+                [50., 102., 480., 30.],
+                12.,
+                [0., 0., 0.],
+            ),
+            (
+                "Indented paragraph",
+                [80., 180., 450., 40.],
+                14.,
+                [0., 0.2, 0.7],
+            ),
+            (
+                "Unselected footer",
+                [50., 760., 480., 40.],
+                12.,
+                [0., 0., 0.],
+            ),
+        ] {
+            source = content::add_text(&source, 1, text, rect, size, color).unwrap();
+        }
+        let runs = mypdf_milestone0::text_geometry::runs(&source, 1).unwrap();
+        let items: Vec<_> = runs
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.text != "Unselected footer")
+            .map(|(i, r)| InlineText {
+                key: (1, 0, 0),
+                target: InlineTarget::Run(i),
+                geometry: r.layout.clone(),
+                original: r.text.clone(),
+                text: r.text.clone(),
+                rect: r.rect.unwrap(),
+                size: r.size,
+                color: r.color,
+                font: r.base_font.clone(),
+                focus: true,
+            })
+            .collect();
+        let page = PageSize {
+            width: 595.,
+            height: 842.,
+        };
+        let mut draft = selected_block(items.clone(), [40., 40., 540., 240.], page).unwrap();
+        assert_eq!(
+            draft.text,
+            "MICROSOFT STORE\nVersion 8.11\nPublish Date: March 17, 2026\nIndented paragraph"
+        );
+        assert!(!draft.changed());
+        let line = line_at(items[0].clone(), &items, page);
+        assert_eq!(line.text, "MICROSOFT STORE");
+        let InlineTarget::Block(single) = &line.target else {
+            panic!()
+        };
+        assert_eq!(single.selection.runs.len(), 1);
+        assert!(
+            line.rect[3] < items[1].rect[1],
+            "A one-line editor must not cover the next line"
+        );
+        draft.text = draft.text.replace("MICROSOFT STORE", "MY STORE");
+        let InlineTarget::Block(block) = &draft.target else {
+            panic!()
+        };
+        let pdf = text_block::replace(
+            &source,
+            1,
+            &text_block::Replacement {
+                selection: block.selection.clone(),
+                text: draft.text.clone(),
+                rect: [
+                    draft.rect[0],
+                    draft.rect[1],
+                    draft.rect[2] - draft.rect[0],
+                    draft.rect[3] - draft.rect[1],
+                ],
+                size: draft.size,
+                color: draft.color,
+                format: TextFormat::default(),
+                spans: mypdf_milestone0::rich_text::edited(
+                    &block.styled_text,
+                    &draft.text,
+                    &block.spans,
+                ),
+                layout: mypdf_milestone0::rich_text::edited_layout(
+                    &block.styled_text,
+                    &draft.text,
+                    &block.layout,
+                    draft.size * 1.3,
+                ),
+            },
+        )
+        .unwrap();
+        let after = mypdf_milestone0::text_geometry::runs(&pdf, 1).unwrap();
+        for old in runs.iter().filter(|r| r.text != "MICROSOFT STORE") {
+            let new = after
+                .iter()
+                .find(|r| r.text == old.text)
+                .unwrap_or_else(|| panic!("missing {}", old.text));
+            assert_eq!(new.size, old.size);
+            assert_eq!(new.color, old.color);
+            let a = old.layout.as_ref().unwrap().origin;
+            let b = new.layout.as_ref().unwrap().origin;
+            assert!(
+                (a[0] - b[0]).abs() < 0.1 && (a[1] - b[1]).abs() < 0.1,
+                "{}: {a:?} vs {b:?}",
+                old.text
+            );
+        }
+        // Editing a clicked line leaves all other PDF operators and layout alone.
+        let pdf = text_block::replace(
+            &source,
+            1,
+            &text_block::Replacement {
+                selection: single.selection.clone(),
+                text: "TITLE".into(),
+                rect: [
+                    line.rect[0],
+                    line.rect[1],
+                    line.rect[2] - line.rect[0],
+                    line.rect[3] - line.rect[1],
+                ],
+                size: line.size,
+                color: line.color,
+                format: TextFormat::default(),
+                spans: mypdf_milestone0::rich_text::edited(&line.text, "TITLE", &single.spans),
+                layout: single.layout.clone(),
+            },
+        )
+        .unwrap();
+        let after = mypdf_milestone0::text_geometry::runs(&pdf, 1).unwrap();
+        for old in runs.iter().skip(1) {
+            let new = after.iter().find(|r| r.text == old.text).unwrap();
+            assert_eq!(new.rect, old.rect);
+            assert_eq!(new.base_font, old.base_font);
+        }
+    }
+
+    #[test]
+    fn mixed_size_area_rows_follow_baselines_and_multiline_notes_keep_breaks() {
+        let item = |index, text: &str, rect: [f32; 4], baseline, size| InlineText {
+            key: (1, 0, 0),
+            target: InlineTarget::Run(index),
+            geometry: Some(document::RunLayout {
+                text: text.into(),
+                origin: [rect[0], baseline],
+                end: [rect[2], baseline],
+                direction: [1., 0.],
+                space_width: 4.,
+            }),
+            original: text.into(),
+            text: text.into(),
+            rect,
+            size,
+            color: [0.; 3],
+            font: "Arial".into(),
+            focus: true,
+        };
+        let page = PageSize {
+            width: 595.,
+            height: 842.,
+        };
+        let items = vec![
+            item(0, "Earlier", [50., 90., 100., 102.], 100., 12.),
+            item(1, "Large", [50., 80., 140., 125.], 120., 40.),
+            item(2, "small", [144., 110., 180., 122.], 120., 12.),
+        ];
+        let draft = selected_block(items, [40., 70., 300., 160.], page).unwrap();
+        assert_eq!(draft.text, "Earlier\nLarge small");
+        let InlineTarget::Block(block) = draft.target else {
+            panic!()
+        };
+        assert_eq!(block.layout.len(), 2);
+        assert!((block.layout[1].baseline - block.layout[0].baseline - 20.).abs() < 0.01);
+        let mut note = item(0, "First\nSecond", [50., 70., 300., 150.], 90., 16.);
+        note.target = InlineTarget::Annotation("note".into());
+        note.geometry = None;
+        let draft = selected_block(vec![note], [40., 60., 320., 170.], page).unwrap();
+        assert_eq!(draft.text, "First\nSecond");
+        assert!(!draft.changed());
+        let InlineTarget::Block(block) = draft.target else {
+            panic!()
+        };
+        assert!(block.layout.is_empty());
+        assert!(!block.preserve_layout);
+    }
+
     #[test]
     fn rectangular_selection_types_reflows_cancels_and_saves_in_place() {
         use eframe::App;
@@ -4368,13 +4691,10 @@ mod tests {
             &mut app,
             vec![
                 key(egui::Key::A, egui::Modifiers::COMMAND),
-                egui::Event::Text("Changed: İstanbul!".into()),
+                egui::Event::Text("İstanbul!".into()),
             ],
         );
-        assert_eq!(
-            app.content.existing.as_ref().unwrap().text,
-            "Changed: İstanbul!"
-        );
+        assert_eq!(app.content.existing.as_ref().unwrap().text, "İstanbul!");
         assert!(ctx.memory(|m| m.has_focus(egui::Id::new((id, 0_usize, "inline_existing_text")))));
         frame(
             &mut app,
@@ -4383,11 +4703,26 @@ mod tests {
         wait(&mut app, |a| {
             a.content.existing.is_none() && !a.content.loading && !a.content.busy
         });
-        let runs = document::text_runs(&app.tabs[0].session.as_ref().unwrap().source, 1).unwrap();
+        let runs: Vec<_> = document::text_runs(&app.tabs[0].session.as_ref().unwrap().source, 1)
+            .unwrap()
+            .into_iter()
+            .filter(|r| !r.text.is_empty())
+            .collect();
+        assert_eq!(
+            runs.iter().filter(|r| r.text == "Repeated").count(),
+            1,
+            "Only the clicked occurrence is replaced"
+        );
         assert_eq!(runs[0].text, "Repeated");
-        assert_eq!(runs[1].text, "Changed: İstanbul!");
+        assert_eq!(
+            runs.iter()
+                .skip(1)
+                .map(|r| r.text.as_str())
+                .collect::<String>(),
+            "İstanbul!"
+        );
         let r = ctx
-            .read_response(egui::Id::new((id, 0_usize, "existing_text", 2_usize)))
+            .read_response(egui::Id::new((id, 0_usize, "existing_text", runs.len())))
             .unwrap()
             .rect;
         click(&mut app, r.center());
@@ -4446,7 +4781,7 @@ mod tests {
             app.content
                 .existing
                 .as_ref()
-                .is_some_and(|e| e.target == InlineTarget::Run(0)),
+                .is_some_and(|e| matches!(&e.target, InlineTarget::Block(b) if b.selection.runs.len()==1 && b.selection.runs[0].0==0)),
             "wrong target: {:?} at {:?}",
             app.content.existing.as_ref().map(|e| (&e.target, &e.text)),
             r
@@ -4461,13 +4796,13 @@ mod tests {
                 && a.content
                     .existing
                     .as_ref()
-                    .is_some_and(|e| e.original == "Changed: İstanbul!")
+                    .is_some_and(|e| e.original == "İstanbul!")
         });
         frame(
             &mut app,
             vec![
                 key(egui::Key::A, egui::Modifiers::COMMAND),
-                egui::Event::Text("Changed: İstanbul!".into()),
+                egui::Event::Text("İstanbul!".into()),
             ],
         );
         // Closing must commit or finish the on-page editor before asking about the PDF.
@@ -4482,11 +4817,7 @@ mod tests {
             .snapshot_bytes()
             .unwrap();
         let doc = lopdf::Document::load_mem(&bytes).unwrap();
-        assert!(
-            doc.extract_text(&[1])
-                .unwrap()
-                .contains("Changed: İstanbul!")
-        );
+        assert!(doc.extract_text(&[1]).unwrap().contains("İstanbul!"));
         assert!(
             matches!(&mypdf_milestone0::annotations::load(&doc)[0].kind,Kind::Text{text} if text=="Text box changed in place")
         );

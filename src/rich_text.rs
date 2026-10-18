@@ -14,6 +14,96 @@ pub struct Span {
     pub size: f32,
     pub color: [f32; 3],
 }
+
+/// One explicit line's UTF-8 start and text origin, relative to a block's
+/// top-left corner in displayed PDF points. Soft wrapping is not stored here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineLayout {
+    pub start: usize,
+    pub left: f32,
+    pub baseline: f32,
+}
+
+fn line_starts(text: &str) -> impl Iterator<Item = usize> + '_ {
+    std::iter::once(0).chain(text.match_indices('\n').map(|(i, _)| i + 1))
+}
+
+/// Remap a contiguous edit without reflowing untouched lines. New hard lines
+/// inherit the preceding indentation. Adding/removing hard breaks shifts later
+/// original baselines by `line_height` points per break, retaining their gaps.
+pub fn edited_layout(
+    before: &str,
+    after: &str,
+    layout: &[LineLayout],
+    line_height: f32,
+) -> Vec<LineLayout> {
+    if layout.is_empty() || before == after {
+        return layout.to_vec();
+    }
+    if after.is_empty() {
+        return vec![LineLayout {
+            start: 0,
+            ..layout[0]
+        }];
+    }
+    let line_height = if line_height.is_finite() && line_height > 0. {
+        line_height
+    } else {
+        16.
+    };
+    let prefix = before
+        .chars()
+        .zip(after.chars())
+        .take_while(|(a, b)| a == b)
+        .map(|(c, _)| c.len_utf8())
+        .sum::<usize>();
+    let suffix = before[prefix..]
+        .chars()
+        .rev()
+        .zip(after[prefix..].chars().rev())
+        .take_while(|(a, b)| a == b)
+        .map(|(c, _)| c.len_utf8())
+        .sum::<usize>();
+    let cut = before.len() - suffix;
+    let end = after.len() - suffix;
+    let breaks = |text: &str| text.bytes().filter(|b| *b == b'\n').count() as f32;
+    let shift = (breaks(&after[prefix..end]) - breaks(&before[prefix..cut])) * line_height;
+    let original_at = |offset| {
+        *layout
+            .iter()
+            .rev()
+            .find(|line| line.start <= offset)
+            .unwrap_or(&layout[0])
+    };
+    let mut out: Vec<LineLayout> = Vec::new();
+    for start in line_starts(after) {
+        let mut line = if start < prefix {
+            original_at(start)
+        } else if start >= end {
+            let mut line = original_at(cut + start - end);
+            line.baseline += shift;
+            line
+        } else if let Some(previous) = out.last() {
+            LineLayout {
+                baseline: previous.baseline + line_height,
+                ..*previous
+            }
+        } else {
+            original_at(prefix)
+        };
+        line.start = start;
+        // Removing an unusually tight line must not produce a negative or
+        // reversed baseline. Ordinary edits keep the original gaps exactly.
+        line.baseline = line.baseline.max(layout[0].baseline);
+        if let Some(previous) = out.last()
+            && line.baseline <= previous.baseline
+        {
+            line.baseline = previous.baseline + line_height;
+        }
+        out.push(line);
+    }
+    out
+}
 impl Span {
     fn same_style(&self, b: &Self) -> bool {
         self.font == b.font && self.size == b.size && self.color == b.color
@@ -137,6 +227,39 @@ pub fn add_aligned(
     spans: &[Span],
     alignment: crate::text_style::Alignment,
 ) -> Result<Vec<u8>> {
+    add_with_layout(bytes, page, text, rect, spans, alignment, &[])
+}
+
+/// Keep each explicit line's indentation and baseline. Soft wraps use the same
+/// indentation and move subsequent lines down while retaining their original gaps.
+pub fn add_positioned(
+    bytes: &[u8],
+    page: u32,
+    text: &str,
+    rect: [f32; 4],
+    spans: &[Span],
+    layout: &[LineLayout],
+) -> Result<Vec<u8>> {
+    add_with_layout(
+        bytes,
+        page,
+        text,
+        rect,
+        spans,
+        crate::text_style::Alignment::Left,
+        layout,
+    )
+}
+
+fn add_with_layout(
+    bytes: &[u8],
+    page: u32,
+    text: &str,
+    rect: [f32; 4],
+    spans: &[Span],
+    alignment: crate::text_style::Alignment,
+    layout: &[LineLayout],
+) -> Result<Vec<u8>> {
     use crate::text_style::Alignment;
     ensure!(
         text.len() <= 32768 && !spans.is_empty() && spans.len() <= 4096,
@@ -176,9 +299,29 @@ pub fn add_aligned(
             && y + h <= size[3] + 0.1,
         "Text block must fit inside the page"
     );
+    if !layout.is_empty() {
+        ensure!(
+            layout.len() <= 32769
+                && layout.iter().map(|line| line.start).eq(line_starts(text))
+                && layout.iter().all(|line| {
+                    line.left.is_finite()
+                        && line.baseline.is_finite()
+                        && x + line.left >= 0.
+                        && line.left < w
+                        && line.baseline >= 0.
+                        && line.baseline <= h + 0.1
+                })
+                && layout
+                    .windows(2)
+                    .all(|rows| rows[0].baseline < rows[1].baseline),
+            "Invalid preserved line layout"
+        );
+    }
     let mut styles: Vec<Span> = vec![];
     let mut writers = vec![];
     let mut rows: Vec<Vec<Piece>> = vec![vec![]];
+    let mut row_layout = vec![layout.first().copied()];
+    let mut logical_line = 0;
     let mut paragraph_ends = std::collections::HashSet::new();
     let mut used = 0.;
     for span in spans {
@@ -198,11 +341,12 @@ pub fn add_aligned(
         // Preserve explicit line breaks. Wrap by words, falling back to the
         // script-aware writer for tokens that cannot fit on one line.
         for token in text[span.range.clone()].split_inclusive([' ', '\n', '\t']) {
+            let available = w - layout.get(logical_line).map_or(0., |line| line.left);
             let newline = token.ends_with('\n');
             let token = token.trim_end_matches('\n').replace('\t', "    ");
-            let pieces = if writer.measure(&token, span.size)? > w {
+            let pieces = if writer.measure(&token, span.size)? > available {
                 writer
-                    .wrap(&token, span.size, w)?
+                    .wrap(&token, span.size, available)?
                     .into_iter()
                     .map(|p| p.0)
                     .collect()
@@ -211,12 +355,13 @@ pub fn add_aligned(
             };
             for (n, piece) in pieces.into_iter().enumerate() {
                 let width = writer.measure(&piece, span.size)?;
-                if (used + width > w + 0.01 || n > 0) && !rows.last().unwrap().is_empty() {
+                if (used + width > available + 0.01 || n > 0) && !rows.last().unwrap().is_empty() {
                     rows.push(vec![]);
+                    row_layout.push(None);
                     used = 0.;
                 }
                 ensure!(
-                    width <= w + 0.01,
+                    width <= available + 0.01,
                     "A character is too wide. Enlarge the block."
                 );
                 if !piece.is_empty() {
@@ -231,22 +376,47 @@ pub fn add_aligned(
             if newline {
                 paragraph_ends.insert(rows.len() - 1);
                 rows.push(vec![]);
+                logical_line += 1;
+                row_layout.push(layout.get(logical_line).copied());
                 used = 0.;
             }
         }
     }
     let mut shaped = vec![];
     let mut top = y;
+    let mut preserved_left = 0.;
+    let mut preserved_baseline = 0.;
+    let mut previous_height = spans[0].size;
+    let mut wrap_shift = 0.;
     paragraph_ends.insert(rows.len() - 1);
     for (row_index, row) in rows.into_iter().enumerate() {
         let height = row
             .iter()
             .map(|p| styles[p.style].size)
-            .fold(spans[0].size, f32::max);
-        ensure!(
-            top - y + height * 1.3 <= h + 0.1,
-            "Text does not fit. Enlarge the block or use a smaller font."
-        );
+            .fold(if layout.is_empty() { spans[0].size } else { 0. }, f32::max);
+        let height = if height > 0. { height } else { spans[0].size };
+        let (baseline, indent) = if layout.is_empty() {
+            ensure!(
+                top - y + height * 1.3 <= h + 0.1,
+                "Text does not fit. Enlarge the block or use a smaller font."
+            );
+            (top + height, 0.)
+        } else {
+            if let Some(line) = row_layout[row_index] {
+                preserved_left = line.left;
+                preserved_baseline = line.baseline + wrap_shift;
+            } else {
+                let advance = previous_height.max(height) * 1.3;
+                preserved_baseline += advance;
+                wrap_shift += advance;
+            }
+            ensure!(
+                preserved_baseline <= h + 0.1,
+                "Text does not fit. Enlarge the block or use a smaller font."
+            );
+            (y + preserved_baseline, preserved_left)
+        };
+        previous_height = height;
         // Merge adjacent pieces of a face before shaping to preserve kerning.
         let mut merged: Vec<Piece> = vec![];
         for p in row {
@@ -268,21 +438,24 @@ pub fn add_aligned(
         }
         let width = lines.iter().map(|p| p.2).sum::<f32>();
         let spaces = lines.iter().map(|p| p.3).sum::<usize>();
-        let mut left = x + match alignment {
-            Alignment::Center => (w - width).max(0.) / 2.,
-            Alignment::Right => (w - width).max(0.),
-            _ => 0.,
-        };
+        let available = w - indent;
+        let mut left = x
+            + indent
+            + match alignment {
+                Alignment::Center => (available - width).max(0.) / 2.,
+                Alignment::Right => (available - width).max(0.),
+                _ => 0.,
+            };
         let gap = if alignment == Alignment::Justified
             && !paragraph_ends.contains(&row_index)
             && spaces > 0
         {
-            (w - width).max(0.) / spaces as f32
+            (available - width).max(0.) / spaces as f32
         } else {
             0.
         };
         for (style, line, width, spaces) in lines {
-            shaped.push((style, line, left, top + height, gap));
+            shaped.push((style, line, left, baseline, gap));
             left += width + gap * spaces as f32;
         }
         top += height * 1.3;

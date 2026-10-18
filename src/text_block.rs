@@ -1,4 +1,4 @@
-//! Replace a rectangular text selection as one reflowable, selectable PDF block.
+//! Replace a rectangular text selection while preserving layout or reflowing it.
 use anyhow::{Context, Result, ensure};
 use lopdf::{Dictionary, Object, Stream, StringFormat};
 use std::collections::HashSet;
@@ -14,6 +14,8 @@ pub struct Selection {
 pub struct Replacement {
     pub selection: Selection,
     pub spans: Vec<crate::rich_text::Span>,
+    /// Preserved hard-line origins; empty opts into the existing reflow writer.
+    pub layout: Vec<crate::rich_text::LineLayout>,
     pub text: String,
     /// Displayed page coordinates: left, top, width, height.
     pub rect: [f32; 4],
@@ -124,6 +126,28 @@ pub fn replace(bytes: &[u8], page: u32, block: &Replacement) -> Result<Vec<u8>> 
     }
     if block.text.trim().is_empty() {
         return Ok(stripped);
+    }
+    if !block.layout.is_empty() {
+        let fallback;
+        let spans = if block.spans.is_empty() {
+            fallback = vec![crate::rich_text::Span {
+                range: 0..block.text.len(),
+                font: block.format.font.clone(),
+                size: block.size,
+                color: block.color,
+            }];
+            &fallback
+        } else {
+            &block.spans
+        };
+        return crate::rich_text::add_positioned(
+            &stripped,
+            page,
+            &block.text,
+            block.rect,
+            spans,
+            &block.layout,
+        );
     }
     if !block.spans.is_empty() {
         return crate::rich_text::add_aligned(

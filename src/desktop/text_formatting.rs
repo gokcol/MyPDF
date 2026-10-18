@@ -329,10 +329,509 @@ pub(super) fn layout(
     ui.fonts_mut(|f| f.layout_job(job))
 }
 
+/// Retain the PDF's explicit line origins while keeping a normal TextEdit
+/// galley: every glyph/newline still maps to the original Unicode cursor index.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn layout_positioned(
+    ui: &egui::Ui,
+    text: &str,
+    source: &str,
+    spans: &[Span],
+    font: FontId,
+    color: Color32,
+    width: f32,
+    scale: f32,
+    alignment: Alignment,
+    lines: &[rich_text::LineLayout],
+) -> Arc<egui::Galley> {
+    let ordinary = layout(
+        ui,
+        text,
+        source,
+        spans,
+        font.clone(),
+        color,
+        width,
+        scale,
+        alignment,
+    );
+    if lines.is_empty() || !scale.is_finite() || scale <= 0. {
+        return ordinary;
+    }
+    let lines = rich_text::edited_layout(source, text, lines, font.size / scale * 1.3);
+    let starts: Vec<_> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    if lines.len() != starts.len()
+        || lines.iter().zip(&starts).any(|(line, start)| {
+            line.start != *start || !line.left.is_finite() || !line.baseline.is_finite()
+        })
+    {
+        return ordinary;
+    }
+
+    let mut galley = (*ordinary).clone();
+    // Stored indentation already describes the original alignment. Explicit
+    // alignment/reflow changes use layout() instead of these retained origins.
+    Arc::make_mut(&mut galley.job).halign = egui::Align::LEFT;
+    Arc::make_mut(&mut galley.job).justify = false;
+    galley.rows.clear();
+    galley.rect = Rect::ZERO;
+    galley.mesh_bounds = Rect::NOTHING;
+    galley.num_vertices = 0;
+    galley.num_indices = 0;
+    let mut wrap_shift = 0.;
+    for (line_index, paragraph) in text.split('\n').enumerate() {
+        let line = lines[line_index];
+        let end = line.start + paragraph.len();
+        let indent = line.left * scale;
+        let mut job = (*galley.job).clone();
+        job.text = paragraph.to_owned();
+        job.wrap.max_width = (width - indent).max(1.);
+        job.sections = galley
+            .job
+            .sections
+            .iter()
+            .filter_map(|section| {
+                let start = section.byte_range.start.max(line.start);
+                let end = section.byte_range.end.min(end);
+                (start < end).then(|| egui::text::LayoutSection {
+                    byte_range: start - line.start..end - line.start,
+                    ..section.clone()
+                })
+            })
+            .collect();
+        if job.sections.is_empty() {
+            let format = galley
+                .job
+                .sections
+                .iter()
+                .rev()
+                .find(|section| section.byte_range.start <= line.start)
+                .map(|section| section.format.clone())
+                .unwrap_or_else(|| egui::TextFormat::simple(font.clone(), color));
+            job.sections.push(egui::text::LayoutSection {
+                leading_space: 0.,
+                byte_range: 0..paragraph.len(),
+                format,
+            });
+        }
+        let paragraph = ui.fonts_mut(|fonts| fonts.layout_job(job));
+        let mut byte = 0;
+        let mut previous_size: Option<f32> = None;
+        for (row_index, placed) in paragraph.rows.iter().enumerate() {
+            let mut placed = placed.clone();
+            let row = Arc::make_mut(&mut placed.row);
+            let row_end = byte
+                + row
+                    .glyphs
+                    .iter()
+                    .map(|glyph| glyph.chr.len_utf8())
+                    .sum::<usize>();
+            let size = paragraph
+                .job
+                .sections
+                .iter()
+                .filter(|section| {
+                    section.byte_range.start < row_end && byte < section.byte_range.end
+                })
+                .map(|section| section.format.font_id.size)
+                .reduce(f32::max)
+                .unwrap_or(paragraph.job.sections[0].format.font_id.size);
+            if let Some(previous) = previous_size {
+                wrap_shift += previous.max(size) * 1.3;
+            }
+            previous_size = Some(size);
+            byte = row_end;
+
+            // egui aligns differently sized fonts at their bottoms. PDF runs
+            // share a baseline, so move each glyph and its mesh together.
+            let baseline = row
+                .glyphs
+                .iter()
+                .map(|glyph| glyph.font_ascent)
+                .reduce(f32::max)
+                .unwrap_or(size);
+            row.visuals.mesh.translate(vec2(indent, 0.));
+            for index in 0..row.glyphs.len() {
+                let glyph = row.glyphs[index];
+                let start = glyph.first_vertex as usize;
+                let end = row
+                    .glyphs
+                    .get(index + 1)
+                    .map_or(row.visuals.glyph_vertex_range.end, |next| {
+                        next.first_vertex as usize
+                    });
+                for vertex in &mut row.visuals.mesh.vertices[start..end] {
+                    vertex.pos.y += baseline - glyph.pos.y;
+                }
+                row.glyphs[index].pos = pos2(glyph.pos.x + indent, baseline);
+            }
+            row.size.x += indent;
+            row.size.y = row.size.y.max(
+                baseline
+                    + row
+                        .glyphs
+                        .iter()
+                        .map(|glyph| glyph.line_height - glyph.font_ascent)
+                        .fold(0., f32::max),
+            );
+            row.ends_with_newline =
+                row_index + 1 == paragraph.rows.len() && line_index + 1 < lines.len();
+            row.visuals.mesh_bounds = row.visuals.mesh.calc_bounds();
+            // Cursor X lookup uses row-local glyphs, unlike pointer hit tests,
+            // so keep indentation in the glyphs/mesh and leave row.pos.x at 0.
+            placed.pos = pos2(0., line.baseline * scale + wrap_shift - baseline);
+            galley.rect |= Rect::from_min_size(placed.pos, row.size);
+            galley.mesh_bounds |= row.visuals.mesh_bounds.translate(placed.pos.to_vec2());
+            galley.num_vertices += row.visuals.mesh.vertices.len();
+            galley.num_indices += row.visuals.mesh.indices.len();
+            galley.rows.push(placed);
+        }
+    }
+    galley.rect |= galley.mesh_bounds;
+    Arc::new(galley)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use egui::text::{CCursor, CCursorRange};
+
+    fn positioned(
+        text: &str,
+        spans: &[Span],
+        lines: &[rich_text::LineLayout],
+        width: f32,
+        scale: f32,
+    ) -> Arc<egui::Galley> {
+        let ctx = egui::Context::default();
+        let mut galley = None;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                galley = Some(layout_positioned(
+                    ui,
+                    text,
+                    text,
+                    spans,
+                    FontId::monospace(12. * scale),
+                    Color32::BLACK,
+                    width,
+                    scale,
+                    Alignment::Left,
+                    lines,
+                ));
+            });
+        });
+        galley.unwrap()
+    }
+
+    fn test_span(range: Range<usize>, size: f32) -> Span {
+        Span {
+            range,
+            font: None,
+            size,
+            color: [0.; 3],
+        }
+    }
+
+    #[test]
+    fn positioned_lines_preserve_indentation_gaps_and_unicode_cursor_geometry() {
+        let text = "İlk satır\nSecond line\nParagraph";
+        let lines = [
+            rich_text::LineLayout {
+                start: 0,
+                left: 24.,
+                baseline: 18.,
+            },
+            rich_text::LineLayout {
+                start: text.find("Second").unwrap(),
+                left: 4.,
+                baseline: 40.,
+            },
+            rich_text::LineLayout {
+                start: text.find("Paragraph").unwrap(),
+                left: 30.,
+                baseline: 100.,
+            },
+        ];
+        let galley = positioned(text, &[test_span(0..text.len(), 12.)], &lines, 600., 1.5);
+        assert_eq!(galley.rows.len(), 3);
+        assert_eq!(galley.text(), text);
+        for (row, line) in galley.rows.iter().zip(&lines) {
+            let first = row.glyphs.first().unwrap();
+            assert!((first.pos.x + row.pos.x - line.left * 1.5).abs() < 0.01);
+            assert!((first.pos.y + row.pos.y - line.baseline * 1.5).abs() < 0.01);
+            let index = text[..line.start].chars().count();
+            let caret = galley.pos_from_cursor(CCursor::new(index));
+            assert!((caret.left() - line.left * 1.5).abs() < 0.01);
+            assert_eq!(
+                galley.cursor_from_pos(caret.center().to_vec2()).index,
+                index
+            );
+            assert!(galley.rect.contains_rect(row.rect()));
+        }
+        assert!(galley.rows[2].min_y() - galley.rows[1].max_y() > 40.);
+        assert!(galley.rect.contains_rect(galley.mesh_bounds));
+        assert_eq!(galley.end().index, text.chars().count());
+    }
+
+    #[test]
+    fn positioned_mixed_sizes_share_baseline_and_include_ascender_overflow() {
+        let text = "small BIG small\nNext";
+        let lines = [
+            rich_text::LineLayout {
+                start: 0,
+                left: 20.,
+                baseline: 16.,
+            },
+            rich_text::LineLayout {
+                start: text.find("Next").unwrap(),
+                left: 0.,
+                baseline: 90.,
+            },
+        ];
+        let galley = positioned(
+            text,
+            &[
+                test_span(0..6, 12.),
+                test_span(6..9, 30.),
+                test_span(9..text.len(), 12.),
+            ],
+            &lines,
+            400.,
+            1.,
+        );
+        assert_eq!(galley.rows.len(), 2);
+        for (row, line) in galley.rows.iter().zip(&lines) {
+            for glyph in &row.glyphs {
+                assert!((row.pos.y + glyph.pos.y - line.baseline).abs() < 0.01);
+            }
+        }
+        assert!(galley.rows[0].glyphs[6].font_height > galley.rows[0].glyphs[0].font_height);
+        assert!(
+            galley.rect.top() < 0.,
+            "a larger font keeps its original baseline"
+        );
+        assert!(galley.rect.contains_rect(galley.mesh_bounds));
+        for index in [1, 7, 12, 17] {
+            let caret = galley.pos_from_cursor(CCursor::new(index));
+            assert_eq!(
+                galley.cursor_from_pos(caret.center().to_vec2()).index,
+                index
+            );
+        }
+    }
+
+    #[test]
+    fn positioned_soft_wraps_keep_indent_and_shift_following_original_lines() {
+        let text = "one two three four five six seven\nTail";
+        let lines = [
+            rich_text::LineLayout {
+                start: 0,
+                left: 18.,
+                baseline: 18.,
+            },
+            rich_text::LineLayout {
+                start: text.find("Tail").unwrap(),
+                left: 5.,
+                baseline: 100.,
+            },
+        ];
+        let galley = positioned(text, &[test_span(0..text.len(), 12.)], &lines, 90., 1.);
+        let wrapped_rows = galley.rows.len() - 1;
+        assert!(wrapped_rows > 1);
+        let mut cursor_index = 0;
+        for (index, row) in galley.rows.iter().enumerate() {
+            let first = row.glyphs.first().unwrap();
+            let (left, baseline) = if index < wrapped_rows {
+                (18., 18. + index as f32 * 12. * 1.3)
+            } else {
+                (5., 100. + (wrapped_rows - 1) as f32 * 12. * 1.3)
+            };
+            assert!((first.pos.x + row.pos.x - left).abs() < 0.01);
+            assert!((first.pos.y + row.pos.y - baseline).abs() < 0.01);
+            let caret = galley.pos_from_cursor(CCursor {
+                index: cursor_index,
+                prefer_next_row: true,
+            });
+            assert!((caret.left() - left).abs() < 0.01);
+            assert_eq!(
+                galley.cursor_from_pos(caret.center().to_vec2()).index,
+                cursor_index
+            );
+            assert_eq!(row.ends_with_newline, index + 1 == wrapped_rows);
+            cursor_index += row.char_count_including_newline();
+        }
+        assert_eq!(cursor_index, text.chars().count());
+        assert!(
+            galley.rows[..wrapped_rows]
+                .iter()
+                // egui retains trailing spaces for cursor movement even when
+                // their logical advances extend past the visible wrap edge.
+                .all(|row| row
+                    .glyphs
+                    .iter()
+                    .filter(|glyph| !glyph.chr.is_whitespace())
+                    .all(|glyph| glyph.max_x() <= 90.1))
+        );
+    }
+
+    #[test]
+    fn positioned_live_newline_keeps_later_gap_and_trailing_empty_cursor() {
+        let source = "A\nB\n";
+        let text = "A\nNew\nB\n";
+        let lines = [
+            rich_text::LineLayout {
+                start: 0,
+                left: 18.,
+                baseline: 18.,
+            },
+            rich_text::LineLayout {
+                start: 2,
+                left: 4.,
+                baseline: 80.,
+            },
+            rich_text::LineLayout {
+                start: 4,
+                left: 8.,
+                baseline: 110.,
+            },
+        ];
+        let ctx = egui::Context::default();
+        let mut result = None;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                result = Some(layout_positioned(
+                    ui,
+                    text,
+                    source,
+                    &[test_span(0..source.len(), 12.)],
+                    FontId::monospace(12.),
+                    Color32::BLACK,
+                    300.,
+                    1.,
+                    Alignment::Left,
+                    &lines,
+                ));
+            });
+        });
+        let galley = result.unwrap();
+        assert_eq!(galley.rows.len(), 4);
+        for (row, (left, baseline)) in
+            galley.rows[..3]
+                .iter()
+                .zip([(18., 18.), (18., 33.6), (4., 95.6)])
+        {
+            assert!((row.glyphs[0].pos.x - left).abs() < 0.01);
+            assert!((row.pos.y + row.glyphs[0].pos.y - baseline).abs() < 0.01);
+        }
+        assert!(galley.rows[3].glyphs.is_empty());
+        assert_eq!(galley.end().index, text.chars().count());
+        let caret = galley.pos_from_cursor(galley.end());
+        assert!((caret.left() - 8.).abs() < 0.01);
+        assert_eq!(
+            galley.cursor_from_pos(caret.center().to_vec2()).index,
+            text.chars().count()
+        );
+        assert!(galley.rect.contains_rect(caret));
+    }
+
+    #[test]
+    fn positioned_native_textedit_drag_selects_across_indented_paragraph_gap() {
+        let ctx = egui::Context::default();
+        let source = "First\nİkinci\nLast";
+        let mut text = source.to_owned();
+        let spans = [test_span(0..source.len(), 12.)];
+        let lines = [
+            rich_text::LineLayout {
+                start: 0,
+                left: 30.,
+                baseline: 18.,
+            },
+            rich_text::LineLayout {
+                start: source.find('İ').unwrap(),
+                left: 6.,
+                baseline: 80.,
+            },
+            rich_text::LineLayout {
+                start: source.find("Last").unwrap(),
+                left: 40.,
+                baseline: 130.,
+            },
+        ];
+        let mut frame = |events| {
+            let mut output = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(500., 400.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, width| {
+                            layout_positioned(
+                                ui,
+                                text.as_str(),
+                                source,
+                                &spans,
+                                FontId::monospace(12.),
+                                Color32::BLACK,
+                                width,
+                                1.,
+                                Alignment::Left,
+                                &lines,
+                            )
+                        };
+                        output = Some(
+                            egui::TextEdit::multiline(&mut text)
+                                .id(egui::Id::new("positioned_text_editor"))
+                                .desired_width(300.)
+                                .desired_rows(1)
+                                .margin(0.)
+                                .frame(false)
+                                .layouter(&mut layouter)
+                                .show(ui),
+                        );
+                    });
+                },
+            );
+            output.unwrap()
+        };
+        let output = frame(vec![]);
+        let point = |index| {
+            output.galley_pos
+                + output
+                    .galley
+                    .pos_from_cursor(CCursor::new(index))
+                    .center()
+                    .to_vec2()
+        };
+        let (start, end) = (point(8), point(15));
+        frame(vec![
+            egui::Event::PointerMoved(start),
+            egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+        ]);
+        frame(vec![egui::Event::PointerMoved(end)]);
+        let selected = frame(vec![egui::Event::PointerButton {
+            pos: end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }])
+        .cursor_range
+        .unwrap();
+        assert_eq!(selected.as_sorted_char_range(), 8..15);
+        let mut bytes = None;
+        capture(source, &mut bytes, Some(selected));
+        assert_eq!(source.get(bytes.unwrap()), Some("inci\nLa"));
+    }
 
     #[test]
     fn selected_unicode_text_keeps_other_attributes_and_survives_pdf_reopen() {
