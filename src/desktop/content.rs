@@ -166,8 +166,9 @@ pub(super) enum Edit {
     FillDetails(Vec<mypdf_milestone0::form_profile::Suggestion>),
 }
 pub(super) enum AfterText {
-    Save(u64),
+    Save(u64, super::save::Intent),
     Close(Option<u64>),
+    Undo(u64, usize),
 }
 pub(super) struct ContentState {
     pub(super) hide_guides: bool,
@@ -191,6 +192,7 @@ pub(super) struct ContentState {
     show_text_inspector: bool,
     focus_new_text: bool,
     new_rect: [f32; 4],
+    new_initial_rect: Option<[f32; 4]>,
     new_drag: Option<[f32; 4]>,
     new_size: f32,
     new_color: [f32; 3],
@@ -211,6 +213,8 @@ pub(super) struct ContentState {
     pub(super) paused: bool,
     rect: [f32; 4],
     pub busy: bool,
+    /// Owned by the UI as well as the worker so closing the app cancels OCR.
+    recognition: Option<Arc<super::recognize::Progress>>,
     tx: mpsc::Sender<Change>,
     rx: mpsc::Receiver<Change>,
     inspect_tx: mpsc::Sender<Inspection>,
@@ -222,6 +226,13 @@ pub(super) struct ContentState {
     dpi: f32,
     erased: Option<Erased>,
 }
+impl Drop for ContentState {
+    fn drop(&mut self) {
+        if let Some(progress) = &self.recognition {
+            progress.cancellation.cancel();
+        }
+    }
+}
 /// The page rendered without the words an open block replaces, so the editor
 /// hides only those words and keeps backgrounds, lines and boxes around them.
 struct Erased {
@@ -231,11 +242,69 @@ struct Erased {
     texture: Option<TextureHandle>,
 }
 impl ContentState {
+    /// Read the inline editor's selection without committing or changing it.
+    pub(super) fn selected_translation_text(
+        &self,
+        ctx: &egui::Context,
+        active: Key,
+    ) -> Option<String> {
+        let (text, id) = if let Some(draft) = &self.existing {
+            if draft.key != active {
+                return None;
+            }
+            (
+                &draft.text,
+                egui::Id::new((draft.key.0, draft.key.2, "inline_existing_text")),
+            )
+        } else if self.new_placed {
+            let (tab, page) = self.add_target?;
+            if (tab, page) != (active.0, active.2) {
+                return None;
+            }
+            (
+                &self.new_text,
+                egui::Id::new((tab, page, "inline_new_text")),
+            )
+        } else {
+            return None;
+        };
+        let state = egui::text_edit::TextEditState::load(ctx, id)?;
+        let range = state.cursor.char_range()?.as_sorted_char_range();
+        if range.is_empty() {
+            return None;
+        }
+        let selected: String = text.chars().skip(range.start).take(range.len()).collect();
+        (!selected.trim().is_empty()).then_some(selected)
+    }
+    /// Capture the source block's page geometry together with a translation.
+    /// Never infer it later from whichever editor or page happens to be active.
+    pub(super) fn translation_anchor(&self, ctx: &egui::Context, active: Key) -> Option<[f32; 4]> {
+        self.selected_translation_text(ctx, active)?;
+        if let Some(draft) = &self.existing {
+            Some(draft.rect)
+        } else {
+            let [x, y, width, height] = self.new_rect;
+            Some([x, y, x + width, y + height])
+        }
+    }
+    /// A note attached to a managed text object must respect its locked state.
+    pub(super) fn translation_source_object(
+        &self,
+        ctx: &egui::Context,
+        active: Key,
+    ) -> Option<String> {
+        self.selected_translation_text(ctx, active)?;
+        match &self.existing.as_ref()?.target {
+            InlineTarget::Annotation(id) => Some(id.clone()),
+            _ => None,
+        }
+    }
     fn clear_new_text(&mut self) {
         self.new_text.clear();
         self.new_styled_text.clear();
         self.new_spans.clear();
         self.new_selection = None;
+        self.new_initial_rect = None;
     }
     fn sync_new_styles(&mut self) {
         let fallback = formatting::span(
@@ -279,6 +348,7 @@ impl ContentState {
         let w = 240_f32.min(size.width - x);
         let h = (self.new_size * 2.6).min(size.height);
         self.new_rect = [x, point[1].clamp(0., (size.height - h).max(0.)), w, h];
+        self.new_initial_rect = Some(self.new_rect);
         self.focus_new_text = true;
         self.show_text_inspector = true;
     }
@@ -372,6 +442,73 @@ impl ContentState {
             .filter(|_| !self.new_text.trim().is_empty())
             .map(|(id, _)| id)
     }
+    pub(super) fn has_pending_text_change(&self, tab: u64) -> bool {
+        self.existing
+            .as_ref()
+            .is_some_and(|draft| draft.key.0 == tab && draft.changed())
+            || self.add_target.is_some_and(|target| target.0 == tab)
+                && !self.new_text.trim().is_empty()
+    }
+    /// Text-field Undo normally stays with typing. Once placement also changes,
+    /// Undo needs the complete draft so it cannot silently leave the move behind.
+    pub(super) fn placement_undo_owns_input(&self, ctx: &egui::Context, tab: u64) -> bool {
+        let (placed, id) = if let Some(draft) = &self.existing {
+            (
+                draft.key.0 == tab
+                    && matches!(&draft.target, InlineTarget::Block(block)
+                    if [draft.rect[0], draft.rect[1]] != block.initial_origin
+                        || draft.rect[2] != block.initial.3),
+                egui::Id::new((tab, draft.key.2, "inline_existing_text")),
+            )
+        } else if let Some((id, page)) = self.add_target {
+            (
+                id == tab
+                    && !self.new_text.trim().is_empty()
+                    && self
+                        .new_initial_rect
+                        .is_some_and(|initial| initial[..3] != self.new_rect[..3]),
+                egui::Id::new((tab, page, "inline_new_text")),
+            )
+        } else {
+            return false;
+        };
+        placed && (!ctx.wants_keyboard_input() || ctx.memory(|memory| memory.has_focus(id)))
+    }
+    /// Toolbar/history Undo must not act on an older document while an edit is
+    /// still in place. Commit then undo atomically; failures retain the draft.
+    pub(super) fn queue_text_undo(&mut self, tab: u64, redo: bool) -> bool {
+        if !self.has_pending_text_change(tab) {
+            if self
+                .existing
+                .as_ref()
+                .is_some_and(|draft| draft.key.0 == tab)
+            {
+                self.existing = None;
+                self.next_existing = None;
+            }
+            if self.add_target.is_some_and(|target| target.0 == tab) {
+                self.clear_new_text();
+                self.new_placed = false;
+                self.add_target = None;
+            }
+            return false;
+        }
+        if !redo && self.after_text.is_none() {
+            let page = self
+                .existing
+                .as_ref()
+                .map(|draft| draft.key.2)
+                .or_else(|| self.add_target.map(|(_, page)| page))
+                .unwrap_or(0);
+            self.after_text = Some(AfterText::Undo(tab, page));
+            self.new_commit = true;
+            self.next_existing = None;
+            self.add_after_existing = None;
+            self.next_text = None;
+            self.exit_text_tool = true;
+        }
+        true
+    }
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
         let (inspect_tx, inspect_rx) = mpsc::channel();
@@ -398,6 +535,7 @@ impl ContentState {
             show_text_inspector: false,
             focus_new_text: false,
             new_rect: [48., 48., 300., 120.],
+            new_initial_rect: None,
             new_drag: None,
             new_size: 18.,
             new_color: [0.13, 0.15, 0.2],
@@ -417,6 +555,7 @@ impl ContentState {
             paused: false,
             rect: [0.; 4],
             busy: false,
+            recognition: None,
             tx,
             rx,
             inspect_tx,
@@ -431,6 +570,23 @@ impl ContentState {
     }
 }
 impl Viewer {
+    fn undo_finished_text(&mut self, id: u64, page: usize, ctx: &egui::Context) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id)
+            && let Some(session) = &mut tab.session
+        {
+            session.undo();
+            // Release the editor's invisible focus so Redo routes to the document.
+            ctx.memory_mut(|memory| {
+                for editor in ["inline_existing_text", "inline_new_text"] {
+                    memory.surrender_focus(egui::Id::new((id, page, editor)));
+                }
+            });
+            self.status = Some((
+                "Text edit undone • Redo restores your text and position".into(),
+                false,
+            ));
+        }
+    }
     pub(super) fn content_events(&mut self, ctx: &egui::Context) {
         if std::mem::take(&mut self.content.show_text_inspector) {
             self.inspector = true;
@@ -439,6 +595,19 @@ impl Viewer {
         let changes: Vec<_> = self.content.rx.try_iter().collect();
         for result in changes {
             self.content.busy = false;
+            if self
+                .content
+                .recognition
+                .take()
+                .is_some_and(|p| p.cancellation.is_cancelled())
+            {
+                self.ocr_progress = None;
+                self.status = Some((
+                    "Text recognition cancelled. The document is unchanged.".into(),
+                    false,
+                ));
+                continue;
+            }
             match result {
                 Ok((id, revision, bytes, note)) => {
                     if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id)
@@ -455,7 +624,13 @@ impl Viewer {
                             self.status=Some(("The document changed during processing. Select the object again and retry.".into(),true));
                             continue;
                         }
-                        match s.commit_document(bytes) {
+                        let commit = if matches!(&self.content.after_text, Some(AfterText::Undo(target, _)) if *target == id)
+                        {
+                            s.commit_document_requiring_undo(bytes)
+                        } else {
+                            s.commit_document(bytes)
+                        };
+                        match commit {
                             Ok(()) => {
                                 s.name_last_change(self.content.change_name);
                                 s.set_change_focus(self.content.change_page, None);
@@ -494,7 +669,7 @@ impl Viewer {
                                 }
                                 self.status = Some((
                                     note.unwrap_or_else(|| {
-                                        "Changes applied • Undo is available • Save a Copy to keep them"
+                                        "Changes applied • Undo is available • Save to keep them"
                                             .into()
                                     }),
                                     false,
@@ -556,13 +731,15 @@ impl Viewer {
         }
         if let Some(action) = after_text {
             match action {
-                AfterText::Save(id) => {
+                AfterText::Save(id, intent) => {
                     if let Some(index) = self.tabs.iter().position(|t| t.id == id) {
                         self.active = index;
+                        self.save_intent = intent;
                         self.save_dialog(ctx);
                     }
                 }
                 AfterText::Close(id) => self.request_close(id, ctx),
+                AfterText::Undo(id, page) => self.undo_finished_text(id, page, ctx),
             }
         }
     }
@@ -602,15 +779,27 @@ impl Viewer {
             _ => "Edit form fields",
         };
         self.content.busy = true;
+        self.content.recognition = match &edit {
+            Edit::RecognizeText(progress) => Some(progress.clone()),
+            _ => None,
+        };
+        self.ocr_progress = self.content.recognition.clone();
+        let recognition = self.content.recognition.clone();
         self.status = Some(("Applying changes…".into(), false));
         std::thread::spawn(move || {
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> anyhow::Result<_> {
+                    if let Some(progress) = &recognition {
+                        progress.cancellation.check()?;
+                    }
                     let bytes = if revision == 0 {
                         source.to_vec()
                     } else {
                         mypdf_milestone0::annotations::export(&source, &annotations)?
                     };
+                    if let Some(progress) = &recognition {
+                        progress.cancellation.check()?;
+                    }
                     let mut note = None;
                     let result = match edit {
                         Edit::AddText {
@@ -754,13 +943,13 @@ impl Viewer {
                             result
                         }
                         Edit::RecognizeText(progress) => {
-                            use std::sync::atomic::Ordering;
-                            let (bytes, r) = mypdf_milestone0::ocr::recognize(&bytes, &|done, total| {
-                                progress.done.store(done, Ordering::Relaxed);
-                                progress.total.store(total, Ordering::Relaxed);
-                            })?;
+                            let (bytes, r) = mypdf_milestone0::ocr::recognize_cancellable(
+                                &bytes,
+                                &progress.cancellation,
+                                &|state| progress.update(state),
+                            )?;
                             note = Some(format!(
-                                "Text recognized on {} page{} • Search, select and copy now work{} • Save a Copy to keep it",
+                                "Text recognized on {} page{} • Search, select and copy now work{} • Save to keep it",
                                 r.pages,
                                 if r.pages == 1 { "" } else { "s" },
                                 if r.skipped > 0 {
@@ -774,7 +963,7 @@ impl Viewer {
                         Edit::ReduceSize(level) => {
                             let (bytes, r) = mypdf_milestone0::compress::reduce(&bytes, level)?;
                             note = Some(format!(
-                                "Reduced from {} to {} ({}% smaller) • Save a Copy to keep it",
+                                "Reduced from {} to {} ({}% smaller) • Save to keep it",
                                 super::shrink::size(r.before),
                                 super::shrink::size(r.after),
                                 100 - r.after * 100 / r.before.max(1)
@@ -834,7 +1023,7 @@ impl Viewer {
                                 }
                             }
                             note = Some(format!(
-                                "Redacted {} • Save a Copy to keep it; Undo is available until then",
+                                "Redacted {} • Save to keep it; Undo is available until then",
                                 if parts.is_empty() {
                                     "the marked areas".to_owned()
                                 } else {
@@ -847,7 +1036,7 @@ impl Viewer {
                             let (bytes, pages) =
                                 mypdf_milestone0::redact::flatten_document(&bytes, dpi)?;
                             note = Some(format!(
-                                "Flattened {pages} page{} into images • Save a Copy to keep it; it can still be signed",
+                                "Flattened {pages} page{} into images • Save to keep it; it can still be signed",
                                 if pages == 1 { "" } else { "s" }
                             ));
                             bytes
@@ -856,7 +1045,7 @@ impl Viewer {
                             let (bytes, pages) =
                                 mypdf_milestone0::header_footer::apply(&bytes, &stamp)?;
                             note = Some(format!(
-                                "Added to {pages} page{} • Save a Copy to keep your changes",
+                                "Added to {pages} page{} • Save to keep your changes",
                                 if pages == 1 { "" } else { "s" }
                             ));
                             bytes
@@ -1056,7 +1245,7 @@ impl Viewer {
                 self.open_memory(path, bytes, ctx);
                 self.editor.mode = editing::Mode::Annotate;
                 self.status = Some((
-                    "New blank A4 PDF • Add text, artwork or pages • Save a Copy when ready".into(),
+                    "New blank A4 PDF • Add text, artwork or pages • Save when ready".into(),
                     false,
                 ));
             }
@@ -1069,6 +1258,7 @@ impl Viewer {
             let source: Arc<[u8]> = bytes.into();
             tab.bytes = Some(source.clone());
             tab.unsaved_on_load = true;
+            tab.has_destination = false;
             tab.remember_open = false;
             let wake = ctx.clone();
             tab.worker = Worker::from_bytes(source, move || wake.request_repaint());
@@ -1319,7 +1509,7 @@ impl Viewer {
             .get(self.active)
             .is_some_and(|t| !t.pages.is_empty());
         egui::SidePanel::right("conversion_panel").exact_width(310.).resizable(false).frame(egui::Frame::new().fill(theme::paper()).inner_margin(18.)).show(ctx,|ui|{
-            ui.heading("Convert");ui.label(RichText::new("Local files. Fresh output copies.").small().color(theme::muted()));ui.add_space(16.);
+            ui.heading("Export");ui.label(RichText::new("Local files. Fresh output copies.").small().color(theme::muted()));ui.add_space(16.);
             ui.add_enabled_ui(!self.content.busy,|ui|{
                 ui.label(RichText::new("Create a PDF").family(ui::semibold()));
                 for(icon,label,key)in[(Icon::Plus,"New blank PDF","blank"),(Icon::Import,"Images to PDF…","images"),(Icon::Text,"Markdown / Word to PDF…","document")]{if ui.add(ActionButton::new(icon,label)).clicked(){action=key;}}
@@ -1637,10 +1827,7 @@ impl Viewer {
                         return;
                     }
                     self.editor.draft = None;
-                    self.status = Some((
-                        "Text updated • Save a Copy to keep your changes".into(),
-                        false,
-                    ));
+                    self.status = Some(("Text updated • Save to keep your changes".into(), false));
                 }
             }
         }
@@ -1652,13 +1839,15 @@ impl Viewer {
         self.begin_add_after_existing();
         if let Some(action) = self.content.after_text.take() {
             match action {
-                AfterText::Save(id) => {
+                AfterText::Save(id, intent) => {
                     if let Some(index) = self.tabs.iter().position(|t| t.id == id) {
                         self.active = index;
+                        self.save_intent = intent;
                         self.save_dialog(ctx);
                     }
                 }
                 AfterText::Close(id) => self.request_close(id, ctx),
+                AfterText::Undo(id, page) => self.undo_finished_text(id, page, ctx),
             }
         }
     }
@@ -1670,6 +1859,14 @@ impl Viewer {
             .and_then(|t| t.pages.get(t.page))
             .copied();
         let mut cancel = false;
+        let mut add_text = false;
+        let editable = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.session.as_ref())
+            .is_some_and(|s| s.editable)
+            && !self.content.busy
+            && !self.organizer.busy;
         egui::SidePanel::right("content_inspector").default_width(290.).width_range(270.0..=380.0).resizable(true)
             .frame(egui::Frame::new().fill(theme::paper()).inner_margin(18.))
             .show(ctx, |ui| {
@@ -1727,11 +1924,18 @@ impl Viewer {
                             });
                         });
                         ui.add_space(14.);
-                        ui.label(RichText::new("Type on the page. Click outside or press ⌘Return to finish. Esc cancels.").size(12.).color(theme::muted()));
+                        ui.label(RichText::new("Type on the page. Drag the handle to move PDF text. Click outside or press ⌘Return to finish. Esc cancels.").size(12.).color(theme::muted()));
                     } else {
-                        ui.label(RichText::new(if self.content.area_mode { "Drag a rectangle around the text you want to edit together." } else { "Click text on the page to edit it." }).size(15.).color(theme::ink()));
-                        ui.add_space(12.);
-                        ui.label(RichText::new("Drag across several lines to edit a block. Add text starts a new block.").color(theme::muted()));
+                        let empty = self.content.inspection.as_ref().is_some_and(|info| info.text.as_ref().is_ok_and(|runs| runs.is_empty()));
+                        if empty {
+                            ui.label(RichText::new("No editable text on this page.").size(15.).color(theme::ink()));
+                            ui.label(RichText::new("Start a new text block anywhere on the page.").color(theme::muted()));
+                            add_text = ui.add_enabled(editable, ActionButton::new(Icon::Text, "Add text").primary()).clicked();
+                        } else {
+                            ui.label(RichText::new(if self.content.area_mode { "Drag a rectangle around the text you want to edit together." } else { "Click text on the page to edit it." }).size(15.).color(theme::ink()));
+                            ui.add_space(12.);
+                            ui.label(RichText::new("Drag across several lines to edit a block. Add text starts a new block.").color(theme::muted()));
+                        }
                         if let Some(hint) = &self.content.selection_hint { ui.add_space(12.); ui.label(RichText::new(hint).color(theme::muted())); }
                         if self.content.loading { ui.add_space(12.); ui.spinner(); }
                         if let Some(info) = &self.content.inspection && let Err(e) = &info.text { ui.add_space(12.); ui.label(RichText::new(e).small().color(theme::muted())); }
@@ -1739,6 +1943,20 @@ impl Viewer {
                     if self.content.busy { ui.spinner(); ui.label("Applying text…"); }
                 });
             });
+        if add_text && let Some((id, page)) = current {
+            self.redaction.active = false;
+            self.content.area_mode = false;
+            self.content.marquee = None;
+            if self.content.existing.is_some() {
+                self.content.new_commit = true;
+                self.content.add_after_existing = Some((id, page));
+            } else if self.content.pending_text().is_none() {
+                self.content.add_target = Some((id, page));
+                self.content.new_placed = false;
+                self.content.clear_new_text();
+            }
+            self.status = Some(("Click anywhere on the page to add text.".into(), false));
+        }
         if cancel {
             self.content.existing = None;
             self.content.next_existing = None;
@@ -2008,6 +2226,90 @@ fn erased_page(
     e.texture.as_ref().map(TextureHandle::id)
 }
 
+#[derive(Clone, Copy)]
+struct TextMoveGesture {
+    rect: [f32; 4],
+    pointer: egui::Pos2,
+}
+
+/// egui clears press_origin/total_drag_delta on release. Keep our own origin,
+/// including a fast press/move/release delivered together between paint frames.
+fn text_move_start(ui: &egui::Ui, response: &egui::Response) -> Option<egui::Pos2> {
+    let (press, released, origin) = ui.input(|input| {
+        let press = input.events.iter().find_map(|event| match event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                ..
+            } => Some(*pos),
+            _ => None,
+        });
+        (
+            press,
+            input.pointer.primary_released(),
+            input.pointer.press_origin(),
+        )
+    });
+    if response.drag_started() {
+        return origin.or(press);
+    }
+    // A whole drag within one frame never enters egui's persistent drag state.
+    // Only accept the handle's visible area in the top interactive layer.
+    press.filter(|press| {
+        released
+            && ui.is_enabled()
+            && response.rect.contains(*press)
+            && ui.clip_rect().contains(*press)
+            && ui.ctx().layer_id_at(*press) == Some(response.layer_id)
+    })
+}
+
+/// Keep a text block's drag handle on the page, outside its editable text.
+fn text_move_handle(rect: Rect, page: Rect) -> Rect {
+    let y = if rect.top() - 16. >= page.top() {
+        rect.top() - 9.
+    } else if rect.bottom() + 16. <= page.bottom() {
+        rect.bottom() + 9.
+    } else {
+        (rect.top() + 9.).min(page.bottom() - 6.)
+    };
+    let width = 40_f32.min(page.width().max(0.));
+    let height = 12_f32.min(page.height().max(0.));
+    Rect::from_center_size(
+        pos2(
+            rect.center()
+                .x
+                .clamp(page.left() + width / 2., page.right() - width / 2.),
+            y.clamp(page.top() + height / 2., page.bottom() - height / 2.),
+        ),
+        vec2(width, height),
+    )
+}
+
+fn paint_text_move_handle(painter: &egui::Painter, rect: Rect) {
+    painter.rect_filled(rect, 6., theme::paper());
+    painter.rect_stroke(
+        rect,
+        6.,
+        Stroke::new(1., theme::accent()),
+        egui::StrokeKind::Inside,
+    );
+    painter.line_segment(
+        [rect.center() - vec2(10., 0.), rect.center() + vec2(10., 0.)],
+        Stroke::new(2., theme::accent()),
+    );
+}
+
+/// Move in PDF coordinates from the gesture's start, retaining the block size.
+fn moved_text_rect(original: [f32; 4], delta: egui::Vec2, page: PageSize) -> [f32; 4] {
+    let width = original[2] - original[0];
+    let height = original[3] - original[1];
+    let x = (original[0] + delta.x).clamp(0., (page.width - width).max(0.));
+    let y = (original[1] + delta.y).clamp(0., (page.height - height).max(0.));
+    [x, y, x + width, y + height]
+}
+
 fn existing_overlay(
     state: &mut ContentState,
     tab: &Tab,
@@ -2226,6 +2528,95 @@ fn existing_overlay(
     if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)) && !state.busy {
         state.new_commit = true;
     }
+    // Process placement before painting the text, selection outline and handle.
+    // A single-run editor retains its existing-font replacement until it is
+    // actually moved; moving requires the same safe block rewrite as area edits.
+    let movable = !matches!(draft.target, InlineTarget::Annotation(_));
+    if movable && !state.busy {
+        let move_id = egui::Id::new((tab.id, page, "move_existing_block"));
+        let moving = ui
+            .interact(
+                text_move_handle(screen(draft.rect), page_rect),
+                move_id,
+                egui::Sense::drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::Move)
+            .on_hover_text("Drag to move text block");
+        moving.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Move text block")
+        });
+        let started = text_move_start(ui, &moving);
+        if let Some(pointer) = started {
+            if matches!(draft.target, InlineTarget::Run(_)) {
+                let original = draft.original.clone();
+                // A run editor can grow beyond its original glyph bounds while
+                // typing. Retain that visible width when it becomes movable.
+                let font = FontId::new(
+                    (draft.size * scale).clamp(4., 800.),
+                    pdf_preview_font(&draft.font),
+                );
+                let width = ui.fonts_mut(|fonts| {
+                    fonts
+                        .layout_no_wrap(draft.text.clone(), font, theme::ink())
+                        .size()
+                        .x
+                }) / scale;
+                let mut area = draft.rect;
+                area[2] = area[2].max(area[0] + width).min(tab.pages[page].width);
+                if let Some(mut block) = selected_block(vec![draft.clone()], area, tab.pages[page])
+                {
+                    block.original = original;
+                    block.focus = false;
+                    *draft = block;
+                }
+            }
+            ui.data_mut(|data| {
+                data.insert_temp(
+                    move_id,
+                    TextMoveGesture {
+                        rect: draft.rect,
+                        pointer,
+                    },
+                )
+            });
+        }
+        if (moving.dragged() || moving.drag_stopped() || started.is_some())
+            && let Some(gesture) = ui.data(|data| data.get_temp::<TextMoveGesture>(move_id))
+            && let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
+        {
+            draft.rect = moved_text_rect(
+                gesture.rect,
+                (pointer - gesture.pointer) / scale,
+                tab.pages[page],
+            );
+        }
+        if !ui.input(|i| i.pointer.primary_down()) {
+            ui.data_mut(|data| data.remove::<TextMoveGesture>(move_id));
+        }
+    }
+    if matches!(draft.target, InlineTarget::Block(_)) && !state.busy {
+        let response = ui
+            .interact(
+                Rect::from_center_size(screen(draft.rect).max, vec2(16., 16.)),
+                egui::Id::new((tab.id, page, "resize_existing_block")),
+                egui::Sense::drag(),
+            )
+            .on_hover_cursor(egui::CursorIcon::ResizeNwSe)
+            .on_hover_text("Resize text block");
+        if response.dragged()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let p = (pos - page_rect.min) / scale;
+            draft.rect[2] = p.x.clamp(
+                (draft.rect[0] + 10.).min(tab.pages[page].width),
+                tab.pages[page].width,
+            );
+            draft.rect[3] = p.y.clamp(
+                (draft.rect[1] + draft.size * 1.3).min(tab.pages[page].height),
+                tab.pages[page].height,
+            );
+        }
+    }
     let original = screen(draft.rect);
     let annotation = matches!(draft.target, InlineTarget::Annotation(_));
     let block = matches!(draft.target, InlineTarget::Block(_));
@@ -2401,31 +2792,13 @@ fn existing_overlay(
             }
         });
     });
+    if movable && !state.busy {
+        paint_text_move_handle(&painter, text_move_handle(screen(draft.rect), page_rect));
+    }
     if block && !state.busy {
-        let handle = Rect::from_center_size(rect.max, vec2(16., 16.));
-        painter.circle_filled(rect.max, 5., Color32::WHITE);
-        painter.circle_stroke(rect.max, 5., Stroke::new(1.5, theme::accent()));
-        let response = ui
-            .interact(
-                handle,
-                egui::Id::new((tab.id, page, "resize_existing_block")),
-                egui::Sense::drag(),
-            )
-            .on_hover_cursor(egui::CursorIcon::ResizeNwSe)
-            .on_hover_text("Resize text block");
-        if response.dragged()
-            && let Some(pos) = response.interact_pointer_pos()
-        {
-            let p = (pos - page_rect.min) / scale;
-            draft.rect[2] = p.x.clamp(
-                (draft.rect[0] + 10.).min(tab.pages[page].width),
-                tab.pages[page].width,
-            );
-            draft.rect[3] = p.y.clamp(
-                (draft.rect[1] + draft.size * 1.3).min(tab.pages[page].height),
-                tab.pages[page].height,
-            );
-        }
+        let corner = screen(draft.rect).max;
+        painter.circle_filled(corner, 5., Color32::WHITE);
+        painter.circle_stroke(corner, 5., Stroke::new(1.5, theme::accent()));
     }
 }
 
@@ -2480,43 +2853,43 @@ pub(super) fn overlay(
             let painter = ui
                 .painter()
                 .with_clip_rect(page_rect.intersect(ui.clip_rect()));
-            if !state.hide_guides {
-                ui::dashed_rect(&painter, r.expand(2.), theme::accent());
-            }
-            let move_rect = Rect::from_center_size(r.center_top() - vec2(0., 9.), vec2(40., 12.));
-            painter.rect_filled(move_rect, 6., Color32::WHITE);
-            painter.rect_stroke(
-                move_rect,
-                6.,
-                Stroke::new(1., theme::accent()),
-                egui::StrokeKind::Inside,
-            );
-            painter.line_segment(
-                [
-                    move_rect.center() - vec2(10., 0.),
-                    move_rect.center() + vec2(10., 0.),
-                ],
-                Stroke::new(2., theme::accent()),
-            );
+            let move_rect = text_move_handle(r, page_rect);
+            let move_id = egui::Id::new((tab.id, page, "move_text_block"));
             let moving = ui
-                .interact(
-                    move_rect,
-                    egui::Id::new((tab.id, page, "move_text_block")),
-                    egui::Sense::drag(),
-                )
+                .interact(move_rect, move_id, egui::Sense::drag())
                 .on_hover_text("Move text box")
                 .on_hover_cursor(egui::CursorIcon::Move);
             let p = &tab.pages[page];
-            if moving.drag_started() {
-                state.new_drag = Some(state.new_rect);
+            let started = text_move_start(ui, &moving);
+            if let Some(pointer) = started {
+                state.new_initial_rect.get_or_insert(state.new_rect);
+                ui.data_mut(|data| {
+                    data.insert_temp(
+                        move_id,
+                        TextMoveGesture {
+                            rect: state.new_rect,
+                            pointer,
+                        },
+                    )
+                });
             }
-            if moving.dragged()
-                && let Some(original) = state.new_drag
+            if (moving.dragged() || moving.drag_stopped() || started.is_some())
+                && let Some(gesture) = ui.data(|data| data.get_temp::<TextMoveGesture>(move_id))
+                && let Some(pointer) = ui.input(|input| input.pointer.interact_pos())
             {
-                let d = moving.total_drag_delta().unwrap_or_default() / scale;
-                state.new_rect[0] = (original[0] + d.x).clamp(0., (p.width - w).max(0.));
-                state.new_rect[1] = (original[1] + d.y).clamp(0., (p.height - h).max(0.));
+                let d = (pointer - gesture.pointer) / scale;
+                state.new_rect[0] = (gesture.rect[0] + d.x).clamp(0., (p.width - w).max(0.));
+                state.new_rect[1] = (gesture.rect[1] + d.y).clamp(0., (p.height - h).max(0.));
             }
+            if !ui.input(|input| input.pointer.primary_down()) {
+                ui.data_mut(|data| data.remove::<TextMoveGesture>(move_id));
+            }
+            let [x, y, w, h] = state.new_rect;
+            let r = Rect::from_min_size(page_rect.min + vec2(x, y) * scale, vec2(w, h) * scale);
+            if !state.hide_guides {
+                ui::dashed_rect(&painter, r.expand(2.), theme::accent());
+            }
+            paint_text_move_handle(&painter, text_move_handle(r, page_rect));
             let rgb = state.new_color;
             let color = Color32::from_rgb(
                 (rgb[0] * 255.) as u8,
@@ -2606,6 +2979,7 @@ pub(super) fn overlay(
                     )
                     .on_hover_cursor(cursor);
                 if resize.drag_started() {
+                    state.new_initial_rect.get_or_insert(state.new_rect);
                     state.new_drag = Some(state.new_rect);
                 }
                 if resize.dragged()
@@ -2695,6 +3069,141 @@ pub(super) fn overlay(
 mod tests {
     use super::*;
     #[test]
+    fn translation_selection_is_scoped_to_its_inline_document_page_and_revision() {
+        use egui::text::{CCursor, CCursorRange};
+        let ctx = egui::Context::default();
+        let mut content = ContentState::new();
+        let selection = |id| {
+            let mut state = egui::text_edit::TextEditState::default();
+            state
+                .cursor
+                .set_char_range(Some(CCursorRange::two(CCursor::new(6), CCursor::new(14))));
+            state.store(&ctx, id);
+        };
+        content.existing = Some(InlineText {
+            key: (11, 3, 2),
+            target: InlineTarget::Run(0),
+            original: "First İstanbul last".into(),
+            text: "First İstanbul last".into(),
+            rect: [10., 10., 200., 40.],
+            size: 18.,
+            color: [0.; 3],
+            font: "Helvetica".into(),
+            focus: false,
+        });
+        selection(egui::Id::new((11_u64, 2_usize, "inline_existing_text")));
+        assert_eq!(
+            content
+                .selected_translation_text(&ctx, (11, 3, 2))
+                .as_deref(),
+            Some("İstanbul")
+        );
+        assert_eq!(
+            content.translation_anchor(&ctx, (11, 3, 2)),
+            Some([10., 10., 200., 40.])
+        );
+        assert!(
+            content
+                .translation_source_object(&ctx, (11, 3, 2))
+                .is_none()
+        );
+        for key in [(12, 3, 2), (11, 3, 1), (11, 4, 2)] {
+            assert!(content.selected_translation_text(&ctx, key).is_none());
+            assert!(content.translation_anchor(&ctx, key).is_none());
+        }
+        content.existing.as_mut().unwrap().target =
+            InlineTarget::Annotation("source-object".into());
+        assert_eq!(
+            content
+                .translation_source_object(&ctx, (11, 3, 2))
+                .as_deref(),
+            Some("source-object")
+        );
+        assert_eq!(
+            content.existing.as_ref().unwrap().text,
+            "First İstanbul last"
+        );
+
+        content.existing = None;
+        content.new_placed = true;
+        content.add_target = Some((11, 2));
+        content.new_text = "First İstanbul last".into();
+        content.new_rect = [30., 40., 200., 50.];
+        selection(egui::Id::new((11_u64, 2_usize, "inline_new_text")));
+        assert_eq!(
+            content
+                .selected_translation_text(&ctx, (11, 3, 2))
+                .as_deref(),
+            Some("İstanbul")
+        );
+        assert_eq!(
+            content.translation_anchor(&ctx, (11, 3, 2)),
+            Some([30., 40., 230., 90.])
+        );
+        for key in [(12, 3, 2), (11, 3, 1)] {
+            assert!(content.selected_translation_text(&ctx, key).is_none());
+        }
+        assert_eq!(content.new_text, "First İstanbul last");
+        assert!(!content.new_commit);
+    }
+
+    #[test]
+    fn cancelled_ocr_discards_even_an_already_completed_worker_result() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        let original = convert::blank(200., 200.).unwrap();
+        app.open_memory(PathBuf::from("Cancel scan.pdf"), original.clone(), &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let revision = app.tabs[0].session.as_ref().unwrap().revision();
+        let progress = Arc::new(super::super::recognize::Progress::default());
+        app.content.busy = true;
+        app.content.recognition = Some(progress.clone());
+        app.ocr_progress = Some(progress.clone());
+        app.content
+            .tx
+            .send(Ok((
+                app.tabs[0].id,
+                revision,
+                convert::blank(400., 400.).unwrap(),
+                None,
+            )))
+            .unwrap();
+        progress.cancellation.cancel();
+        app.content_events(&ctx);
+        let session = app.tabs[0].session.as_ref().unwrap();
+        assert_eq!(session.source.as_ref(), original);
+        assert_eq!(session.revision(), revision);
+        assert!(!session.can_undo());
+        assert!(!app.content.busy);
+        assert!(app.ocr_progress.is_none());
+        assert_eq!(
+            Arc::strong_count(&progress),
+            1,
+            "the UI releases the completed job"
+        );
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|(message, error)| !error && message.contains("cancelled"))
+        );
+    }
+
+    #[test]
+    fn dropping_content_cancels_its_ocr_worker() {
+        let progress = Arc::new(super::super::recognize::Progress::default());
+        let mut state = ContentState::new();
+        state.recognition = Some(progress.clone());
+        drop(state);
+        assert!(progress.cancellation.is_cancelled());
+        assert_eq!(Arc::strong_count(&progress), 1);
+    }
+
+    #[test]
     fn block_alignment_and_position_are_saved_without_changing_words() {
         let ctx = egui::Context::default();
         let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
@@ -2753,6 +3262,529 @@ mod tests {
             "{rect:?}"
         );
         assert!(app.content.existing.is_none());
+    }
+
+    #[test]
+    fn edited_pdf_text_drag_moves_preview_and_commits_one_undoable_change() {
+        // Exercise a normal single-run click editor and a multi-line area editor.
+        for area in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+            let selected_text = if area {
+                "Move me\nSecond line"
+            } else {
+                "Move me"
+            };
+            let source = content::add_text(
+                &content::add_text(
+                    &convert::blank(595., 842.).unwrap(),
+                    1,
+                    selected_text,
+                    [50., 70., 300., 100.],
+                    18.,
+                    [0.; 3],
+                )
+                .unwrap(),
+                1,
+                "Unselected neighbor",
+                [370., 70., 220., 100.],
+                14.,
+                [0.; 3],
+            )
+            .unwrap();
+            app.open_memory(PathBuf::from("Movable text.pdf"), source.clone(), &ctx);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while app.tabs[0].session.is_none() {
+                app.events(&ctx);
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let runs = mypdf_milestone0::text_geometry::runs(&source, 1).unwrap();
+            let neighbor = runs
+                .iter()
+                .find(|r| r.text == "Unselected neighbor")
+                .unwrap()
+                .rect;
+            let items: Vec<_> = runs
+                .into_iter()
+                .enumerate()
+                .filter(|(_, run)| run.text != "Unselected neighbor")
+                .map(|(ordinal, run)| InlineText {
+                    key: (app.tabs[0].id, 0, 0),
+                    target: InlineTarget::Run(ordinal),
+                    original: run.text.clone(),
+                    text: run.text,
+                    rect: run.rect.unwrap(),
+                    size: run.size,
+                    color: run.color,
+                    font: run.base_font,
+                    focus: true,
+                })
+                .collect();
+            app.content.existing = if area {
+                selected_block(items, [50., 70., 350., 170.], app.tabs[0].pages[0])
+            } else {
+                items.into_iter().next()
+            };
+            let id = app.tabs[0].id;
+            let page_rect = Rect::from_min_size(pos2(20., 20.), vec2(595., 842.) * 1.25);
+            let frame = |app: &mut Viewer, events| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(900., 1200.))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            overlay(
+                                &mut app.content,
+                                editing::Mode::Edit,
+                                &app.tabs[0],
+                                ui,
+                                0,
+                                page_rect,
+                                1.25,
+                            );
+                        });
+                    },
+                )
+            };
+            let pointer = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let key = |key, modifiers| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            };
+            let _ = frame(&mut app, vec![]);
+            let _ = frame(&mut app, vec![]);
+            let _ = frame(
+                &mut app,
+                vec![
+                    key(egui::Key::A, egui::Modifiers::COMMAND),
+                    egui::Event::Text("Moved words".into()),
+                ],
+            );
+            let start = ctx
+                .read_response(egui::Id::new((id, 0_usize, "move_existing_block")))
+                .expect("selected PDF text has an accessible move handle")
+                .rect
+                .center();
+            let _ = frame(
+                &mut app,
+                vec![egui::Event::PointerMoved(start), pointer(start, true)],
+            );
+            let end = start + vec2(65., 110.) * 1.25;
+            let output = frame(&mut app, vec![egui::Event::PointerMoved(end)]);
+            let draft = app
+                .content
+                .existing
+                .as_ref()
+                .expect("drag keeps the text editor open");
+            let InlineTarget::Block(block) = &draft.target else {
+                panic!("moving a run promotes it to a safe replacement block")
+            };
+            let moved = draft.rect;
+            assert!(
+                (moved[0] - (block.initial_origin[0] + 65.)).abs() < 0.01,
+                "{moved:?}"
+            );
+            assert!(
+                (moved[1] - (block.initial_origin[1] + 110.)).abs() < 0.01,
+                "{moved:?}"
+            );
+            assert!(
+                block.masks.iter().all(|r| r[1] < moved[1]),
+                "original masks do not travel with the editor"
+            );
+            let expected = page_rect.min + vec2(moved[0], moved[1]) * 1.25;
+            let text_position = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == "Moved words" => {
+                        Some(text.pos)
+                    }
+                    _ => None,
+                })
+                .expect("edited words are painted");
+            assert!(
+                (text_position - expected).length() < 1.,
+                "text is painted at the moved position during this drag frame: {text_position:?} vs {expected:?}"
+            );
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::LineSegment { points, stroke }
+                    if stroke.color == theme::accent() && (points[0] - (expected - vec2(5., 3.))).length() < 0.01)),
+                "selection outline is painted at the same new position in this frame");
+            assert_eq!(
+                &*app.tabs[0].session.as_ref().unwrap().source,
+                &source,
+                "dragging previews the whole draft without mutating the PDF"
+            );
+            let _ = frame(&mut app, vec![pointer(end, false)]);
+            assert!(
+                ctx.wants_keyboard_input(),
+                "moving must not route typing Undo to a previous document change"
+            );
+            assert_eq!(app.content.existing.as_ref().unwrap().text, "Moved words");
+            let pending = app.content.existing.clone();
+            let _ = frame(
+                &mut app,
+                vec![key(egui::Key::Escape, egui::Modifiers::NONE)],
+            );
+            assert!(app.content.existing.is_none());
+            assert_eq!(
+                &*app.tabs[0].session.as_ref().unwrap().source,
+                &source,
+                "Escape cancels the move and typing without creating history"
+            );
+            assert!(!app.tabs[0].session.as_ref().unwrap().can_undo());
+            app.content.existing = pending;
+            app.finish_existing_text(&ctx);
+            while app.content.busy {
+                app.content_events(&ctx);
+                assert!(std::time::Instant::now() < deadline, "{:?}", app.status);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(app.content.existing.is_none(), "{:?}", app.status);
+            let committed = app.tabs[0].session.as_ref().unwrap().source.clone();
+            let runs = mypdf_milestone0::text_geometry::runs(&committed, 1).unwrap();
+            let edited: Vec<_> = runs
+                .iter()
+                .filter(|run| !run.text.is_empty() && run.text != "Unselected neighbor")
+                .collect();
+            assert_eq!(
+                edited
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<String>(),
+                "Moved words"
+            );
+            assert!(
+                !runs
+                    .iter()
+                    .any(|r| r.text.contains("Move me") || r.text.contains("Second line"))
+            );
+            let actual = edited[0].rect.unwrap();
+            assert!(
+                (actual[0] - moved[0]).abs() < 4. && (actual[1] - moved[1]).abs() < 20.,
+                "{actual:?} vs {moved:?}"
+            );
+            assert_eq!(
+                runs.iter()
+                    .find(|r| r.text == "Unselected neighbor")
+                    .unwrap()
+                    .rect,
+                neighbor
+            );
+            app.editor_undo(false);
+            let session = app.tabs[0].session.as_ref().unwrap();
+            assert_eq!(
+                &*session.source, &source,
+                "one Undo restores original content and position"
+            );
+            assert!(
+                !session.can_undo(),
+                "movement and typing are one atomic edit"
+            );
+            app.editor_undo(true);
+            assert_eq!(
+                &*app.tabs[0].session.as_ref().unwrap().source,
+                &*committed,
+                "Redo restores the exact edited-and-moved PDF"
+            );
+        }
+    }
+
+    #[test]
+    fn text_drag_keeps_final_release_position_for_coalesced_input() {
+        for new_text in [false, true] {
+            for event_mode in 0..3 {
+                let ctx = egui::Context::default();
+                let mut app =
+                    Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+                app.new_blank(&ctx);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while app.tabs[0].pages.is_empty() {
+                    app.events(&ctx);
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let id = app.tabs[0].id;
+                if new_text {
+                    app.content
+                        .place_text(id, 0, [50., 70.], app.tabs[0].pages[0]);
+                    app.content.new_text = "Move text".into();
+                } else {
+                    app.content.existing = Some(InlineText {
+                        key: (id, 0, 0),
+                        target: InlineTarget::Run(0),
+                        original: "Move text".into(),
+                        text: "Move text".into(),
+                        rect: [50., 70., 170., 90.],
+                        size: 18.,
+                        color: [0.; 3],
+                        font: "Helvetica".into(),
+                        focus: false,
+                    });
+                }
+                let frame = |app: &mut Viewer, events| {
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(800., 1000.))),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                overlay(
+                                    &mut app.content,
+                                    editing::Mode::Edit,
+                                    &app.tabs[0],
+                                    ui,
+                                    0,
+                                    Rect::from_min_size(pos2(20., 20.), vec2(595., 842.)),
+                                    1.,
+                                );
+                            });
+                        },
+                    );
+                };
+                let button = |pos, pressed| egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                frame(&mut app, vec![]);
+                frame(&mut app, vec![]);
+                let key = if new_text {
+                    "move_text_block"
+                } else {
+                    "move_existing_block"
+                };
+                let start = ctx
+                    .read_response(egui::Id::new((id, 0_usize, key)))
+                    .unwrap()
+                    .rect
+                    .center();
+                let end = start + vec2(130., 95.);
+                if event_mode == 2 {
+                    frame(
+                        &mut app,
+                        vec![
+                            egui::Event::PointerMoved(start),
+                            button(start, true),
+                            egui::Event::PointerMoved(end),
+                            button(end, false),
+                        ],
+                    );
+                } else {
+                    frame(
+                        &mut app,
+                        vec![egui::Event::PointerMoved(start), button(start, true)],
+                    );
+                    if event_mode == 0 {
+                        frame(
+                            &mut app,
+                            vec![egui::Event::PointerMoved(start + vec2(40., 30.))],
+                        );
+                    }
+                    frame(
+                        &mut app,
+                        vec![egui::Event::PointerMoved(end), button(end, false)],
+                    );
+                }
+                let (actual, initial) = if new_text {
+                    (app.content.new_rect, [50., 70.])
+                } else {
+                    let draft = app.content.existing.as_ref().expect("drag keeps editor");
+                    let InlineTarget::Block(block) = &draft.target else {
+                        panic!("fast drag promotes run: mode {event_mode}")
+                    };
+                    (draft.rect, block.initial_origin)
+                };
+                assert!(
+                    (actual[0] - initial[0] - 130.).abs() < 0.01
+                        && (actual[1] - initial[1] - 95.).abs() < 0.01,
+                    "new={new_text} mode={event_mode}: {actual:?} vs {initial:?}"
+                );
+                frame(&mut app, vec![]);
+                let retained = if new_text {
+                    app.content.new_rect
+                } else {
+                    app.content.existing.as_ref().unwrap().rect
+                };
+                assert_eq!(actual, retained, "final placement remains after release");
+            }
+        }
+    }
+
+    #[test]
+    fn text_move_clamps_to_page_and_handle_stays_reachable_at_small_zoom() {
+        let page = PageSize {
+            width: 595.,
+            height: 842.,
+        };
+        let rect = [50., 70., 250., 130.];
+        assert_eq!(
+            moved_text_rect(rect, vec2(-100., -200.), page),
+            [0., 0., 200., 60.]
+        );
+        assert_eq!(
+            moved_text_rect(rect, vec2(1000., 2000.), page),
+            [395., 782., 595., 842.]
+        );
+        for scale in [0.005, 0.05, 1., 4.] {
+            let page = Rect::from_min_size(pos2(10., 10.), vec2(page.width, page.height) * scale);
+            let block = Rect::from_min_size(page.min, vec2(200., 60.) * scale);
+            let handle = text_move_handle(block, page);
+            assert!(
+                handle.is_finite() && page.contains_rect(handle),
+                "{handle:?}, page: {page:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_move_undo_commits_then_undoes_and_failure_keeps_previous_history() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        let source = content::add_text(
+            &convert::blank(595., 842.).unwrap(),
+            1,
+            "Move me",
+            [50., 70., 300., 100.],
+            18.,
+            [0.; 3],
+        )
+        .unwrap();
+        app.open_memory(PathBuf::from("Draft undo.pdf"), source.clone(), &ctx);
+        let wait = |app: &mut Viewer| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.tabs[0].session.is_none() || app.content.busy {
+                app.events(&ctx);
+                app.content_events(&ctx);
+                assert!(std::time::Instant::now() < deadline, "{:?}", app.status);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        wait(&mut app);
+        let id = app.tabs[0].id;
+        let run = mypdf_milestone0::text_geometry::runs(&source, 1)
+            .unwrap()
+            .remove(0);
+        let original = InlineText {
+            key: (id, 0, 0),
+            target: InlineTarget::Run(0),
+            original: run.text.clone(),
+            text: run.text,
+            rect: run.rect.unwrap(),
+            size: run.size,
+            color: run.color,
+            font: run.base_font,
+            focus: false,
+        };
+        let mut moved =
+            selected_block(vec![original], [50., 70., 350., 170.], app.tabs[0].pages[0]).unwrap();
+        moved.text = "Moved words".into();
+        moved.rect = moved_text_rect(moved.rect, vec2(45., 90.), app.tabs[0].pages[0]);
+        app.content.existing = Some(moved.clone());
+        assert!(!app.tabs[0].session.as_ref().unwrap().can_undo());
+        assert!(
+            app.content.has_pending_text_change(id),
+            "toolbar Undo is available for the first unsaved draft"
+        );
+        assert!(app.content.placement_undo_owns_input(&ctx, id));
+        app.action("edit_undo", &ctx);
+        assert!(matches!(app.content.after_text, Some(AfterText::Undo(target, 0)) if target == id));
+        assert_eq!(&*app.tabs[0].session.as_ref().unwrap().source, &source);
+        app.finish_new_text(&ctx);
+        wait(&mut app);
+        assert!(app.content.existing.is_none(), "{:?}", app.status);
+        assert_eq!(&*app.tabs[0].session.as_ref().unwrap().source, &source);
+        assert!(app.tabs[0].session.as_ref().unwrap().can_redo());
+        app.action("edit_redo", &ctx);
+        let restored = app.tabs[0].session.as_ref().unwrap().source.clone();
+        assert_ne!(&*restored, &source);
+        assert_eq!(
+            mypdf_milestone0::text_geometry::runs(&restored, 1)
+                .unwrap()
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>(),
+            "Moved words"
+        );
+        // A stale selected operator causes safe replacement to fail. Undo must
+        // retain the draft and the already-committed previous change.
+        moved.key.1 = app.tabs[0].session.as_ref().unwrap().revision();
+        app.content.existing = Some(moved);
+        app.action("undo", &ctx);
+        app.finish_new_text(&ctx);
+        wait(&mut app);
+        assert_eq!(&*app.tabs[0].session.as_ref().unwrap().source, &*restored);
+        assert!(app.tabs[0].session.as_ref().unwrap().can_undo());
+        assert!(app.content.existing.is_some());
+        assert!(app.content.after_text.is_none());
+        assert!(app.status.as_ref().is_some_and(|(_, error)| *error));
+    }
+
+    #[test]
+    fn pending_new_text_toolbar_undo_and_redo_preserve_the_complete_draft() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        let source = convert::blank(595., 842.).unwrap();
+        app.open_memory(PathBuf::from("New text undo.pdf"), source.clone(), &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let id = app.tabs[0].id;
+        app.content
+            .place_text(id, 0, [50., 70.], app.tabs[0].pages[0]);
+        app.content.new_text = "Added and moved".into();
+        assert!(
+            !app.content.placement_undo_owns_input(&ctx, id),
+            "ordinary typing keeps its field undo"
+        );
+        app.content.new_rect[3] += 40.;
+        assert!(
+            !app.content.placement_undo_owns_input(&ctx, id),
+            "automatic height growth is not a movement"
+        );
+        app.content.new_rect[0] += 45.;
+        app.content.new_rect[1] += 90.;
+        assert!(app.content.placement_undo_owns_input(&ctx, id));
+        app.action("undo", &ctx);
+        app.finish_new_text(&ctx);
+        while app.content.busy {
+            app.content_events(&ctx);
+            assert!(std::time::Instant::now() < deadline, "{:?}", app.status);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let session = app.tabs[0].session.as_ref().unwrap();
+        assert_eq!(&*session.source, &source);
+        assert!(!session.can_undo() && session.can_redo());
+        assert!(!app.content.new_placed && app.content.new_text.is_empty());
+        app.action("redo", &ctx);
+        let runs =
+            mypdf_milestone0::text_geometry::runs(&app.tabs[0].session.as_ref().unwrap().source, 1)
+                .unwrap();
+        assert_eq!(
+            runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+            "Added and moved"
+        );
+        let rect = runs.iter().find_map(|run| run.rect).unwrap();
+        assert!(rect[0] > 90. && rect[1] > 150., "{rect:?}");
     }
 
     #[test]

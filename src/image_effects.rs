@@ -86,7 +86,16 @@ pub fn blurred(png: &Arc<Vec<u8>>, radius: f32) -> Result<Arc<Vec<u8>>> {
         result.len() <= crate::assets::MAX_ASSET_BYTES,
         "Blurred image exceeds the asset size limit"
     );
+    Ok(cache_result(cache, key, result))
+}
+
+fn cache_result(cache: &Mutex<Cache>, key: String, result: Arc<Vec<u8>>) -> Arc<Vec<u8>> {
     let mut cache = cache.lock().unwrap();
+    // Rendering and export can compute the same effect concurrently. Recheck
+    // after that work so all callers reuse the winner and retain only one copy.
+    if let Some((_, existing)) = cache.iter().find(|(k, _)| k == &key) {
+        return existing.clone();
+    }
     while !cache.is_empty()
         && (cache.len() >= 8
             || cache.iter().map(|(_, p)| p.len()).sum::<usize>() + result.len() > 32 * 1024 * 1024)
@@ -94,5 +103,50 @@ pub fn blurred(png: &Arc<Vec<u8>>, radius: f32) -> Result<Arc<Vec<u8>>> {
         cache.remove(0);
     }
     cache.push((key, result.clone()));
-    Ok(result)
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    #[test]
+    fn simultaneous_cache_misses_publish_one_shared_result() {
+        let cache = Mutex::new(Cache::new());
+        let ready = Barrier::new(8);
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        // Every worker has already missed and computed its own
+                        // result before any worker can publish to the cache.
+                        let computed = Arc::new(vec![17; 4096]);
+                        let allocation = Arc::downgrade(&computed);
+                        ready.wait();
+                        let shared = cache_result(&cache, "same-effect".into(), computed);
+                        (shared, allocation)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(cache.lock().unwrap().len(), 1);
+        assert!(
+            results
+                .iter()
+                .all(|(shared, _)| Arc::ptr_eq(shared, &results[0].0))
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, computed)| computed.upgrade().is_some())
+                .count(),
+            1,
+            "All losing computations release their buffers"
+        );
+    }
 }

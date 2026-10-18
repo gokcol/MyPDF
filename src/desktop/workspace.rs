@@ -42,6 +42,9 @@ pub(super) struct State {
     _temporary: tempfile::TempDir,
 }
 impl State {
+    pub(super) fn invalidate(&mut self) {
+        self.last = None;
+    }
     pub fn new() -> Self {
         #[cfg(test)]
         let temporary = tempfile::tempdir().unwrap();

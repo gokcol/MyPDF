@@ -31,10 +31,9 @@ fn blur_keeps_transparency_source_pixels_and_rejects_invalid_values() {
     );
     assert_eq!(source, original);
     assert_eq!(image_effects::blurred(&source, 0.).unwrap(), original);
-    assert!(Arc::ptr_eq(
-        &changed,
-        &image_effects::blurred(&source, 3.).unwrap()
-    ));
+    // Other documents may evict this effect from the shared bounded cache.
+    // Reusing an allocation is an optimization; reproduced pixels must match.
+    assert_eq!(changed, image_effects::blurred(&source, 3.).unwrap());
     assert!(image_effects::blurred(&source, f32::NAN).is_err());
 }
 #[test]

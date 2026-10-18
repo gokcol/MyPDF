@@ -1,10 +1,10 @@
 # Privacy Policy for MyPDF (OG)
 
-Effective date: 17 October 2026
+Effective date: 18 October 2026
 
 This policy covers MyPDF (OG), the Microsoft Store edition of MyPDF by
 Orhan Gökçöl, and the MyPDF desktop application distributed through the project's
-GitHub releases. It describes the behavior of version 1.1.
+GitHub releases. It describes the behavior in version 1.2.0.
 
 ## Information processed on your device
 
@@ -43,6 +43,31 @@ to your settings and its own policies.
 Settings, artwork and recovery files are not separately encrypted by MyPDF.
 Their protection depends on operating-system access controls and any device
 encryption you enable. Recovery copies can contain sensitive document content.
+
+## On-device translation
+
+Translation runs on the device with no cloud fallback. On supported Macs, MyPDF
+uses Apple's installed translation models. Apple's translation service may
+collect language and usage metrics, but not original or translated text. MyPDF
+requires a separate, explicit language-download action before a missing pair
+can be used; document text is not included in that download request.
+
+On Windows, MyPDF uses a local CTranslate2 runtime. When you choose to download
+a language pack, MyPDF contacts the pack's public distribution host (currently
+Argos Open Tech's argos-net.com service). That host may receive ordinary
+connection information such as your IP address and the requested model file,
+but no document text. Downloads are verified before use. Inference uses local
+files and does not make network requests.
+
+Language choices and favorites, model files and model verification metadata are
+stored locally. Source and translated text are held in memory and are not saved in a separate
+translation history. Translation itself does not change the PDF. If you choose
+Attach translation as note, the result becomes a document annotation and is
+included in normal PDF saves and recovery copies. Closing the translation panel
+or changing the document/page clears the displayed text. Copying a result to
+the system clipboard is an explicit action. Downloaded Windows model packs can
+be removed from the app's translation-models directory while MyPDF is closed;
+Apple's downloaded models are managed by the operating system.
 
 ## Certificates and digital signatures
 

@@ -91,6 +91,83 @@ struct Entry {
     #[serde(default)]
     token: bool,
 }
+/// The purpose declared by the certificate's extended key usage. This is
+/// descriptive, not a statement that a recipient will trust this identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CertificatePurpose {
+    GeneralSigning,
+    CodeSigning,
+    Authentication,
+    Specific,
+    Unknown,
+}
+impl CertificatePurpose {
+    fn of(der: &[u8]) -> Self {
+        let Ok((_, cert)) = x509_parser::parse_x509_certificate(der) else {
+            return Self::Unknown;
+        };
+        let Ok(usage) = cert.extended_key_usage() else {
+            return Self::Unknown;
+        };
+        let Some(usage) = usage else {
+            return Self::GeneralSigning;
+        };
+        let usage = usage.value;
+        if usage.any {
+            Self::GeneralSigning
+        } else if usage.code_signing
+            && !usage.server_auth
+            && !usage.client_auth
+            && !usage.email_protection
+            && !usage.time_stamping
+            && !usage.ocsp_signing
+            && usage.other.is_empty()
+        {
+            Self::CodeSigning
+        } else if (usage.server_auth || usage.client_auth)
+            && !usage.code_signing
+            && !usage.email_protection
+            && !usage.time_stamping
+            && !usage.ocsp_signing
+            && usage.other.is_empty()
+        {
+            Self::Authentication
+        } else {
+            Self::Specific
+        }
+    }
+    fn other_purpose(self) -> bool {
+        matches!(self, Self::CodeSigning | Self::Authentication)
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::GeneralSigning => "General signing",
+            Self::CodeSigning => "Code signing",
+            Self::Authentication => "Authentication",
+            Self::Specific => "Restricted certificate purposes",
+            Self::Unknown => "Unknown certificate purpose",
+        }
+    }
+    fn explanation(self) -> &'static str {
+        match self {
+            Self::GeneralSigning => {
+                "This certificate does not restrict extended key usage. Recipient trust and certificate validity are checked separately."
+            }
+            Self::CodeSigning => {
+                "This certificate is intended for signing software. Choose a personal or document-signing ID for PDFs; recipients may reject this certificate for document signatures."
+            }
+            Self::Authentication => {
+                "This certificate is intended for server or client authentication. Choose a personal or document-signing ID for PDFs; recipients may reject this certificate for document signatures."
+            }
+            Self::Specific => {
+                "This certificate declares specific extended key usages. Check with its issuer that PDF signing is permitted; being available on this computer does not establish recipient trust."
+            }
+            Self::Unknown => {
+                "The certificate purpose could not be read. Inspect its details before using it."
+            }
+        }
+    }
+}
 impl Entry {
     fn file(path: PathBuf, imported: identity::ImportedIdentity) -> Self {
         Self {
@@ -106,8 +183,16 @@ impl Entry {
             token: false,
         }
     }
+    fn purpose(&self) -> CertificatePurpose {
+        CertificatePurpose::of(&self.der)
+    }
     fn label(&self) -> String {
-        format!("{} • {}", self.info.subject, self.source_label())
+        format!(
+            "{} • {} • {}",
+            self.info.subject,
+            self.source_label(),
+            self.purpose().label()
+        )
     }
     fn source_label(&self) -> &str {
         match &self.source {
@@ -1173,6 +1258,8 @@ impl Viewer {
             return;
         }
         let mut quick = false;
+        let mut close = false;
+        let mut can_sign = false;
         let active = self.tabs.get(self.active);
         let mut open = true;
         let mut action = None;
@@ -1186,10 +1273,9 @@ impl Viewer {
             .id(egui::Id::new("digital_window"))
             .open(&mut open)
             .collapsible(false)
-            .vscroll(true)
-            .max_height((ctx.content_rect().height() - 160.0).max(260.0))
-            .default_width(640.0)
-            .default_height(560.0)
+            .resizable([true, false])
+            .default_width(ui::dialog_width(ctx, 640.))
+            .max_width(ui::dialog_width(ctx, 900.))
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 10.;
                 const PANELS: [(Panel, &str); 5] = [
@@ -1209,6 +1295,7 @@ impl Viewer {
                     self.digital.error = None;
                     self.digital.message.clear();
                 }
+                ui::dialog_body(ui, "digital_manager_body", 560., |ui| {
                 if self.digital.busy {
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -1236,15 +1323,6 @@ impl Viewer {
                 ui.add_enabled_ui(!self.digital.busy, |ui| match self.digital.panel {
                     Panel::Signatures => {
                         self.digital.signatures_panel(ui, &mut self.editor, &assets, &mut action);
-                        if !self.digital.signatures.is_empty() {
-                            quick = ui
-                                .add_enabled(
-                                    active.is_some_and(|t| t.bytes.is_some()),
-                                    ActionButton::new(Icon::Sign, "Quick Sign").primary(),
-                                )
-                                .on_hover_text("Drag a box on the page to sign with the starred signature")
-                                .clicked();
-                        }
                     }
                     Panel::Identities => {
                         self.digital.identities_panel(ui, &mut self.editor, &mut action);
@@ -1660,7 +1738,7 @@ impl Viewer {
                                 .small()
                                 .color(theme::muted()),
                         );
-                        let usable = active.is_some_and(|t| {
+                        can_sign = active.is_some_and(|t| {
                             t.bytes.is_some()
                                 && self.digital.document == Some(t.id)
                                 && t.capabilities.as_ref().is_some_and(|c| {
@@ -1671,12 +1749,6 @@ impl Viewer {
                                 && e.eligible
                                 && !matches!(e.source, Source::Certificate)
                         });
-                        if ui
-                            .add_enabled(usable, ActionButton::new(Icon::Sign, "Sign and save a copy…").primary())
-                            .clicked()
-                        {
-                            action = Some(Action::Sign);
-                        }
                     }
                     Panel::Trusted => {
                         ui.label(
@@ -1782,15 +1854,6 @@ impl Viewer {
                                     });
                             }
                         });
-                        if ui
-                            .add_enabled(
-                                active.is_some_and(|t| t.bytes.is_some()),
-                                ActionButton::new(Icon::Shield, "Validate signatures").primary(),
-                            )
-                            .clicked()
-                        {
-                            action = Some(Action::Verify);
-                        }
                         ui.label(
                             RichText::new("Integrity, certificate trust and later revisions are separate checks. Revocation and timestamp trust are not checked online. Trusted roots are never modified.")
                                 .small()
@@ -1868,7 +1931,21 @@ impl Viewer {
                         }
                     }
                 });
+                });
+                ui::dialog_footer(ui, |ui| {
+                    match self.digital.panel {
+                        Panel::Sign if ui.add_enabled(!self.digital.busy && can_sign, ActionButton::new(Icon::Sign, "Sign and save a copy…").primary()).clicked() => action = Some(Action::Sign),
+                        Panel::Signatures if !self.digital.signatures.is_empty() => {
+                            quick = ui.add_enabled(!self.digital.busy && active.is_some_and(|t| t.bytes.is_some()), ActionButton::new(Icon::Sign, "Quick Sign").primary())
+                                .on_hover_text("Drag a box on the page to sign with the starred signature").clicked();
+                        }
+                        Panel::Validate if ui.add_enabled(!self.digital.busy && active.is_some_and(|t| t.bytes.is_some()), ActionButton::new(Icon::Shield, "Validate signatures").primary()).clicked() => action = Some(Action::Verify),
+                        _ => {}
+                    }
+                    close = ui.add_enabled(!self.digital.busy, ActionButton::new(Icon::Close, "Close")).clicked();
+                });
             });
+        open &= !close;
         if quick {
             self.quick_sign();
         }
@@ -2528,9 +2605,8 @@ impl Viewer {
                 if cfg!(any(target_os = "macos", target_os = "windows")) {
                     let name = self
                         .digital
-                        .entries
-                        .iter()
-                        .find(|e| e.eligible)
+                        .signing_entries()
+                        .find(|e| !e.purpose().other_purpose())
                         .map(Entry::signer_name)
                         .unwrap_or_default();
                     self.digital.manager.new_id = Some(manager::NewId {
@@ -3029,6 +3105,85 @@ fn trust_controls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certificate_purpose_uses_declared_usage_not_its_display_name() {
+        use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair};
+        let cert = |purposes| {
+            let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+            let mut params = CertificateParams::default();
+            params.extended_key_usages = purposes;
+            params.self_signed(&key).unwrap().der().to_vec()
+        };
+        assert_eq!(
+            CertificatePurpose::of(&cert(vec![])),
+            CertificatePurpose::GeneralSigning
+        );
+        assert_eq!(
+            CertificatePurpose::of(&cert(vec![ExtendedKeyUsagePurpose::Any])),
+            CertificatePurpose::GeneralSigning
+        );
+        assert_eq!(
+            CertificatePurpose::of(&cert(vec![ExtendedKeyUsagePurpose::CodeSigning])),
+            CertificatePurpose::CodeSigning
+        );
+        assert_eq!(
+            CertificatePurpose::of(&cert(vec![
+                ExtendedKeyUsagePurpose::ServerAuth,
+                ExtendedKeyUsagePurpose::ClientAuth
+            ])),
+            CertificatePurpose::Authentication
+        );
+        assert_eq!(
+            CertificatePurpose::of(&cert(vec![ExtendedKeyUsagePurpose::EmailProtection])),
+            CertificatePurpose::Specific
+        );
+        assert_eq!(
+            CertificatePurpose::of(b"invalid"),
+            CertificatePurpose::Unknown
+        );
+    }
+
+    #[test]
+    fn signature_manager_keeps_tabs_and_primary_actions_visible_on_small_windows() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        for (panel, primary) in [
+            (Panel::Sign, "Sign and save a copy…"),
+            (Panel::Validate, "Validate signatures"),
+        ] {
+            app.digital.open = true;
+            app.digital.panel = panel;
+            app.digital.error = Some(
+                "A long certificate or validation message stays in the scrolling body. ".repeat(12),
+            );
+            let mut bounds = HashMap::new();
+            for _ in 0..4 {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(720., 480.))),
+                        ..Default::default()
+                    },
+                    |ctx| app.digital_window(ctx),
+                );
+                for (_, node) in output.platform_output.accesskit_update.unwrap().nodes {
+                    if let (Some(label), Some(rect)) = (node.label(), node.bounds()) {
+                        bounds.insert(label.to_owned(), rect);
+                    }
+                }
+            }
+            for label in ["My signatures", "Digital IDs", primary, "Close"] {
+                let rect = bounds
+                    .get(label)
+                    .unwrap_or_else(|| panic!("Missing {label}"));
+                assert!(
+                    rect.x0 >= 0. && rect.y0 >= 0. && rect.x1 <= 720. && rect.y1 <= 480.,
+                    "{label} offscreen: {rect:?}"
+                );
+            }
+        }
+    }
     #[test]
     fn transparent_signature_keeps_original_artwork_and_persists_selection() {
         use mypdf_milestone0::annotations::{Kind, Style};
@@ -3704,6 +3859,7 @@ mod tests {
         // Scroll the window until the control is in view, then click it.
         let click = |app: &mut Viewer, label: &str, in_window: bool| {
             let mut at = None;
+            let mut stable = None::<egui::Pos2>;
             for _ in 0..60 {
                 let output = frame(app, vec![]);
                 let nodes = output.platform_output.accesskit_update.unwrap().nodes;
@@ -3718,19 +3874,34 @@ mod tests {
                 let window = ctx
                     .memory(|m| m.area_rect(egui::Id::new("digital_window")))
                     .unwrap();
-                if !in_window || (window.top() + 40.0..window.bottom() - 16.).contains(&center.y) {
-                    at = Some(center);
-                    break;
+                // The title tabs and action footer are pinned; scrolling content
+                // must be inside the body, not merely somewhere in the window.
+                let body_top = nodes
+                    .iter()
+                    .find(|(_, n)| n.label() == Some("My signatures"))
+                    .and_then(|(_, n)| n.bounds())
+                    .map_or(window.top() + 70., |r| r.y1 as f32 + 12.);
+                let body_bottom = nodes
+                    .iter()
+                    .find(|(_, n)| n.label() == Some("Close"))
+                    .and_then(|(_, n)| n.bounds())
+                    .map_or(window.bottom() - 65., |r| r.y0 as f32 - 22.);
+                if !in_window || (r.y0 as f32 >= body_top && r.y1 as f32 <= body_bottom - 16.) {
+                    // Animated scrolling must settle before the click lands.
+                    if stable.is_some_and(|last| last.distance(center) < 0.5) {
+                        at = Some(center);
+                        break;
+                    }
+                    stable = Some(center);
+                    continue;
                 }
-                let delta = if center.y > window.center().y {
-                    -60.
-                } else {
-                    60.
-                };
+                stable = None;
+                let body_center = pos2(window.center().x, (body_top + body_bottom) / 2.);
+                let delta = if center.y > body_center.y { -60. } else { 60. };
                 frame(
                     app,
                     vec![
-                        egui::Event::PointerMoved(window.center()),
+                        egui::Event::PointerMoved(body_center),
                         egui::Event::MouseWheel {
                             unit: egui::MouseWheelUnit::Point,
                             delta: vec2(0., delta),

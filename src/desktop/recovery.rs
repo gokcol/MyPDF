@@ -189,9 +189,8 @@ impl Viewer {
                             }
                             Err(e) => {
                                 t.changed = Instant::now() + Duration::from_secs(25);
-                                self.recovery.error = Some(format!(
-                                    "Autosave failed: {e}. Save a Copy to keep your work."
-                                ));
+                                self.recovery.error =
+                                    Some(format!("Autosave failed: {e}. Save to keep your work."));
                             }
                         }
                     }
@@ -216,10 +215,8 @@ impl Viewer {
                                 self.recovery.origins.insert(tab.id, entry.clone());
                             }
                             self.recovery.entries.retain(|e| e.file != entry.file);
-                            self.status = Some((
-                                "Recovered your changes • Save a Copy when ready".into(),
-                                false,
-                            ));
+                            self.status =
+                                Some(("Recovered your changes • Save when ready".into(), false));
                         }
                         Ok(_) => {
                             self.recovery.error =
@@ -288,9 +285,8 @@ impl Viewer {
                         })
                         .is_ok();
                     if !self.recovery.busy {
-                        self.recovery.error = Some(
-                            "Autosave worker unavailable. Save a Copy to keep your changes.".into(),
-                        );
+                        self.recovery.error =
+                            Some("Autosave worker unavailable. Save to keep your changes.".into());
                     }
                 }
             }

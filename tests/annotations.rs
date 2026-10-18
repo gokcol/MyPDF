@@ -230,6 +230,106 @@ fn annotation_history_tracks_save_undo_and_redo() {
 }
 
 #[test]
+fn comment_icon_stays_recognizable_when_resized_and_preserves_unicode_contents() {
+    use mypdf_milestone0::{convert, stroke::StrokeStyle, viewer};
+
+    let source = convert::blank(180., 140.).unwrap();
+    let contents = "Translation · English → Turkish\n\nİstanbul’da gizlilik. Straße, Größe.";
+    for rect in [
+        [32., 32., 56., 56.],
+        [20., 20., 140., 44.],
+        [20., 20., 44., 120.],
+    ] {
+        for fill in [None, Some([0.86, 0.93, 1.])] {
+            let note = Annotation::new(
+                0,
+                rect,
+                Kind::Note {
+                    text: contents.into(),
+                },
+                Style {
+                    color: [0.15, 0.49, 0.85],
+                    fill,
+                    // Comment glyphs must remain recognizable if a drawing
+                    // style was active before the comment was created.
+                    stroke: StrokeStyle::Wave,
+                    ..Default::default()
+                },
+            );
+            let primitives = ann::primitives(&note);
+            let outline = primitives
+                .iter()
+                .find_map(|p| match p {
+                    ann::Primitive::Path {
+                        points,
+                        closed: true,
+                        fill: false,
+                    } => Some(points),
+                    _ => None,
+                })
+                .expect("comment needs a visible perimeter");
+            let x0 = outline.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min);
+            let x1 = outline
+                .iter()
+                .map(|p| p[0])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let y0 = outline.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
+            let y1 = outline
+                .iter()
+                .map(|p| p[1])
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                ((x1 - x0) - (y1 - y0)).abs() < 0.001,
+                "icon must not stretch into an empty rectangle"
+            );
+            assert_eq!(primitives.iter().filter(|p| matches!(p,
+                ann::Primitive::Path { points, closed: false, fill: false } if points.len() == 2
+            )).count(), 2, "comment needs two visible content marks");
+
+            let output = ann::export(&source, std::slice::from_ref(&note)).unwrap();
+            let saved = lopdf::Document::load_mem(&output).unwrap();
+            assert_eq!(ann::load(&saved), vec![note.clone()]);
+            let pdf_note = saved
+                .objects
+                .values()
+                .filter_map(|o| o.as_dict().ok())
+                .find(|d| d.get(b"Subtype").and_then(lopdf::Object::as_name).ok() == Some(b"Text"))
+                .unwrap();
+            assert_eq!(
+                lopdf::decode_text_string(pdf_note.get(b"Contents").unwrap()).unwrap(),
+                contents
+            );
+            assert_eq!(
+                pdf_note.get(b"Name").unwrap().as_name().unwrap(),
+                b"Comment"
+            );
+
+            // Ordinary 100% zoom must show dark-blue marks within the bubble,
+            // not only a pale block or an isolated folded corner.
+            let (size, pixels) = viewer::render_page(&output, 0, 1.).unwrap();
+            let side = (rect[2] - rect[0]).min(rect[3] - rect[1]);
+            let origin = [
+                (rect[0] + rect[2] - side) / 2.,
+                (rect[1] + rect[3] - side) / 2.,
+            ];
+            let mut dark_marks = 0;
+            for y in (origin[1] + side * 0.25) as usize..(origin[1] + side * 0.56) as usize {
+                for x in (origin[0] + side * 0.27) as usize..(origin[0] + side * 0.73) as usize {
+                    let pixel = &pixels[(y * size[0] + x) * 4..][..4];
+                    if pixel[0] < 130 && pixel[2] > 160 {
+                        dark_marks += 1;
+                    }
+                }
+            }
+            assert!(
+                dark_marks >= 18,
+                "content marks must be legible at normal zoom: {dark_marks}"
+            );
+        }
+    }
+}
+
+#[test]
 fn annotations_cannot_rewrite_signed_or_certified_pdfs() {
     let mut doc = lopdf::Document::load_mem(&source()).unwrap();
     doc.add_object(lopdf::dictionary! { "Type" => "Sig", "ByteRange" => lopdf::Object::Array([0_i64, 1, 2, 3].map(lopdf::Object::Integer).to_vec()), "Contents" => lopdf::Object::string_literal("synthetic") });

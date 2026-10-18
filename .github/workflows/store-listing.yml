@@ -38,6 +38,6 @@ jobs:
           } | ConvertTo-Json | Set-Content artifacts/store-listing/provenance.json
       - uses: actions/upload-artifact@v6
         with:
-          name: MyPDF-1.1-Store-listing-en-US
+          name: MyPDF-Store-listing-en-US
           path: artifacts/store-listing/
           if-no-files-found: error

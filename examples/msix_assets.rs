@@ -1,9 +1,9 @@
 //! Generate MSIX artwork from the same native icon used by the desktop app.
 #[path = "../src/desktop/icon.rs"]
+#[allow(dead_code)] // This exporter always uses the master, not runtime caches.
 mod icon;
 
 use anyhow::{Context, Result};
-use image::{RgbaImage, imageops::FilterType};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
@@ -13,8 +13,6 @@ fn main() -> Result<()> {
             .context("Pass an output folder")?,
     );
     std::fs::create_dir_all(&out)?;
-    let master =
-        RgbaImage::from_raw(1024, 1024, icon::rgba(1024)).context("Invalid icon pixels")?;
     for (name, base) in [
         ("StoreLogo", 50),
         ("Square44x44Logo", 44),
@@ -27,14 +25,25 @@ fn main() -> Result<()> {
             } else {
                 format!("{name}.scale-{scale}.png")
             };
-            image::imageops::resize(&master, size, size, FilterType::Lanczos3)
-                .save(out.join(file))?;
+            image::save_buffer(
+                out.join(file),
+                &icon::render_master(size),
+                size,
+                size,
+                image::ColorType::Rgba8,
+            )?;
         }
     }
     for size in [16, 24, 32, 44, 48, 256] {
-        image::imageops::resize(&master, size, size, FilterType::Lanczos3).save(out.join(
-            format!("Square44x44Logo.targetsize-{size}_altform-unplated.png"),
-        ))?;
+        image::save_buffer(
+            out.join(format!(
+                "Square44x44Logo.targetsize-{size}_altform-unplated.png"
+            )),
+            &icon::render_master(size),
+            size,
+            size,
+            image::ColorType::Rgba8,
+        )?;
     }
     Ok(())
 }

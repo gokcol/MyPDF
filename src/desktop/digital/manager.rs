@@ -265,6 +265,13 @@ pub(super) fn status(entry: &Entry) -> (String, ui::Tone) {
     match expiry(&entry.der) {
         Some((days, date)) if days < 0 => (format!("Expired on {date}"), ui::Tone::Danger),
         _ if !entry.eligible => ("Not available right now".into(), ui::Tone::Warning),
+        _ if entry.purpose().other_purpose() => (
+            format!(
+                "{} · choose a document ID for PDFs",
+                entry.purpose().label()
+            ),
+            ui::Tone::Warning,
+        ),
         Some((days, date)) if days <= 30 => {
             (format!("Ready · expires soon ({date})"), ui::Tone::Warning)
         }
@@ -576,9 +583,19 @@ impl DigitalState {
     }
     /// Digital IDs that can sign.
     pub(super) fn signing_entries(&self) -> impl Iterator<Item = &Entry> {
+        // Keep unrelated certificate purposes available for explicit inspection
+        // and selection, but never put them ahead of ordinary signing IDs.
+        let available = |e: &&Entry| e.eligible && !matches!(e.source, Source::Certificate);
         self.entries
             .iter()
-            .filter(|e| e.eligible && !matches!(e.source, Source::Certificate))
+            .filter(available)
+            .filter(|e| !e.purpose().other_purpose())
+            .chain(
+                self.entries
+                    .iter()
+                    .filter(available)
+                    .filter(|e| e.purpose().other_purpose()),
+            )
     }
     pub(super) fn signature(&self, id: &str) -> Option<&SavedSignature> {
         self.signatures.iter().find(|s| s.id == id)
@@ -1009,7 +1026,21 @@ impl DigitalState {
         ui::field(ui, "Signs with", |ui| {
             let ids: Vec<(DefaultIdentity, String)> = self
                 .signing_entries()
-                .map(|e| (e.reference(), format!("{} · {}", e.signer_name(), place(e))))
+                .map(|e| {
+                    (
+                        e.reference(),
+                        format!(
+                            "{} · {}{}",
+                            e.signer_name(),
+                            place(e),
+                            if e.purpose().other_purpose() {
+                                format!(" · {}", e.purpose().label())
+                            } else {
+                                String::new()
+                            }
+                        ),
+                    )
+                })
                 .collect();
             if ids.is_empty() {
                 ui::callout(
@@ -1080,6 +1111,13 @@ impl DigitalState {
                 let (text, tone) = status(entry);
                 if !matches!(tone, ui::Tone::Success) {
                     ui::callout(ui, tone, &text);
+                }
+                if entry.purpose().other_purpose() {
+                    ui.label(
+                        RichText::new(entry.purpose().explanation())
+                            .small()
+                            .color(theme::muted()),
+                    );
                 }
                 if entry.info.self_issued {
                     ui.label(
@@ -1160,7 +1198,7 @@ impl DigitalState {
                 Source::Keychain { .. } | Source::WindowsStore { .. }
             )
         };
-        let groups: [(&str, Vec<Entry>, &str); 4] = [
+        let groups: [(&str, Vec<Entry>, &str); 5] = [
             (
                 if cfg!(target_os = "windows") {
                     "On this computer"
@@ -1169,7 +1207,7 @@ impl DigitalState {
                 },
                 self.entries
                     .iter()
-                    .filter(|e| system(e) && !e.token)
+                    .filter(|e| system(e) && !e.token && !e.purpose().other_purpose())
                     .cloned()
                     .collect(),
                 "",
@@ -1178,7 +1216,7 @@ impl DigitalState {
                 "Smart cards and USB tokens",
                 self.entries
                     .iter()
-                    .filter(|e| system(e) && e.token)
+                    .filter(|e| system(e) && e.token && !e.purpose().other_purpose())
                     .cloned()
                     .collect(),
                 "Insert your e-signature card or token and choose Refresh. It appears here once its driver is installed.",
@@ -1187,7 +1225,20 @@ impl DigitalState {
                 "Files",
                 self.entries
                     .iter()
-                    .filter(|e| matches!(e.source, Source::File { .. }))
+                    .filter(|e| {
+                        matches!(e.source, Source::File { .. }) && !e.purpose().other_purpose()
+                    })
+                    .cloned()
+                    .collect(),
+                "",
+            ),
+            (
+                "Other purposes · software signing and authentication",
+                self.entries
+                    .iter()
+                    .filter(|e| {
+                        !matches!(e.source, Source::Certificate) && e.purpose().other_purpose()
+                    })
                     .cloned()
                     .collect(),
                 "",
@@ -1242,6 +1293,12 @@ impl DigitalState {
             ui::section(ui, &entry.signer_name(), |ui| {
                 let (text, tone) = status(&entry);
                 ui::callout(ui, tone, &format!("{} · {text}", place(&entry)));
+                ui.label(RichText::new(format!("Purpose: {}", entry.purpose().label())).strong());
+                ui.label(
+                    RichText::new(entry.purpose().explanation())
+                        .small()
+                        .color(theme::muted()),
+                );
                 if let Some(explanation) = &entry.explanation {
                     ui.label(RichText::new(explanation).small().color(theme::muted()));
                 }
@@ -1339,12 +1396,13 @@ impl DigitalState {
             .backdrop_color(Color32::from_black_alpha(64))
             .frame(ui::modal_frame())
             .show(ctx, |ui| {
-                ui.set_width(360.);
+                ui.set_width(ui::dialog_width(ctx, 360.));
+                ui::title(ui, "Create your digital ID", 16.);
+                ui::dialog_body(ui, "create_identity_body", 420., |ui| {
                 ui.vertical_centered(|ui| {
                     let (r, _) = ui.allocate_exact_size(vec2(54., 54.), egui::Sense::hover());
                     ui::badge(ui.painter(), r, Icon::Shield, ui::Fill::Brand, Color32::WHITE);
                     ui.add_space(12.);
-                    ui::title(ui, "Create your digital ID", 16.);
                     ui.label(
                         RichText::new(if cfg!(target_os = "windows") {
                             "MyPDF creates a personal digital ID and keeps it in Windows. There is no password to remember."
@@ -1383,6 +1441,10 @@ impl DigitalState {
                         .size(11.5)
                         .color(theme::muted()),
                 );
+                if let Some(error) = &self.error {
+                    ui::callout(ui, ui::Tone::Danger, error);
+                }
+                });
                 ui.add_space(12.);
                 let half = (ui.available_width() - 10.) / 2.;
                 ui.horizontal(|ui| {
@@ -1466,4 +1528,51 @@ pub(super) fn create_in_store(
         signature,
         trusted,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_identity_keeps_actions_visible_with_a_long_error() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.digital.manager.new_id = Some(NewId {
+            signature: None,
+            name: "Preview Person".into(),
+            email: String::new(),
+            trust: false,
+        });
+        app.digital.error = Some(
+            "This example error explains why the digital ID could not be created. ".repeat(20),
+        );
+        let mut bounds = HashMap::new();
+        for _ in 0..4 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(720., 480.))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.digital.new_id_dialog(ctx, &mut app.editor);
+                },
+            );
+            for (_, node) in output.platform_output.accesskit_update.unwrap().nodes {
+                if let (Some(label), Some(rect)) = (node.label(), node.bounds()) {
+                    bounds.insert(label.to_owned(), rect);
+                }
+            }
+        }
+        for label in ["Create", "Cancel"] {
+            let rect = bounds
+                .get(label)
+                .unwrap_or_else(|| panic!("Missing {label}"));
+            assert!(
+                rect.x0 >= 0. && rect.y0 >= 0. && rect.x1 <= 720. && rect.y1 <= 480.,
+                "{label} is outside the viewport: {rect:?}"
+            );
+        }
+    }
 }

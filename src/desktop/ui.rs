@@ -1,6 +1,6 @@
 //! MyPDF design system: native fonts, gradient fills, vector icons and controls.
-//! Everything is drawn procedurally, so it stays crisp at any display scale, and
-//! every control carries an accessible text label.
+//! Controls use vector artwork; the app mark uses the shared calico icon.
+//! Every control carries an accessible text label.
 use super::*;
 use std::sync::OnceLock;
 
@@ -232,40 +232,23 @@ pub(super) fn badge(painter: &egui::Painter, rect: Rect, icon: Icon, fill: Fill,
         Color32::WHITE,
     );
 }
-/// The MyPDF mark: a folded white page with a highlighted line on the brand gradient.
+/// The same calico mark used by the Dock, installers and platform app icons.
 pub(super) fn logo(painter: &egui::Painter, rect: Rect) {
-    let radius = (rect.width() * 0.26) as u8;
-    gradient_rect(painter, rect, radius, Fill::Brand, Color32::WHITE);
-    let p = |x: f32, y: f32| rect.min + vec2(x, y) * rect.size();
-    let sheet = vec![
-        p(0.3, 0.2),
-        p(0.6, 0.2),
-        p(0.74, 0.34),
-        p(0.74, 0.8),
-        p(0.3, 0.8),
-    ];
-    painter.add(egui::Shape::convex_polygon(
-        sheet,
+    let ctx = painter.ctx();
+    let id = egui::Id::new("mypdf_calico_logo");
+    let texture = ctx.data(|data| data.get_temp::<egui::TextureHandle>(id));
+    let texture = texture.unwrap_or_else(|| {
+        let image = egui::ColorImage::from_rgba_unmultiplied([256, 256], &super::icon::rgba(256));
+        let texture = ctx.load_texture("MyPDF calico", image, egui::TextureOptions::LINEAR);
+        ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
+        texture
+    });
+    painter.image(
+        texture.id(),
+        rect,
+        Rect::from_min_max(pos2(0., 0.), pos2(1., 1.)),
         Color32::WHITE,
-        Stroke::NONE,
-    ));
-    painter.add(egui::Shape::convex_polygon(
-        vec![p(0.6, 0.2), p(0.74, 0.34), p(0.6, 0.34)],
-        Color32::from_rgb(204, 214, 255),
-        Stroke::NONE,
-    ));
-    let w = rect.height() * 0.055;
-    painter.rect_filled(
-        Rect::from_min_max(p(0.36, 0.45), p(0.68, 0.53)),
-        1.,
-        Color32::from_rgb(255, 214, 64),
     );
-    for (y, x) in [(0.62, 0.68), (0.71, 0.58)] {
-        painter.line_segment(
-            [p(0.37, y), p(x, y)],
-            Stroke::new(w, Color32::from_rgb(150, 160, 230)),
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +267,7 @@ pub(super) enum Icon {
     Form,
     Shapes,
     Read,
+    Translate,
     Pen,
     Sign,
     Shield,
@@ -575,6 +559,16 @@ pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: 
             fill_box([0.62, 0.43], [0.88, 0.57], 0.02, soft);
             line(&[[0.65, 0.5], [0.85, 0.5]]);
             line(&[[0.65, 0.66], [0.8, 0.66]]);
+        }
+        Icon::Translate => {
+            // Two letterforms and a translation arrow, all vector strokes.
+            line(&[[0.08, 0.62], [0.28, 0.12], [0.48, 0.62]]);
+            line(&[[0.16, 0.43], [0.4, 0.43]]);
+            line(&[[0.5, 0.35], [0.92, 0.35]]);
+            line(&[[0.71, 0.23], [0.71, 0.35]]);
+            line(&[[0.83, 0.35], [0.77, 0.54], [0.58, 0.73]]);
+            line(&[[0.59, 0.43], [0.69, 0.59], [0.9, 0.74]]);
+            line(&[[0.12, 0.83], [0.49, 0.83], [0.4, 0.73]]);
         }
         Icon::Swap => {
             line(&[[0.16, 0.32], [0.84, 0.32]]);
@@ -1214,6 +1208,7 @@ pub(super) struct MenuItem<'a> {
     icon: Icon,
     label: &'a str,
     shortcut: Option<egui::KeyboardShortcut>,
+    width: Option<f32>,
 }
 impl<'a> MenuItem<'a> {
     pub fn new(icon: Icon, label: &'a str) -> Self {
@@ -1221,46 +1216,105 @@ impl<'a> MenuItem<'a> {
             icon,
             label,
             shortcut: None,
+            width: None,
         }
     }
     pub fn shortcut(mut self, value: Option<egui::KeyboardShortcut>) -> Self {
         self.shortcut = value;
         self
     }
+    pub fn width(mut self, value: f32) -> Self {
+        self.width = Some(value);
+        self
+    }
+}
+
+fn shortcut_label(key: egui::KeyboardShortcut) -> String {
+    if cfg!(target_os = "macos") && key.modifiers == egui::Modifiers::NONE {
+        match key.logical_key {
+            egui::Key::Backspace => return "⌫".into(),
+            egui::Key::Escape => return "⎋".into(),
+            _ => {}
+        }
+    }
+    key.format(
+        if cfg!(target_os = "macos") {
+            &egui::ModifierNames::SYMBOLS
+        } else {
+            &egui::ModifierNames::NAMES
+        },
+        cfg!(target_os = "macos"),
+    )
+}
+
+/// Measure a menu once, so every row shares an icon gutter and shortcut column.
+/// The popup's available width is deliberately not used: it can grow each frame.
+pub(super) fn menu_width<'a>(
+    ui: &egui::Ui,
+    items: impl IntoIterator<Item = (&'a str, Option<egui::KeyboardShortcut>)>,
+) -> f32 {
+    let mut label_width = 0_f32;
+    let mut shortcut_width = 0_f32;
+    for (label, shortcut) in items {
+        label_width = label_width.max(
+            ui.painter()
+                .layout_no_wrap(label.into(), FontId::proportional(13.), Color32::WHITE)
+                .size()
+                .x,
+        );
+        if let Some(shortcut) = shortcut {
+            shortcut_width = shortcut_width.max(
+                ui.painter()
+                    .layout_no_wrap(
+                        shortcut_label(shortcut),
+                        FontId::proportional(12.),
+                        Color32::WHITE,
+                    )
+                    .size()
+                    .x,
+            );
+        }
+    }
+    (44. + label_width
+        + if shortcut_width > 0. {
+            shortcut_width + 20.
+        } else {
+            0.
+        })
+    .max(220.)
+    .min((ui.ctx().content_rect().width() - 32.).max(120.))
 }
 impl egui::Widget for MenuItem<'_> {
     fn ui(self, ui: &mut egui::Ui) -> egui::Response {
         let color = ui.visuals().text_color();
-        let galley =
+        let mut galley =
             ui.painter()
                 .layout_no_wrap(self.label.into(), FontId::proportional(13.), color);
         let hint = self.shortcut.map(|key| {
-            let label = if cfg!(target_os = "macos") {
-                match key.logical_key {
-                    egui::Key::Backspace => Some("⌫"),
-                    egui::Key::Escape => Some("⎋"),
-                    _ => None,
-                }
-            } else {
-                None
-            };
             ui.painter().layout_no_wrap(
-                label.map(str::to_owned).unwrap_or_else(|| {
-                    key.format(
-                        if cfg!(target_os = "macos") {
-                            &egui::ModifierNames::SYMBOLS
-                        } else {
-                            &egui::ModifierNames::NAMES
-                        },
-                        cfg!(target_os = "macos"),
-                    )
-                }),
+                shortcut_label(key),
                 FontId::proportional(12.),
                 ui.visuals().weak_text_color(),
             )
         });
-        let hint_width = hint.as_ref().map_or(0., |g| g.size().x + 30.);
-        let width = (galley.size().x + 44. + hint_width).max(ui.available_width().min(360.));
+        let hint_width = hint.as_ref().map_or(0., |g| g.size().x + 20.);
+        let width = self.width.unwrap_or(galley.size().x + 44. + hint_width);
+        let label_width = (width - 44. - hint_width).max(20.);
+        if galley.size().x > label_width {
+            let mut job = egui::text::LayoutJob::simple_singleline(
+                self.label.into(),
+                FontId::proportional(13.),
+                color,
+            );
+            job.wrap = egui::text::TextWrapping {
+                max_width: label_width,
+                max_rows: 1,
+                break_anywhere: true,
+                ..Default::default()
+            };
+            galley = ui.painter().layout_job(job);
+        }
+        let elided = galley.elided;
         let (rect, response) = ui.allocate_exact_size(vec2(width, 27.), egui::Sense::click());
         response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), self.label)
@@ -1290,7 +1344,11 @@ impl egui::Widget for MenuItem<'_> {
                 ui.visuals().weak_text_color(),
             );
         }
-        response
+        if elided {
+            response.on_hover_text(self.label)
+        } else {
+            response
+        }
     }
 }
 
@@ -1612,6 +1670,38 @@ pub(super) fn color_swatch(ui: &mut egui::Ui, current: &mut [f32; 3], label: &st
 // ---------------------------------------------------------------------------
 // Dialogs
 
+/// Shared sizing for utility dialogs. The body scrolls; the action row does not.
+/// Reserve space for the title, frame and footer even on a 480-point-high window.
+pub(super) fn dialog_body<R>(
+    ui: &mut egui::Ui,
+    id: &str,
+    preferred_height: f32,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let height = preferred_height.min((ui.ctx().content_rect().height() - 240.).max(80.));
+    egui::ScrollArea::vertical()
+        .id_salt(id)
+        .max_height(height)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.spacing_mut().interact_size.y = 28.;
+            ui.spacing_mut().button_padding.y = 5.;
+            content(ui)
+        })
+        .inner
+}
+
+pub(super) fn dialog_footer(ui: &mut egui::Ui, actions: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(8.);
+    ui.separator();
+    ui.add_space(4.);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), actions);
+}
+
+pub(super) fn dialog_width(ctx: &egui::Context, preferred_width: f32) -> f32 {
+    preferred_width.min((ctx.content_rect().width() - 80.).max(240.))
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum DialogTone {
     Primary,
@@ -1622,7 +1712,9 @@ pub(super) enum DialogTone {
 pub(super) fn dialog_button(ui: &mut egui::Ui, label: &str, tone: DialogTone) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), 32.), egui::Sense::click());
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
     let hovered = response.hovered();
     let painter = ui.painter();
     let text = match tone {

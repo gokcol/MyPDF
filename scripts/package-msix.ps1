@@ -39,10 +39,18 @@ try {
         if ([string]::IsNullOrWhiteSpace($value) -or $value.Length -gt 256) { throw 'Display names must contain 1–256 characters.' }
     }
     $crateVersion = (Select-String -Path Cargo.toml -Pattern '^version = "([0-9]+\.[0-9]+\.[0-9]+)"').Matches[0].Groups[1].Value
-    if (-not $PackageVersion) { $PackageVersion = "$crateVersion.0" }
-    if ($PackageVersion -notmatch '^([1-9][0-9]*)\.([0-9]+)\.([0-9]+)\.0$' -or
-        @($PackageVersion.Split('.') | Where-Object { [decimal]$_ -gt 65535 }).Count -ne 0) {
-        throw 'Use a four-part Store version such as 1.0.0.0; major must be nonzero, each part <= 65535, and revision must be 0.'
+    # The public version reset from 1.11.x to 1.2.0. Keep Store update ordering
+    # independent so existing 1.11.1.0 packages can receive this release.
+    $defaultPackageVersion = (Get-Content 'packaging/windows/msix/version.txt' -Raw).Trim()
+    if (-not $PackageVersion) { $PackageVersion = $defaultPackageVersion }
+    foreach ($version in @($defaultPackageVersion, $PackageVersion)) {
+        if ($version -notmatch '^([1-9][0-9]*)\.([0-9]+)\.([0-9]+)\.0$' -or
+            @($version.Split('.') | Where-Object { [decimal]$_ -gt 65535 }).Count -ne 0) {
+            throw 'Use a four-part Store version such as 1.0.0.0; major must be nonzero, each part <= 65535, and revision must be 0.'
+        }
+    }
+    if ([version]$PackageVersion -lt [version]$defaultPackageVersion) {
+        throw "Package version must be at least $defaultPackageVersion to preserve Store upgrade ordering."
     }
     if ($env:OS -ne 'Windows_NT') { throw 'MSIX packaging requires Windows and the Windows 10/11 SDK.' }
     $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin'
@@ -55,6 +63,7 @@ try {
     $makeappx = Join-Path $sdk.FullName 'x64/makeappx.exe'
     $makepri = Join-Path $sdk.FullName 'x64/makepri.exe'
     if (-not $SkipBuild) {
+        & (Join-Path $PSScriptRoot 'build-translation-windows.ps1')
         & cargo build --locked --release --bin mypdf --example msix_assets
         if ($LASTEXITCODE -ne 0) { throw 'Rust release build failed.' }
     }
@@ -80,7 +89,8 @@ try {
     $null = New-Item -ItemType Directory -Path $layout -Force
     try {
         Copy-Item $exe (Join-Path $layout 'MyPDF.exe')
-        Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY_NOTICES.md $layout
+        Copy-Item -Path @('README.md', 'LICENSE-MIT', 'LICENSE-APACHE', 'THIRD_PARTY_NOTICES.md') -Destination $layout
+        & (Join-Path $PSScriptRoot 'copy-translation-runtime.ps1') -DestinationDirectory $layout
         & $assetsTool (Join-Path $layout 'Assets')
         if ($LASTEXITCODE -ne 0) { throw 'MSIX artwork generation failed.' }
         [xml]$manifest = Get-Content packaging/windows/msix/AppxManifest.xml -Raw
@@ -105,6 +115,15 @@ try {
         if ((Get-FileHash $exe).Hash -ne (Get-FileHash (Join-Path $unpacked 'MyPDF.exe')).Hash) {
             throw 'Packaged executable differs from the release build.'
         }
+        $runtime = Join-Path $layout 'translation'
+        foreach ($file in @(Get-ChildItem $runtime -Recurse -File)) {
+            $relative = $file.FullName.Substring($layout.Length).TrimStart([char[]]@('/', '\'))
+            $roundTripFile = Join-Path $unpacked $relative
+            if (-not (Test-Path $roundTripFile -PathType Leaf) -or
+                (Get-FileHash $file.FullName).Hash -ne (Get-FileHash $roundTripFile).Hash) {
+                throw "Packaged translation runtime differs from the release build: $relative"
+            }
+        }
         [xml]$roundTrip = Get-Content (Join-Path $unpacked 'AppxManifest.xml') -Raw
         if ($roundTrip.Package.Identity.Name -ne $IdentityName -or $roundTrip.Package.Identity.Publisher -ne $Publisher -or
             $roundTrip.Package.Identity.Version -ne $PackageVersion) { throw 'Packaged identity does not match the requested identity.' }
@@ -122,9 +141,11 @@ try {
         [ordered]@{
             identityMode = $(if ($TestIdentity) { 'test-only' } else { 'store' })
             name = $IdentityName; publisher = $Publisher; publisherDisplayName = $PublisherDisplayName
-            displayName = $DisplayName; version = $PackageVersion; architecture = 'x64'
+            displayName = $DisplayName; appVersion = $crateVersion; version = $PackageVersion; architecture = 'x64'
             minimumWindowsVersion = '10.0.19041.0'; sdkVersion = $sdk.Name
             sourceCommit = $commit; sha256 = $digest; signed = $false
+            offlineTranslation = 'CTranslate2 CPU'; languageModelsBundled = $false
+            translationRuntimeSha256 = (Get-FileHash (Join-Path $runtime 'mypdf_ct2.dll') -Algorithm SHA256).Hash.ToLowerInvariant()
         } | ConvertTo-Json | Set-Content "$package.json" -Encoding utf8
         Write-Host "Built $package"
         Write-Host $(if ($TestIdentity) { 'TEST ONLY: do not submit this identity to the Store or publish it as an installer.' } else { 'Unsigned Partner Center upload: Store certification and signing have not yet occurred.' })

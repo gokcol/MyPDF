@@ -36,9 +36,14 @@ On GitHub, run **Actions → Microsoft Store MSIX → Run workflow**:
 
 - `ref`: the release tag or full commit SHA to package.
 - `mode`: `store` after configuring the three variables; `test` otherwise.
-- `package_version`: usually blank, which maps Cargo `1.1.0` to MSIX `1.1.0.0`.
-  The fourth field is reserved by Microsoft and must remain zero. Increment
-  the package version for subsequent Store updates.
+- `package_version`: usually blank, which uses `version.txt` in this directory.
+  For MyPDF **1.2.0**, the internal MSIX version is **1.12.0.0**. The latest
+  generated Store package was **1.11.1.0**; using **1.2.0.0** would sort below
+  it and prevent an ordinary upgrade. Public app versions and MSIX package
+  versions are therefore maintained separately. Increase `version.txt` for
+  each Store release, even when the public version uses a different sequence.
+  An explicit override must be at least the checked-in package version.
+  The fourth field is reserved by Microsoft and must remain zero.
 
 On a Windows machine with Rust and the Windows SDK:
 
@@ -55,7 +60,8 @@ The script builds the desktop executable and icon generator, produces DPI-aware
 artwork and a resource index with MakePri, then uses MakeAppx with semantic
 validation enabled. It unpacks the result and verifies the executable and identity
 round trip. Outputs in `dist/msix` are the `.msix`, SHA-256 sidecar, and JSON build
-metadata (identity, version, source commit and Windows SDK version). An existing
+metadata (identity, public `appVersion`, internal package `version`, source commit
+and Windows SDK version). An existing
 package is never overwritten. `-SkipBuild` is available when both binaries have
 already been built with `cargo build --locked --release --bin mypdf --example msix_assets`.
 

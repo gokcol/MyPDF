@@ -17,12 +17,24 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@1.93.1
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install pinned native build tooling
+        run: python -m pip install cmake==3.31.6
+      - name: Build and verify offline translation runtime
+        shell: pwsh
+        run: |
+          & ./scripts/build-translation-windows.ps1
+          & ./scripts/test-translation-runtime.ps1
+          & ./scripts/test-translation-packaging.ps1
       - run: cargo build --locked --release --bin mypdf
       - name: Pack
         shell: pwsh
@@ -36,7 +48,8 @@ jobs:
           $name = "MyPDF-$version-windows-x64"
           New-Item -ItemType Directory -Path "pack\MyPDF" | Out-Null
           Copy-Item target\release\mypdf.exe pack\MyPDF\MyPDF.exe
-          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY_NOTICES.md pack\MyPDF\
+          Copy-Item -Path @('README.md', 'LICENSE-MIT', 'LICENSE-APACHE', 'THIRD_PARTY_NOTICES.md') -Destination 'pack\MyPDF\'
+          & ./scripts/copy-translation-runtime.ps1 -DestinationDirectory "$pwd\pack\MyPDF"
           Compress-Archive -Path pack\MyPDF -DestinationPath "$name.zip"
           $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File -Encoding ascii -NoNewline "$name.zip.sha256"

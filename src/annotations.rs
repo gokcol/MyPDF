@@ -534,10 +534,11 @@ pub struct Session {
     saved: u64,
     name: Option<String>,
     focus: Option<(usize, Option<Box2>)>,
+    retained_bytes: usize,
 }
 impl Session {
     pub fn new(source: Arc<[u8]>, annotations: Vec<Annotation>, editable: bool) -> Self {
-        Self {
+        let mut session = Self {
             source,
             annotations,
             editable,
@@ -548,7 +549,10 @@ impl Session {
             saved: 0,
             name: None,
             focus: None,
-        }
+            retained_bytes: 0,
+        };
+        session.retained_bytes = session.history_bytes();
+        session
     }
     pub fn revision(&self) -> u64 {
         self.revision
@@ -619,9 +623,6 @@ impl Session {
                 focus: self.focus,
             });
         }
-        if self.past.len() > 100 {
-            self.past.remove(0);
-        }
         self.future.clear();
         self.name = None;
         self.next += 1;
@@ -662,14 +663,40 @@ impl Session {
             (first.page, Some(bounds(&points)))
         });
         self.annotations = annotations;
+        self.trim_history_to_budget(384 * 1024 * 1024);
         Ok(())
     }
     /// A page transaction shares the same undo timeline as annotation edits.
     pub fn commit_document(&mut self, bytes: Vec<u8>) -> Result<()> {
+        self.commit_document_with_budget(bytes, 384 * 1024 * 1024, false)
+    }
+    /// Used when the caller will immediately Undo a pending edit. Reject before
+    /// mutation if history trimming could otherwise discard its previous state.
+    pub fn commit_document_requiring_undo(&mut self, bytes: Vec<u8>) -> Result<()> {
+        self.commit_document_with_budget(bytes, 384 * 1024 * 1024, true)
+    }
+    fn commit_document_with_budget(
+        &mut self,
+        bytes: Vec<u8>,
+        budget: usize,
+        require_undo: bool,
+    ) -> Result<()> {
         ensure!(self.editable, "This document is read-only");
         let doc = Document::load_mem(&bytes)?;
         ensure!(inspect(&doc).rewritable(), "Page result is not editable");
         let annotations = load(&doc);
+        let source: Arc<[u8]> = bytes.into();
+        if require_undo {
+            let required = Self::buffer_bytes([
+                (&self.source, self.annotations.as_slice()),
+                (&source, annotations.as_slice()),
+            ]);
+            let current = Self::buffer_bytes(std::iter::once((&source, annotations.as_slice())));
+            ensure!(
+                required <= budget.max(current),
+                "This edit is too large to retain Undo and Redo within the history memory limit. The PDF is unchanged and your text edit is still open; use Cancel to discard it."
+            );
+        }
         self.past.push(Snapshot {
             source: self.source.clone(),
             annotations: self.annotations.clone(),
@@ -679,27 +706,72 @@ impl Session {
         });
         self.future.clear();
         self.focus = Some((0, None));
-        self.source = bytes.into();
+        self.source = source;
         self.annotations = annotations;
         self.name = None;
         self.next += 1;
         self.revision = self.next;
-        // Bound unique PDF revisions as well as the number of undo steps.
-        while self.past.len() > 100
-            || (self.past.len() > 1 && self.history_bytes() > 384 * 1024 * 1024)
-        {
-            self.past.remove(0);
-        }
+        self.trim_history_to_budget(budget);
         Ok(())
     }
+    /// Unique PDF and source-image storage in the current document plus both
+    /// directions of history. Shared Arc payloads count once, not once per step.
+    /// This excludes decoder/GPU caches, which the viewer budgets separately.
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+    /// Essential source storage, excluding undo and redo. Useful as the floor
+    /// when the viewer divides a shared memory budget between open documents.
+    pub fn current_retained_bytes(&self) -> usize {
+        Self::buffer_bytes(std::iter::once((&self.source, self.annotations.as_slice())))
+    }
+    /// Evict the oldest undo / most distant redo states. The current document
+    /// is never discarded, even when it alone exceeds the requested budget.
+    pub fn trim_history_to_budget(&mut self, budget: usize) {
+        // Shared payloads can make old states effectively free. If the current
+        // document alone is too large, removing those states would not help.
+        let budget = budget.max(self.current_retained_bytes());
+        self.retained_bytes = self.history_bytes();
+        while self.past.len() + self.future.len() > 100 || self.retained_bytes > budget {
+            if !self.past.is_empty() {
+                self.past.remove(0);
+            } else if !self.future.is_empty() {
+                self.future.remove(0);
+            } else {
+                break;
+            }
+            self.retained_bytes = self.history_bytes();
+        }
+    }
     fn history_bytes(&self) -> usize {
-        let mut seen = std::collections::HashSet::new();
-        self.past
-            .iter()
-            .filter(|s| seen.insert(s.source.as_ptr()))
-            .map(|s| s.source.len())
-            .sum::<usize>()
-            + self.source.len()
+        Self::buffer_bytes(
+            std::iter::once((&self.source, self.annotations.as_slice())).chain(
+                self.past
+                    .iter()
+                    .chain(&self.future)
+                    .map(|s| (&s.source, s.annotations.as_slice())),
+            ),
+        )
+    }
+    fn buffer_bytes<'a>(
+        states: impl IntoIterator<Item = (&'a Arc<[u8]>, &'a [Annotation])>,
+    ) -> usize {
+        let mut pdfs = std::collections::HashSet::new();
+        let mut images = std::collections::HashSet::new();
+        let mut total = 0usize;
+        for (source, annotations) in states {
+            if pdfs.insert(source.as_ptr()) {
+                total = total.saturating_add(source.len());
+            }
+            for annotation in annotations {
+                if let Kind::Image { png } = &annotation.kind
+                    && images.insert(Arc::as_ptr(png))
+                {
+                    total = total.saturating_add(png.capacity());
+                }
+            }
+        }
+        total
     }
     pub fn undo(&mut self) {
         if let Some(previous) = self.past.pop() {
@@ -1129,9 +1201,11 @@ pub fn primitives(a: &Annotation) -> Vec<Primitive> {
                     closed,
                     fill: false,
                 } => {
-                    // Preserve the familiar arrowheads while styling the shaft.
-                    let style = if index > 0
-                        && matches!(a.kind, Kind::Line { .. } | Kind::DoubleArrow { .. })
+                    // Preserve arrowheads and comment glyphs as recognizable
+                    // icons, even when a drawing stroke style was selected.
+                    let style = if matches!(a.kind, Kind::Note { .. })
+                        || index > 0
+                            && matches!(a.kind, Kind::Line { .. } | Kind::DoubleArrow { .. })
                     {
                         StrokeStyle::Solid
                     } else {
@@ -1318,14 +1392,46 @@ fn raw_primitives(a: &Annotation) -> Vec<Primitive> {
                 false,
             )],
         },
-        Kind::Note { .. } => vec![
-            path(
-                vec![[0.0, 0.0], [0.75, 0.0], [1.0, 0.25], [1.0, 1.0], [0.0, 1.0]],
-                true,
-                true,
-            ),
-            path(vec![[0.75, 0.0], [0.75, 0.25], [1.0, 0.25]], false, false),
-        ],
+        Kind::Note { .. } => {
+            // A comment is an icon, not a blank text box. Keep the speech
+            // bubble square when older notes have a wide/tall rectangle, and
+            // use the same outline and content marks in the editor and PDF.
+            let size = (r[2] - r[0]).min(r[3] - r[1]);
+            let origin = [(r[0] + r[2] - size) / 2., (r[1] + r[3] - size) / 2.];
+            let icon_path = |points: &[[f32; 2]], closed, fill| Primitive::Path {
+                points: points
+                    .iter()
+                    .map(|p| [origin[0] + p[0] * size, origin[1] + p[1] * size])
+                    .collect(),
+                closed,
+                fill,
+            };
+            let outline = [
+                [0.20, 0.10],
+                [0.80, 0.10],
+                [0.86, 0.12],
+                [0.90, 0.18],
+                [0.90, 0.64],
+                [0.86, 0.70],
+                [0.80, 0.72],
+                [0.44, 0.72],
+                [0.22, 0.90],
+                [0.22, 0.72],
+                [0.20, 0.72],
+                [0.14, 0.70],
+                [0.10, 0.64],
+                [0.10, 0.18],
+                [0.14, 0.12],
+            ];
+            let mut result = vec![];
+            if a.style.fill.is_some() {
+                result.push(icon_path(&outline, true, true));
+            }
+            result.push(icon_path(&outline, true, false));
+            result.push(icon_path(&[[0.28, 0.31], [0.72, 0.31]], false, false));
+            result.push(icon_path(&[[0.28, 0.51], [0.60, 0.51]], false, false));
+            result
+        }
         Kind::Text { text } => {
             let mut p = vec![];
             if a.style.fill.is_some() {
@@ -1764,4 +1870,158 @@ pub fn export(bytes: &[u8], annotations: &[Annotation]) -> Result<Vec<u8>> {
         "Saved annotations failed the reopen check"
     );
     Ok(out)
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    fn image(color: u8) -> Annotation {
+        let picture = image::RgbaImage::from_pixel(8, 8, image::Rgba([color, 90, 180, 255]));
+        let mut output = std::io::Cursor::new(Vec::with_capacity(4096));
+        picture
+            .write_to(&mut output, image::ImageFormat::Png)
+            .unwrap();
+        Annotation::new(
+            0,
+            [10., 10., 90., 90.],
+            Kind::Image {
+                png: Arc::new(output.into_inner()),
+            },
+            Style::default(),
+        )
+    }
+
+    #[test]
+    fn shared_pdf_and_image_payloads_count_once_across_undo_and_redo() {
+        let source: Arc<[u8]> = vec![0u8; 100].into();
+        let mut mark = image(10);
+        let mut session = Session::new(source, vec![mark.clone()], true);
+        let bytes = session.retained_bytes();
+        assert_eq!(bytes, 100 + 4096);
+        for i in 1..12 {
+            mark.rotation = i as f32;
+            session
+                .commit(vec![mark.clone(), mark.duplicate()])
+                .unwrap();
+        }
+        for _ in 0..6 {
+            session.undo();
+            assert_eq!(session.retained_bytes(), bytes);
+            assert_eq!(
+                session.history_bytes(),
+                bytes,
+                "redo is included without double counting"
+            );
+        }
+        session.trim_history_to_budget(bytes);
+        assert_eq!(session.past.len() + session.future.len(), 11);
+        for _ in 0..6 {
+            session.redo();
+            assert_eq!(session.history_bytes(), bytes);
+        }
+    }
+
+    #[test]
+    fn image_churn_budget_evicts_oldest_states_and_releases_their_buffers() {
+        let mut session = Session::new(vec![0u8; 100].into(), vec![], true);
+        let mut weak = Vec::new();
+        for color in 0..40 {
+            let mark = image(color);
+            let Kind::Image { png } = &mark.kind else {
+                unreachable!()
+            };
+            weak.push(Arc::downgrade(png));
+            session.commit(vec![mark]).unwrap();
+            session.trim_history_to_budget(100 + 3 * 4096);
+            assert!(session.retained_bytes() <= 100 + 3 * 4096);
+        }
+        assert!(weak[..37].iter().all(|w| w.upgrade().is_none()));
+        session.undo();
+        assert!(session.can_redo());
+        assert_eq!(session.history_bytes(), session.retained_bytes());
+        session.trim_history_to_budget(100 + 2 * 4096);
+        assert_eq!(session.past.len(), 0, "old undo states go first");
+        assert!(session.can_redo(), "nearest redo survives while it fits");
+        session.redo();
+        assert_eq!(session.history_bytes(), session.retained_bytes());
+        drop(session);
+        assert!(weak.iter().all(|w| w.upgrade().is_none()));
+    }
+
+    #[test]
+    fn required_document_undo_rejects_before_mutation_when_snapshots_exceed_budget() {
+        let original = crate::convert::blank(595., 842.).unwrap();
+        let replacement = crate::convert::blank(600., 800.).unwrap();
+        let mut session = Session::new(original.clone().into(), vec![], true);
+        session.commit(vec![image(10)]).unwrap();
+        session.undo();
+        let source = session.source.clone();
+        let before = (
+            session.revision,
+            session.next,
+            session.past.len(),
+            session.future.len(),
+        );
+        let result = session.commit_document_with_budget(replacement, original.len(), true);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("history memory limit")
+        );
+        assert!(Arc::ptr_eq(&session.source, &source));
+        assert!(session.annotations.is_empty());
+        assert_eq!(
+            (
+                session.revision,
+                session.next,
+                session.past.len(),
+                session.future.len()
+            ),
+            before
+        );
+        session.redo();
+        assert_eq!(
+            session.annotations.len(),
+            1,
+            "a rejected pending Undo does not destroy older history"
+        );
+    }
+
+    #[test]
+    fn required_document_undo_retains_latest_snapshot_with_a_bounded_budget() {
+        let original = crate::convert::blank(595., 842.).unwrap();
+        let replacement = crate::convert::blank(600., 800.).unwrap();
+        let budget = original.len() + replacement.len();
+        let mut session = Session::new(original.clone().into(), vec![], true);
+        session
+            .commit_document_with_budget(replacement.clone(), budget, true)
+            .unwrap();
+        assert!(session.can_undo());
+        session.undo();
+        assert_eq!(&*session.source, &original);
+        assert!(session.can_redo());
+        session.redo();
+        assert_eq!(&*session.source, &replacement);
+        assert!(session.retained_bytes() <= budget);
+    }
+
+    #[test]
+    fn over_budget_current_document_is_never_discarded() {
+        let mark = image(10);
+        let mut session = Session::new(vec![0u8; 100].into(), vec![mark.clone()], true);
+        let mut next = mark;
+        next.rotation = 90.;
+        session.commit(vec![next.clone()]).unwrap();
+        session.trim_history_to_budget(1);
+        assert_eq!(session.annotations, vec![next]);
+        assert_eq!(
+            session.past.len(),
+            1,
+            "shared history costs no extra image storage"
+        );
+        assert!(session.future.is_empty());
+        assert_eq!(session.retained_bytes(), 100 + 4096);
+    }
 }

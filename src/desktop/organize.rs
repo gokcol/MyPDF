@@ -126,7 +126,11 @@ impl Viewer {
                                 if self.organizer.tab == id {
                                     self.organizer.selected.clear();
                                 }
-                                self.status=Some(("Pages updated • Undo is available • Save a Copy to keep your changes".into(),false));
+                                self.status = Some((
+                                    "Pages updated • Undo is available • Save to keep your changes"
+                                        .into(),
+                                    false,
+                                ));
                             }
                             Err(e) => self.status = Some((format!("{e:#}"), true)),
                         }
@@ -692,7 +696,7 @@ impl Viewer {
                 ui.horizontal(|ui|{ui.label("Every");let r=ui.add(egui::DragValue::new(&mut self.organizer.split_every).range(1..=10_000));self.editor.text_editing|=r.has_focus();ui.label("pages");});
                 ui.label(RichText::new("Split saves the whole document into a new folder. Extract saves just the selected pages.").small().color(theme::muted()));
                 ui.add_space(20.0);
-                ui::tip(ui, "Your original stays intact", "Reorder, rotate, crop and delete are undoable. Use Save a Copy when you are ready.");
+                ui::tip(ui, "Your original stays intact", "Reorder, rotate, crop and delete are undoable. Use Save when you are ready.");
             }
         });
         let pages = self.organizer.selected.iter().copied().collect();
