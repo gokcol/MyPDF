@@ -19,3 +19,11 @@ underskrift = { path = "../../vendor/underskrift" }
 [profile.release]
 opt-level = 2
 debug = false
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

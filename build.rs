@@ -66,6 +66,15 @@ fn build_apple_translation() {
         _ => return,
     };
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
+    // Share the Swift compiler cache within this Cargo target/profile instead
+    // of retaining another copy for every build-script fingerprint. Swift keys
+    // its cache entries by compiler/SDK/options; Cargo's output tree still keeps
+    // different target architectures separate.
+    let module_cache = out
+        .ancestors()
+        .nth(3)
+        .expect("Cargo profile output directory")
+        .join("mypdf-swift-module-cache");
     let object = out.join("TranslationBridge.o");
     let library = out.join("libmypdf_translation.a");
     let status = Command::new("xcrun")
@@ -85,7 +94,7 @@ fn build_apple_translation() {
         ])
         .arg(&sdk)
         .args(["-module-cache-path"])
-        .arg(out.join("swift-module-cache"))
+        .arg(module_cache)
         .args(["native/translation/TranslationBridge.swift", "-o"])
         .arg(&object)
         .status()
