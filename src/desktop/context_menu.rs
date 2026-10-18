@@ -300,6 +300,7 @@ fn candidates(state: &ContentState, tab: &Tab, page: usize) -> Vec<InlineText> {
                 drafts.push(InlineText {
                     key,
                     target: InlineTarget::Run(ordinal),
+                    geometry: run.layout.clone(),
                     original: run.text.clone(),
                     text: run.text.clone(),
                     rect,
@@ -320,6 +321,7 @@ fn candidates(state: &ContentState, tab: &Tab, page: usize) -> Vec<InlineText> {
             drafts.push(InlineText {
                 key,
                 target: InlineTarget::Annotation(a.id.clone()),
+                geometry: None,
                 original: text.clone(),
                 text: text.clone(),
                 rect: a.bounds(),
@@ -369,7 +371,7 @@ fn target_at(
     if editor.mode == editing::Mode::Edit {
         let texts = candidates(state, tab, page);
         if let Some(d) = texts.iter().rev().find(|d| contains(d.rect, p)) {
-            return Target::Text(Box::new(paragraph_at(d.clone(), &texts, tab.pages[page])));
+            return Target::Text(Box::new(line_at(d.clone(), &texts, tab.pages[page])));
         }
         if let Some(info) = state
             .inspection
@@ -478,7 +480,7 @@ pub(in crate::desktop) fn smart_select(
         let texts = candidates(state, tab, page);
         if clicked && let Some(d) = texts.iter().rev().find(|d| contains(d.rect, point)) {
             if session.editable {
-                let draft = paragraph_at(d.clone(), &texts, tab.pages[page]);
+                let draft = line_at(d.clone(), &texts, tab.pages[page]);
                 state.context.command = Some((
                     "edit_text_here",
                     Menu {

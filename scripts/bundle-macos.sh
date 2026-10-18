@@ -12,7 +12,10 @@ if [ "${1:-}" = --debug ]; then
 else
     cargo build --locked --release --bin mypdf --example app_icon
 fi
-app=dist/MyPDF.app
+# Build into a fresh bundle so Finder does not inherit an old directory/icon
+# cache timestamp when the packaged app replaces an installed version.
+app=dist/MyPDF-staging.app
+rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "target/$profile/mypdf" "$app/Contents/MacOS/.MyPDF.new"
 mv "$app/Contents/MacOS/.MyPDF.new" "$app/Contents/MacOS/MyPDF"
@@ -24,6 +27,10 @@ for size in 16 32 128 256 512; do
     double=$((size * 2))
     sips -z "$double" "$double" dist/MyPDF.png --out "dist/MyPDF.iconset/icon_${size}x${size}@2x.png" >/dev/null
 done
-iconutil -c icns dist/MyPDF.iconset -o "$app/Contents/Resources/MyPDF.icns"
+iconutil -c icns dist/MyPDF.iconset -o "$app/Contents/Resources/MyPDF-calico-v2.icns"
+touch "$app"
 codesign --force --sign - "$app"
+rm -rf dist/MyPDF.app
+mv "$app" dist/MyPDF.app
+app=dist/MyPDF.app
 echo "Built $PWD/$app"

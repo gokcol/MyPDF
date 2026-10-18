@@ -30,6 +30,39 @@ pub struct TextRun {
     pub rect: Option<[f32; 4]>,
     pub size: f32,
     pub color: [f32; 3],
+    /// Display geometry and reconstructed word gaps. `text` above remains the
+    /// exact decoded operator contents used to validate replacement transactions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<RunLayout>,
+}
+
+/// Baseline geometry uses glyph advances, which include sidebearings; an ink
+/// bounding box alone cannot distinguish a word gap from a narrow digit.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RunLayout {
+    pub text: String,
+    pub origin: [f32; 2],
+    pub end: [f32; 2],
+    pub direction: [f32; 2],
+    pub space_width: f32,
+}
+
+impl RunLayout {
+    /// Whether the advance gap to a following fragment represents a word space.
+    /// Existing whitespace is always retained; different baselines are not joined.
+    pub fn needs_space_before(&self, next: &Self) -> bool {
+        if self.text.ends_with(char::is_whitespace)
+            || next.text.starts_with(char::is_whitespace)
+            || self.direction[0] * next.direction[0] + self.direction[1] * next.direction[1] < 0.99
+        {
+            return false;
+        }
+        let delta = [next.origin[0] - self.end[0], next.origin[1] - self.end[1]];
+        let along = delta[0] * self.direction[0] + delta[1] * self.direction[1];
+        let across = (delta[0] * self.direction[1] - delta[1] * self.direction[0]).abs();
+        let space = self.space_width.max(next.space_width);
+        space > 0. && across <= (space * 0.5).max(0.1) && along > space * 0.5 + 0.01
+    }
 }
 
 pub fn has_signatures(doc: &Document) -> bool {
@@ -144,6 +177,7 @@ pub fn text_runs(bytes: &[u8], page: u32) -> Result<Vec<TextRun>> {
                 rect: None,
                 size,
                 color,
+                layout: None,
             });
         }
     }
