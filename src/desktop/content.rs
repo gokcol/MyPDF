@@ -22,7 +22,7 @@ type Key = (u64, u64, usize);
 enum InlineTarget {
     Run(usize),
     Annotation(String),
-    Block(BlockDraft),
+    Block(Box<BlockDraft>),
 }
 #[derive(Clone, PartialEq, Debug)]
 struct BlockDraft {
@@ -63,7 +63,7 @@ impl InlineText {
                     || b.spans != b.initial_spans
                     || [self.rect[0], self.rect[1]] != b.initial_origin
                     || b.alignment != Alignment::Left
-                    || b.preserve_layout != !b.layout.is_empty())
+                    || b.preserve_layout == b.layout.is_empty())
     }
 }
 
@@ -2220,7 +2220,7 @@ fn selected_block(
     Some(InlineText {
         key: first.key,
         geometry: None,
-        target: InlineTarget::Block(BlockDraft {
+        target: InlineTarget::Block(Box::new(BlockDraft {
             selection,
             masks,
             initial_spans: spans.clone(),
@@ -2233,7 +2233,7 @@ fn selected_block(
             initial_origin: [x, y],
             layout,
             preserve_layout,
-        }),
+        })),
         original: text.clone(),
         text,
         rect: [x, y, right, bottom],
