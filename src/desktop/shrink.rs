@@ -112,7 +112,10 @@ mod tests {
 
     #[test]
     fn reducing_the_file_size_is_an_edit_that_says_how_much() {
-        let image = image::RgbImage::from_fn(2000, 1500, |x, y| {
+        // This tests the asynchronous edit and its size feedback. Large-photo
+        // downsampling is covered by tests/basics.rs; keep the UI fixture small
+        // enough that debug image codecs do not dominate the worker deadline.
+        let image = image::RgbImage::from_fn(400, 300, |x, y| {
             image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x * y) % 239) as u8])
         });
         let mut png = std::io::Cursor::new(vec![]);

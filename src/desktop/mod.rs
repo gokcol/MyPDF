@@ -11,9 +11,11 @@ pub mod icon;
 mod manipulation;
 mod menu;
 mod navigate;
+mod navigation_editor;
 mod nup;
 pub mod open_with;
 mod organize;
+mod preferences;
 #[cfg(test)]
 mod preview;
 mod print;
@@ -22,13 +24,17 @@ mod reading;
 mod recognize;
 mod recovery;
 mod redaction;
+mod review;
 mod selection;
 mod shrink;
 mod signatures;
+mod styles;
 mod text_selection;
 mod theme;
 mod ui;
 mod watermark;
+mod workbench;
+mod workspace;
 mod zen;
 use ui::{ActionButton, Icon};
 
@@ -281,6 +287,7 @@ fn document_tab(ui: &mut egui::Ui, tab: &Tab, active: bool, dirty: bool) -> Opti
 }
 
 pub struct Viewer {
+    workbench: workbench::State,
     home: home::Home,
     content: content::ContentState,
     organizer: organize::Organizer,
@@ -333,6 +340,9 @@ pub struct Viewer {
     zen: Option<zen::Zen>,
     details: details::DetailsState,
     reading_memory: reading::Memory,
+    workspace: workspace::State,
+    review: review::State,
+    navigation_editor: Option<navigation_editor::Draft>,
 }
 impl Viewer {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> Self {
@@ -342,6 +352,7 @@ impl Viewer {
         let (save_tx, save_events) = mpsc::channel();
         let (signature_tx, signature_rx) = mpsc::channel();
         let mut app = Self {
+            workbench: workbench::State::default(),
             home: home::Home::new(&cc.egui_ctx),
             content: content::ContentState::new(),
             organizer: organize::Organizer::new(),
@@ -388,7 +399,13 @@ impl Viewer {
             zen: None,
             details: details::DetailsState::new(),
             reading_memory: Default::default(),
+            workspace: workspace::State::new(),
+            review: review::State::default(),
+            navigation_editor: None,
         };
+        if paths.is_empty() {
+            app.restore_workspace(&cc.egui_ctx);
+        }
         for path in paths {
             app.open(path, &cc.egui_ctx);
         }
@@ -605,6 +622,16 @@ impl Viewer {
     }
     fn close(&mut self, index: usize) {
         if index < self.tabs.len() {
+            let t = &self.tabs[index];
+            if t.path.is_absolute() && t.path.is_file() {
+                self.workspace.closed.push(workspace::SavedTab {
+                    path: t.path.clone(),
+                    view: t.view_preferences.clone(),
+                });
+                if self.workspace.closed.len() > 16 {
+                    self.workspace.closed.remove(0);
+                }
+            }
             self.recovery.clear(self.tabs[index].id);
             self.tabs.remove(index);
             if self.active > index {
@@ -617,6 +644,12 @@ impl Viewer {
         }
     }
     fn action(&mut self, action: &str, ctx: &egui::Context) {
+        if self.context_native_action(action, ctx) {
+            return;
+        }
+        if self.workbench_action(action, ctx) {
+            return;
+        }
         if self.home.visible
             && matches!(
                 action,
@@ -932,6 +965,12 @@ impl Viewer {
             && !self.editor.text_editing
     }
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.context_shortcuts(ctx) {
+            return;
+        }
+        if self.workbench_keys(ctx) {
+            return;
+        }
         if self.pages_clipboard_keys(ctx) {
             let (copy, paste) = ctx.input_mut(|i| {
                 let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
@@ -1337,6 +1376,7 @@ impl Viewer {
                             tab.jump(n.saturating_sub(1));
                         }
                         ui.label(format!("/ {}", tab.pages.len()));
+                        if let Some(label)=tab.nav.as_ref().and_then(|n|n.label(tab.page)) && label!=(tab.page+1).to_string() {ui.label(RichText::new(label).color(theme::accent())).on_hover_text("Page label");}
                         if ui
                             .add_enabled(
                                 tab.page + 1 < tab.pages.len(),
@@ -1353,7 +1393,7 @@ impl Viewer {
                     if ui
                         .add_enabled(
                             session.is_some_and(|s| s.can_undo()),
-                            ActionButton::new(Icon::Undo, "Undo").compact(),
+                            ActionButton::new(Icon::Undo, &session.and_then(|s| s.undo_label()).map(|s| format!("Undo {s}")).unwrap_or_else(|| "Undo".into())).compact(),
                         )
                         .clicked()
                     {
@@ -1362,12 +1402,15 @@ impl Viewer {
                     if ui
                         .add_enabled(
                             session.is_some_and(|s| s.can_redo()),
-                            ActionButton::new(Icon::Redo, "Redo").compact(),
+                            ActionButton::new(Icon::Redo, &session.and_then(|s| s.redo_label()).map(|s| format!("Redo {s}")).unwrap_or_else(|| "Redo".into())).compact(),
                         )
                         .clicked()
                     {
                         action = Some("redo");
                     }
+                    if ui.add(ActionButton::new(Icon::Search, "Find a tool (⌘K)").compact()).clicked() { action = Some("tool_search"); }
+                    if ui.add(ActionButton::new(Icon::History, "Document history").compact()).clicked() { action = Some("history"); }
+                    if ui.add(ActionButton::new(Icon::Guides, if self.editor.hide_guides { "Show editing guides" } else { "Hide editing guides" }).compact().selected(!self.editor.hide_guides)).clicked() { action = Some("guides"); }
                     if let Some(tab) = self.tabs.get(self.active)
                         && let Some(s) = &tab.session
                     {
@@ -1524,7 +1567,8 @@ impl Viewer {
                 });
                 if let Some(index) = chosen { tab.select_hit(index); }
             } else if self.outline {
-                navigate::outline_list(tab, ui, ctx);
+                if ui.add(ActionButton::new(Icon::Outline,"Edit bookmarks & labels…")).clicked(){self.workbench.request=Some("edit_navigation".into());}
+                    navigate::outline_list(tab, ui, ctx);
             } else {
                 ui.label(RichText::new(pages_label(tab.pages.len())).color(theme::muted()).size(11.5));
                 egui::ScrollArea::vertical().id_salt((tab.id, "thumbnails")).show_rows(ui, 176.0, tab.pages.len(), |ui, range| {
@@ -1777,6 +1821,11 @@ impl Viewer {
                                 }
                             }
                         }
+                        if self.workbench.paste.is_none() && self.workbench.crop.is_none() && !self.organizer.busy && !self.redaction.active {
+                            content::smart_select(&mut self.content,&mut self.editor,tab,ui,page,page_rect,scale,&mut self.inspector);
+                        }
+                        let placing = workbench::crop_overlay(&mut self.workbench, &mut self.editor, tab, ui, page, page_rect, scale) || workbench::paste_overlay(&mut self.workbench, &mut self.editor, tab, ui, page, page_rect, scale, &mut self.status);
+                        if !placing {
                         editing::page_interaction(
                             &mut self.editor,
                             tab,
@@ -1786,7 +1835,9 @@ impl Viewer {
                             scale,
                             &mut self.status,
                         );
-                        self.content.paused = self.redaction.active && self.editor.mode == editing::Mode::Edit;
+                        }
+                        self.content.hide_guides = self.editor.hide_guides;
+                        self.content.paused = placing || self.redaction.active && self.editor.mode == editing::Mode::Edit;
                         if self.editor.mode == editing::Mode::Forms {
                             let editable = !self.content.busy
                                 && !self.organizer.busy
@@ -1794,6 +1845,9 @@ impl Viewer {
                             form_tools::overlay(&mut self.forms, self.content.inspection.as_ref(), tab, editable, ui, page, page_rect, scale);
                         } else {
                             content::overlay(&mut self.content,self.editor.mode,tab,ui,page,page_rect,scale);
+                        }
+                        if !placing && !self.content.paused && !self.organizer.busy {
+                            content::page_menu(&mut self.content, &mut self.editor, tab, ui, page, page_rect, scale);
                         }
                         if self.content.paused {
                             redaction::overlay(&mut self.redaction, tab, ui, page, page_rect, scale);
@@ -1803,6 +1857,7 @@ impl Viewer {
                         {
                             signatures::page_overlay(tab, ui, page, page_rect, scale);
                         }
+                        workbench::reveal_overlay(&self.workbench,tab,ui,page,page_rect,scale);
                         if let Some(target) = navigate::link_overlay(tab, self.editor.mode, ui, page, page_rect, scale) {
                             follow = Some(target);
                         }
@@ -1859,6 +1914,14 @@ impl eframe::App for Viewer {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         theme::sync(ctx.theme());
         self.tick += 1;
+        if let Some(menu) = &self._native_menu {
+            let session = self.tabs.get(self.active).and_then(|t| t.session.as_ref());
+            menu.history_labels(
+                session.and_then(|s| s.undo_label()),
+                session.and_then(|s| s.redo_label()),
+                ctx.wants_keyboard_input(),
+            );
+        }
         let arrivals = open_with::take(ctx);
         arrivals.activate(ctx);
         for path in arrivals.paths {
@@ -1873,6 +1936,14 @@ impl eframe::App for Viewer {
         self.shortcuts(ctx);
         self.zen_keys(ctx);
         self.compare_tick(ctx);
+        if !self.home.visible
+            && matches!(
+                self.editor.mode,
+                editing::Mode::Edit | editing::Mode::Draw | editing::Mode::Annotate
+            )
+        {
+            self.inspect_content(ctx);
+        }
         self.editor.text_editing = false;
         self.toolbar(ctx);
         self.restore_reading_panels();
@@ -1882,6 +1953,7 @@ impl eframe::App for Viewer {
             self.content_tools(ctx);
             self.form_ribbon(ctx);
             self.signature_bar(ctx);
+            self.workbench_bar(ctx);
         }
         if let Some((status, true)) = &self.status {
             let status = status.clone();
@@ -1915,7 +1987,7 @@ impl eframe::App for Viewer {
             self.sidebar(ctx);
             if self.signature_panel_open() {
                 self.signature_panel(ctx);
-            } else if self.inspector {
+            } else if self.inspector && self.workbench.crop.is_none() {
                 if self.editor.mode == editing::Mode::Edit && self.redaction.active {
                     self.redaction_panel(ctx);
                 } else if self.editor.mode == editing::Mode::Forms {
@@ -1952,6 +2024,7 @@ impl eframe::App for Viewer {
         self.digital_window(ctx);
         self.background_window(ctx);
         self.image_region_window(ctx);
+        self.workbench_windows(ctx);
         self.header_footer_window(ctx);
         self.redaction_dialogs(ctx);
         self.signature_dialogs(ctx);
@@ -1999,6 +2072,10 @@ impl eframe::App for Viewer {
                 });
         }
         self.remember_reading(ctx, self.exit_approved);
+        self.remember_workspace(ctx);
+        self.workspace_window(ctx);
+        self.review_window(ctx);
+        self.navigation_editor_window(ctx);
         self.trim_cache();
         if !ctx.input(|i| i.raw.hovered_files.is_empty()) {
             let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop"));

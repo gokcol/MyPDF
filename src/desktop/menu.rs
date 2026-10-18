@@ -6,9 +6,26 @@ pub struct NativeMenu {
     menu: muda::Menu,
     rust_edit: muda::Submenu,
     dialog_edit: muda::Submenu,
+    undo: muda::MenuItem,
+    redo: muda::MenuItem,
 }
 #[cfg(target_os = "macos")]
 impl NativeMenu {
+    pub fn history_labels(&self, undo: Option<String>, redo: Option<String>, text: bool) {
+        self.undo.set_text(if text {
+            "Undo".into()
+        } else {
+            undo.map(|s| format!("Undo {s}"))
+                .unwrap_or_else(|| "Undo".into())
+        });
+        self.redo.set_text(if text {
+            "Redo".into()
+        } else {
+            redo.map(|s| format!("Redo {s}"))
+                .unwrap_or_else(|| "Redo".into())
+        });
+    }
+
     fn dialog(&self, active: bool) {
         let (remove, insert) = if active {
             (&self.rust_edit, &self.dialog_edit)
@@ -26,6 +43,10 @@ impl NativeMenu {
 }
 #[cfg(not(target_os = "macos"))]
 pub struct NativeMenu;
+#[cfg(not(target_os = "macos"))]
+impl NativeMenu {
+    pub fn history_labels(&self, _: Option<String>, _: Option<String>, _: bool) {}
+}
 
 /// What MyPDF is, in the About window and the README.
 #[cfg(all(target_os = "macos", not(test)))]
@@ -74,11 +95,20 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
         &[
             &item("new", "New Blank PDF", Code::KeyN, Modifiers::empty()),
             &item("open", "Open…", Code::KeyO, Modifiers::empty()),
+            &item(
+                "reopen_closed",
+                "Reopen Closed Tab",
+                Code::KeyT,
+                Modifiers::SHIFT,
+            ),
+            &MenuItem::with_id("workspace", "Workspace…", true, None),
             &item("save", "Save a Copy…", Code::KeyS, Modifiers::empty()),
             &item("save", "Save As…", Code::KeyS, Modifiers::SHIFT),
             &P::separator(),
             &item("print", "Print…", Code::KeyP, Modifiers::empty()),
             &MenuItem::with_id("nup", "Multiple Pages per Sheet…", true, None),
+            &MenuItem::with_id("edit_navigation", "Bookmarks and Page Labels…", true, None),
+            &MenuItem::with_id("review_comments", "Review Comments…", true, None),
             &MenuItem::with_id("compare", "Compare Documents…", true, None),
             &P::separator(),
             &MenuItem::with_id("protect", "Protect with Password…", true, None),
@@ -88,17 +118,38 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             &item("close", "Close Tab", Code::KeyW, Modifiers::empty()),
         ],
     );
+    let undo = item("edit_undo", "Undo", Code::KeyZ, Modifiers::empty());
+    let redo = item("edit_redo", "Redo", Code::KeyZ, Modifiers::SHIFT);
     let edit = Submenu::with_items(
         "Edit",
         true,
         &[
-            &item("edit_undo", "Undo", Code::KeyZ, Modifiers::empty()),
-            &item("edit_redo", "Redo", Code::KeyZ, Modifiers::SHIFT),
+            &undo,
+            &redo,
             &P::separator(),
             &item("cut", "Cut", Code::KeyX, Modifiers::empty()),
             &item("copy", "Copy", Code::KeyC, Modifiers::empty()),
             &item("paste", "Paste", Code::KeyV, Modifiers::empty()),
+            &item(
+                "paste_original",
+                "Paste in Original Position",
+                Code::KeyV,
+                Modifiers::SHIFT,
+            ),
             &item("select_all", "Select All", Code::KeyA, Modifiers::empty()),
+            &P::separator(),
+            &item(
+                "context_copy_format",
+                "Copy Object Style",
+                Code::KeyC,
+                Modifiers::ALT,
+            ),
+            &item(
+                "context_paste_format",
+                "Paste Object Style",
+                Code::KeyV,
+                Modifiers::ALT,
+            ),
             &P::separator(),
             &MenuItem::with_id("undo", "Undo Document Change", true, None),
             &MenuItem::with_id("redo", "Redo Document Change", true, None),
@@ -186,6 +237,14 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             &MenuItem::with_id("fit_page", "Fit Page", true, None),
             &MenuItem::with_id("sidebar", "Show / Hide Left Panel (⇧⌘L)", true, None),
             &MenuItem::with_id("inspector", "Show / Hide Right Panel (⇧⌘R)", true, None),
+            &MenuItem::with_id("guides", "Show / Hide Editing Guides", true, None),
+            &MenuItem::with_id("history", "Document History…", true, None),
+            &item(
+                "tool_search",
+                "Find a Tool…",
+                Code::KeyK,
+                Modifiers::empty(),
+            ),
             &MenuItem::with_id("recovery", "Document Recovery…", true, None),
             &MenuItem::with_id("page_text", "Accessible Page Text…", true, None),
         ],
@@ -239,6 +298,8 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             menu,
             rust_edit: edit,
             dialog_edit,
+            undo,
+            redo,
         }),
         rx,
     )

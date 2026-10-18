@@ -58,8 +58,6 @@ pub(super) fn png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
 pub(super) struct MarksClip {
     marks: Vec<Annotation>,
     marker: String,
-    from: (u64, usize),
-    pastes: usize,
 }
 
 /// A box of `size` points centered on the page, shrunk to fit `room` of it.
@@ -116,9 +114,41 @@ impl Viewer {
             .filter(|a| ids.contains(&a.id))
             .cloned()
             .collect();
-        let Some(first) = marks.first() else {
+        if cut && marks.iter().any(|a| a.object.locked) {
+            self.status = Some(("Unlock the object before cutting it".into(), false));
+            return false;
+        }
+        let Some(n) = self.copy_artwork(ctx, marks) else {
             return false;
         };
+        if cut {
+            self.editor_delete();
+        }
+        self.status = Some((
+            format!(
+                "{} {n} object{} • {} pastes on any page of any open PDF",
+                if cut { "Cut" } else { "Copied" },
+                if n == 1 { "" } else { "s" },
+                if cfg!(target_os = "macos") {
+                    "⌘V"
+                } else {
+                    "Ctrl+V"
+                },
+            ),
+            false,
+        ));
+        true
+    }
+
+    /// Store self-contained artwork independently of its source document.
+    /// Region previews can copy directly without adding anything to that PDF.
+    pub(super) fn copy_artwork(
+        &mut self,
+        ctx: &egui::Context,
+        marks: Vec<Annotation>,
+    ) -> Option<usize> {
+        let tab = self.tabs.get(self.active)?;
+        marks.first()?;
         let n = marks.len();
         let marker = format!(
             "MyPDF: {n} mark{} from {}",
@@ -126,24 +156,11 @@ impl Viewer {
             tab.name()
         );
         self.editor.marks_clip = Some(MarksClip {
-            from: (tab.id, first.page),
             marks,
             marker: marker.clone(),
-            pastes: 0,
         });
         ctx.copy_text(marker);
-        if cut {
-            self.editor_delete();
-        }
-        self.status = Some((
-            format!(
-                "{} {n} mark{} • ⌘V pastes on any page of any open PDF",
-                if cut { "Cut" } else { "Copied" },
-                if n == 1 { "" } else { "s" }
-            ),
-            false,
-        ));
-        true
+        Some(n)
     }
 
     /// Paste marks, or an image or text from another app, on the current page.
@@ -172,59 +189,45 @@ impl Viewer {
     }
 
     fn paste_marks(&mut self) {
-        let Some(clip) = self.editor.marks_clip.as_mut() else {
+        let Some(clip) = &self.editor.marks_clip else {
             return;
         };
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            return;
-        };
-        let page = tab.page.min(tab.pages.len().saturating_sub(1));
-        let Some(size) = tab.pages.get(page).copied() else {
-            return;
-        };
-        clip.pastes += 1;
-        let offset = if clip.from == (tab.id, page) {
-            12. * clip.pastes as f32
-        } else {
-            0.
-        };
-        let copies: Vec<Annotation> = clip
-            .marks
-            .iter()
-            .map(|a| {
-                let mut copy = a.duplicate();
-                copy.rect = a.rect;
-                copy.page = page;
-                copy
-            })
-            .collect();
-        let copies = selection::moved(&copies, [offset, offset], size);
-        let n = copies.len();
-        let Some(session) = tab.session.as_mut() else {
-            return;
-        };
-        let mut entries = session.annotations.clone();
-        entries.extend(copies.iter().cloned());
-        match session.commit(entries) {
-            Ok(()) => {
-                if !matches!(
-                    self.editor.mode,
-                    editing::Mode::Annotate | editing::Mode::Draw
-                ) {
-                    self.editor.mode = editing::Mode::Annotate;
-                }
-                selection::set(
-                    tab,
-                    &mut self.editor,
-                    copies.into_iter().map(|a| a.id).collect(),
-                );
-                self.status = Some((
-                    format!("Pasted {n} mark{}", if n == 1 { "" } else { "s" }),
-                    false,
-                ));
+        self.workbench.paste = Some(
+            clip.marks
+                .iter()
+                .zip(mypdf_milestone0::object_tools::duplicate(&clip.marks))
+                .map(|(a, mut c)| {
+                    c.rect = a.rect;
+                    c.object.hidden = false;
+                    c
+                })
+                .collect(),
+        );
+        self.status = Some((
+            "Click a page to place the artwork · Escape cancels · ⇧⌘V keeps its original position"
+                .into(),
+            false,
+        ));
+    }
+    pub(super) fn paste_original(&mut self) {
+        if self.workbench.paste.is_none() {
+            let clip = read();
+            let ours = self
+                .editor
+                .marks_clip
+                .as_ref()
+                .is_some_and(|m| match &clip {
+                    Clip::Text(t) => t == &m.marker,
+                    Clip::Empty => true,
+                    _ => false,
+                });
+            if !ours {
+                self.status = Some(("Copy artwork in MyPDF first".into(), false));
+                return;
             }
-            Err(e) => self.status = Some((format!("{e:#}"), true)),
+            self.paste_marks();
         }
+        self.place_pending_original();
     }
 
     fn paste_image(&mut self, ctx: &egui::Context, png: Vec<u8>, pixels: [u32; 2]) {
@@ -237,28 +240,18 @@ impl Viewer {
         };
         // Screenshots are usually 2× pixels; show them at their point size.
         let rect = centered(size, [pixels[0] as f32 / 2., pixels[1] as f32 / 2.], 0.6);
-        if self.editor.mode == editing::Mode::Edit {
-            self.content_change(
-                ctx,
-                content::Edit::AddImage {
-                    page: page as u32 + 1,
-                    rect,
-                    image: png,
-                },
-            );
-            return;
-        }
-        self.add_mark(
-            Annotation::new(
-                page,
-                rect,
-                Kind::Image { png: Arc::new(png) },
-                Default::default(),
-            ),
-            "Pasted image • drag a corner to resize",
-        );
+        let _ = ctx;
+        self.workbench.paste = Some(vec![Annotation::new(
+            page,
+            rect,
+            Kind::Image { png: Arc::new(png) },
+            Default::default(),
+        )]);
+        self.status = Some((
+            "Click a page to place the image · Escape cancels".into(),
+            false,
+        ));
     }
-
     fn paste_text(&mut self, text: String) {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
@@ -396,7 +389,7 @@ mod tests {
         let marks =
             |app: &Viewer, tab: usize| app.tabs[tab].session.as_ref().unwrap().annotations.clone();
 
-        // Copy a rectangle and paste it twice on the same page: each copy steps aside.
+        // Paste previews do not mutate until placed; original-position keeps geometry.
         app.active = 0;
         app.editor.mode = editing::Mode::Annotate;
         let rect = Annotation::new(
@@ -413,11 +406,13 @@ mod tests {
         for step in 1..=2 {
             set_for_test(Clip::Text(marker.clone()));
             app.paste(&ctx);
+            assert!(app.workbench.paste.is_some());
+            app.place_pending_original();
             let all = marks(&app, 0);
             assert_eq!(all.len(), step + 1);
             let pasted = all.last().unwrap();
             assert_ne!(pasted.id, rect.id);
-            assert_eq!(pasted.rect[0], 100. + 12. * step as f32);
+            assert_eq!(pasted.rect[0], 100.);
             assert_eq!(app.tabs[0].selected_annotation.as_ref(), Some(&pasted.id));
         }
 
@@ -425,6 +420,7 @@ mod tests {
         app.active = 1;
         set_for_test(Clip::Text(marker.clone()));
         app.paste(&ctx);
+        app.place_pending_original();
         assert_eq!(marks(&app, 1).len(), 1);
         assert_eq!(marks(&app, 1)[0].rect, rect.rect);
         assert!(app.copy_marks(&ctx, true));
@@ -434,6 +430,7 @@ mod tests {
         let png = png(200, 100, &[200; 200 * 100 * 4]).unwrap();
         set_for_test(Clip::Image(png.clone(), [200, 100]));
         app.paste(&ctx);
+        app.place_pending_original();
         let image = marks(&app, 1).pop().unwrap();
         assert!(matches!(image.kind, Kind::Image { .. }));
         assert_eq!(
@@ -442,25 +439,29 @@ mod tests {
         );
         set_for_test(Clip::Text("Hello\nWorld".into()));
         app.paste(&ctx);
+        app.place_pending_original();
         assert!(
             matches!(&marks(&app, 1).pop().unwrap().kind, Kind::Text { text } if text == "Hello\nWorld")
         );
 
-        // In Edit, an image becomes page content and text opens Add text.
+        // Images remain reversible layers in Edit; text still opens Add text.
         app.editor.mode = editing::Mode::Edit;
         until(&mut app, &|a| editable(&a.tabs[1]));
         set_for_test(Clip::Image(png, [200, 100]));
         app.paste(&ctx);
+        app.place_pending_original();
         until(&mut app, &|a| !a.content.busy && editable(&a.tabs[1]));
         let source = app.tabs[1].session.as_ref().unwrap().source.clone();
         assert_eq!(
             mypdf_milestone0::content::images(&source, 1).unwrap().len(),
-            1,
+            0,
             "{:?}",
             app.status
         );
+        app.editor.mode = editing::Mode::Edit;
         set_for_test(Clip::Text("Typed elsewhere".into()));
         app.paste(&ctx);
+        app.place_pending_original();
         assert_eq!(app.content.pending_text(), Some(app.tabs[1].id));
     }
 }

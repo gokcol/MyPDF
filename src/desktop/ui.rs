@@ -330,6 +330,16 @@ pub(super) enum Icon {
     Trash,
     Close,
     Copy,
+    Cut,
+    Paste,
+    Group,
+    Ungroup,
+    Lock,
+    Unlock,
+    Format,
+    BringForward,
+    SendBackward,
+    Guides,
     Theme,
     Lasso,
     AlignObjectsLeft,
@@ -417,6 +427,52 @@ pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: 
         }
     };
     match icon {
+        Icon::Cut => {
+            painter.circle_stroke(p(0.25, 0.7), rect.width() * 0.13, stroke);
+            painter.circle_stroke(p(0.75, 0.7), rect.width() * 0.13, stroke);
+            line(&[[0.32, 0.59], [0.78, 0.12]]);
+            line(&[[0.68, 0.59], [0.22, 0.12]]);
+        }
+        Icon::Paste => {
+            box_at([0.2, 0.18], [0.8, 0.92], 0.06);
+            fill_box([0.35, 0.08], [0.65, 0.27], 0.04, color);
+            line(&[[0.34, 0.48], [0.66, 0.48]]);
+            line(&[[0.34, 0.65], [0.6, 0.65]]);
+        }
+        Icon::Group | Icon::Ungroup => {
+            box_at([0.2, 0.2], [0.58, 0.58], 0.03);
+            box_at([0.42, 0.42], [0.8, 0.8], 0.03);
+            if matches!(icon, Icon::Group) {
+                box_at([0.05, 0.05], [0.95, 0.95], 0.02);
+            } else {
+                line(&[[0.1, 0.3], [0.1, 0.1], [0.3, 0.1]]);
+                line(&[[0.7, 0.9], [0.9, 0.9], [0.9, 0.7]]);
+            }
+        }
+        Icon::Lock | Icon::Unlock => {
+            box_at([0.2, 0.44], [0.8, 0.9], 0.08);
+            line(&arc(
+                [0.5, 0.4],
+                0.24,
+                180.,
+                if matches!(icon, Icon::Unlock) {
+                    310.
+                } else {
+                    360.
+                },
+            ));
+            line(&[[0.5, 0.6], [0.5, 0.73]]);
+        }
+        Icon::Format => {
+            box_at([0.15, 0.12], [0.75, 0.38], 0.04);
+            line(&[
+                [0.75, 0.25],
+                [0.88, 0.25],
+                [0.88, 0.52],
+                [0.5, 0.52],
+                [0.5, 0.88],
+            ]);
+        }
         Icon::HeaderFooter => {
             box_at([0.18, 0.08], [0.82, 0.92], 0.06);
             fill_box([0.3, 0.17], [0.7, 0.27], 0.02, color);
@@ -1047,6 +1103,34 @@ pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: 
             line(&[[0.22, 0.22], [0.78, 0.78]]);
             line(&[[0.78, 0.22], [0.22, 0.78]]);
         }
+        Icon::BringForward | Icon::SendBackward => {
+            let (front, back) = if matches!(icon, Icon::BringForward) {
+                ([0.12, 0.1, 0.68, 0.66], [0.34, 0.34, 0.9, 0.9])
+            } else {
+                ([0.34, 0.34, 0.9, 0.9], [0.12, 0.1, 0.68, 0.66])
+            };
+            box_at([back[0], back[1]], [back[2], back[3]], 0.04);
+            fill_box(
+                [front[0], front[1]],
+                [front[2], front[3]],
+                0.04,
+                theme::paper(),
+            );
+            fill_box([front[0], front[1]], [front[2], front[3]], 0.04, soft);
+            box_at([front[0], front[1]], [front[2], front[3]], 0.04);
+        }
+        Icon::Guides => {
+            box_at([0.19, 0.19], [0.81, 0.81], 0.01);
+            for [x, y] in [[0.19, 0.19], [0.81, 0.19], [0.81, 0.81], [0.19, 0.81]] {
+                fill_box(
+                    [x - 0.08, y - 0.08],
+                    [x + 0.08, y + 0.08],
+                    0.02,
+                    theme::paper(),
+                );
+                box_at([x - 0.08, y - 0.08], [x + 0.08, y + 0.08], 0.02);
+            }
+        }
         Icon::Copy => {
             line(&[
                 [0.28, 0.62],
@@ -1124,6 +1208,91 @@ pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: 
 
 // ---------------------------------------------------------------------------
 // Buttons
+
+/// A compact menu row with a fixed icon gutter and an accessible, unpadded label.
+pub(super) struct MenuItem<'a> {
+    icon: Icon,
+    label: &'a str,
+    shortcut: Option<egui::KeyboardShortcut>,
+}
+impl<'a> MenuItem<'a> {
+    pub fn new(icon: Icon, label: &'a str) -> Self {
+        Self {
+            icon,
+            label,
+            shortcut: None,
+        }
+    }
+    pub fn shortcut(mut self, value: Option<egui::KeyboardShortcut>) -> Self {
+        self.shortcut = value;
+        self
+    }
+}
+impl egui::Widget for MenuItem<'_> {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let color = ui.visuals().text_color();
+        let galley =
+            ui.painter()
+                .layout_no_wrap(self.label.into(), FontId::proportional(13.), color);
+        let hint = self.shortcut.map(|key| {
+            let label = if cfg!(target_os = "macos") {
+                match key.logical_key {
+                    egui::Key::Backspace => Some("⌫"),
+                    egui::Key::Escape => Some("⎋"),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            ui.painter().layout_no_wrap(
+                label.map(str::to_owned).unwrap_or_else(|| {
+                    key.format(
+                        if cfg!(target_os = "macos") {
+                            &egui::ModifierNames::SYMBOLS
+                        } else {
+                            &egui::ModifierNames::NAMES
+                        },
+                        cfg!(target_os = "macos"),
+                    )
+                }),
+                FontId::proportional(12.),
+                ui.visuals().weak_text_color(),
+            )
+        });
+        let hint_width = hint.as_ref().map_or(0., |g| g.size().x + 30.);
+        let width = (galley.size().x + 44. + hint_width).max(ui.available_width().min(360.));
+        let (rect, response) = ui.allocate_exact_size(vec2(width, 27.), egui::Sense::click());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), self.label)
+        });
+        let visuals = ui.style().interact(&response);
+        if response.hovered() || response.has_focus() {
+            ui.painter().rect_filled(rect, 5., visuals.weak_bg_fill);
+        }
+        draw_icon(
+            ui.painter(),
+            Rect::from_center_size(pos2(rect.left() + 15., rect.center().y), vec2(16., 16.)),
+            self.icon,
+            visuals.fg_stroke.color,
+        );
+        ui.painter().galley(
+            pos2(rect.left() + 32., rect.center().y - galley.size().y / 2.),
+            galley,
+            visuals.fg_stroke.color,
+        );
+        if let Some(hint) = hint {
+            ui.painter().galley(
+                pos2(
+                    rect.right() - 12. - hint.size().x,
+                    rect.center().y - hint.size().y / 2.,
+                ),
+                hint,
+                ui.visuals().weak_text_color(),
+            );
+        }
+        response
+    }
+}
 
 pub(super) struct ActionButton<'a> {
     icon: Icon,

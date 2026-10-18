@@ -15,7 +15,7 @@ pub const PRESETS: [(usize, usize); 8] = [
     (4, 4),
 ];
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Layout {
     pub columns: usize,
     pub rows: usize,

@@ -268,6 +268,18 @@ fn native_visual_preview() {
         "SignatureImage",
         "TransparentImage",
         "ImageEffects",
+        "CropImage",
+        "ReviewComments",
+        "BookmarkEditor",
+        "Workspace",
+        "Objects",
+        "ToolSearch",
+        "History",
+        "RepeatArtwork",
+        "ContextDrawing",
+        "ContextImage",
+        "ContextText",
+        "ContextBlank",
         "RegionCopy",
         "AddText",
         "Prompt",
@@ -309,6 +321,12 @@ fn native_visual_preview() {
         {
             continue;
         }
+        app.workbench = workbench::State::default();
+        app.nup = None;
+        app.review.open = false;
+        app.navigation_editor = None;
+        app.workspace.options = false;
+        app.editor.annotation_sidebar = false;
         app.home.visible = matches!(collection, "Home" | "HomeEmpty");
         if collection == "Home" {
             for (i, name) in [
@@ -368,7 +386,16 @@ fn native_visual_preview() {
                 .commit(vec![a])
                 .unwrap();
         }
-        if collection == "ImageEffects" {
+        if matches!(
+            collection,
+            "ImageEffects"
+                | "CropImage"
+                | "Objects"
+                | "ToolSearch"
+                | "History"
+                | "RepeatArtwork"
+                | "ReviewComments"
+        ) {
             use mypdf_milestone0::annotations::{Annotation, Kind, StrokeStyle, Style};
             let image = image::RgbaImage::from_fn(320, 200, |x, y| {
                 let inside =
@@ -444,6 +471,32 @@ fn native_visual_preview() {
             } else {
                 selection::set(&mut app.tabs[0], &mut app.editor, vec![]);
                 app.editor.select_tool(editing::Tool::Lasso);
+            }
+        }
+        if collection.starts_with("Context") {
+            use mypdf_milestone0::annotations::{Annotation, Kind};
+            app.editor.mode = editing::Mode::Edit;
+            app.content = content::ContentState::new();
+            let kind = if collection == "ContextImage" {
+                Kind::Image {
+                    png: Arc::new(clipboard::png(2, 2, &[20, 110, 180, 255].repeat(4)).unwrap()),
+                }
+            } else {
+                Kind::Rectangle
+            };
+            app.tabs[0]
+                .session
+                .as_mut()
+                .unwrap()
+                .commit(vec![Annotation::new(
+                    0,
+                    [150., 330., 400., 460.],
+                    kind,
+                    Default::default(),
+                )])
+                .unwrap();
+            if collection == "ContextText" {
+                app.content.text_preview(app.tabs[0].id);
             }
         }
         app.digital.open = false;
@@ -881,6 +934,53 @@ fn native_visual_preview() {
         } else {
             vec![]
         };
+        if let Some(action) = match collection {
+            "CropImage" => Some("crop_object"),
+            "Objects" => Some("objects"),
+            "ToolSearch" => Some("tool_search"),
+            "History" => Some("history"),
+            "RepeatArtwork" => Some("repeat_objects"),
+            "ReviewComments" => Some("review_comments"),
+            "BookmarkEditor" => Some("edit_navigation"),
+            "Workspace" => Some("workspace"),
+            _ => None,
+        } {
+            app.workbench_action(action, &ctx);
+            for _ in 0..3 {
+                preview.capture(&mut app, &ctx);
+            }
+        }
+        if collection.starts_with("Context") {
+            let t = &app.tabs[0];
+            let (view, offset, _) = t.document_view.unwrap();
+            let layout = t.document_layout.as_ref().unwrap();
+            let point = if collection == "ContextText" {
+                vec2(120., 190.)
+            } else if collection == "ContextBlank" {
+                vec2(450., 600.)
+            } else {
+                vec2(150., 380.)
+            };
+            let p = view.min - offset + layout.rects[0].min.to_vec2() + point * layout.scale;
+            for pressed in [true, false] {
+                preview.capture_with(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(p),
+                        egui::Event::PointerButton {
+                            pos: p,
+                            button: egui::PointerButton::Secondary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            for _ in 0..3 {
+                preview.capture(&mut app, &ctx);
+            }
+        }
         let output = preview.capture_with(&mut app, &ctx, events);
         preview.save(
             &ctx,

@@ -139,8 +139,14 @@ pub(super) fn members(tab: &Tab) -> Vec<&Annotation> {
 }
 /// Replace the selection: none, one mark (the regular inspector) or a group.
 pub(super) fn set(tab: &mut Tab, editor: &mut EditorState, mut ids: Vec<String>) {
+    if let Some(s) = &tab.session {
+        ids = mypdf_milestone0::object_tools::expand_groups(&s.annotations, &ids);
+    }
     let mut seen = HashSet::new();
     ids.retain(|id| seen.insert(id.clone()));
+    if !ids.is_empty() {
+        editor.text_selection = None;
+    }
     editor.property_edit = None;
     editor.group_edit = None;
     tab.group.clear();
@@ -190,10 +196,20 @@ pub(super) fn toggle(tab: &mut Tab, editor: &mut EditorState, a: &Annotation) {
         .into_iter()
         .filter(|id| page_of(id) == Some(a.page))
         .collect();
-    if let Some(i) = ids.iter().position(|id| id == &a.id) {
-        ids.remove(i);
+    let unit = tab
+        .session
+        .as_ref()
+        .map(|s| {
+            mypdf_milestone0::object_tools::expand_groups(
+                &s.annotations,
+                std::slice::from_ref(&a.id),
+            )
+        })
+        .unwrap_or_default();
+    if ids.contains(&a.id) {
+        ids.retain(|id| !unit.contains(id));
     } else {
-        ids.push(a.id.clone());
+        ids.extend(unit);
     }
     set(tab, editor, ids);
 }
@@ -235,7 +251,7 @@ fn picks(tab: &Tab, m: &Marquee) -> Vec<String> {
     let last = *m.points.last().unwrap();
     s.annotations
         .iter()
-        .filter(|a| a.page == m.page)
+        .filter(|a| a.page == m.page && !a.object.hidden)
         .filter(|a| {
             let c = center(a);
             if m.lasso {
@@ -403,7 +419,10 @@ fn corners(b: Box2) -> [[f32; 2]; 4] {
 /// The group handle or body under page point `p`, if any.
 fn grab(tab: &Tab, page: usize, p: [f32; 2], scale: f32) -> Option<Drag> {
     let group = members(tab);
-    if group.len() < 2 || group[0].page != page {
+    if group.len() < 2
+        || group[0].page != page
+        || group.iter().any(|a| a.object.locked || a.object.hidden)
+    {
         return None;
     }
     let b = union_bounds(group.iter().copied());
@@ -440,6 +459,7 @@ pub(super) fn begin(
         return false;
     }
     if let Some(drag) = grab(tab, page, p, scale) {
+        let drag = if editor.hide_guides { Drag::Move } else { drag };
         let originals: Vec<_> = members(tab).into_iter().cloned().collect();
         editor.group_gesture = Some(GroupGesture {
             tab: tab.id,
@@ -459,8 +479,11 @@ pub(super) fn begin(
                 s.annotations.iter().any(|a| {
                     &a.id == id
                         && a.page == page
+                        && !a.object.hidden
+                        && !editor.hide_guides
                         && (editing::corner_at(a, p, scale).is_some()
-                            || manipulation::endpoint_at(a, p, scale).is_some())
+                            || manipulation::endpoint_at(a, p, scale).is_some()
+                            || manipulation::rotation_at(a, p, scale))
                 })
             })
         });
@@ -561,10 +584,11 @@ pub(super) fn update(
             if g.duplicate {
                 let copies: Vec<_> = g
                     .preview
-                    .into_iter()
-                    .map(|mut a| {
-                        a.id = format!("{:032x}", rand::random::<u128>());
-                        a
+                    .iter()
+                    .zip(mypdf_milestone0::object_tools::duplicate(&g.preview))
+                    .map(|(original, mut copy)| {
+                        copy.rect = original.rect;
+                        copy
                     })
                     .collect();
                 let ids = copies.iter().map(|a| a.id.clone()).collect();

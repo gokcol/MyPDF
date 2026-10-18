@@ -124,6 +124,10 @@ fn perform(v: Value) -> Result<Value> {
                 .iter()
                 .position(|m| m.id == id && m.page == page)
                 .context("Object not found")?;
+            ensure!(
+                command == "preview_without" || !marks[index].object.locked,
+                "Unlock the object before editing it"
+            );
             if command == "delete" || command == "preview_without" {
                 marks.remove(index);
             } else if command == "place" {
@@ -183,5 +187,101 @@ pub unsafe extern "C" fn mypdf_ipad_call(input: *const c_char) -> *mut c_char {
 pub unsafe extern "C" fn mypdf_ipad_free(value: *mut c_char) {
     if !value.is_null() {
         drop(unsafe { CString::from_raw(value) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mypdf_milestone0::{convert, object_tools, review};
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn desktop_objects_and_review_metadata_survive_ipad_edit_and_page_round_trip() {
+        let ink = ann::Annotation::new(
+            0,
+            [30., 40., 150., 100.],
+            ann::Kind::Ink {
+                strokes: vec![vec![[0., 0.], [0.5, 1.], [1., 0.]]],
+            },
+            Default::default(),
+        );
+        let root = Scratch(std::env::temp_dir().join(format!("mypdf-ipad-roundtrip-{}", ink.id)));
+        std::fs::create_dir(&root.0).unwrap();
+        let mut objects = vec![
+            ink.clone(),
+            ann::Annotation::new(
+                0,
+                [200., 40., 300., 120.],
+                ann::Kind::Rectangle,
+                Default::default(),
+            ),
+            ann::Annotation::new(
+                0,
+                [220., 140., 320., 190.],
+                ann::Kind::Note {
+                    text: "Check layout".into(),
+                },
+                Default::default(),
+            ),
+        ];
+        let ids = objects[1..]
+            .iter()
+            .map(|a| a.id.clone())
+            .collect::<Vec<_>>();
+        object_tools::group(&mut objects, &ids, false).unwrap();
+        objects[2].object.review = review::Review {
+            author: "Reviewer".into(),
+            created: 1,
+            resolved: true,
+            replies: vec![review::Reply {
+                author: "Editor".into(),
+                created: 2,
+                text: "Corrected".into(),
+            }],
+        };
+        let input = root.0.join("desktop.pdf");
+        let edited = root.0.join("ipad.pdf");
+        let paged = root.0.join("pages.pdf");
+        let source = convert::blank(500., 700.).unwrap();
+        let saved = ann::export(&source, &objects).unwrap();
+        std::fs::write(&input, &saved).unwrap();
+        perform(json!({"command":"place","input":input,"output":edited,"page":0,"id":ink.id,"rect":[70.,80.,190.,140.]})).unwrap();
+        objects[0].rect = [70., 80., 190., 140.];
+        let loaded = perform(json!({"command":"annotations","input":edited})).unwrap();
+        assert_eq!(
+            loaded["annotations"],
+            serde_json::to_value(&objects).unwrap()
+        );
+        perform(json!({"command":"pages","action":"blank","input":edited,"output":paged,"at":0,"size":[500.,700.]})).unwrap();
+        for a in &mut objects {
+            a.page = 1;
+        }
+        let doc = lopdf::Document::load(&paged).unwrap();
+        assert_eq!(ann::load(&doc), objects);
+        assert_eq!(
+            std::fs::read(&input).unwrap(),
+            saved,
+            "Source file must stay unchanged"
+        );
+        objects[0].object.locked = true;
+        let locked = root.0.join("locked.pdf");
+        let refused = root.0.join("refused.pdf");
+        std::fs::write(
+            &locked,
+            ann::export(&std::fs::read(&paged).unwrap(), &objects).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            perform(
+                json!({"command":"delete","input":locked,"output":refused,"page":1,"id":ink.id})
+            )
+            .is_err()
+        );
+        assert!(!refused.exists());
     }
 }

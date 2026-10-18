@@ -7,7 +7,16 @@ enum Job {
     Preview(u64, RasterResult),
     Saved(Result<PathBuf, String>),
 }
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SavedLayout {
+    name: String,
+    layout: Layout,
+}
 pub(super) struct Draft {
+    presets: Vec<SavedLayout>,
+    preset_name: String,
+    preset_error: Option<String>,
+    preset_root: PathBuf,
     source: Arc<[u8]>,
     annotations: Option<Vec<annotations::Annotation>>,
     path: PathBuf,
@@ -63,7 +72,18 @@ impl Viewer {
             return;
         }
         let (tx, rx) = mpsc::channel();
+        let (presets, preset_error) = match preferences::load::<Vec<SavedLayout>>(
+            &self.workspace.root,
+            "export-presets.json",
+        ) {
+            Ok(v) => (v, None),
+            Err(e) => (vec![], Some(e.to_string())),
+        };
         self.nup = Some(Draft {
+            presets,
+            preset_error,
+            preset_name: String::new(),
+            preset_root: self.workspace.root.clone(),
             source: s.source.clone(),
             annotations: (s.revision() != 0).then(|| s.annotations.clone()),
             path: tab.path.clone(),
@@ -149,6 +169,29 @@ impl Viewer {
                 ui.add_enabled_ui(!d.saving, |ui| {
                     ui.columns(2,|cols| {
                         egui::ScrollArea::vertical().id_salt("sheet_layout_options").max_height(height).show(&mut cols[0],|ui| {
+                            ui::caption(ui,"Saved export presets");
+                            egui::ComboBox::from_id_salt("saved_export_layout").selected_text(if d.preset_name.is_empty(){"Choose a preset"}else{&d.preset_name}).width(ui.available_width()).show_ui(ui,|ui|{
+                                for entry in &d.presets {
+                                    if ui.selectable_label(entry.name==d.preset_name,&entry.name).clicked(){
+                                        match entry.layout.validate(){Ok(())=>{d.layout=entry.layout.clone();d.preset_name=entry.name.clone();},Err(e)=>d.error=Some(e.to_string())}
+                                    }
+                                }
+                            });
+                            ui.horizontal(|ui|{
+                                ui.add(egui::TextEdit::singleline(&mut d.preset_name).hint_text("Preset name").char_limit(80).desired_width((ui.available_width()-80.).max(60.)));
+                                if ui.add_enabled(!d.preset_name.trim().is_empty() && d.preset_error.is_none() && d.layout.validate().is_ok(),ActionButton::new(Icon::Save,"Save preset").compact()).clicked(){
+                                    let name=d.preset_name.trim().to_owned();let mut entries=d.presets.clone();entries.retain(|p|p.name!=name);
+                                    entries.push(SavedLayout{name,layout:d.layout.clone()});
+                                    if entries.len()>50 {d.error=Some("Keep up to 50 export presets".into());}
+                                    else {match preferences::save(&d.preset_root,"export-presets.json",&entries){Ok(())=>d.presets=entries,Err(e)=>d.preset_error=Some(e.to_string())}}
+                                }
+                                if ui.add_enabled(d.presets.iter().any(|p|p.name==d.preset_name),ActionButton::new(Icon::Trash,"Delete preset").compact()).clicked(){
+                                    let mut entries=d.presets.clone();entries.retain(|p|p.name!=d.preset_name);
+                                    match preferences::save(&d.preset_root,"export-presets.json",&entries){Ok(())=>{d.presets=entries;d.preset_name.clear();},Err(e)=>d.preset_error=Some(e.to_string())}
+                                }
+                            });
+                            if let Some(e)=&d.preset_error {ui.colored_label(theme::danger(),e);}
+                            ui.separator();
                             ui::caption(ui,"Layout · columns × rows");
                             ui.horizontal_wrapped(|ui| {
                                 for (columns,rows) in mypdf_milestone0::nup::PRESETS {

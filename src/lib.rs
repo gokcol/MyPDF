@@ -20,13 +20,16 @@ pub mod image_region;
 #[cfg(target_os = "macos")]
 pub mod keychain;
 pub mod navigation;
+pub mod navigation_edit;
 pub mod nup;
+pub mod object_tools;
 pub mod ocr;
 pub mod pages;
 pub mod pdf_font;
 pub mod proof;
 pub mod recovery;
 pub mod redact;
+pub mod review;
 pub mod security;
 pub mod signature_edit;
 pub mod signing;

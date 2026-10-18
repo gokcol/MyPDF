@@ -130,6 +130,35 @@ pub(super) fn panel(
         *size = style.size;
         *color = style.color;
     }
+    let preset = styles::Preset::Text {
+        font: fonts.get(*font).map(|f| f.path.clone()),
+        size: *size,
+        color: *color,
+    };
+    if let Some(styles::Preset::Text {
+        font: next_font,
+        size: next_size,
+        color: next_color,
+    }) = styles::panel(ui, preset)
+    {
+        let range = selected
+            .clone()
+            .filter(|r| !r.is_empty())
+            .unwrap_or(0..text.len());
+        *spans = rich_text::restyle(spans, range, |s| {
+            s.font = next_font.clone();
+            s.size = next_size;
+            s.color = next_color;
+        });
+        if let Some(i) = fonts
+            .iter()
+            .position(|f| Some(&f.path) == next_font.as_ref())
+        {
+            *font = i;
+        }
+        *size = next_size;
+        *color = next_color;
+    }
     let selected_text = selected
         .as_ref()
         .filter(|r| !r.is_empty())
