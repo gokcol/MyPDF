@@ -21,6 +21,7 @@ pub(super) struct Organizer {
     dragged: Option<usize>,
     pressed: Option<(usize, egui::Pos2)>,
     pub busy: bool,
+    change_name: &'static str,
     tx: mpsc::Sender<Change>,
     rx: mpsc::Receiver<Change>,
     output_tx: mpsc::Sender<Result<String, String>>,
@@ -47,6 +48,7 @@ impl Organizer {
             dragged: None,
             pressed: None,
             busy: false,
+            change_name: "Edit pages",
             tx,
             rx,
             output_tx,
@@ -117,6 +119,7 @@ impl Viewer {
                         }
                         match s.commit_document(bytes) {
                             Ok(()) => {
+                                s.name_last_change(self.organizer.change_name);
                                 if active {
                                     self.editor.draft = None;
                                 }
@@ -179,6 +182,15 @@ impl Viewer {
         );
         let tx = self.organizer.tx.clone();
         let wake = ctx.clone();
+        self.organizer.change_name = match &operation {
+            Operation::Reorder(_) => "Reorder pages",
+            Operation::Delete(_) => "Delete pages",
+            Operation::InsertBlank { .. } => "Insert blank page",
+            Operation::InsertPdf { .. } => "Insert PDF pages",
+            Operation::Rotate { .. } => "Rotate pages",
+            Operation::Crop { .. } => "Crop pages",
+            Operation::ResetCrop(_) => "Restore page crop",
+        };
         self.organizer.busy = true;
         self.status = Some(("Updating pages…".into(), false));
         std::thread::spawn(move || {
@@ -469,6 +481,12 @@ impl Viewer {
             .count();
         order.splice(at..at, selected.iter().copied());
         self.page_change(ctx, Operation::Reorder(order));
+    }
+    pub(super) fn merge_files(&mut self, ctx: &egui::Context) {
+        if let Some(t) = self.tabs.get(self.active) {
+            let count = t.pages.len();
+            self.import_pages(ctx, count);
+        }
     }
     fn import_pages(&mut self, ctx: &egui::Context, at: usize) {
         let Some(paths) = self.native_picks(

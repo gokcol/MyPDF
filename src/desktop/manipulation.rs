@@ -58,6 +58,30 @@ pub(super) fn snap(
         },
     )
 }
+pub(super) fn rotation_handle(a: &Annotation, scale: f32) -> Option<[f32; 2]> {
+    if matches!(
+        a.kind,
+        Kind::Text { .. } | Kind::Note { .. } | Kind::Markup { .. }
+    ) {
+        return None;
+    }
+    let b = a.bounds();
+    Some([(b[0] + b[2]) / 2., b[1] - 25. / scale.max(0.1)])
+}
+pub(super) fn rotation_at(a: &Annotation, p: [f32; 2], scale: f32) -> bool {
+    rotation_handle(a, scale).is_some_and(|h| (p[0] - h[0]).hypot(p[1] - h[1]) * scale < 11.)
+}
+pub(super) fn rotated_drag(a: &Annotation, start: [f32; 2], p: [f32; 2], snap: bool) -> Annotation {
+    let c = [(a.rect[0] + a.rect[2]) / 2., (a.rect[1] + a.rect[3]) / 2.];
+    let delta =
+        ((p[1] - c[1]).atan2(p[0] - c[0]) - (start[1] - c[1]).atan2(start[0] - c[0])).to_degrees();
+    let mut out = a.clone();
+    out.rotate_by(delta);
+    if snap {
+        out.rotation = (out.rotation / 15.).round() * 15.;
+    }
+    out
+}
 pub(super) fn endpoints(a: &Annotation) -> Option<[[f32; 2]; 2]> {
     match &a.kind {
         Kind::Line { start, end, .. } | Kind::DoubleArrow { start, end } => {
@@ -139,5 +163,22 @@ mod tests {
             (endpoints(&c).unwrap()[1][1] - before[0][1]).abs() < 0.01,
             "Shift constrains to 45° increments"
         );
+    }
+    #[test]
+    fn rotation_handle_keeps_center_and_shift_snaps_to_fifteen_degrees() {
+        let a = Annotation::new(
+            0,
+            [100., 100., 200., 200.],
+            Kind::Rectangle,
+            Style::default(),
+        );
+        let h = rotation_handle(&a, 1.).unwrap();
+        assert!(rotation_at(&a, h, 1.));
+        let rotated = rotated_drag(&a, h, [240., 110.], true);
+        assert_eq!(rotated.rect, a.rect);
+        assert_eq!(rotated.rotation % 15., 0.);
+        assert!(rotated.rotation > 0.);
+        let free = rotated_drag(&a, h, [240., 110.], false);
+        assert_ne!(free.rotation, rotated.rotation);
     }
 }

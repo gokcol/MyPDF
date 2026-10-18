@@ -101,6 +101,7 @@ struct Gesture {
     /// The corner being dragged (top-left, top-right, bottom-right, bottom-left).
     resize: Option<usize>,
     endpoint: Option<usize>,
+    rotate: bool,
     duplicate: bool,
     guides: manipulation::Guides,
     preview: Option<Annotation>,
@@ -237,6 +238,7 @@ enum SignatureInput {
 }
 
 pub(super) struct EditorState {
+    pub hide_guides: bool,
     background: Option<background::Draft>,
     svg: SvgEditor,
     pub mode: Mode,
@@ -292,6 +294,17 @@ pub(super) struct EditorState {
     image_used: HashMap<String, u64>,
 }
 impl EditorState {
+    pub(super) fn interaction_active(&self) -> bool {
+        self.gesture.is_some()
+            || self.group_gesture.is_some()
+            || self.marquee.is_some()
+            || self.vertices.is_some()
+    }
+
+    pub(super) fn is_building_path(&self) -> bool {
+        self.vertices.is_some()
+    }
+
     pub fn new() -> Self {
         #[cfg(not(test))]
         let root = assets::data_directory();
@@ -305,6 +318,7 @@ impl EditorState {
         let (import_tx, import_rx) = mpsc::channel();
         let (signature_tx, signature_rx) = mpsc::channel();
         Self {
+            hide_guides: false,
             background: None,
             svg: SvgEditor::default(),
             mode: Mode::Read,
@@ -1246,8 +1260,11 @@ pub(super) fn page_interaction(
                         .find(|a| {
                             &a.id == id
                                 && a.page == page
+                                && !a.object.hidden
+                                && !editor.hide_guides
                                 && (corner_at(a, p, scale).is_some()
-                                    || manipulation::endpoint_at(a, p, scale).is_some())
+                                    || manipulation::endpoint_at(a, p, scale).is_some()
+                                    || manipulation::rotation_at(a, p, scale))
                         })
                         .cloned()
                 })
@@ -1257,14 +1274,19 @@ pub(super) fn page_interaction(
         };
         let endpoint = original
             .as_ref()
+            .filter(|_| !editor.hide_guides)
             .and_then(|a| manipulation::endpoint_at(a, p, scale));
+        let rotating = original
+            .as_ref()
+            .is_some_and(|a| !editor.hide_guides && manipulation::rotation_at(a, p, scale));
         let resize = original
             .as_ref()
-            .filter(|a| Some(&a.id) == tab.selected_annotation.as_ref())
+            .filter(|a| Some(&a.id) == tab.selected_annotation.as_ref() && !editor.hide_guides)
             .and_then(|a| corner_at(a, p, scale));
         if (matches!(editor.mode, Mode::Annotate | Mode::Draw)
             && editable
-            && (editor.tool != Tool::Select || original.is_some()))
+            && (editor.tool != Tool::Select || original.is_some())
+            && original.as_ref().is_none_or(|a| !a.object.locked))
             || (editor.mode == Mode::Sign && editor.tool == Tool::SignArea)
         {
             editor.gesture = Some(Gesture {
@@ -1273,9 +1295,13 @@ pub(super) fn page_interaction(
                 start: p,
                 points: vec![p],
                 original,
+                rotate: rotating,
                 resize,
                 endpoint,
-                duplicate: ctx.input(|i| i.modifiers.alt) && endpoint.is_none() && resize.is_none(),
+                duplicate: ctx.input(|i| i.modifiers.alt)
+                    && endpoint.is_none()
+                    && resize.is_none()
+                    && !rotating,
                 guides: Default::default(),
                 preview: None,
             });
@@ -1308,7 +1334,14 @@ pub(super) fn page_interaction(
             }
             let mut preview = if let Some(original) = &gesture.original {
                 let mut next = original.clone();
-                if let Some(end) = gesture.endpoint {
+                if gesture.rotate {
+                    next = manipulation::rotated_drag(
+                        original,
+                        gesture.start,
+                        p,
+                        ctx.input(|i| i.modifiers.shift),
+                    );
+                } else if let Some(end) = gesture.endpoint {
                     next = manipulation::move_endpoint(
                         original,
                         end,
@@ -1386,6 +1419,7 @@ pub(super) fn page_interaction(
                 } else if gesture.duplicate && gesture.original.is_some() {
                     let mut copy = a.clone();
                     copy.id = format!("{:032x}", rand::random::<u128>());
+                    copy.object.group = None;
                     commit_new(editor, tab, copy, status);
                 } else if gesture.original.is_some() {
                     if let Some(s) = &mut tab.session {
@@ -1480,12 +1514,40 @@ pub(super) fn page_interaction(
                     .find(|a| Some(&a.id) == tab.selected_annotation.as_ref() && a.page == page)
             })
         });
-    if let Some(a) = single {
-        if let Some(points) = manipulation::endpoints(a) {
+    if let Some(a) = single.filter(|a| !a.object.hidden && !editor.hide_guides) {
+        if !a.object.locked
+            && let Some(points) = manipulation::endpoints(a)
+        {
             for point in points {
                 let p = page_rect.min + vec2(point[0], point[1]) * scale;
                 painter.circle_filled(p, 5., Color32::WHITE);
                 painter.circle_stroke(p, 5., Stroke::new(1.8, theme::accent()));
+            }
+        }
+        if !a.object.locked
+            && let Some(h) = manipulation::rotation_handle(a, scale)
+        {
+            let b = a.bounds();
+            let h = page_rect.min + vec2(h[0], h[1]) * scale;
+            painter.line_segment(
+                [pos2(h.x, page_rect.top() + b[1] * scale), h],
+                Stroke::new(1., theme::accent()),
+            );
+            painter.circle_filled(h, 7., theme::paper());
+            ui::draw_icon(
+                &painter,
+                Rect::from_center_size(h, vec2(13., 13.)),
+                Icon::RotateRight,
+                theme::accent(),
+            );
+            if editor.gesture.as_ref().is_some_and(|g| g.rotate) {
+                painter.text(
+                    h + vec2(14., 0.),
+                    egui::Align2::LEFT_CENTER,
+                    format!("{:.0}°", a.rotation),
+                    FontId::proportional(12.),
+                    theme::accent(),
+                );
             }
         }
         let b = a.bounds();
@@ -1500,14 +1562,16 @@ pub(super) fn page_interaction(
             Stroke::new(1.2, theme::accent()),
             egui::StrokeKind::Middle,
         );
-        for c in [
-            frame.left_top(),
-            frame.right_top(),
-            frame.right_bottom(),
-            frame.left_bottom(),
-        ] {
-            painter.circle_filled(c, 4.5, Color32::WHITE);
-            painter.circle_stroke(c, 4.5, Stroke::new(1.5, theme::accent()));
+        if !a.object.locked {
+            for c in [
+                frame.left_top(),
+                frame.right_top(),
+                frame.right_bottom(),
+                frame.left_bottom(),
+            ] {
+                painter.circle_filled(c, 4.5, Color32::WHITE);
+                painter.circle_stroke(c, 4.5, Stroke::new(1.5, theme::accent()));
+            }
         }
     }
     // Grab to move, grabbing while moving, diagonal arrows on the corners.
@@ -1525,7 +1589,9 @@ pub(super) fn page_interaction(
             Some(g) => g.resize,
             None => response.hover_pos().and_then(|pos| {
                 let p = normal(pos);
-                single.and_then(|a| corner_at(a, p, scale))
+                single
+                    .filter(|a| !a.object.locked && !a.object.hidden && !editor.hide_guides)
+                    .and_then(|a| corner_at(a, p, scale))
             }),
         };
         let cursor = match (corner, dragging) {
@@ -1535,21 +1601,24 @@ pub(super) fn page_interaction(
             (None, None) => response
                 .hover_pos()
                 .and_then(|pos| hit_annotation(tab, page, normal(pos), scale))
+                .filter(|a| !a.object.locked)
                 .map(|_| egui::CursorIcon::Grab),
         };
         if let Some(cursor) = cursor {
             ctx.set_cursor_icon(cursor);
         }
     }
-    selection::paint(
-        editor,
-        tab,
-        page,
-        &painter,
-        page_rect,
-        scale,
-        response.hover_pos(),
-    );
+    if !editor.hide_guides {
+        selection::paint(
+            editor,
+            tab,
+            page,
+            &painter,
+            page_rect,
+            scale,
+            response.hover_pos(),
+        );
+    }
     text_selection::paint(
         &editor.text_selection,
         tab,
@@ -1764,6 +1833,34 @@ pub(super) fn hit_annotation(
 }
 
 impl Viewer {
+    pub(super) fn selected_image_background(&mut self) {
+        let Some(t) = self.tabs.get(self.active) else {
+            return;
+        };
+        let Some(s) = &t.session else {
+            return;
+        };
+        if !s.editable {
+            return;
+        }
+        if let Some(a) = s
+            .annotations
+            .iter()
+            .find(|a| Some(&a.id) == t.selected_annotation.as_ref() && !a.object.locked)
+            && let Kind::Image { png } = &a.kind
+        {
+            self.editor.background = Some(background::Draft::new(
+                background::Target::Annotation {
+                    tab: t.id,
+                    id: a.id.clone(),
+                    revision: s.revision(),
+                },
+                png.clone(),
+            ));
+        } else {
+            self.status = Some(("Select an unlocked image layer first".into(), false));
+        }
+    }
     /// The Sign tab of the main toolbar, with its menu of ways to sign.
     pub(super) fn sign_menu(&mut self, ui: &mut egui::Ui, compact: bool) {
         let mut button = ActionButton::new(Icon::Sign, "Sign")
@@ -1858,10 +1955,16 @@ impl Viewer {
         if let Some(tab) = self.tabs.get_mut(self.active)
             && let Some(s) = &mut tab.session
         {
+            let focus = if redo { s.redo_focus() } else { s.undo_focus() };
             if redo {
                 s.redo();
             } else {
                 s.undo();
+            }
+            if let Some((page, rect)) = focus {
+                let page = page.min(tab.pages.len().saturating_sub(1));
+                tab.jump(page);
+                self.workbench.reveal = Some((tab.id, page, rect, std::time::Instant::now()));
             }
             tab.selected_annotation = None;
             tab.group.clear();
@@ -1917,7 +2020,7 @@ impl Viewer {
                 .map(|s| {
                     s.annotations
                         .iter()
-                        .filter(|a| a.page == page)
+                        .filter(|a| a.page == page && !a.object.hidden)
                         .map(|a| a.id.clone())
                         .collect()
                 })
@@ -2167,45 +2270,7 @@ impl Viewer {
         }
     }
     pub(super) fn annotation_list(&mut self, ui: &mut egui::Ui) {
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            return;
-        };
-        let Some(s) = &tab.session else {
-            return;
-        };
-        if s.annotations.is_empty() {
-            ui.label(RichText::new("Your annotations appear here. Existing annotations from other apps remain visible but are not editable in this version.").small().color(theme::muted()));
-        }
-        let entries = s.annotations.clone();
-        let mut selected = None;
-        egui::ScrollArea::vertical()
-            .id_salt((tab.id, "annotations"))
-            .show(ui, |ui| {
-                for a in &entries {
-                    if ui
-                        .selectable_label(
-                            tab.selected_annotation.as_ref() == Some(&a.id)
-                                || tab.group.contains(&a.id),
-                            format!("Page {} • {}", a.page + 1, a.kind.label()),
-                        )
-                        .clicked()
-                    {
-                        selected = Some(a.clone());
-                    }
-                    if let Some(text) = a.kind.text() {
-                        ui.label(
-                            RichText::new(text.chars().take(60).collect::<String>())
-                                .small()
-                                .color(theme::muted()),
-                        );
-                    }
-                    ui.separator();
-                }
-            });
-        if let Some(a) = selected {
-            tab.jump(a.page);
-            selection::set(tab, &mut self.editor, vec![a.id]);
-        }
+        self.objects_panel(ui);
     }
     /// Shared properties, alignment and actions for a multi-object selection.
     fn group_inspector(&mut self, ctx: &egui::Context) {
@@ -2216,7 +2281,8 @@ impl Viewer {
         let Some(first) = marks.first().cloned() else {
             return;
         };
-        let editable = tab.session.as_ref().is_some_and(|s| s.editable);
+        let editable = tab.session.as_ref().is_some_and(|s| s.editable)
+            && marks.iter().all(|a| !a.object.locked);
         let mut changed: Option<Vec<Annotation>> = None;
         let mut arranged = None;
         let mut duplicate = false;
@@ -2254,6 +2320,11 @@ impl Viewer {
                         });
                         ui.separator();
                         ui.add_enabled_ui(editable, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.add(ActionButton::new(Icon::Group, "Group")).clicked() { self.workbench.request=Some("group_objects".into()); }
+                                if ui.add_enabled(marks.iter().any(|a|a.object.group.is_some()), ActionButton::new(Icon::Ungroup,"Ungroup")).clicked() { self.workbench.request=Some("ungroup_objects".into()); }
+                            });
+                            if let Some(styles::Preset::Drawing(style))=styles::panel(ui,styles::Preset::Drawing(first.style.clone())) { apply(&mut changed,&|a|a.style=style.clone()); }
                             ui::caption(ui, "Color");
                             let mut color = first.style.color;
                             if color_palette(ui, &mut color) {
@@ -2384,7 +2455,7 @@ impl Viewer {
             selection::commit(tab, &next, None, &mut self.status);
         }
         if duplicate && let Some(s) = &mut tab.session {
-            let copies: Vec<_> = marks.iter().map(Annotation::duplicate).collect();
+            let copies: Vec<_> = mypdf_milestone0::object_tools::duplicate(&marks);
             let mut entries = s.annotations.clone();
             entries.extend(copies.iter().cloned());
             match s.commit(entries) {
@@ -2467,6 +2538,7 @@ impl Viewer {
         }
         let mut duplicate = false;
         let mut delete = false;
+        let mut copy_image = false;
         let mut save_asset = false;
         let mut edit_svg = None;
         let mut update_library = false;
@@ -2504,9 +2576,22 @@ impl Viewer {
                             );
                         });
                         ui.separator();
-                        let editable = tab.session.as_ref().is_some_and(|s| s.editable);
+                        if matches!(selected.kind, Kind::Image { .. }) {
+                            copy_image = ui.add(ActionButton::new(Icon::Copy, "Copy image"))
+                                .on_hover_text("Paste this image, including its appearance, onto another page or another open PDF")
+                                .clicked();
+                            if ui.add_enabled(!selected.object.locked, ActionButton::new(Icon::Crop, "Crop image…")).clicked() {
+                                self.workbench.request = Some("crop_object".into());
+                            }
+                            ui.separator();
+                        }
+                        if ui.add(ActionButton::new(Icon::Copy, "Repeat on pages…")).clicked() { self.workbench.request = Some("repeat_objects".into()); }
+                        if selected.object.locked { ui.weak("Locked · Unlock in the Marks panel"); }
+                        let editable = tab.session.as_ref().is_some_and(|s| s.editable) && !selected.object.locked;
                         ui.add_enabled_ui(editable, |ui| {
                             let a = self.editor.draft.as_mut().unwrap();
+                            if let Some(styles::Preset::Drawing(style))=styles::panel(ui, styles::Preset::Drawing(a.style.clone())) { a.style=style; }
+
                             if let Some(text) = a.kind.text_mut() {
                                 let r = ui.add(
                                     egui::TextEdit::multiline(text)
@@ -2718,7 +2803,7 @@ impl Viewer {
                         });
                         if !editable {
                             ui.label(
-                                RichText::new("Read-only document")
+                                RichText::new(if selected.object.locked { "Unlock in Marks to edit" } else { "Read-only document" })
                                     .small()
                                     .color(theme::muted()),
                             );
@@ -2837,7 +2922,14 @@ impl Viewer {
                     asset.id = format!("{:032x}", rand::random::<u128>());
                     asset.name = format!("{} custom", asset.name);
                 }
-                asset.kind = current.kind.clone();
+                asset.kind = if let Kind::Image { png } = &current.kind {
+                    Kind::Image {
+                        png: mypdf_milestone0::object_tools::cropped(png, current.object.crop)
+                            .unwrap_or_else(|_| png.clone()),
+                    }
+                } else {
+                    current.kind.clone()
+                };
                 asset.style = current.style.clone();
                 asset.aspect =
                     (current.rect[2] - current.rect[0]) / (current.rect[3] - current.rect[1]);
@@ -2867,7 +2959,17 @@ impl Viewer {
         if save_asset {
             let asset = Asset::new(
                 &self.editor.asset_name,
-                self.editor.draft.as_ref().unwrap_or(&selected).kind.clone(),
+                {
+                    let a = self.editor.draft.as_ref().unwrap_or(&selected);
+                    if let Kind::Image { png } = &a.kind {
+                        Kind::Image {
+                            png: mypdf_milestone0::object_tools::cropped(png, a.object.crop)
+                                .unwrap_or_else(|_| png.clone()),
+                        }
+                    } else {
+                        a.kind.clone()
+                    }
+                },
                 self.editor
                     .draft
                     .as_ref()
@@ -2882,6 +2984,9 @@ impl Viewer {
                 }
                 Err(e) => self.status = Some((e, true)),
             }
+        }
+        if copy_image {
+            self.copy_marks(ctx, false);
         }
         if delete {
             self.editor_delete();
@@ -4331,6 +4436,51 @@ mod tests {
             });
         }
         input(app, ctx, events);
+    }
+    #[test]
+    fn rotation_handle_drag_is_one_undo_step_and_keeps_object_center() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        app.editor.mode = Mode::Draw;
+        app.editor.tool = Tool::Select;
+        let mark = Annotation::new(
+            0,
+            [150., 150., 250., 220.],
+            Kind::Rectangle,
+            Default::default(),
+        );
+        app.tabs[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .commit(vec![mark.clone()])
+            .unwrap();
+        selection::set(&mut app.tabs[0], &mut app.editor, vec![mark.id.clone()]);
+        let revision = app.tabs[0].session.as_ref().unwrap().revision();
+        input(&mut app, &ctx, vec![]);
+        input(&mut app, &ctx, vec![]);
+        let start = manipulation::rotation_handle(&mark, 1.).unwrap();
+        pointer(&mut app, &ctx, start, Some(true));
+        pointer(&mut app, &ctx, [260., 150.], None);
+        pointer(&mut app, &ctx, [260., 185.], None);
+        pointer(&mut app, &ctx, [260., 185.], Some(false));
+        let s = app.tabs[0].session.as_mut().unwrap();
+        assert_eq!(s.revision(), revision + 1);
+        assert!(
+            (s.annotations[0].rotation - 90.).abs() < 0.01,
+            "{:?}",
+            s.annotations[0]
+        );
+        assert_eq!(s.annotations[0].rect, mark.rect);
+        s.undo();
+        assert_eq!(s.annotations, vec![mark]);
     }
     #[test]
     fn corner_resizing_anchors_the_opposite_corner_and_can_keep_proportions() {

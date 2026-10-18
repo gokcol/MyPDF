@@ -243,6 +243,24 @@ impl Default for Style {
         }
     }
 }
+/// Editable object metadata travels with the artwork, including through the clipboard.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ObjectProperties {
+    #[serde(default)]
+    pub review: crate::review::Review,
+    /// A persistent, page-local group. Copies receive independent group IDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub locked: bool,
+    /// Normalized source-image coordinates. Original pixels are never discarded.
+    #[serde(default)]
+    pub crop: Option<Box2>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Annotation {
     pub id: String,
@@ -257,6 +275,8 @@ pub struct Annotation {
     pub style: Style,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset_id: Option<String>,
+    #[serde(default)]
+    pub object: ObjectProperties,
 }
 impl Annotation {
     pub fn new(page: usize, rect: Box2, kind: Kind, style: Style) -> Self {
@@ -270,6 +290,7 @@ impl Annotation {
             kind,
             style,
             asset_id: None,
+            object: ObjectProperties::default(),
         }
     }
     pub fn validate(&self) -> Result<()> {
@@ -307,6 +328,35 @@ impl Annotation {
                 && (1.0..=144.0).contains(&self.style.font_size),
             "Invalid annotation style"
         );
+        ensure!(
+            self.object.name.chars().count() <= 200,
+            "Object name is too long"
+        );
+        ensure!(
+            self.object
+                .group
+                .as_ref()
+                .is_none_or(|g| g.len() == 32 && g.bytes().all(|c| c.is_ascii_hexdigit())),
+            "Invalid object group"
+        );
+        ensure!(
+            self.object.review.author.chars().count() <= 200
+                && self.object.review.replies.len() <= 100
+                && self
+                    .object
+                    .review
+                    .replies
+                    .iter()
+                    .all(|r| r.author.chars().count() <= 200 && r.text.len() <= 16000),
+            "Review thread exceeds its limit"
+        );
+        if let Some(crop) = self.object.crop {
+            ensure!(
+                matches!(self.kind, Kind::Image { .. }),
+                "Only images can be cropped"
+            );
+            crate::object_tools::validate_crop(crop)?;
+        }
         self.kind.validate()?;
         if let Kind::Image { png } = &self.kind {
             crate::image_effects::blurred(png, self.style.image_blur)?;
@@ -379,6 +429,9 @@ impl Annotation {
     /// Hit the drawing itself rather than the empty corners of a diagonal line's box.
     /// Tolerance is supplied in page points, so the UI can keep a constant screen target.
     pub fn hit_test(&self, p: Point2, tolerance: f32) -> bool {
+        if self.object.hidden {
+            return false;
+        }
         let p = self.untransformed(p);
         let tolerance = tolerance + self.style.width / 2.;
         let paths = if self.style.stroke == StrokeStyle::Wave {
@@ -428,6 +481,8 @@ impl Annotation {
     pub fn duplicate(&self) -> Self {
         let mut next = self.clone();
         next.id = format!("{:032x}", rand::random::<u128>());
+        next.object.locked = false;
+        next.object.group = None;
         next.rect[0] += 12.0;
         next.rect[1] += 12.0;
         next.rect[2] += 12.0;
@@ -465,6 +520,8 @@ struct Snapshot {
     source: Arc<[u8]>,
     annotations: Vec<Annotation>,
     revision: u64,
+    name: Option<String>,
+    focus: Option<(usize, Option<Box2>)>,
 }
 pub struct Session {
     pub source: Arc<[u8]>,
@@ -475,6 +532,8 @@ pub struct Session {
     revision: u64,
     next: u64,
     saved: u64,
+    name: Option<String>,
+    focus: Option<(usize, Option<Box2>)>,
 }
 impl Session {
     pub fn new(source: Arc<[u8]>, annotations: Vec<Annotation>, editable: bool) -> Self {
@@ -487,6 +546,8 @@ impl Session {
             revision: 0,
             next: 0,
             saved: 0,
+            name: None,
+            focus: None,
         }
     }
     pub fn revision(&self) -> u64 {
@@ -529,6 +590,19 @@ impl Session {
         for a in &annotations {
             a.validate()?;
         }
+        // A locked object can be renamed, shown/hidden, or explicitly unlocked,
+        // but ordinary transforms, formatting and delete cannot change it.
+        for old in self.annotations.iter().filter(|a| a.object.locked) {
+            let new = annotations
+                .iter()
+                .find(|a| a.id == old.id)
+                .ok_or_else(|| anyhow::anyhow!("Unlock the object before deleting it"))?;
+            let mut allowed = old.clone();
+            allowed.object.name = new.object.name.clone();
+            allowed.object.hidden = new.object.hidden;
+            allowed.object.locked = new.object.locked;
+            ensure!(&allowed == new, "Unlock the object before editing it");
+        }
         if annotations == self.annotations {
             return Ok(());
         }
@@ -541,14 +615,52 @@ impl Session {
                 source: self.source.clone(),
                 annotations: self.annotations.clone(),
                 revision: self.revision,
+                name: self.name.clone(),
+                focus: self.focus,
             });
         }
         if self.past.len() > 100 {
             self.past.remove(0);
         }
         self.future.clear();
+        self.name = None;
         self.next += 1;
         self.revision = self.next;
+        let before: std::collections::HashMap<_, _> = self
+            .annotations
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (&a.id, (i, a)))
+            .collect();
+        let after: std::collections::HashMap<_, _> = annotations
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (&a.id, (i, a)))
+            .collect();
+        let changed: Vec<_> = annotations
+            .iter()
+            .enumerate()
+            .filter(|(i, a)| before.get(&a.id).is_none_or(|old| *old != (*i, *a)))
+            .map(|(_, a)| a)
+            .chain(
+                self.annotations
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, a)| after.get(&a.id).is_none_or(|new| *new != (*i, *a)))
+                    .map(|(_, a)| a),
+            )
+            .collect();
+        self.focus = changed.first().map(|first| {
+            let points: Vec<_> = changed
+                .iter()
+                .filter(|a| a.page == first.page)
+                .flat_map(|a| {
+                    let b = a.bounds();
+                    [[b[0], b[1]], [b[2], b[3]]]
+                })
+                .collect();
+            (first.page, Some(bounds(&points)))
+        });
         self.annotations = annotations;
         Ok(())
     }
@@ -562,10 +674,14 @@ impl Session {
             source: self.source.clone(),
             annotations: self.annotations.clone(),
             revision: self.revision,
+            name: self.name.clone(),
+            focus: self.focus,
         });
         self.future.clear();
+        self.focus = Some((0, None));
         self.source = bytes.into();
         self.annotations = annotations;
+        self.name = None;
         self.next += 1;
         self.revision = self.next;
         // Bound unique PDF revisions as well as the number of undo steps.
@@ -591,8 +707,12 @@ impl Session {
                 source: std::mem::replace(&mut self.source, previous.source),
                 annotations: std::mem::replace(&mut self.annotations, previous.annotations),
                 revision: self.revision,
+                name: self.name.clone(),
+                focus: self.focus,
             });
             self.revision = previous.revision;
+            self.name = previous.name;
+            self.focus = previous.focus;
         }
     }
     pub fn redo(&mut self) {
@@ -601,8 +721,80 @@ impl Session {
                 source: std::mem::replace(&mut self.source, next.source),
                 annotations: std::mem::replace(&mut self.annotations, next.annotations),
                 revision: self.revision,
+                name: self.name.clone(),
+                focus: self.focus,
             });
             self.revision = next.revision;
+            self.name = next.name;
+            self.focus = next.focus;
+        }
+    }
+    pub fn set_change_focus(&mut self, page: usize, rect: Option<Box2>) {
+        self.focus = Some((page, rect));
+    }
+    pub fn undo_focus(&self) -> Option<(usize, Option<Box2>)> {
+        self.past.last().and(self.focus)
+    }
+    pub fn redo_focus(&self) -> Option<(usize, Option<Box2>)> {
+        self.future.last().and_then(|s| s.focus)
+    }
+    pub fn name_last_change(&mut self, name: impl Into<String>) {
+        self.name = Some(name.into());
+    }
+    pub fn undo_label(&self) -> Option<String> {
+        self.past.last().map(|s| {
+            self.name.clone().unwrap_or_else(|| {
+                change_label(&s.source, &s.annotations, &self.source, &self.annotations)
+            })
+        })
+    }
+    pub fn redo_label(&self) -> Option<String> {
+        self.future.last().map(|s| {
+            s.name.clone().unwrap_or_else(|| {
+                change_label(&self.source, &self.annotations, &s.source, &s.annotations)
+            })
+        })
+    }
+    /// Ordered states, including states available through Redo. The cursor is current.
+    pub fn history(&self) -> (usize, Vec<String>) {
+        let mut states: Vec<(&Arc<[u8]>, &[Annotation])> = self
+            .past
+            .iter()
+            .map(|s| (&s.source, s.annotations.as_slice()))
+            .collect();
+        states.push((&self.source, &self.annotations));
+        states.extend(
+            self.future
+                .iter()
+                .rev()
+                .map(|s| (&s.source, s.annotations.as_slice())),
+        );
+        let mut labels = vec!["Earlier state".to_owned()];
+        labels.extend(
+            states
+                .windows(2)
+                .map(|w| change_label(w[0].0, w[0].1, w[1].0, w[1].1)),
+        );
+        let names = self
+            .past
+            .iter()
+            .map(|s| &s.name)
+            .chain(std::iter::once(&self.name))
+            .chain(self.future.iter().rev().map(|s| &s.name));
+        for (label, name) in labels.iter_mut().zip(names) {
+            if let Some(name) = name {
+                *label = name.clone();
+            }
+        }
+        (self.past.len(), labels)
+    }
+    pub fn seek_history(&mut self, cursor: usize) {
+        let target = cursor.min(self.past.len() + self.future.len());
+        while self.past.len() > target {
+            self.undo();
+        }
+        while self.past.len() < target {
+            self.redo();
         }
     }
     pub fn snapshot_bytes(&self) -> Result<Vec<u8>> {
@@ -612,6 +804,72 @@ impl Session {
             export(&self.source, &self.annotations)
         }
     }
+}
+
+fn change_label(
+    old_source: &Arc<[u8]>,
+    old: &[Annotation],
+    source: &Arc<[u8]>,
+    new: &[Annotation],
+) -> String {
+    if !Arc::ptr_eq(old_source, source) {
+        return "Edit PDF content or pages".into();
+    }
+    if new.len() > old.len() {
+        let n = new.len() - old.len();
+        return format!("Add {n} {}", if n == 1 { "object" } else { "objects" });
+    }
+    if new.len() < old.len() {
+        let n = old.len() - new.len();
+        return format!("Delete {n} {}", if n == 1 { "object" } else { "objects" });
+    }
+    let by_id: std::collections::HashMap<_, _> = new.iter().map(|a| (a.id.as_str(), a)).collect();
+    if old.iter().any(|a| !by_id.contains_key(a.id.as_str())) {
+        return "Replace objects".into();
+    }
+    let changed: Vec<_> = old
+        .iter()
+        .filter_map(|a| {
+            by_id
+                .get(a.id.as_str())
+                .copied()
+                .filter(|b| a != *b)
+                .map(|b| (a, b))
+        })
+        .collect();
+    if changed.is_empty() {
+        return "Reorder objects".into();
+    }
+    let (a, b) = changed[0];
+    let verb = if a.object.crop != b.object.crop {
+        "Crop"
+    } else if a.object.hidden != b.object.hidden {
+        if b.object.hidden { "Hide" } else { "Show" }
+    } else if a.object.locked != b.object.locked {
+        if b.object.locked { "Lock" } else { "Unlock" }
+    } else if a.object.name != b.object.name {
+        "Rename"
+    } else if a.rotation != b.rotation {
+        "Rotate"
+    } else if a.flip_x != b.flip_x || a.flip_y != b.flip_y {
+        "Flip"
+    } else if a.rect != b.rect {
+        "Move or resize"
+    } else {
+        "Format"
+    };
+    format!(
+        "{verb} {}",
+        if changed.len() == 1 {
+            if matches!(a.kind, Kind::Image { .. }) {
+                "image".into()
+            } else {
+                a.kind.label().to_lowercase()
+            }
+        } else {
+            format!("{} objects", changed.len())
+        }
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -836,6 +1094,9 @@ pub fn triangulate(polygon: &[Point2]) -> Vec<[Point2; 3]> {
 }
 
 pub fn primitives(a: &Annotation) -> Vec<Primitive> {
+    if a.object.hidden {
+        return vec![];
+    }
     raw_primitives(a)
         .into_iter()
         .enumerate()
@@ -1092,8 +1353,7 @@ fn raw_primitives(a: &Annotation) -> Vec<Primitive> {
             .unwrap_or_default(),
         Kind::Image { png } => {
             let mut result = vec![Primitive::Image {
-                png: crate::image_effects::blurred(png, a.style.image_blur)
-                    .unwrap_or_else(|_| png.clone()),
+                png: crate::object_tools::image_appearance(a).unwrap_or_else(|_| png.clone()),
                 rect: r,
             }];
             if a.style.image_border {
@@ -1198,7 +1458,9 @@ pub fn appearance(
     if let Some(font) = font {
         resources.set("Font", dictionary! { "UF" => font.id });
     }
-    let primitives = if let Kind::Svg { source, tint } = &a.kind {
+    let primitives = if a.object.hidden {
+        vec![]
+    } else if let Kind::Svg { source, tint } = &a.kind {
         let (id, w, h) = crate::svg::embed(doc, source, tint.then_some(a.style.color))?;
         resources.set("XObject", dictionary! { "Svg" => id });
         content.push_str(&format!(
@@ -1362,7 +1624,7 @@ pub fn export(bytes: &[u8], annotations: &[Annotation]) -> Result<Vec<u8>> {
             Kind::Polygon { .. } => "PolyLine",
             _ => "Stamp",
         };
-        let mut d = dictionary! { "Type" => "Annot", "Subtype" => subtype, "Rect" => pdf_numbers(rect), "P" => page_id, "F" => 4, "NM" => Object::string_literal(format!("MyPDF-{}", a.id)), "T" => text_string("MyPDF"), "C" => pdf_numbers(a.style.color), "CA" => a.style.opacity, "BS" => dictionary! { "W" => a.style.width, "S" => "S" }, "AP" => dictionary! { "N" => ap }, "MyPDFData" => Object::string_literal(serde_json::to_string(a)?) };
+        let mut d = dictionary! { "Type" => "Annot", "Subtype" => subtype, "Rect" => pdf_numbers(rect), "P" => page_id, "F" => (if a.object.hidden { 2 } else { 4 } | if a.object.locked { 128 } else { 0 }), "NM" => Object::string_literal(format!("MyPDF-{}", a.id)), "T" => text_string("MyPDF"), "C" => pdf_numbers(a.style.color), "CA" => a.style.opacity, "BS" => dictionary! { "W" => a.style.width, "S" => "S" }, "AP" => dictionary! { "N" => ap }, "MyPDFData" => Object::string_literal(serde_json::to_string(a)?) };
         if let Some(dash) = a.style.stroke.dash_array(a.style.width) {
             d.set(
                 "BS",
@@ -1371,6 +1633,16 @@ pub fn export(bytes: &[u8], annotations: &[Annotation]) -> Result<Vec<u8>> {
         }
         if let Some(text) = a.kind.text() {
             d.set("Contents", text_string(text));
+        }
+        if !a.object.review.author.is_empty() {
+            d.set("T", text_string(&a.object.review.author));
+        }
+        if !a.object.review.replies.is_empty() {
+            let mut text = a.kind.text().unwrap_or(a.kind.label()).to_owned();
+            for reply in &a.object.review.replies {
+                text.push_str(&format!("\n\n{}: {}", reply.author, reply.text));
+            }
+            d.set("Contents", text_string(&text));
         }
         let point = |p: Point2| {
             let p = a.rotated(p);

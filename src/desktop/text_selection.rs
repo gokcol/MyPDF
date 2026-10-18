@@ -28,6 +28,67 @@ impl TextSelection {
             .map(str::to_owned)
             .filter(|t| !t.trim().is_empty())
     }
+    pub(super) fn contains(&self, tab: &Tab, p: [f32; 2]) -> bool {
+        self.rects(tab).iter().any(|r| {
+            p[0] >= r[0] - 2. && p[0] <= r[2] + 2. && p[1] >= r[1] - 2. && p[1] <= r[3] + 2.
+        })
+    }
+    pub(super) fn rects(&self, tab: &Tab) -> Vec<[f32; 4]> {
+        let Some(text) = tab.text.get(self.page).and_then(Option::as_ref) else {
+            return vec![];
+        };
+        let (lo, hi) = self.span();
+        let mut bands: Vec<[f32; 4]> = vec![];
+        for g in text.glyphs.iter().skip(lo).take(hi + 1 - lo) {
+            let r = g.rect;
+            match bands.last_mut() {
+                Some(b)
+                    if r[1] < b[3] && r[3] > b[1] && r[0] >= b[0] - 2. && r[0] <= b[2] + 12. =>
+                {
+                    b[0] = b[0].min(r[0]);
+                    b[1] = b[1].min(r[1]);
+                    b[2] = b[2].max(r[2]);
+                    b[3] = b[3].max(r[3]);
+                }
+                _ => bands.push(r),
+            }
+        }
+        bands
+    }
+    pub(super) fn word_at(tab: &Tab, page: usize, p: [f32; 2]) -> Option<Self> {
+        let text = tab.text.get(page)?.as_ref()?;
+        if !over_text(text, p) {
+            return None;
+        }
+        let i = nearest(text, p)?;
+        let word = |i: usize| {
+            text.text
+                .get(text.glyphs[i].range.clone())
+                .is_some_and(|s| !s.trim().is_empty())
+        };
+        if !word(i) {
+            return None;
+        }
+        let mut lo = i;
+        let mut hi = i;
+        let same_line = |i: usize, j: usize| {
+            let a = text.glyphs[i].rect;
+            let b = text.glyphs[j].rect;
+            a[1] < b[3] && a[3] > b[1] && (a[0] - b[2]).abs().min((b[0] - a[2]).abs()) < 12.
+        };
+        while lo > 0 && word(lo - 1) && same_line(lo, lo - 1) {
+            lo -= 1;
+        }
+        while hi + 1 < text.glyphs.len() && word(hi + 1) && same_line(hi, hi + 1) {
+            hi += 1;
+        }
+        Some(Self {
+            tab: tab.id,
+            page,
+            anchor: lo,
+            focus: hi,
+        })
+    }
     /// Every glyph of a page.
     pub fn all(tab: &Tab, page: usize) -> Option<Self> {
         let text = tab.text.get(page)?.as_ref()?;

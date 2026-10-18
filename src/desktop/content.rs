@@ -7,12 +7,15 @@ use mypdf_milestone0::{
     text_style::{self, Alignment, TextFormat},
 };
 
+#[path = "context_menu.rs"]
+pub(super) mod context;
 #[path = "text_formatting.rs"]
 mod formatting;
 #[path = "image_effects.rs"]
 mod image_effects;
 #[path = "image_region.rs"]
 mod region;
+pub(super) use context::{page_menu, smart_select};
 
 type Key = (u64, u64, usize);
 #[derive(Clone, PartialEq, Debug)]
@@ -73,6 +76,10 @@ type Change = Result<(u64, u64, Vec<u8>, Option<String>), String>;
 type Output = Result<(String, Option<PathBuf>), String>;
 #[derive(Clone)]
 pub(super) enum Edit {
+    Navigation {
+        bookmarks: Option<Vec<mypdf_milestone0::navigation_edit::Bookmark>>,
+        labels: Option<Vec<mypdf_milestone0::navigation_edit::LabelRule>>,
+    },
     AddText {
         spans: Vec<mypdf_milestone0::rich_text::Span>,
         page: u32,
@@ -163,6 +170,10 @@ pub(super) enum AfterText {
     Close(Option<u64>),
 }
 pub(super) struct ContentState {
+    pub(super) hide_guides: bool,
+    context: context::State,
+    change_page: usize,
+    change_name: &'static str,
     pub(super) after_text: Option<AfterText>,
     existing: Option<InlineText>,
     next_existing: Option<InlineText>,
@@ -366,6 +377,10 @@ impl ContentState {
         let (inspect_tx, inspect_rx) = mpsc::channel();
         let (output_tx, output_rx) = mpsc::channel();
         Self {
+            hide_guides: false,
+            context: Default::default(),
+            change_page: 0,
+            change_name: "Edit PDF content",
             after_text: None,
             existing: None,
             next_existing: None,
@@ -442,6 +457,8 @@ impl Viewer {
                         }
                         match s.commit_document(bytes) {
                             Ok(()) => {
+                                s.name_last_change(self.content.change_name);
+                                s.set_change_focus(self.content.change_page, None);
                                 tab.keep_stale = true;
                                 self.editor.draft = None;
                                 self.content.key = None;
@@ -553,6 +570,7 @@ impl Viewer {
         if self.content.busy || self.organizer.busy || !self.apply_pending_annotation() {
             return;
         }
+        self.content.change_page = self.tabs.get(self.active).map_or(0, |t| t.page);
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
@@ -568,6 +586,21 @@ impl Viewer {
         );
         let tx = self.content.tx.clone();
         let wake = ctx.clone();
+        self.content.change_name = match &edit {
+            Edit::AddText { .. } => "Add text",
+            Edit::Text { .. } | Edit::Block { .. } => "Edit text",
+            Edit::Image { .. } => "Edit image",
+            Edit::AddImage { .. } => "Add image",
+            Edit::HeaderFooter(_) => "Add header or footer",
+            Edit::RemoveHeaderFooter(_) => "Remove header or footer",
+            Edit::Redact { .. } => "Redact content",
+            Edit::Flatten { .. } => "Flatten PDF",
+            Edit::Watermark(_) => "Add watermark",
+            Edit::RemoveWatermarks => "Remove watermarks",
+            Edit::ReduceSize(_) => "Reduce file size",
+            Edit::RecognizeText(_) => "Recognize text",
+            _ => "Edit form fields",
+        };
         self.content.busy = true;
         self.status = Some(("Applying changes…".into(), false));
         std::thread::spawn(move || {
@@ -713,6 +746,12 @@ impl Viewer {
                                 if chosen.len() == 1 { "" } else { "s" }
                             ));
                             bytes
+                        }
+                        Edit::Navigation{bookmarks,labels} => {
+                            let mut result=bytes;
+                            if let Some(b)=bookmarks {result=mypdf_milestone0::navigation_edit::set_bookmarks(&result,&b)?;}
+                            if let Some(l)=labels {result=mypdf_milestone0::navigation_edit::set_labels(&result,&l)?;}
+                            result
                         }
                         Edit::RecognizeText(progress) => {
                             use std::sync::atomic::Ordering;
@@ -1039,7 +1078,7 @@ impl Viewer {
         if self.editor.mode != editing::Mode::Edit {
             return;
         }
-        if self.content.add_target.is_none() && !self.content.image_mode {
+        if self.content.add_target.is_none() {
             self.inspect_content(ctx);
         }
         let editable = self
@@ -2008,7 +2047,11 @@ fn existing_overlay(
             }
         }
     }
-    for a in session.annotations.iter().filter(|a| a.page == page) {
+    for a in session
+        .annotations
+        .iter()
+        .filter(|a| a.page == page && !a.object.hidden && !a.object.locked)
+    {
         if let mypdf_milestone0::annotations::Kind::Text { text } = &a.kind {
             candidates.push(InlineText {
                 key,
@@ -2144,7 +2187,7 @@ fn existing_overlay(
                 ),
             )
         });
-        if response.hovered() {
+        if response.hovered() && !state.hide_guides {
             painter.rect_stroke(
                 r,
                 2.,
@@ -2262,8 +2305,10 @@ fn existing_overlay(
         painter.rect_filled(original.expand(1.5), 0., Color32::WHITE);
     }
     let outline = rect.expand2(vec2(5., 3.));
-    ui::dashed_rect(&painter, outline, theme::accent());
-    if !block {
+    if !state.hide_guides {
+        ui::dashed_rect(&painter, outline, theme::accent());
+    }
+    if !block && !state.hide_guides {
         for center in [outline.left_center(), outline.right_center()] {
             painter.circle_filled(center, 4.5, Color32::WHITE);
             painter.circle_stroke(center, 4.5, Stroke::new(1.5, theme::accent()));
@@ -2306,8 +2351,10 @@ fn existing_overlay(
             } else {
                 egui::TextEdit::singleline(&mut draft.text).margin(ui::FIELD_MARGIN)
             };
-            let output = edit
-                .id(egui::Id::new((tab.id, page, "inline_existing_text")))
+            let text_id = egui::Id::new((tab.id, page, "inline_existing_text"));
+            let retained_selection = context::secondary_selection(ui.ctx(), text_id);
+            let mut output = edit
+                .id(text_id)
                 .font(font.clone())
                 .text_color(color)
                 .frame(false)
@@ -2317,6 +2364,14 @@ fn existing_overlay(
                 .char_limit(32768)
                 .layouter(&mut layouter)
                 .show(ui);
+            context::restore_secondary_selection(&mut output, retained_selection);
+            context::text_menu(
+                &mut output,
+                &mut draft.text,
+                &mut state.new_commit,
+                &mut state.show_text_inspector,
+                &mut state.context.cancel_text,
+            );
             if let InlineTarget::Block(b) = &mut draft.target {
                 formatting::capture(&draft.text, &mut b.selected_chars, output.cursor_range);
             }
@@ -2425,7 +2480,9 @@ pub(super) fn overlay(
             let painter = ui
                 .painter()
                 .with_clip_rect(page_rect.intersect(ui.clip_rect()));
-            ui::dashed_rect(&painter, r.expand(2.), theme::accent());
+            if !state.hide_guides {
+                ui::dashed_rect(&painter, r.expand(2.), theme::accent());
+            }
             let move_rect = Rect::from_center_size(r.center_top() - vec2(0., 9.), vec2(40., 12.));
             painter.rect_filled(move_rect, 6., Color32::WHITE);
             painter.rect_stroke(
@@ -2485,9 +2542,11 @@ pub(super) fn overlay(
             };
             ui.scope_builder(egui::UiBuilder::new().max_rect(r), |ui| {
                 ui.set_clip_rect(r.intersect(page_rect).intersect(ui.clip_rect()));
-                let edit = egui::TextEdit::multiline(&mut state.new_text)
+                let text_id = egui::Id::new((tab.id, page, "inline_new_text"));
+                let retained_selection = context::secondary_selection(ui.ctx(), text_id);
+                let mut edit = egui::TextEdit::multiline(&mut state.new_text)
                     .margin(ui::FIELD_MARGIN)
-                    .id(egui::Id::new((tab.id, page, "inline_new_text")))
+                    .id(text_id)
                     .text_color(color)
                     .frame(false)
                     .margin(0.)
@@ -2498,6 +2557,14 @@ pub(super) fn overlay(
                     .hint_text("Type here")
                     .layouter(&mut layouter)
                     .show(ui);
+                context::restore_secondary_selection(&mut edit, retained_selection);
+                context::text_menu(
+                    &mut edit,
+                    &mut state.new_text,
+                    &mut state.new_commit,
+                    &mut state.show_text_inspector,
+                    &mut state.context.cancel_text,
+                );
                 formatting::capture(&state.new_text, &mut state.new_selection, edit.cursor_range);
                 if edit.response.changed() {
                     let fallback = formatting::span(
@@ -2588,36 +2655,33 @@ pub(super) fn overlay(
                 .collect()
         })
         .unwrap_or_default();
+    let background = ui.interact(
+        page_rect,
+        egui::Id::new((tab.id, page, "image_background")),
+        egui::Sense::click(),
+    );
+    if background.clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        state.selected = None;
+    }
     for (i, r, selected) in boxes {
         let r = Rect::from_min_max(
             page_rect.min + vec2(r[0], r[1]) * scale,
             page_rect.min + vec2(r[2], r[3]) * scale,
         );
-        painter.rect_filled(
-            r,
-            2.,
-            Color32::from_rgba_unmultiplied(39, 126, 216, if selected { 28 } else { 10 }),
+        let response = ui.interact(
+            r.intersect(page_rect),
+            egui::Id::new((tab.id, page, "content", i)),
+            egui::Sense::click(),
         );
-        painter.rect_stroke(
-            r,
-            2.,
-            Stroke::new(
-                if selected { 2. } else { 1. },
-                if selected {
-                    theme::accent()
-                } else {
-                    Color32::from_rgb(147, 183, 220)
-                },
-            ),
-            egui::StrokeKind::Inside,
-        );
-        if ui
-            .interact(
-                r.intersect(page_rect),
-                egui::Id::new((tab.id, page, "content", i)),
-                egui::Sense::click(),
-            )
-            .clicked()
+        if !state.hide_guides && (selected || response.hovered()) {
+            painter.rect_stroke(
+                r,
+                2.,
+                Stroke::new(if selected { 1.5 } else { 1. }, theme::accent()),
+                egui::StrokeKind::Outside,
+            );
+        }
+        if response.clicked()
             && let Ok(images) = &info.images
         {
             state.selected = Some(i);

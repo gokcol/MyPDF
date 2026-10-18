@@ -4,6 +4,7 @@ use super::*;
 use mypdf_milestone0::navigation::{self, Link, OutlineItem, Target};
 
 pub(super) struct NavData {
+    labels: Vec<String>,
     pub outline: Result<Vec<OutlineItem>, String>,
     pub links: Vec<Link>,
 }
@@ -14,6 +15,11 @@ pub(super) struct Nav {
     data: Option<NavData>,
 }
 
+impl Nav {
+    pub(super) fn label(&self, page: usize) -> Option<&str> {
+        self.data.as_ref()?.labels.get(page).map(String::as_str)
+    }
+}
 impl Tab {
     /// The document's outline and links, worked out in the background. While a
     /// changed document is read again, the previous ones stay.
@@ -26,13 +32,17 @@ impl Tab {
         {
             let (tx, rx) = mpsc::channel();
             let bytes = source.clone();
+            let count = self.pages.len();
             let wake = ctx.clone();
             std::thread::spawn(move || {
                 let data = std::panic::catch_unwind(|| NavData {
+                    labels: mypdf_milestone0::navigation_edit::labels(&bytes, count)
+                        .unwrap_or_default(),
                     outline: navigation::outline(&bytes).map_err(|e| format!("{e:#}")),
                     links: navigation::links(&bytes).unwrap_or_default(),
                 })
                 .unwrap_or_else(|_| NavData {
+                    labels: vec![],
                     outline: Err("The outline could not be read".into()),
                     links: vec![],
                 });

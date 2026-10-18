@@ -171,7 +171,7 @@ impl Viewer {
                 .is_some_and(|s| s.editable)
             && !self.content.busy
             && !self.organizer.busy;
-        let (mut add, mut cancel) = (false, false);
+        let (mut add, mut copy, mut cancel) = (false, false, false);
         let modal = egui::Modal::new(egui::Id::new("copy_region_preview"))
             .frame(ui::modal_frame()).show(ctx, |ui| {
                 ui.set_width(460.);
@@ -195,7 +195,7 @@ impl Viewer {
                     });
                 });
                 ui.add_space(8.);
-                ui.checkbox(&mut draft.cover, "Cover the original area");
+                ui.checkbox(&mut draft.cover, "Cover the original area when adding here");
                 if draft.cover {
                     ui.horizontal(|ui| { ui.label("Cover color"); ui.color_edit_button_srgb(&mut draft.color); });
                     ui.weak("Adds a separate rectangle behind the copy. The cover stays in place when you move the image; delete it to reveal the original.");
@@ -208,12 +208,18 @@ impl Viewer {
                 if !valid { ui.colored_label(theme::danger(), "The document or page changed. Cancel and select the region again."); }
                 ui.add_space(12.);
                 ui.horizontal(|ui| {
-                    let response = ui.add_enabled(valid && draft.preview.is_some() && draft.pending.is_none()
-                        && draft.error.is_none() && draft.rendered_dpi == Some(draft.dpi),
+                    let ready = valid && draft.preview.is_some() && draft.pending.is_none()
+                        && draft.error.is_none() && draft.rendered_dpi == Some(draft.dpi);
+                    let response = ui.add_enabled(ready,
                         ActionButton::new(Icon::Plus, "Add image layer").primary());
                     #[cfg(test)]
                     ctx.data_mut(|d| d.insert_temp(egui::Id::new("region_add_button"), response.rect));
                     add = response.clicked();
+                    let response = ui.add_enabled(ready, ActionButton::new(Icon::Copy, "Copy image"))
+                        .on_hover_text("Copy just the image, then paste on another page or in another open PDF. The source page stays unchanged.");
+                    #[cfg(test)]
+                    ctx.data_mut(|d| d.insert_temp(egui::Id::new("region_copy_button"), response.rect));
+                    copy = response.clicked();
                     cancel = ui.add(ActionButton::new(Icon::Close, "Cancel")).clicked();
                 });
             });
@@ -246,6 +252,29 @@ impl Viewer {
             let draft = self.content.region.draft.take().unwrap();
             let cover = draft.cover.then(|| draft.color.map(|c| c as f32 / 255.));
             self.use_region_copy(draft.key, draft.rect, draft.preview.unwrap().0, cover);
+        } else if copy {
+            let draft = self.content.region.draft.take().unwrap();
+            let mark = ann::Annotation::new(
+                draft.key.2,
+                draft.rect,
+                ann::Kind::Image {
+                    png: draft.preview.unwrap().0,
+                },
+                ann::Style::default(),
+            );
+            if self.copy_artwork(ctx, vec![mark]).is_some() {
+                let shortcut = if cfg!(target_os = "macos") {
+                    "⌘V"
+                } else {
+                    "Ctrl+V"
+                };
+                self.status = Some((
+                    format!(
+                        "Region copied • Go to another page or PDF tab and press {shortcut} • Source page unchanged"
+                    ),
+                    false,
+                ));
+            }
         } else if cancel || modal.should_close() {
             self.content.region.draft = None;
         }
@@ -305,6 +334,15 @@ mod tests {
             png.get_ref(),
         )
         .unwrap();
+        let source = mypdf_milestone0::pages::apply(
+            &source,
+            &mypdf_milestone0::pages::Operation::InsertBlank {
+                at: 1,
+                width: 300.,
+                height: 240.,
+            },
+        )
+        .unwrap();
         let images = content::images(&source, 1).unwrap();
         let index = images[0].index;
         assert_ne!(index, 0);
@@ -332,8 +370,8 @@ mod tests {
         });
         (app, ctx, index)
     }
-    fn frame(app: &mut Viewer, ctx: &egui::Context, events: Vec<egui::Event>) {
-        let _ = ctx.run(
+    fn frame(app: &mut Viewer, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
+        ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1000., 800.))),
                 events,
@@ -354,7 +392,7 @@ mod tests {
                 });
                 app.image_region_window(ctx);
             },
-        );
+        )
     }
     fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
         egui::Event::PointerButton {
@@ -422,5 +460,124 @@ mod tests {
         );
         app.editor_undo(false);
         assert!(app.tabs[0].session.as_ref().unwrap().annotations.is_empty());
+    }
+
+    #[test]
+    fn region_clipboard_crosses_pages_and_documents_without_changing_the_source() {
+        use crate::desktop::clipboard::{Clip, set_for_test};
+        let (mut app, ctx, _) = fixture();
+        let original = app.tabs[0].session.as_ref().unwrap().source.clone();
+        let revision = app.tabs[0].session.as_ref().unwrap().revision();
+        app.content.region.request = Some((app.content.key.unwrap(), [35., 35., 145., 105.]));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            frame(&mut app, &ctx, vec![]);
+            if app.region_preview_ready() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Even when a cover is checked, copying alone must not change the source.
+        app.content.region.draft.as_mut().unwrap().cover = true;
+        frame(&mut app, &ctx, vec![]);
+        let copy = ctx
+            .data(|d| d.get_temp::<Rect>(egui::Id::new("region_copy_button")))
+            .unwrap()
+            .center();
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(copy), button(copy, true)],
+        );
+        let output = frame(&mut app, &ctx, vec![button(copy, false)]);
+        let marker = output
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .expect("Copy image writes the object clipboard marker");
+        assert!(app.content.region.draft.is_none());
+        let s = app.tabs[0].session.as_ref().unwrap();
+        assert!(s.annotations.is_empty());
+        assert_eq!(s.revision(), revision);
+        assert_eq!(s.source, original);
+
+        // The normal Paste action targets page 2, keeping points and image pixels.
+        app.tabs[0].page = 1;
+        app.editor.mode = editing::Mode::Read;
+        app.editor.tool = editing::Tool::Rectangle;
+        set_for_test(Clip::Text(marker));
+        app.action("paste", &ctx);
+        app.place_pending_original();
+        assert_eq!(app.editor.mode, editing::Mode::Draw);
+        assert!(app.editor.tool == editing::Tool::Select);
+        let s = app.tabs[0].session.as_mut().unwrap();
+        assert_eq!(s.annotations.len(), 1, "The source cover is not copied");
+        let mut styled = s.annotations[0].clone();
+        assert_eq!(styled.page, 1);
+        assert_eq!(styled.rect, [35., 35., 145., 105.]);
+        styled.style.opacity = 0.65;
+        styled.style.image_blur = 2.;
+        styled.style.image_border = true;
+        styled.rotation = 17.;
+        styled.flip_x = true;
+        s.commit(vec![styled.clone()]).unwrap();
+        selection::set(&mut app.tabs[0], &mut app.editor, vec![styled.id.clone()]);
+        app.action("copy", &ctx);
+        let marker = ctx
+            .output(|o| {
+                o.commands.iter().rev().find_map(|c| match c {
+                    egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap();
+
+        let destination = convert::blank(600., 800.).unwrap();
+        app.open_memory(PathBuf::from("Destination.pdf"), destination, &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.tabs[1].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Clipboard artwork survives closing its source tab.
+        app.tabs.remove(0);
+        app.active = 0;
+        app.editor.mode = editing::Mode::Read;
+        set_for_test(Clip::Text(marker.clone()));
+        app.action("paste", &ctx);
+        app.place_pending_original();
+        let s = app.tabs[0].session.as_mut().unwrap();
+        assert_eq!(s.annotations.len(), 1);
+        let pasted = s.annotations[0].clone();
+        assert_eq!(pasted.page, 0);
+        assert_ne!(pasted.id, styled.id);
+        assert_eq!(pasted.rect, styled.rect);
+        assert_eq!(pasted.kind, styled.kind);
+        assert_eq!(pasted.style, styled.style);
+        assert_eq!((pasted.rotation, pasted.flip_x), (17., true));
+        let saved = s.snapshot_bytes().unwrap();
+        let reopened = ann::load(&lopdf::Document::load_mem(&saved).unwrap());
+        assert_eq!(reopened, vec![pasted.clone()]);
+        s.undo();
+        assert!(s.annotations.is_empty());
+        s.redo();
+        assert_eq!(s.annotations, vec![pasted.clone()]);
+        assert_eq!(app.tabs[0].selected_annotation.as_ref(), Some(&pasted.id));
+
+        // Paste cannot alter a protected destination.
+        let s = app.tabs[0].session.as_mut().unwrap();
+        let revision = s.revision();
+        s.editable = false;
+        set_for_test(Clip::Text(marker));
+        app.paste(&ctx);
+        let s = app.tabs[0].session.as_ref().unwrap();
+        assert_eq!(s.revision(), revision);
+        assert_eq!(s.annotations, vec![pasted]);
     }
 }
