@@ -141,10 +141,7 @@ impl Viewer {
         self.content.area_mode = false;
         self.redaction.active = true;
         self.inspector = true;
-        self.status = Some((
-            "Drag over what to redact, or search for words to mark · nothing is removed until you apply".into(),
-            false,
-        ));
+        self.status = None;
     }
 
     /// Mark every occurrence of the search text on the active document.
@@ -308,7 +305,7 @@ impl Viewer {
                     );
                     ui.radio_value(&mut self.redaction.flatten_pages, true, "Flatten marked pages to images");
                     ui.label(
-                        RichText::new("For pages MyPDF can't edit glyph by glyph. Those pages lose selectable text.")
+                        RichText::new("Recommended for sensitive vector artwork or complex pages. Rebuilds marked pages from visible pixels; those pages lose selectable text and editable objects.")
                             .size(11.5)
                             .color(theme::muted()),
                     );
@@ -325,11 +322,11 @@ impl Viewer {
                         ui.label("Redacting…");
                     });
                 }
-                ui.label(
-                    RichText::new("Vector drawings under a box are covered, not removed. Metadata and bookmarks are not changed.")
-                        .size(11.)
-                        .color(theme::muted()),
-                );
+                ui::callout(ui, ui::Tone::Warning, if self.redaction.flatten_pages {
+                    "Only marked pages are flattened. Metadata, bookmarks and other pages are not sanitized; review the saved copy before sharing."
+                } else {
+                    "Vector drawings can remain under the cover. For sensitive artwork, choose Flatten marked pages to images. Metadata and bookmarks are not sanitized."
+                });
                 });
             });
         if search {

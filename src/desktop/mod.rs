@@ -8,6 +8,7 @@ mod form_tools;
 mod header_footer;
 mod home;
 pub mod icon;
+mod interface;
 mod manipulation;
 mod menu;
 mod navigate;
@@ -25,17 +26,21 @@ mod recognize;
 mod recovery;
 mod redaction;
 mod review;
+mod save;
 mod selection;
 mod shrink;
 mod signatures;
 mod styles;
 mod text_selection;
 mod theme;
+mod translation;
+mod translation_note;
 mod ui;
 mod watermark;
 mod workbench;
 mod workspace;
 mod zen;
+use interface::{StatusContext, tab_caption};
 use ui::{ActionButton, Icon};
 
 use eframe::egui::{self, Color32, FontId, Rect, RichText, Stroke, TextureHandle, pos2, vec2};
@@ -46,6 +51,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 
 const CACHE_BUDGET: usize = 128 * 1024 * 1024;
+const HISTORY_BUDGET: usize = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Zoom {
@@ -61,6 +67,8 @@ struct Raster {
 struct Tab {
     id: u64,
     path: PathBuf,
+    /// False for new, imported, or recovered in-memory documents until first Save.
+    has_destination: bool,
     worker: Worker,
     bytes: Option<Arc<[u8]>>,
     pages: Vec<PageSize>,
@@ -217,11 +225,15 @@ enum TabClick {
     Close,
 }
 /// A document tab chip: PDF glyph, name, unsaved dot and a close button on hover.
-fn document_tab(ui: &mut egui::Ui, tab: &Tab, active: bool, dirty: bool) -> Option<TabClick> {
-    let mut name = tab.name();
-    if name.chars().count() > 28 {
-        name = format!("{}…", name.chars().take(27).collect::<String>());
-    }
+fn document_tab(
+    ui: &mut egui::Ui,
+    tab: &Tab,
+    active: bool,
+    dirty: bool,
+    reveal: bool,
+) -> Option<TabClick> {
+    let full_name = tab.name();
+    let name = tab_caption(&full_name);
     let font = FontId::proportional(13.);
     let galley = ui
         .painter()
@@ -229,8 +241,11 @@ fn document_tab(ui: &mut egui::Ui, tab: &Tab, active: bool, dirty: bool) -> Opti
     let size = vec2(galley.size().x + 74., 30.);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Button, true, active, name.as_str())
+        egui::WidgetInfo::selected(egui::WidgetType::Button, true, active, full_name.as_str())
     });
+    if reveal {
+        response.scroll_to_me(Some(egui::Align::Center));
+    }
     let close_rect =
         Rect::from_center_size(pos2(rect.right() - 16., rect.center().y), vec2(20., 20.));
     let close = ui.interact(
@@ -295,6 +310,10 @@ pub struct Viewer {
     digital: digital::DigitalState,
     tabs: Vec<Tab>,
     active: usize,
+    tab_revealed: Option<u64>,
+    tab_strip_width: f32,
+    status_context: Option<StatusContext>,
+    status_seen: Option<(String, bool)>,
     next_id: u64,
     tick: u64,
     sidebar: bool,
@@ -307,8 +326,10 @@ pub struct Viewer {
     focus_search: bool,
     status: Option<(String, bool)>,
     saving: bool,
-    /// The file name the next Save a Copy suggests.
+    /// The file name the next Save suggests.
     save_name: Option<String>,
+    save_intent: save::Intent,
+    saving_adopts: bool,
     /// A web or mail link waiting for the user to agree to open it.
     link_confirm: Option<String>,
     protect: Option<protect::ProtectDraft>,
@@ -343,6 +364,7 @@ pub struct Viewer {
     workspace: workspace::State,
     review: review::State,
     navigation_editor: Option<navigation_editor::Draft>,
+    translation: translation::State,
 }
 impl Viewer {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> Self {
@@ -360,6 +382,10 @@ impl Viewer {
             digital: digital::DigitalState::new(),
             tabs: vec![],
             active: 0,
+            tab_revealed: None,
+            tab_strip_width: 0.,
+            status_context: None,
+            status_seen: None,
             next_id: 0,
             tick: 0,
             sidebar: true,
@@ -369,6 +395,8 @@ impl Viewer {
             search: false,
             outline: false,
             save_name: None,
+            save_intent: save::Intent::Automatic,
+            saving_adopts: false,
             link_confirm: None,
             protect: None,
             unprotect: false,
@@ -402,6 +430,7 @@ impl Viewer {
             workspace: workspace::State::new(),
             review: review::State::default(),
             navigation_editor: None,
+            translation: translation::State::new(),
         };
         if paths.is_empty() {
             app.restore_workspace(&cc.egui_ctx);
@@ -438,6 +467,7 @@ impl Viewer {
         let view_preferences = saved_view.unwrap_or_default();
         self.tabs.push(Tab {
             id: self.next_id,
+            has_destination: true,
             path,
             worker,
             bytes: None,
@@ -528,13 +558,23 @@ impl Viewer {
         }
     }
     fn save_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(id) = self.tabs.get(self.active).map(|t| t.id)
+            && self.pending_form_edits(id)
+        {
+            self.focus_pending_form_edits(id);
+            self.status = Some((
+                "Apply or discard the pending form changes before saving.".into(),
+                false,
+            ));
+            return;
+        }
         if let Some(id) = self
             .content
             .pending_text()
             .filter(|id| self.tabs.get(self.active).is_some_and(|t| t.id == *id))
             && !self.content.busy
         {
-            self.content.after_text = Some(content::AfterText::Save(id));
+            self.content.after_text = Some(content::AfterText::Save(id, self.save_intent));
             self.content.new_commit = true;
             self.finish_new_text(ctx);
             return;
@@ -576,19 +616,30 @@ impl Viewer {
         let signed_original = tab.signed_original.clone();
         let password = tab.password.clone();
         let stem = tab.path.file_stem().unwrap_or_default().to_string_lossy();
-        let name = self
-            .save_name
-            .take()
-            .unwrap_or_else(|| format!("{stem}-copy.pdf"));
+        let adopts = self.save_intent.adopts();
+        let name = self.save_name.take().unwrap_or_else(|| {
+            if !tab.has_destination {
+                tab.name()
+            } else {
+                format!("{stem}-copy.pdf")
+            }
+        });
         let dialog = rfd::FileDialog::new()
-            .set_title("Save a Copy • choose a new filename")
+            .set_title(if adopts {
+                "Save PDF • choose a new filename"
+            } else {
+                "Save a Copy • source stays open"
+            })
             .add_filter("PDF document", &["pdf"])
             .set_file_name(name)
             .set_directory(tab.path.parent().unwrap_or(std::path::Path::new(".")));
         let Some(destination) = self.native_save(dialog) else {
             self.close_after_save = None;
+            self.save_intent = save::Intent::Automatic;
             return;
         };
+        self.saving_adopts = adopts;
+        self.save_intent = save::Intent::Automatic;
         self.saving = true;
         self.status = Some(("Saving a complete copy…".into(), false));
         let tx = self.save_tx.clone();
@@ -633,6 +684,7 @@ impl Viewer {
                 }
             }
             self.recovery.clear(self.tabs[index].id);
+            self.clear_form_drafts(self.tabs[index].id);
             self.tabs.remove(index);
             if self.active > index {
                 self.active -= 1;
@@ -654,6 +706,8 @@ impl Viewer {
             && matches!(
                 action,
                 "save"
+                    | "save_as"
+                    | "save_copy"
                     | "print"
                     | "protect"
                     | "unprotect"
@@ -682,10 +736,27 @@ impl Viewer {
             return;
         }
         match action {
+            "translate_selection" => self.translate_selection(ctx),
+            "translate_page" => self.translate_page(ctx),
+            "translation_languages" => self.translation_languages(ctx),
             "home" => self.show_home(),
             "new" => self.new_blank(ctx),
             "open" => self.open_dialog(ctx),
-            "save" => self.save_dialog(ctx),
+            "save" | "save_as" | "save_copy" => {
+                if self.content.busy || self.organizer.busy {
+                    self.status = Some((
+                        "Wait for the current operation before saving.".into(),
+                        false,
+                    ));
+                } else if !self.saving {
+                    self.save_intent = match action {
+                        "save_as" => save::Intent::As,
+                        "save_copy" => save::Intent::Copy,
+                        _ => save::Intent::Automatic,
+                    };
+                    self.save_dialog(ctx);
+                }
+            }
             "nup" => self.open_nup(),
             "close" => self.request_close(self.tabs.get(self.active).map(|t| t.id), ctx),
             "quit" => self.request_close(None, ctx),
@@ -771,7 +842,13 @@ impl Viewer {
             "paste" => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
             "select_all" => Self::text_command(ctx, egui::Key::A, false),
             "edit_undo" | "edit_redo" => {
-                if ctx.wants_keyboard_input() {
+                if self
+                    .tabs
+                    .get(self.active)
+                    .is_some_and(|tab| self.content.placement_undo_owns_input(ctx, tab.id))
+                {
+                    self.editor_undo(action == "edit_redo");
+                } else if ctx.wants_keyboard_input() {
                     Self::text_command(ctx, egui::Key::Z, action == "edit_redo");
                 } else if !self.home.visible {
                     self.editor_undo(action == "edit_redo");
@@ -917,22 +994,20 @@ impl Viewer {
             self.saving = false;
             self.status = Some(match saved {
                 Ok((path, id, revision)) => {
-                    self.home.remember(&path);
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
-                        if let Some(session) = &mut tab.session {
-                            session.mark_saved(revision);
-                        } else {
-                            tab.unsaved_on_load = false;
-                        }
-                        if !tab.unsaved_on_load && tab.session.as_ref().is_none_or(|s| !s.dirty()) {
-                            self.recovery.clear(id);
-                        }
-                    }
+                    self.finish_save(&path, id, revision, self.saving_adopts);
                     if let Some(intent) = self.close_after_save.take() {
                         self.request_close(intent, ctx);
                     }
                     (
-                        format!("Saved {} • source file preserved", path.display()),
+                        format!(
+                            "{} {} • original file preserved",
+                            if self.saving_adopts {
+                                "Saved"
+                            } else {
+                                "Exported a copy to"
+                            },
+                            path.display()
+                        ),
                         false,
                     )
                 }
@@ -1009,6 +1084,26 @@ impl Viewer {
             }
         }
         if !self.home.visible
+            && !self.digital.open
+            && !self.editor.signature_open
+            && !self.editor.library_open
+            && self
+                .tabs
+                .get(self.active)
+                .is_some_and(|tab| self.content.placement_undo_owns_input(ctx, tab.id))
+        {
+            if ctx.input_mut(|i| {
+                i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::Z,
+                )
+            }) {
+                self.editor_undo(true);
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
+                self.editor_undo(false);
+            }
+        }
+        if !self.home.visible
             && !ctx.wants_keyboard_input()
             && !self.editor.text_editing
             && !self.digital.open
@@ -1043,6 +1138,14 @@ impl Viewer {
         }
         // macOS menu accelerators own these shortcuts to prevent duplicate dialogs.
         if !cfg!(target_os = "macos") || self._native_menu.is_none() {
+            if ctx.input_mut(|i| {
+                i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::S,
+                )
+            }) {
+                self.action("save_as", ctx);
+            }
             for (key, action) in [
                 (egui::Key::N, "new"),
                 (egui::Key::O, "open"),
@@ -1105,61 +1208,122 @@ impl Viewer {
                     .inner_margin(egui::Margin::symmetric(12, 6)),
             )
             .show(ctx, |ui| {
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.;
-                        #[cfg(target_os = "macos")]
-                        ui.add_space(70.0);
-                        let (mark, _) =
-                            ui.allocate_exact_size(vec2(22., 22.), egui::Sense::hover());
-                        ui::logo(ui.painter(), mark);
-                        ui.add_space(3.);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.;
+                    #[cfg(target_os = "macos")]
+                    ui.add_space(70.);
+                    let (mark, _) = ui.allocate_exact_size(vec2(22., 22.), egui::Sense::hover());
+                    ui::logo(ui.painter(), mark);
+                    if ui.available_width() > 620. {
                         ui.label(
                             RichText::new("MyPDF")
                                 .font(ui::bold(ui, 14.))
                                 .color(theme::ink()),
                         );
-                        ui.add_space(12.0);
-                        if ui
-                            .add(
-                                ActionButton::new(Icon::Home, "Home")
-                                    .tab()
-                                    .selected(self.home.visible),
-                            )
-                            .on_hover_text("Home · ⇧⌘H")
-                            .clicked()
-                        {
-                            action = Some("home");
-                        }
-                        for (i, tab) in self.tabs.iter().enumerate() {
-                            let active = i == self.active && !self.home.visible;
-                            let dirty = tab.session.as_ref().is_some_and(|s| s.dirty());
-                            match document_tab(ui, tab, active, dirty) {
-                                Some(TabClick::Select) => {
-                                    self.active = i;
-                                    self.home.visible = false;
+                    }
+                    if ui
+                        .add(
+                            ActionButton::new(Icon::Home, "Home")
+                                .tab()
+                                .selected(self.home.visible),
+                        )
+                        .on_hover_text("Home · ⇧⌘H")
+                        .clicked()
+                    {
+                        action = Some("home");
+                    }
+                    let available = (ui.available_width() - 112.).max(40.);
+                    let selected = (!self.home.visible)
+                        .then(|| self.tabs.get(self.active).map(|t| t.id))
+                        .flatten();
+                    let reveal = selected != self.tab_revealed
+                        || (self.tab_strip_width - available).abs() > 1.;
+                    self.tab_revealed = selected;
+                    self.tab_strip_width = available;
+                    ui.allocate_ui_with_layout(
+                        vec2(available, 32.),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            egui::ScrollArea::horizontal()
+                                .id_salt("tab_strip")
+                                .auto_shrink([false, true])
+                                .scroll_bar_visibility(
+                                    egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                )
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        for (i, tab) in self.tabs.iter().enumerate() {
+                                            let active = selected == Some(tab.id);
+                                            let dirty = tab.unsaved_on_load
+                                                || tab.session.as_ref().is_some_and(|s| s.dirty());
+                                            match document_tab(
+                                                ui,
+                                                tab,
+                                                active,
+                                                dirty,
+                                                active && reveal,
+                                            ) {
+                                                Some(TabClick::Select) => {
+                                                    self.active = i;
+                                                    self.home.visible = false;
+                                                }
+                                                Some(TabClick::Close) => close = Some(i),
+                                                None => {}
+                                            }
+                                        }
+                                        let drag = ui.allocate_response(
+                                            vec2(ui.available_width().max(1.), 30.),
+                                            egui::Sense::drag(),
+                                        );
+                                        if drag.drag_started() {
+                                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                                        }
+                                    });
+                                });
+                        },
+                    );
+                    let response =
+                        ui.add(ActionButton::new(Icon::Outline, "All open tabs").compact());
+                    egui::Popup::menu(&response).show(|ui| {
+                        ui.set_width(280.);
+                        egui::ScrollArea::vertical()
+                            .max_height(360.)
+                            .show(ui, |ui| {
+                                if self.tabs.is_empty() {
+                                    ui.weak("No open documents");
                                 }
-                                Some(TabClick::Close) => close = Some(i),
-                                None => {}
-                            }
-                        }
-                        if ui
-                            .add(ActionButton::new(Icon::Plus, "Open PDF").compact())
-                            .clicked()
-                        {
-                            action = Some("open");
-                        }
-                        let drag = ui.allocate_response(
-                            vec2((ui.available_width() - 40.).max(1.0), 30.0),
-                            egui::Sense::drag(),
-                        );
-                        if drag.drag_started() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                        }
-                        if let Some(choice) = ui::theme_menu(ui) {
-                            action = Some(choice);
-                        }
-                    })
+                                for (i, tab) in self.tabs.iter().enumerate() {
+                                    let name = if tab.session.as_ref().is_some_and(|s| s.dirty()) {
+                                        format!("● {}", tab.name())
+                                    } else {
+                                        tab.name()
+                                    };
+                                    if ui
+                                        .selectable_label(
+                                            i == self.active && !self.home.visible,
+                                            name,
+                                        )
+                                        .on_hover_text(tab.path.display().to_string())
+                                        .clicked()
+                                    {
+                                        self.active = i;
+                                        self.home.visible = false;
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        ui.separator();
+                        ui.weak("Ctrl+Tab / Ctrl+Shift+Tab to switch");
+                    });
+                    if ui
+                        .add(ActionButton::new(Icon::Plus, "Open PDF").compact())
+                        .clicked()
+                    {
+                        action = Some("open");
+                    }
+                    if let Some(choice) = ui::theme_menu(ui) {
+                        action = Some(choice);
+                    }
                 });
             });
         if let Some(index) = close.take() {
@@ -1213,7 +1377,7 @@ impl Viewer {
                     for (icon, label, key) in [
                         (Icon::Blank, "New blank PDF", "new"),
                         (Icon::Open, "Open…", "open"),
-                        (Icon::Save, "Save a Copy…", "save"),
+                        (Icon::Save, "Save PDF…", "save"),
                         (Icon::Print, "Print… (⌘P)", "print"),
                         (Icon::Compare, "Compare Documents…", "compare"),
                     ] {
@@ -1299,7 +1463,7 @@ impl Viewer {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 5.;
-                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                    if let Some(tab) = self.tabs.get_mut(self.active).filter(|t| !t.pages.is_empty() && t.error.is_none()) {
                         if ui
                             .add(ActionButton::new(Icon::Minus, "Zoom out").compact())
                             .clicked()
@@ -1390,10 +1554,11 @@ impl Viewer {
 
                     ui.separator();
                     let session = self.tabs.get(self.active).and_then(|t| t.session.as_ref());
+                    let pending_text = self.tabs.get(self.active).is_some_and(|tab| self.content.has_pending_text_change(tab.id));
                     if ui
                         .add_enabled(
-                            session.is_some_and(|s| s.can_undo()),
-                            ActionButton::new(Icon::Undo, &session.and_then(|s| s.undo_label()).map(|s| format!("Undo {s}")).unwrap_or_else(|| "Undo".into())).compact(),
+                            !self.content.busy && !self.organizer.busy && (pending_text || session.is_some_and(|s| s.can_undo())),
+                            ActionButton::new(Icon::Undo, &if pending_text { "Undo text edit".into() } else { session.and_then(|s| s.undo_label()).map(|s| format!("Undo {s}")).unwrap_or_else(|| "Undo".into()) }).compact(),
                         )
                         .clicked()
                     {
@@ -1401,7 +1566,7 @@ impl Viewer {
                     }
                     if ui
                         .add_enabled(
-                            session.is_some_and(|s| s.can_redo()),
+                            !pending_text && !self.content.busy && !self.organizer.busy && session.is_some_and(|s| s.can_redo()),
                             ActionButton::new(Icon::Redo, &session.and_then(|s| s.redo_label()).map(|s| format!("Redo {s}")).unwrap_or_else(|| "Redo".into())).compact(),
                         )
                         .clicked()
@@ -1425,7 +1590,7 @@ impl Viewer {
                                 theme::warning()
                             },
                         );
-                        ui.label(RichText::new(label).size(11.5).color(theme::muted())).on_hover_text(if s.dirty() { "Your PDF has unsaved changes. Recovery copies are local backups; Save a Copy writes a PDF you can keep or share." } else { "No unsaved document changes." });
+                        ui.label(RichText::new(label).size(11.5).color(theme::muted())).on_hover_text(if s.dirty() { "Your PDF has unsaved changes. Save writes a new PDF and switches to it; Save a Copy exports without changing this document." } else { "No unsaved document changes." });
                     }
                     if let Some(tab) = self.tabs.get_mut(self.active) {
                         if tab.signed_original.is_some() {
@@ -1458,12 +1623,7 @@ impl Viewer {
                             self.status
                                 .as_ref()
                                 .map(|(s, _)| s.clone())
-                                .unwrap_or_else(|| {
-                                    self.tabs
-                                        .get(self.active)
-                                        .map(|t| t.name())
-                                        .unwrap_or_else(|| "Local files · Native Rust".into())
-                                });
+                                .unwrap_or_else(|| self.tool_guidance().into());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add(
                                 egui::Label::new(RichText::new(&message).size(11.5).color(theme::muted()))
@@ -1602,6 +1762,7 @@ impl Viewer {
         });
     }
     fn document(&mut self, ctx: &egui::Context) {
+        let mut error_action = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::canvas()))
             .show(ctx, |ui| {
@@ -1643,6 +1804,12 @@ impl Viewer {
                         ui.vertical_centered(|ui| {
                             ui.heading("Could not open this PDF");
                             ui.label(error);
+                            ui.add_space(16.);
+                            ui.horizontal(|ui| {
+                                if ui.add(ActionButton::new(Icon::Open, "Open another PDF…").primary()).clicked() { error_action = Some("open"); }
+                                if ui.add(ActionButton::new(Icon::Redo, "Retry")).clicked() { error_action = Some("retry"); }
+                                if ui.add(ActionButton::new(Icon::Close, "Close")).clicked() { error_action = Some("close"); }
+                            });
                             ui.label(
                                 RichText::new(tab.path.display().to_string())
                                     .small()
@@ -1882,30 +2049,78 @@ impl Viewer {
                     tab.page_input = (visible_page + 1).to_string();
                 }
             });
+        match error_action {
+            Some("retry") => self.retry_document(ctx),
+            Some(action) => self.action(action, ctx),
+            None => {}
+        }
     }
     fn trim_cache(&mut self) {
+        // Derived pages (including transitional rasters) and image textures have
+        // separate caps; together with history the managed estimate is 704 MiB
+        // (not a process-footprint cap: decoder/driver allocations are separate).
+        // Current documents are never discarded, even when they exceed it.
+        self.editor.trim_image_cache_to(if self.tabs.is_empty() {
+            0
+        } else {
+            64 * 1024 * 1024
+        });
         let mut total: usize = self
             .tabs
             .iter()
-            .flat_map(|t| t.rasters.values())
+            .flat_map(|t| t.rasters.values().chain(t.stale.values()))
             .map(|r| r.bytes)
             .sum();
-        if total <= CACHE_BUDGET {
-            return;
-        }
         let mut candidates: Vec<_> = self
             .tabs
             .iter()
             .enumerate()
-            .flat_map(|(i, t)| t.rasters.iter().map(move |(k, r)| (r.used, i, *k, r.bytes)))
+            .flat_map(|(i, t)| {
+                t.rasters
+                    .iter()
+                    .map(move |(k, r)| (r.used, i, Some(*k), k.page, r.bytes))
+                    .chain(
+                        t.stale
+                            .iter()
+                            .map(move |(page, r)| (r.used, i, None, *page, r.bytes)),
+                    )
+            })
             .collect();
         candidates.sort_by_key(|r| r.0);
-        for (_, tab, key, bytes) in candidates {
+        for (_, tab, key, page, bytes) in candidates {
             if total <= CACHE_BUDGET {
                 break;
             }
-            self.tabs[tab].rasters.remove(&key);
+            if let Some(key) = key {
+                self.tabs[tab].rasters.remove(&key);
+            } else {
+                self.tabs[tab].stale.remove(&page);
+            }
             total -= bytes;
+        }
+        let mut retained: usize = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.session.as_ref())
+            .map(|s| s.retained_bytes())
+            .sum();
+        // Retain the active document's most recent undo steps for as long as possible.
+        let order: Vec<_> = (0..self.tabs.len())
+            .filter(|i| *i != self.active)
+            .chain((self.active < self.tabs.len()).then_some(self.active))
+            .collect();
+        for i in order {
+            if retained <= HISTORY_BUDGET {
+                break;
+            }
+            if let Some(session) = &mut self.tabs[i].session {
+                let before = session.retained_bytes();
+                if before <= session.current_retained_bytes() {
+                    continue;
+                }
+                session.trim_history_to_budget(before.saturating_sub(retained - HISTORY_BUDGET));
+                retained = retained.saturating_sub(before - session.retained_bytes());
+            }
         }
     }
 }
@@ -1915,11 +2130,23 @@ impl eframe::App for Viewer {
         theme::sync(ctx.theme());
         self.tick += 1;
         if let Some(menu) = &self._native_menu {
-            let session = self.tabs.get(self.active).and_then(|t| t.session.as_ref());
+            let tab = self.tabs.get(self.active);
+            let session = tab.and_then(|t| t.session.as_ref());
+            let pending_text = tab.is_some_and(|tab| self.content.has_pending_text_change(tab.id));
+            let placement =
+                tab.is_some_and(|tab| self.content.placement_undo_owns_input(ctx, tab.id));
             menu.history_labels(
-                session.and_then(|s| s.undo_label()),
-                session.and_then(|s| s.redo_label()),
-                ctx.wants_keyboard_input(),
+                if pending_text {
+                    Some("text edit".into())
+                } else {
+                    session.and_then(|s| s.undo_label())
+                },
+                if pending_text {
+                    None
+                } else {
+                    session.and_then(|s| s.redo_label())
+                },
+                ctx.wants_keyboard_input() && !placement,
             );
         }
         let arrivals = open_with::take(ctx);
@@ -1930,6 +2157,7 @@ impl eframe::App for Viewer {
         self.content_events(ctx);
         self.page_events(ctx);
         self.events(ctx);
+        self.translation_tick(ctx);
         self.editor_events();
         self.digital_events(ctx);
         self.signature_events(ctx);
@@ -1945,9 +2173,14 @@ impl eframe::App for Viewer {
             self.inspect_content(ctx);
         }
         self.editor.text_editing = false;
+        self.sync_status_context();
         self.toolbar(ctx);
         self.restore_reading_panels();
-        if !self.home.visible && self.comparison.is_none() && self.zen.is_none() {
+        if !self.home.visible
+            && self.comparison.is_none()
+            && self.zen.is_none()
+            && self.active_document_ready()
+        {
             self.editor_tools(ctx);
             self.page_tools(ctx);
             self.content_tools(ctx);
@@ -1955,6 +2188,7 @@ impl eframe::App for Viewer {
             self.signature_bar(ctx);
             self.workbench_bar(ctx);
         }
+        self.sync_status_context();
         if let Some((status, true)) = &self.status {
             let status = status.clone();
             let mut dismiss = false;
@@ -1971,6 +2205,14 @@ impl eframe::App for Viewer {
                 self.status = None;
             }
         }
+        self.note_reader_requests(ctx);
+        let translation_visible = self.translation.open
+            && self.inspector
+            && self.zen.is_none()
+            && self.comparison.is_none();
+        if translation_visible {
+            self.translation_panel(ctx);
+        }
         if self.home.visible {
             self.home_screen(ctx);
         } else if self.comparison.is_some() {
@@ -1978,16 +2220,18 @@ impl eframe::App for Viewer {
         } else if self.zen.is_some() {
             self.document(ctx);
             self.zen_overlay(ctx);
+        } else if !self.active_document_ready() {
+            self.document(ctx);
         } else if self.editor.mode == editing::Mode::Pages {
-            if self.inspector {
+            if self.inspector && !translation_visible {
                 self.organizer_panel(ctx);
             }
             self.page_overview(ctx);
         } else {
             self.sidebar(ctx);
-            if self.signature_panel_open() {
+            if self.signature_panel_open() && !translation_visible {
                 self.signature_panel(ctx);
-            } else if self.inspector && self.workbench.crop.is_none() {
+            } else if self.inspector && self.workbench.crop.is_none() && !translation_visible {
                 if self.editor.mode == editing::Mode::Edit && self.redaction.active {
                     self.redaction_panel(ctx);
                 } else if self.editor.mode == editing::Mode::Forms {
@@ -2007,6 +2251,9 @@ impl eframe::App for Viewer {
             self.document(ctx);
         }
         self.finish_new_text(ctx);
+        if let Some(text) = content::context::take_translation_text(ctx) {
+            self.translate_text(ctx, text, "Selected text".into());
+        }
         self.form_events(ctx);
         self.form_dialogs(ctx);
         self.password_prompt(ctx);

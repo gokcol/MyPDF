@@ -8,6 +8,24 @@ pub struct NativeMenu {
     dialog_edit: muda::Submenu,
     undo: muda::MenuItem,
     redo: muda::MenuItem,
+    dialog_depth: DialogDepth,
+}
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct DialogDepth(std::cell::Cell<usize>);
+#[cfg(target_os = "macos")]
+impl DialogDepth {
+    /// Switch commands only on the outermost entry/exit of a native panel.
+    fn transition(&self, entering: bool) -> bool {
+        let old = self.0.get();
+        let new = if entering {
+            old.saturating_add(1)
+        } else {
+            old.saturating_sub(1)
+        };
+        self.0.set(new);
+        if entering { old == 0 } else { old == 1 }
+    }
 }
 #[cfg(target_os = "macos")]
 impl NativeMenu {
@@ -27,6 +45,9 @@ impl NativeMenu {
     }
 
     fn dialog(&self, active: bool) {
+        if !self.dialog_depth.transition(active) {
+            return;
+        }
         let (remove, insert) = if active {
             (&self.rust_edit, &self.dialog_edit)
         } else {
@@ -102,8 +123,9 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
                 Modifiers::SHIFT,
             ),
             &MenuItem::with_id("workspace", "Workspace…", true, None),
-            &item("save", "Save a Copy…", Code::KeyS, Modifiers::empty()),
-            &item("save", "Save As…", Code::KeyS, Modifiers::SHIFT),
+            &item("save", "Save…", Code::KeyS, Modifiers::empty()),
+            &item("save_as", "Save As…", Code::KeyS, Modifiers::SHIFT),
+            &MenuItem::with_id("save_copy", "Save a Copy…", true, None),
             &P::separator(),
             &item("print", "Print…", Code::KeyP, Modifiers::empty()),
             &MenuItem::with_id("nup", "Multiple Pages per Sheet…", true, None),
@@ -120,6 +142,29 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
     );
     let undo = item("edit_undo", "Undo", Code::KeyZ, Modifiers::empty());
     let redo = item("edit_redo", "Redo", Code::KeyZ, Modifiers::SHIFT);
+    let translation = Submenu::with_items(
+        "Translation",
+        true,
+        &[
+            &MenuItem::with_id(
+                "translate_selection",
+                "Translate Selected Text…",
+                true,
+                None,
+            ),
+            &MenuItem::with_id("translate_page", "Translate Page…", true, None),
+            &P::separator(),
+            &MenuItem::with_id(
+                "translation_languages",
+                "Translation Languages…",
+                true,
+                None,
+            ),
+        ],
+    );
+    let Ok(translation) = translation else {
+        return (None, rx);
+    };
     let edit = Submenu::with_items(
         "Edit",
         true,
@@ -155,6 +200,7 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             &MenuItem::with_id("redo", "Redo Document Change", true, None),
             &P::separator(),
             &item("find", "Find…", Code::KeyF, Modifiers::empty()),
+            &translation,
         ],
     );
     let header_footer = Submenu::with_items(
@@ -300,6 +346,7 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             dialog_edit,
             undo,
             redo,
+            dialog_depth: DialogDepth::default(),
         }),
         rx,
     )
@@ -333,4 +380,20 @@ pub fn with_file_dialog<T>(menu: Option<&NativeMenu>, show: impl FnOnce() -> T) 
     #[cfg(not(target_os = "macos"))]
     let _ = menu;
     show()
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    #[test]
+    fn native_commands_restore_only_after_outermost_panel_closes() {
+        let depth = DialogDepth::default();
+        assert!(depth.transition(true));
+        assert!(!depth.transition(true));
+        assert!(!depth.transition(false));
+        assert!(depth.transition(false));
+        assert!(!depth.transition(false));
+        assert!(depth.transition(true));
+        assert!(depth.transition(false));
+    }
 }

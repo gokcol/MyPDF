@@ -48,6 +48,7 @@ try {
     $manifest = Get-AppxPackageManifest -Package $installed.PackageFullName
     if ($manifest.Package.Applications.Application.Id -ne 'MyPDF') { throw 'Missing desktop application registration.' }
     if (-not (Test-Path (Join-Path $installed.InstallLocation 'MyPDF.exe'))) { throw 'Packaged executable missing.' }
+    & (Join-Path $PSScriptRoot 'test-translation-runtime.ps1') -RuntimeDirectory (Join-Path $installed.InstallLocation 'translation')
     Write-Host "PASS package installation: $($installed.PackageFullName)"
     Remove-AppxPackage -Package $installed.PackageFullName
     $installed = $null

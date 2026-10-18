@@ -159,16 +159,18 @@ impl Viewer {
         let before = (d.layout.clone(), d.range.clone(), d.sheet);
         let mut close = false;
         let mut save = false;
-        let height = (ctx.content_rect().height() - 200.).clamp(160., 600.);
+        let height = (ctx.content_rect().height() - 200.).clamp(80., 480.);
         let modal=egui::Modal::new(egui::Id::new("multiple_pages_per_sheet"))
             .backdrop_color(Color32::from_black_alpha(64)).frame(ui::modal_frame()).show(ctx, |ui| {
-                ui.set_width((ctx.content_rect().width()-80.).clamp(620.,900.));
+                ui.set_width(ui::dialog_width(ctx, 900.));
                 ui.heading("Multiple pages per sheet");
                 ui.label("Save a new PDF with smaller pages arranged on each sheet.");
                 ui.add_space(12.);
+                let mut valid = d.layout.validate().and_then(|_| mypdf_milestone0::pages::parse_range(&d.range,d.count).map(|_| ()));
+                ui::dialog_body(ui, "sheet_layout_body", 480., |ui| {
                 ui.add_enabled_ui(!d.saving, |ui| {
                     ui.columns(2,|cols| {
-                        egui::ScrollArea::vertical().id_salt("sheet_layout_options").max_height(height).show(&mut cols[0],|ui| {
+                        cols[0].vertical(|ui| {
                             ui::caption(ui,"Saved export presets");
                             egui::ComboBox::from_id_salt("saved_export_layout").selected_text(if d.preset_name.is_empty(){"Choose a preset"}else{&d.preset_name}).width(ui.available_width()).show_ui(ui,|ui|{
                                 for entry in &d.presets {
@@ -178,7 +180,7 @@ impl Viewer {
                                 }
                             });
                             ui.horizontal(|ui|{
-                                ui.add(egui::TextEdit::singleline(&mut d.preset_name).hint_text("Preset name").char_limit(80).desired_width((ui.available_width()-80.).max(60.)));
+                                ui.add(egui::TextEdit::singleline(&mut d.preset_name).margin(ui::FIELD_MARGIN).hint_text("Preset name").char_limit(80).desired_width((ui.available_width()-96.).max(60.)));
                                 if ui.add_enabled(!d.preset_name.trim().is_empty() && d.preset_error.is_none() && d.layout.validate().is_ok(),ActionButton::new(Icon::Save,"Save preset").compact()).clicked(){
                                     let name=d.preset_name.trim().to_owned();let mut entries=d.presets.clone();entries.retain(|p|p.name!=name);
                                     entries.push(SavedLayout{name,layout:d.layout.clone()});
@@ -227,13 +229,13 @@ impl Viewer {
                             ui.add_space(10.);ui::caption(ui,"Sheet margins");
                             margins(ui,&mut d.layout.margins);
                             ui.horizontal(|ui| {
-                                if ui.small_button("No margins").clicked(){d.layout.margins=[0.;4];}
+                                if ui.button("No margins").clicked(){d.layout.margins=[0.;4];}
                                 ui.label("Gap");ui.add(egui::DragValue::new(&mut d.layout.gap).range(0. ..=144.).suffix(" pt"));
                             });
                             egui::CollapsingHeader::new("Trim source page edges").show(ui,|ui| {
                                 ui.weak("Remove whitespace before fitting each page. Content in these edges is clipped.");
                                 margins(ui,&mut d.layout.trim);
-                                if ui.small_button("No trimming").clicked(){d.layout.trim=[0.;4];}
+                                if ui.button("No trimming").clicked(){d.layout.trim=[0.;4];}
                             });
                             ui.separator();
                             egui::CollapsingHeader::new("Header & footer").show(ui,|ui| {
@@ -255,11 +257,11 @@ impl Viewer {
                             egui::Frame::new().fill(theme::canvas()).corner_radius(10).inner_margin(12.).show(ui,|ui| {
                                 if let Some(texture)=&d.preview {
                                     let size=texture.size_vec2();
-                                    let scale=(ui.available_width()/size.x).min((height-80.)/size.y);
+                                    let scale=(ui.available_width()/size.x).min((height-80.).max(80.)/size.y);
                                     let response=ui.add(egui::Image::new(texture).fit_to_exact_size(size*scale));
                                     ui.painter().rect_stroke(response.rect,0.,Stroke::new(1.,theme::line()),egui::StrokeKind::Outside);
                                 } else {
-                                    ui.allocate_ui(vec2(ui.available_width(),height-80.),|ui| {ui.centered_and_justified(|ui| {ui.weak("Preparing preview…");});});
+                                    ui.allocate_ui(vec2(ui.available_width(),(height-80.).max(80.)),|ui| {ui.centered_and_justified(|ui| {ui.weak("Preparing preview…");});});
                                 }
                             });
                             if let Ok(pages)=mypdf_milestone0::pages::parse_range(&d.range,d.count) {
@@ -275,15 +277,16 @@ impl Viewer {
                         });
                     });
                 });
-                let valid=d.layout.validate().and_then(|_| mypdf_milestone0::pages::parse_range(&d.range,d.count).map(|_| ()));
+                valid=d.layout.validate().and_then(|_| mypdf_milestone0::pages::parse_range(&d.range,d.count).map(|_| ()));
                 if let Err(error)=&valid {ui.colored_label(theme::danger(),error.to_string());}
                 if let Some(error)=&d.error {ui.colored_label(theme::danger(),error);}
                 ui.add_space(8.);
                 ui.weak("Creates flattened copies of annotations and form fields. Digital signatures remain with the original PDF.");
-                ui.horizontal(|ui| {
-                    if d.saving {ui.spinner();ui.label("Saving PDF…");}
+                });
+                ui::dialog_footer(ui, |ui| {
                     save=ui.add_enabled(!d.saving && valid.is_ok() && d.preview.is_some() && before==(d.layout.clone(),d.range.clone(),d.sheet),ActionButton::new(Icon::Save,"Save as PDF…").primary()).clicked();
                     close=ui.add_enabled(!d.saving,ActionButton::new(Icon::Close,"Cancel")).clicked();
+                    if d.saving {ui.spinner();ui.label("Saving PDF…");}
                 });
             });
         if !d.saving && (close || modal.should_close()) {

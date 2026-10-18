@@ -232,7 +232,7 @@ impl Viewer {
                             tab.bytes = None;
                             tab.refresh_document(ctx);
                             self.status = Some((
-                                "Signature removed • Save a Copy to keep the change; your original file is unchanged".into(),
+                                "Signature removed • Save to keep the change; your original file is unchanged".into(),
                                 false,
                             ));
                         }
@@ -726,7 +726,7 @@ impl Viewer {
                 ctx,
                 "remove_signature",
                 &format!("Remove the signature “{field}”?"),
-                "The signature is cleared from its field, which can be signed again. Other signatures stay valid. Your original file is unchanged until you Save a Copy.",
+                "The signature is cleared from its field, which can be signed again. Other signatures stay valid. Save writes a new PDF; your original file stays unchanged.",
                 &[
                     ("Keep Signature", ui::DialogTone::Primary),
                     ("Remove Signature", ui::DialogTone::Destructive),
@@ -758,7 +758,8 @@ impl Viewer {
                 tab.bytes = None;
                 tab.refresh_document(ctx);
                 self.status = Some((
-                    "Editing a signed PDF • Save a Copy appends your changes after the signed version".into(),
+                    "Editing a signed PDF • Save appends your changes after the signed version"
+                        .into(),
                     false,
                 ));
             }

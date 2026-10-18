@@ -4,7 +4,12 @@ on:
     paths:
       - '.github/workflows/windows-msix.yml'
       - 'packaging/windows/msix/**'
+      - 'packaging/branding/**'
       - 'scripts/*msix*'
+      - 'scripts/*translation*'
+      - 'native/translation-ct2/**'
+      - 'src/translation.rs'
+      - 'src/translation/**'
       - 'examples/msix_assets.rs'
       - 'src/desktop/icon.rs'
       - 'Cargo.toml'
@@ -13,7 +18,12 @@ on:
     paths:
       - '.github/workflows/windows-msix.yml'
       - 'packaging/windows/msix/**'
+      - 'packaging/branding/**'
       - 'scripts/*msix*'
+      - 'scripts/*translation*'
+      - 'native/translation-ct2/**'
+      - 'src/translation.rs'
+      - 'src/translation/**'
       - 'examples/msix_assets.rs'
       - 'src/desktop/icon.rs'
       - 'Cargo.toml'
@@ -30,20 +40,31 @@ on:
         options: [test, store]
         default: test
       package_version:
-        description: Optional four-part Store version (last part must be 0)
+        description: Optional Store version override (at least version.txt; last part 0)
         default: ''
 permissions:
   contents: read
 jobs:
   package:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || github.sha }}
       - uses: dtolnay/rust-toolchain@1.93.1
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install pinned native build tooling
+        run: python -m pip install cmake==3.31.6
+      - name: Build and verify offline translation runtime
+        shell: pwsh
+        run: |
+          & ./scripts/build-translation-windows.ps1
+          & ./scripts/test-translation-runtime.ps1
+          & ./scripts/test-translation-packaging.ps1
       - name: Build desktop app and Store artwork
         run: cargo build --locked --release --bin mypdf --example msix_assets
       - name: Package and validate
@@ -66,14 +87,14 @@ jobs:
           } else {
             $packageArgs.TestIdentity = $true
           }
-          ./scripts/package-msix.ps1 @packageArgs
+          & ./scripts/package-msix.ps1 @packageArgs
       - name: Validate packaging boundaries
         shell: pwsh
-        run: ./scripts/test-msix.ps1
+        run: '& ./scripts/test-msix.ps1'
       - name: Install and uninstall the test package
         if: ${{ inputs.mode != 'store' }}
         shell: powershell
-        run: ./scripts/test-msix-install.ps1
+        run: '& ./scripts/test-msix-install.ps1'
       - uses: actions/upload-artifact@v6
         with:
           name: MyPDF-msix-${{ inputs.mode || 'test' }}-x64

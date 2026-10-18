@@ -38,6 +38,7 @@ pub mod svg;
 pub mod text_block;
 pub mod text_geometry;
 pub mod text_style;
+pub mod translation;
 pub mod trust;
 pub mod unicode_text;
 pub mod viewer;

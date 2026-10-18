@@ -124,6 +124,7 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
         ],
         Target::SelectedText(_) => vec![
             item("Copy selected text", "copy_text", true),
+            item("Translate selected text…", "translate_selection", true),
             item("Highlight", "highlight", editable),
             item("Underline", "underline", editable),
             item("Strikethrough", "strikeout", editable),
@@ -132,6 +133,7 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
         Target::Text(_) => vec![
             item("Edit text…", "edit_text_here", editable),
             item("Copy text", "copy_text", true),
+            item("Translate text…", "translate_text", true),
             item("Select text area…", "text_area", editable),
         ],
         Target::Image(_) => vec![
@@ -149,6 +151,7 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
             if single.is_some_and(|a| matches!(a.kind, Kind::Text { .. })) {
                 v.push(item("Edit text…", "edit_text_here", change));
                 v.push(item("Copy text", "copy_artwork_text", true));
+                v.push(item("Translate text…", "translate_text", true));
             }
             v.push(item(
                 match single.map(|a| &a.kind) {
@@ -214,6 +217,7 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
             item("Add image…", "add_image", editable),
             item("Copy region…", "copy_region", editable),
             item("Select all page text", "all_text", true),
+            item("Translate page…", "translate_page", true),
             item("Fit width", "fit_width", true),
             item("Fit page", "fit_page", true),
         ],
@@ -230,6 +234,7 @@ fn action_icon(action: &str, label: &str) -> Icon {
         "underline" => Icon::Underline,
         "strikeout" => Icon::Strikeout,
         "all" | "all_text" | "text_area" => Icon::TextArea,
+        "translate_selection" | "translate_text" | "translate_page" => Icon::Translate,
         "done" | "finish_text" => Icon::Check,
         "cancel" | "cancel_text" => Icon::Close,
         "edit_text_here" | "add_text_here" => Icon::Text,
@@ -253,8 +258,8 @@ fn action_icon(action: &str, label: &str) -> Icon {
         _ => Icon::Inspector,
     }
 }
-fn menu_layout(ui: &mut egui::Ui) {
-    ui.set_min_width(220.);
+fn menu_layout(ui: &mut egui::Ui, width: f32) {
+    ui.set_width(width);
     ui.spacing_mut().interact_size.y = 24.;
     ui.spacing_mut().item_spacing.y = 2.;
     ui.spacing_mut().button_padding = vec2(6., 2.);
@@ -271,10 +276,12 @@ fn submenu(action: &str) -> Option<(&'static str, Icon)> {
         _ => None,
     }
 }
-fn action_row(ui: &mut egui::Ui, i: &Item) -> bool {
+fn action_row(ui: &mut egui::Ui, i: &Item, width: f32) -> bool {
     ui.add_enabled(
         i.enabled,
-        ui::MenuItem::new(action_icon(i.action, i.label), i.label).shortcut(shortcut(i.action)),
+        ui::MenuItem::new(action_icon(i.action, i.label), i.label)
+            .shortcut(shortcut(i.action))
+            .width(width),
     )
     .clicked()
 }
@@ -425,6 +432,18 @@ pub(in crate::desktop) fn smart_select(
     let Some(session) = &tab.session else { return };
     let key = (tab.id, session.revision(), page);
     if let Some(a) = editing::hit_annotation(tab, page, point, scale) {
+        // A note is a comment, not an empty drawing or underlying PDF text.
+        // Keep the pointer press for page gestures, and open its body on click.
+        if matches!(a.kind, Kind::Note { .. }) && !ui.input(|i| i.modifiers.shift) {
+            if clicked {
+                selection::set(tab, editor, vec![a.id.clone()]);
+                editor.note_requested = Some((tab.id, a.id));
+                if editor.mode == editing::Mode::Edit {
+                    editor.mode = editing::Mode::Annotate;
+                }
+            }
+            return;
+        }
         // Keep the text widget alive through press/release so it receives focus
         // before the next keystroke. Edit already handles these boxes in place.
         if matches!(a.kind, Kind::Text { .. })
@@ -568,67 +587,90 @@ pub(in crate::desktop) fn page_menu(
         .open_memory(open)
         .at_pointer_fixed()
         .show(|ui| {
-            menu_layout(ui);
             let entries = items(&menu.target, editable);
-            if let Some(group) = state.context.group {
-                if ui
-                    .add(ui::MenuItem::new(Icon::Left, "Back to object actions"))
-                    .clicked()
-                {
-                    state.context.group = None;
-                }
-                ui.separator();
-                ui.weak(group);
-                for entry in entries
-                    .iter()
-                    .filter(|e| submenu(e.action).is_some_and(|g| g.0 == group))
-                {
-                    if action_row(ui, entry) {
-                        state.context.command = Some((entry.action, menu.clone()));
-                        state.context.group = None;
-                        ui.close();
+            let mut labels = entries
+                .iter()
+                .filter_map(|entry| match (state.context.group, submenu(entry.action)) {
+                    (Some(group), Some((name, _))) if group == name => {
+                        Some((entry.label, shortcut(entry.action)))
                     }
-                }
-                return;
+                    (None, Some((name, _))) => Some((name, None)),
+                    (None, None) => Some((entry.label, shortcut(entry.action))),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if state.context.group.is_some() {
+                labels.push(("Back to object actions", None));
             }
-            let mut shown_groups = std::collections::HashSet::new();
-            for i in &entries {
-                if let Some((label, icon)) = submenu(i.action) {
-                    if !shown_groups.insert(label) {
-                        continue;
+            let width = ui::menu_width(ui, labels);
+            menu_layout(ui, width);
+            egui::ScrollArea::vertical()
+                .id_salt("context_actions_scroll")
+                .max_height((ctx.content_rect().height() - 40.).max(80.))
+                .show(ui, |ui| {
+                    if let Some(group) = state.context.group {
+                        if ui
+                            .add(
+                                ui::MenuItem::new(Icon::Left, "Back to object actions")
+                                    .width(width),
+                            )
+                            .clicked()
+                        {
+                            state.context.group = None;
+                        }
+                        ui.separator();
+                        ui.weak(group);
+                        for entry in entries
+                            .iter()
+                            .filter(|e| submenu(e.action).is_some_and(|g| g.0 == group))
+                        {
+                            if action_row(ui, entry, width) {
+                                state.context.command = Some((entry.action, menu.clone()));
+                                state.context.group = None;
+                                ui.close();
+                            }
+                        }
+                        return;
                     }
-                    let response = ui.add(ui::MenuItem::new(icon, label));
-                    ui::draw_icon(
-                        ui.painter(),
-                        Rect::from_center_size(
-                            pos2(response.rect.right() - 12., response.rect.center().y),
-                            vec2(12., 12.),
-                        ),
-                        Icon::Right,
-                        ui.visuals().text_color(),
-                    );
-                    if response.clicked() {
-                        state.context.group = Some(label);
+                    let mut shown_groups = std::collections::HashSet::new();
+                    for i in &entries {
+                        if let Some((label, icon)) = submenu(i.action) {
+                            if !shown_groups.insert(label) {
+                                continue;
+                            }
+                            let response = ui.add(ui::MenuItem::new(icon, label).width(width));
+                            ui::draw_icon(
+                                ui.painter(),
+                                Rect::from_center_size(
+                                    pos2(response.rect.right() - 12., response.rect.center().y),
+                                    vec2(12., 12.),
+                                ),
+                                Icon::Right,
+                                ui.visuals().text_color(),
+                            );
+                            if response.clicked() {
+                                state.context.group = Some(label);
+                            }
+                            continue;
+                        }
+                        if matches!(
+                            i.action,
+                            "object_copy"
+                                | "rotate_right"
+                                | "front"
+                                | "object_delete"
+                                | "delete_image"
+                                | "add_text_here"
+                                | "fit_width"
+                        ) {
+                            ui.separator();
+                        }
+                        if action_row(ui, i, width) {
+                            state.context.command = Some((i.action, menu.clone()));
+                            ui.close();
+                        }
                     }
-                    continue;
-                }
-                if matches!(
-                    i.action,
-                    "object_copy"
-                        | "rotate_right"
-                        | "front"
-                        | "object_delete"
-                        | "delete_image"
-                        | "add_text_here"
-                        | "fit_width"
-                ) {
-                    ui.separator();
-                }
-                if action_row(ui, i) {
-                    state.context.command = Some((i.action, menu.clone()));
-                    ui.close();
-                }
-            }
+                });
         });
 }
 
@@ -656,6 +698,18 @@ pub(super) fn restore_secondary_selection(
     }
 }
 
+/// Inline editors cannot borrow the Viewer while laying out their TextEdit.
+/// Capture the chosen characters for the translation panel without committing
+/// the draft, changing focus, or retaining the document beyond the next frame.
+pub(crate) fn take_translation_text(ctx: &egui::Context) -> Option<String> {
+    ctx.data_mut(|data| {
+        let id = egui::Id::new("inline_translation_request");
+        let text = data.get_temp::<String>(id);
+        data.remove::<String>(id);
+        text
+    })
+}
+
 /// Text commands operate on the TextEdit's captured Unicode character range.
 /// Secondary clicks do not replace that range with the whole block.
 pub(super) fn text_menu(
@@ -677,28 +731,43 @@ pub(super) fn text_menu(
     egui::Popup::context_menu(&output.response)
         .frame(egui::Frame::popup(&ctx.style()).fill(theme::paper()))
         .show(|ui| {
-            menu_layout(ui);
-            for (label, name, enabled) in [
+            let entries = [
                 ("Cut", "cut", selected),
                 ("Copy", "copy", selected),
+                ("Translate selected text…", "translate_selection", selected),
                 ("Paste", "paste", true),
                 ("Delete selected text", "delete", selected),
                 ("Select all text", "all", !text.is_empty()),
                 ("Text properties…", "properties", true),
                 ("Finish text edit", "done", true),
                 ("Cancel text edit", "cancel", true),
-            ] {
-                if ui
-                    .add_enabled(
-                        enabled,
-                        ui::MenuItem::new(action_icon(name, label), label).shortcut(shortcut(name)),
-                    )
-                    .clicked()
-                {
-                    action = Some(name);
-                    ui.close();
-                }
-            }
+            ];
+            let width = ui::menu_width(
+                ui,
+                entries
+                    .iter()
+                    .map(|(label, name, _)| (*label, shortcut(name))),
+            );
+            menu_layout(ui, width);
+            egui::ScrollArea::vertical()
+                .id_salt("text_context_actions_scroll")
+                .max_height((ctx.content_rect().height() - 40.).max(80.))
+                .show(ui, |ui| {
+                    for (label, name, enabled) in entries {
+                        if ui
+                            .add_enabled(
+                                enabled,
+                                ui::MenuItem::new(action_icon(name, label), label)
+                                    .shortcut(shortcut(name))
+                                    .width(width),
+                            )
+                            .clicked()
+                        {
+                            action = Some(name);
+                            ui.close();
+                        }
+                    }
+                });
         });
     let Some(action) = action else { return };
     output.response.request_focus();
@@ -707,6 +776,18 @@ pub(super) fn text_menu(
         "done" => *done = true,
         "cancel" => *cancel = true,
         "properties" => *properties = true,
+        "translate_selection" => {
+            let selection: String = text
+                .chars()
+                .skip(lo.index)
+                .take(hi.index - lo.index)
+                .collect();
+            if !selection.trim().is_empty() {
+                ctx.data_mut(|data| {
+                    data.insert_temp(egui::Id::new("inline_translation_request"), selection);
+                });
+            }
+        }
         "all" => {
             output.cursor_range = Some(CCursorRange::two(
                 CCursor::new(0),
@@ -1007,6 +1088,47 @@ impl Viewer {
             );
         }
         match action {
+            "translate_selection" => {
+                if let Target::SelectedText(selection) = menu.target {
+                    self.editor.text_selection = Some(selection);
+                    if let Some(text) = selection.text(&self.tabs[index]) {
+                        let anchor = selection.rects(&self.tabs[index]).first().copied();
+                        self.translate_text(ctx, text, "Selected text".into());
+                        if let Some(anchor) = anchor {
+                            self.set_translation_anchor(anchor, None);
+                        }
+                    }
+                }
+            }
+            "translate_text" => {
+                let text = match &menu.target {
+                    Target::Text(draft) => Some(draft.text.clone()),
+                    Target::Artwork(marks) => {
+                        marks.first().and_then(|a| a.kind.text().map(str::to_owned))
+                    }
+                    _ => None,
+                };
+                if let Some(text) = text {
+                    let anchor = match &menu.target {
+                        Target::Text(draft) => Some((
+                            draft.rect,
+                            match &draft.target {
+                                InlineTarget::Annotation(id) => Some(id.clone()),
+                                _ => None,
+                            },
+                        )),
+                        Target::Artwork(marks) => {
+                            marks.first().map(|a| (a.bounds(), Some(a.id.clone())))
+                        }
+                        _ => None,
+                    };
+                    self.translate_text(ctx, text, "Selected text".into());
+                    if let Some((anchor, object)) = anchor {
+                        self.set_translation_anchor(anchor, object);
+                    }
+                }
+            }
+            "translate_page" => self.translate_page(ctx),
             "review_comments" => {
                 self.review.open = true;
                 if let Target::Artwork(m) = &menu.target {
@@ -1182,9 +1304,16 @@ impl Viewer {
                 }
             }
             "object_properties" => {
-                self.editor.mode = editing::Mode::Draw;
-                self.editor.tool = editing::Tool::Select;
-                self.inspector = true;
+                if let Target::Artwork(marks) = &menu.target
+                    && marks.len() == 1
+                    && matches!(marks[0].kind, Kind::Note { .. })
+                {
+                    self.open_note_reader(menu.key.0, &marks[0].id);
+                } else {
+                    self.editor.mode = editing::Mode::Draw;
+                    self.editor.tool = editing::Tool::Select;
+                    self.inspector = true;
+                }
             }
             "rotate_right" | "rotate_left" | "flip_horizontal" | "flip_vertical" | "front"
             | "back" | "lock" => {
@@ -1644,6 +1773,64 @@ mod tests {
         frame(app, ctx, vec![]);
     }
     #[test]
+    fn drawing_menu_stays_compact_and_transform_submenu_remains_actionable() {
+        for dark in [false, true] {
+            let (mut app, ctx) = fixture();
+            ctx.set_theme(if dark {
+                egui::ThemePreference::Dark
+            } else {
+                egui::ThemePreference::Light
+            });
+            let shape = Annotation::new(
+                0,
+                [100., 100., 180., 180.],
+                Kind::Rectangle,
+                Default::default(),
+            );
+            app.tabs[0]
+                .session
+                .as_mut()
+                .unwrap()
+                .commit(vec![shape])
+                .unwrap();
+            frame(&mut app, &ctx, vec![]);
+            click(
+                &mut app,
+                &ctx,
+                pos2(120., 150.),
+                egui::PointerButton::Secondary,
+            );
+            // Width must not expand as egui remembers the preceding popup size.
+            for _ in 0..12 {
+                frame(&mut app, &ctx, vec![]);
+            }
+            let bounds = ctx
+                .data(|d| d.get_temp::<HashMap<String, Rect>>(egui::Id::new("context_test_bounds")))
+                .unwrap();
+            let property = bounds["Drawing properties…"];
+            assert!(property.width() <= 300., "oversized menu: {property:?}");
+            for label in ["Copy", "Cut", "Duplicate", "Transform", "Style", "Delete"] {
+                assert_eq!(
+                    bounds[label].width(),
+                    property.width(),
+                    "misaligned {label}"
+                );
+                assert_eq!(
+                    bounds[label].right(),
+                    property.right(),
+                    "shortcut gutter for {label}"
+                );
+            }
+            menu_click(&mut app, &ctx, "Transform");
+            menu_click(&mut app, &ctx, "Rotate 90° clockwise");
+            assert_eq!(
+                app.tabs[0].session.as_ref().unwrap().annotations[0].rotation,
+                90.
+            );
+            assert!(!egui::Popup::is_any_open(&ctx));
+        }
+    }
+    #[test]
     fn target_follows_right_click_and_only_offers_relevant_actions_in_edit_mode() {
         let (mut app, ctx) = fixture();
         let image = Annotation::new(
@@ -1860,6 +2047,92 @@ mod tests {
         assert!(app.editor.marks_clip.is_some());
         assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
     }
+    #[test]
+    fn translation_actions_follow_text_or_page_context_even_for_read_only_documents() {
+        use mypdf_milestone0::viewer::{GlyphBox, PageText};
+        let (mut app, _) = fixture();
+        app.tabs[0].text[0] = Some(Arc::new(PageText {
+            text: "Hello".into(),
+            limited: false,
+            glyphs: (0..5)
+                .map(|i| GlyphBox {
+                    range: i..i + 1,
+                    rect: [20. + i as f32 * 8., 50., 28. + i as f32 * 8., 62.],
+                })
+                .collect(),
+        }));
+        let selection = text_selection::TextSelection::all(&app.tabs[0], 0).unwrap();
+        let selected = commands(&Target::SelectedText(selection), false);
+        assert!(selected.contains(&"translate_selection"));
+        assert!(!selected.contains(&"translate_page"));
+        assert!(!selected.contains(&"highlight"));
+        let page = commands(&Target::Page, false);
+        assert!(page.contains(&"translate_page"));
+        assert!(!page.contains(&"translate_selection"));
+        let drawing = Annotation::new(
+            0,
+            [100., 100., 180., 180.],
+            Kind::Rectangle,
+            Default::default(),
+        );
+        assert!(
+            !commands(&Target::Artwork(vec![drawing]), true)
+                .iter()
+                .any(|action| action.starts_with("translate"))
+        );
+        let text = Annotation::new(
+            0,
+            [100., 100., 180., 180.],
+            Kind::Text {
+                text: "Merhaba".into(),
+            },
+            Default::default(),
+        );
+        assert!(commands(&Target::Artwork(vec![text]), false).contains(&"translate_text"));
+        for action in ["translate_selection", "translate_text", "translate_page"] {
+            assert!(matches!(action_icon(action, ""), Icon::Translate));
+            assert!(
+                shortcut(action).is_none(),
+                "translation must not steal a shortcut"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_translation_snapshots_unicode_selection_without_changing_the_draft() {
+        use egui::text::{CCursor, CCursorRange};
+        let (mut app, ctx) = fixture();
+        app.content
+            .place_text(app.tabs[0].id, 0, [50., 60.], app.tabs[0].pages[0]);
+        app.content.new_text = "First İstanbul last".into();
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let id = egui::Id::new((app.tabs[0].id, 0usize, "inline_new_text"));
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::two(CCursor::new(6), CCursor::new(14))));
+        state.store(&ctx, id);
+        frame(&mut app, &ctx, vec![]);
+        click(
+            &mut app,
+            &ctx,
+            pos2(110., 85.),
+            egui::PointerButton::Secondary,
+        );
+        menu_click(&mut app, &ctx, "Translate selected text…");
+        assert_eq!(take_translation_text(&ctx).as_deref(), Some("İstanbul"));
+        assert!(
+            take_translation_text(&ctx).is_none(),
+            "requests are consumed once"
+        );
+        assert_eq!(app.content.new_text, "First İstanbul last");
+        assert_eq!(app.content.new_selection, Some(6..15));
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
+        assert!(app.content.pending_text().is_some());
+        assert!(!egui::Popup::is_any_open(&ctx));
+    }
+
     #[test]
     fn live_text_context_menu_preserves_unicode_selection_cut_paste_and_cancel() {
         use egui::text::{CCursor, CCursorRange};

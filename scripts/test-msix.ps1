@@ -20,6 +20,9 @@ Expect-Rejection @{ IdentityName = 'Invalid/Name'; Publisher = 'CN=Example'; Pub
 foreach ($version in @('1.0.0.1', '0.1.0.0', '65536.0.0.0', '1.0.0-beta.0')) {
     Expect-Rejection @{ TestIdentity = $true; PackageVersion = $version } 'four-part Store version'
 }
+foreach ($version in @('1.2.0.0', '1.11.1.0')) {
+    Expect-Rejection @{ TestIdentity = $true; PackageVersion = $version } 'preserve Store upgrade ordering'
+}
 # Exercise XML-special characters as data, not manifest markup. This QA
 # identity lives only in a disposable folder, never in published artifacts.
 $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('mypdf-msix-qa-' + [guid]::NewGuid().ToString('N'))
@@ -30,6 +33,9 @@ try {
     if (-not $package) { throw 'XML escaping validation did not produce a package.' }
     $info = Get-Content ($package.FullName + '.json') -Raw | ConvertFrom-Json
     if ($info.displayName -cne 'MyPDF (QA) <Test>' -or $info.publisherDisplayName -cne 'QA Gökçöl & Co') { throw 'Display-name escaping did not round-trip.' }
+    $expectedVersion = (Get-Content (Join-Path $PSScriptRoot '../packaging/windows/msix/version.txt') -Raw).Trim()
+    $expectedAppVersion = (Select-String -Path (Join-Path $PSScriptRoot '../Cargo.toml') -Pattern '^version = "([0-9]+\.[0-9]+\.[0-9]+)"').Matches[0].Groups[1].Value
+    if ($info.version -cne $expectedVersion -or $info.appVersion -cne $expectedAppVersion) { throw 'Public app version or Store package version does not match its source.' }
     Expect-Rejection @{ IdentityName = 'MyPDF.XmlEscapingQA'; Publisher = 'CN=MyPDF QA, O=QA & Co'; PublisherDisplayName = 'QA & Co'; OutputDirectory = $scratch } 'Output already exists'
     Write-Host 'PASS XML identity escaping, validated package round trip and safe output handling.'
 } finally {

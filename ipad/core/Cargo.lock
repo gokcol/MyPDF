@@ -3560,7 +3560,7 @@ dependencies = [
 
 [[package]]
 name = "mypdf-milestone0"
-version = "1.11.1"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3571,6 +3571,7 @@ dependencies = [
  "fontdb",
  "hayro",
  "image",
+ "libloading",
  "lopdf 0.45.0",
  "muda",
  "objc2 0.6.5",
@@ -3580,6 +3581,7 @@ dependencies = [
  "quick-xml",
  "rand 0.8.8",
  "rcgen",
+ "reqwest",
  "resvg",
  "rfd",
  "rpassword",

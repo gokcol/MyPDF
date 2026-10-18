@@ -224,12 +224,20 @@ fn drop_ghost(state: &mut FormState, moved: bool) {
 
 /// Property edits not applied yet.
 struct Draft {
+    tab: u64,
     field: lopdf::ObjectId,
     widget: lopdf::ObjectId,
     revision: u64,
     kind: FieldType,
     original: Properties,
     edited: Properties,
+}
+struct ValueDraft {
+    tab: u64,
+    field: lopdf::ObjectId,
+    revision: u64,
+    original: String,
+    edited: String,
 }
 pub(super) struct FormState {
     /// The field type placed by the next drag or click on the page.
@@ -244,15 +252,47 @@ pub(super) struct FormState {
     pub(super) selected: Option<(lopdf::ObjectId, lopdf::ObjectId)>,
     /// Select this field once the document is newer than this revision: name, page, rectangle.
     pending_select: Option<(String, usize, [f32; 4], u64)>,
+    pending_focus: Option<(u64, lopdf::ObjectId)>,
     grab: Option<(u64, usize, Grab, [f32; 4])>,
     ghost: Option<Ghost>,
     pending_edit: Option<Edit>,
     draft: Option<Draft>,
-    value: Option<(lopdf::ObjectId, u64, String)>,
+    value: Option<ValueDraft>,
+    saved_values: HashMap<(u64, lopdf::ObjectId), ValueDraft>,
+    saved_properties: HashMap<(u64, lopdf::ObjectId, lopdf::ObjectId), Draft>,
     pub show_order: bool,
     confirm: Option<Confirm>,
 }
 impl FormState {
+    fn stash_value(&mut self) {
+        if let Some(draft) = self.value.take()
+            && draft.original != draft.edited
+        {
+            self.saved_values.insert((draft.tab, draft.field), draft);
+        }
+    }
+    fn stash_properties(&mut self) {
+        if let Some(draft) = self.draft.take()
+            && draft.original != draft.edited
+        {
+            self.saved_properties
+                .insert((draft.tab, draft.field, draft.widget), draft);
+        }
+    }
+    fn pending_field(&self, tab: u64) -> Option<lopdf::ObjectId> {
+        self.value
+            .iter()
+            .chain(self.saved_values.values())
+            .find(|d| d.tab == tab && d.original != d.edited)
+            .map(|d| d.field)
+            .or_else(|| {
+                self.draft
+                    .iter()
+                    .chain(self.saved_properties.values())
+                    .find(|d| d.tab == tab && d.original != d.edited)
+                    .map(|d| d.field)
+            })
+    }
     pub fn new() -> Self {
         Self {
             tool: None,
@@ -261,11 +301,14 @@ impl FormState {
             recent_layouts: vec![],
             selected: None,
             pending_select: None,
+            pending_focus: None,
             grab: None,
             ghost: None,
             pending_edit: None,
             draft: None,
             value: None,
+            saved_values: HashMap::new(),
+            saved_properties: HashMap::new(),
             show_order: false,
             confirm: None,
         }
@@ -363,8 +406,12 @@ pub(super) fn overlay(
             egui::CursorIcon::Default
         });
     if placing && editable {
-        // The drag begins where the button went down, before the drag threshold.
-        if background.drag_started()
+        // Capture the press before the drag threshold. Native input can deliver
+        // the final movement and release in one frame, in which case egui never
+        // reports `drag_started`/`drag_stopped` for this response.
+        let pressed_here =
+            background.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed());
+        if (pressed_here || background.drag_started())
             && let Some(p) = ui.input(|i| i.pointer.press_origin())
         {
             let p = to_page(p);
@@ -388,8 +435,14 @@ pub(super) fn overlay(
                 start.y.max(p.y).min(size.height),
             ];
         }
-        let released = background.drag_stopped() || background.clicked();
-        if released && let Some(p) = background.interact_pointer_pos() {
+        let finishing_own_drag = matches!(state.grab, Some((t, g, Grab::Create(_), _)) if t == tab.id && g == page)
+            && ui.input(|i| i.pointer.primary_released());
+        let released = background.drag_stopped() || background.clicked() || finishing_own_drag;
+        if released
+            && let Some(p) = background
+                .interact_pointer_pos()
+                .or_else(|| ui.ctx().pointer_latest_pos())
+        {
             let drawn = match state.grab.take() {
                 Some((_, _, Grab::Create(_), r)) if r[2] - r[0] >= 6. && r[3] - r[1] >= 6. => {
                     Some(r)
@@ -573,7 +626,33 @@ pub(super) fn overlay(
                 } else {
                     egui::CursorIcon::Grab
                 });
-            if response.clicked() || response.drag_started() {
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::Button,
+                    true,
+                    this,
+                    format!(
+                        "{} · {} · page {}{}",
+                        field.name,
+                        field.kind.label(),
+                        page + 1,
+                        if locked {
+                            " · signed, read only"
+                        } else {
+                            " · arrow keys move, Shift moves 10 points"
+                        }
+                    ),
+                )
+            });
+            if response.has_focus() {
+                painter.rect_stroke(
+                    r.expand(3.),
+                    3.,
+                    Stroke::new(2., theme::accent()),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            if response.clicked() || response.drag_started() || response.gained_focus() {
                 state.selected = Some((field.id, w.id));
             }
             if response.drag_started() && !locked {
@@ -675,7 +754,7 @@ impl Viewer {
                 .is_some_and(|s| s.editable)
     }
     /// The current inspection, when it is up to date with the active document.
-    fn fresh_inspection(&self) -> Option<&Inspection> {
+    pub(super) fn fresh_inspection(&self) -> Option<&Inspection> {
         let tab = self.tabs.get(self.active)?;
         let revision = tab.session.as_ref()?.revision();
         self.content
@@ -948,6 +1027,46 @@ impl Viewer {
         });
     }
 
+    /// Save/close must not silently discard an inspector draft.
+    pub(super) fn pending_form_edits(&self, tab: u64) -> bool {
+        self.forms.pending_field(tab).is_some()
+    }
+    pub(super) fn focus_pending_form_edits(&mut self, tab: u64) -> bool {
+        let Some(field) = self.forms.pending_field(tab) else {
+            return false;
+        };
+        let Some(index) = self.tabs.iter().position(|t| t.id == tab) else {
+            return false;
+        };
+        self.active = index;
+        self.home.visible = false;
+        self.inspector = true;
+        self.editor.mode = editing::Mode::Forms;
+        self.forms.pending_focus = Some((tab, field));
+        if let Some(designed) = self
+            .fresh_inspection()
+            .and_then(|i| i.designed.as_ref().ok())
+            .and_then(|fields| fields.iter().find(|f| f.id == field))
+            && let Some(widget) = designed.widgets.first()
+        {
+            self.forms.selected = Some((field, widget.id));
+        }
+        true
+    }
+    pub(super) fn clear_form_drafts(&mut self, tab: u64) {
+        if self.forms.pending_focus.is_some_and(|(t, _)| t == tab) {
+            self.forms.pending_focus = None;
+        }
+        if self.forms.value.as_ref().is_some_and(|d| d.tab == tab) {
+            self.forms.value = None;
+        }
+        if self.forms.draft.as_ref().is_some_and(|d| d.tab == tab) {
+            self.forms.draft = None;
+        }
+        self.forms.saved_values.retain(|(t, _), _| *t != tab);
+        self.forms.saved_properties.retain(|(t, _, _), _| *t != tab);
+    }
+
     /// Edits requested on the page, selection upkeep and keys.
     pub(super) fn form_events(&mut self, ctx: &egui::Context) {
         if self.editor.mode != editing::Mode::Forms {
@@ -962,7 +1081,19 @@ impl Viewer {
         if !ctx.input(|i| i.pointer.any_down()) {
             self.forms.grab = None;
         }
-        let typing = self.editor.text_editing || ctx.memory(|m| m.focused().is_some());
+        let focus = ctx.memory(|m| m.focused());
+        let canvas_focus = self.tabs.get(self.active).is_some_and(|tab| {
+            self.fresh_inspection()
+                .and_then(|i| i.designed.as_ref().ok())
+                .is_some_and(|fields| {
+                    fields.iter().any(|f| {
+                        f.widgets.iter().any(|w| {
+                            focus == Some(egui::Id::new((tab.id, w.page, "form_widget", w.id)))
+                        })
+                    })
+                })
+        });
+        let typing = self.editor.text_editing || focus.is_some() && !canvas_focus;
         if !typing && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             if self.forms.tool.is_some() || self.forms.layout.is_some() {
                 self.forms.tool = None;
@@ -979,6 +1110,42 @@ impl Viewer {
         else {
             return;
         };
+        let active_tab = self.tabs[self.active].id;
+        if let Some((tab, field)) = self.forms.pending_focus
+            && tab == active_tab
+            && let Some(widget) = fields
+                .iter()
+                .find(|f| f.id == field)
+                .and_then(|f| f.widgets.first())
+        {
+            self.forms.pending_focus = None;
+            self.forms.selected = Some((field, widget.id));
+            self.tabs[self.active].jump(widget.page);
+        }
+        // A deleted field cannot leave a hidden draft that blocks Save forever.
+        let exists = |id| fields.iter().any(|f| f.id == id);
+        self.forms
+            .saved_values
+            .retain(|(tab, field), _| *tab != active_tab || exists(*field));
+        self.forms
+            .saved_properties
+            .retain(|(tab, field, _), _| *tab != active_tab || exists(*field));
+        if self
+            .forms
+            .value
+            .as_ref()
+            .is_some_and(|d| d.tab == active_tab && !exists(d.field))
+        {
+            self.forms.value = None;
+        }
+        if self
+            .forms
+            .draft
+            .as_ref()
+            .is_some_and(|d| d.tab == active_tab && !exists(d.field))
+        {
+            self.forms.draft = None;
+        }
         // A field just added: select it once the document includes it.
         let revision = self
             .tabs
@@ -1015,6 +1182,47 @@ impl Viewer {
                 .any(|d| d.id == f && d.widgets.iter().any(|x| x.id == w))
         }) {
             self.forms.selected = None;
+        }
+        if !typing
+            && canvas_focus
+            && self.form_editable()
+            && let Some((field_id, widget_id)) = self.forms.selected
+            && let Some(field) = fields.iter().find(|f| f.id == field_id && !f.signed)
+            && let Some(widget) = field.widgets.iter().find(|w| w.id == widget_id)
+        {
+            let delta = ctx.input_mut(|i| {
+                let modifiers = if i.modifiers.shift {
+                    egui::Modifiers::SHIFT
+                } else {
+                    egui::Modifiers::NONE
+                };
+                let step = if modifiers.shift { 10. } else { 1. };
+                let mut delta = egui::Vec2::ZERO;
+                for (key, direction) in [
+                    (egui::Key::ArrowLeft, vec2(-1., 0.)),
+                    (egui::Key::ArrowRight, vec2(1., 0.)),
+                    (egui::Key::ArrowUp, vec2(0., -1.)),
+                    (egui::Key::ArrowDown, vec2(0., 1.)),
+                ] {
+                    if i.consume_key(modifiers, key) {
+                        delta += direction * step;
+                    }
+                }
+                delta
+            });
+            if delta != egui::Vec2::ZERO {
+                let page = self.tabs[self.active].pages[widget.page];
+                let [l, t, r, b] = widget.rect;
+                let x = (l + delta.x).clamp(0., (page.width - (r - l)).max(0.));
+                let y = (t + delta.y).clamp(0., (page.height - (b - t)).max(0.));
+                self.content_change(
+                    ctx,
+                    Edit::PlaceField {
+                        widget: widget_id,
+                        rect: [x, y, x + r - l, y + b - t],
+                    },
+                );
+            }
         }
         let delete = !typing
             && ctx.input_mut(|i| {
@@ -1126,6 +1334,24 @@ impl Viewer {
                         return;
                     }
                 };
+                if let Some(tab) = self.tabs.get(self.active).map(|t| t.id)
+                    && let Some(pending) = self.forms.pending_field(tab)
+                    && self
+                        .forms
+                        .selected
+                        .is_none_or(|(field, _)| field != pending)
+                {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new("Unapplied form edits")
+                                .small()
+                                .color(theme::warning()),
+                        );
+                        if ui.add(ActionButton::new(Icon::Form, "Review")).clicked() {
+                            self.focus_pending_form_edits(tab);
+                        }
+                    });
+                }
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -1349,18 +1575,33 @@ impl Viewer {
                 return;
             }
             let current = value.value.clone();
+            let tab = self.tabs[self.active].id;
             if self
                 .forms
                 .value
                 .as_ref()
-                .is_none_or(|(f, r, _)| *f != field.id || *r != revision)
+                .is_none_or(|d| d.tab != tab || d.field != field.id || d.revision != revision)
             {
-                self.forms.value = Some((field.id, revision, current.clone()));
+                self.forms.stash_value();
+                let saved = self.forms.saved_values.remove(&(tab, field.id));
+                self.forms.value = Some(match saved {
+                    Some(mut draft) if draft.edited != current => {
+                        draft.revision = revision;
+                        draft
+                    }
+                    _ => ValueDraft {
+                        tab,
+                        field: field.id,
+                        revision,
+                        original: current.clone(),
+                        edited: current.clone(),
+                    },
+                });
             }
             let mut apply = None;
             match &value.kind {
                 FieldKind::Text { multiline, max } => {
-                    let text = &mut self.forms.value.as_mut().unwrap().2;
+                    let text = &mut self.forms.value.as_mut().unwrap().edited;
                     let edit = if *multiline {
                         egui::TextEdit::multiline(text).desired_rows(4)
                     } else {
@@ -1372,6 +1613,12 @@ impl Viewer {
                             .char_limit(max.unwrap_or(32_768))
                             .hint_text("Type the value"),
                     );
+                    r.widget_info(|| {
+                        let mut info =
+                            egui::WidgetInfo::text_edit(true, &current, &*text, "Type the value");
+                        info.label = Some(format!("{} value", field.name));
+                        info
+                    });
                     self.editor.text_editing |= r.has_focus();
                     if !*multiline
                         && r.lost_focus()
@@ -1381,13 +1628,18 @@ impl Viewer {
                     }
                 }
                 FieldKind::Date { format } => {
-                    let text = &mut self.forms.value.as_mut().unwrap().2;
+                    let text = &mut self.forms.value.as_mut().unwrap().edited;
                     let r = ui.add(
                         egui::TextEdit::singleline(text)
                             .margin(ui::FIELD_MARGIN)
                             .desired_width(f32::INFINITY)
                             .hint_text(format.as_str()),
                     );
+                    r.widget_info(|| {
+                        let mut info = egui::WidgetInfo::text_edit(true, &current, &*text, format);
+                        info.label = Some(format!("{} value", field.name));
+                        info
+                    });
                     self.editor.text_editing |= r.has_focus();
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         apply = Some(text.clone());
@@ -1442,7 +1694,7 @@ impl Viewer {
                                 }
                             });
                         if *editable {
-                            let text = &mut self.forms.value.as_mut().unwrap().2;
+                            let text = &mut self.forms.value.as_mut().unwrap().edited;
                             let r = ui.add(
                                 egui::TextEdit::singleline(text)
                                     .margin(ui::FIELD_MARGIN)
@@ -1512,17 +1764,40 @@ impl Viewer {
                     .forms
                     .value
                     .as_ref()
-                    .map(|v| v.2.clone())
+                    .map(|v| v.edited.clone())
                     .unwrap_or_default();
-                if ui
-                    .add_enabled(
-                        draft != current,
-                        ActionButton::new(Icon::Check, "Apply value").primary(),
-                    )
-                    .clicked()
-                {
-                    apply = Some(draft);
+                if draft != current {
+                    ui.label(
+                        RichText::new("Unapplied value · kept while you switch fields")
+                            .small()
+                            .color(theme::warning()),
+                    );
                 }
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            draft != current,
+                            ActionButton::new(Icon::Check, "Apply value").primary(),
+                        )
+                        .clicked()
+                    {
+                        apply = Some(draft);
+                    }
+                    if ui
+                        .add_enabled(
+                            self.forms
+                                .value
+                                .as_ref()
+                                .is_some_and(|d| d.edited != current),
+                            ActionButton::new(Icon::Close, "Discard value"),
+                        )
+                        .clicked()
+                        && let Some(draft) = &mut self.forms.value
+                    {
+                        draft.original = current.clone();
+                        draft.edited = current.clone();
+                    }
+                });
             }
             if let Some(v) = apply
                 && v != current
@@ -1544,10 +1819,10 @@ impl Viewer {
         revision: u64,
         edit: &mut Option<Edit>,
     ) {
-        let fresh =
-            self.forms.draft.as_ref().is_none_or(|d| {
-                d.field != field.id || d.widget != widget.id || d.revision != revision
-            });
+        let tab = self.tabs[self.active].id;
+        let fresh = self.forms.draft.as_ref().is_none_or(|d| {
+            d.tab != tab || d.field != field.id || d.widget != widget.id || d.revision != revision
+        });
         if fresh {
             // Radio buttons share the group's settings; the export value is this button's.
             let mut p = field.properties.clone();
@@ -1555,13 +1830,25 @@ impl Viewer {
                 p.export_value = widget.export.clone();
                 p.checked = values_selected(field, widget);
             }
-            self.forms.draft = Some(Draft {
-                field: field.id,
-                widget: widget.id,
-                revision,
-                kind: field.kind,
-                original: p.clone(),
-                edited: p,
+            self.forms.stash_properties();
+            let saved = self
+                .forms
+                .saved_properties
+                .remove(&(tab, field.id, widget.id));
+            self.forms.draft = Some(match saved {
+                Some(mut draft) if draft.edited != p => {
+                    draft.revision = revision;
+                    draft
+                }
+                _ => Draft {
+                    tab,
+                    field: field.id,
+                    widget: widget.id,
+                    revision,
+                    kind: field.kind,
+                    original: p.clone(),
+                    edited: p,
+                },
             });
         }
         let draft = self.forms.draft.as_mut().unwrap();
@@ -1861,7 +2148,14 @@ impl Viewer {
                 }
             });
             let dirty = p != &draft.original;
-            ui.horizontal(|ui| {
+            if dirty {
+                ui.label(
+                    RichText::new("Unapplied properties · kept while you switch fields")
+                        .small()
+                        .color(theme::warning()),
+                );
+            }
+            ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(
                         dirty,
@@ -1875,7 +2169,11 @@ impl Viewer {
                         properties: p.clone(),
                     });
                 }
-                if dirty && ui.add(ActionButton::new(Icon::Undo, "Revert")).clicked() {
+                if dirty
+                    && ui
+                        .add(ActionButton::new(Icon::Close, "Discard changes"))
+                        .clicked()
+                {
                     *p = draft.original.clone();
                 }
             });
@@ -1907,16 +2205,18 @@ impl Viewer {
         };
         let mut open = true;
         let mut place = false;
+        let mut cancel = false;
         let mut focus = false;
         egui::Window::new(format!("Add {}", layout.title().to_lowercase()))
             .id(egui::Id::new("form_layout_dialog"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(420.)
+            .default_width(ui::dialog_width(ctx, 440.))
             .anchor(egui::Align2::CENTER_CENTER, vec2(0., 0.))
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 10.;
+                ui::dialog_body(ui, "form_layout_body", 480., |ui| {
                 let lines = |ui: &mut egui::Ui, list: &mut Vec<String>, hint: &str, focus: &mut bool| {
                     let mut text = list.join("\n");
                     let r = ui.add(
@@ -2053,13 +2353,17 @@ impl Viewer {
                     }
                     Err(e) => ui::callout(ui, ui::Tone::Warning, &format!("{e:#}")),
                 }
-                ui.horizontal(|ui| {
+                });
+                let [w, h] = layout.default_size();
+                ui::dialog_footer(ui, |ui| {
                     place = ui
                         .add_enabled(layout.plan([0., 0., w, h]).is_ok(), ActionButton::new(Icon::Plus, "Place on page").primary())
                         .on_hover_text("Then drag the area on the page, or click to use this size")
                         .clicked();
+                    cancel = ui.add(ActionButton::new(Icon::Close, "Cancel")).clicked();
                 });
             });
+        cancel |= ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         self.editor.text_editing |= focus;
         if place && let Some(layout) = self.forms.layout_dialog.take() {
             self.forms
@@ -2076,7 +2380,7 @@ impl Viewer {
             self.forms.layout = Some(layout);
             self.forms.tool = None;
             self.forms.selected = None;
-        } else if !open {
+        } else if !open || cancel {
             self.forms.layout_dialog = None;
         }
     }
@@ -2181,6 +2485,203 @@ impl Viewer {
 mod tests {
     use super::*;
     use eframe::App;
+
+    #[test]
+    fn pending_form_values_and_properties_survive_field_and_document_switches() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        let mut bytes = convert::blank(595., 842.).unwrap();
+        for (name, top) in [("First", 100.), ("Second", 160.)] {
+            bytes = form_design::add(
+                &bytes,
+                0,
+                [80., top, 280., top + 24.],
+                FieldType::Text,
+                &Properties::new(FieldType::Text, name),
+            )
+            .unwrap()
+            .0;
+        }
+        app.open_memory(PathBuf::from("Drafts A.pdf"), bytes.clone(), &ctx);
+        app.editor.mode = editing::Mode::Forms;
+        let frame = |app: &mut Viewer| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1200., 900.))),
+                    ..Default::default()
+                },
+                |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+            );
+        };
+        let settle = |app: &mut Viewer| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while app.fresh_inspection().is_none() {
+                assert!(std::time::Instant::now() < until);
+                frame(app);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            for _ in 0..3 {
+                frame(app);
+            }
+        };
+        settle(&mut app);
+        let first_tab = app.tabs[0].id;
+        let fields = app.fresh_inspection().unwrap().designed.clone().unwrap();
+        let first = fields.iter().find(|f| f.name == "First").unwrap();
+        let second = fields.iter().find(|f| f.name == "Second").unwrap();
+        app.forms.selected = Some((first.id, first.widgets[0].id));
+        frame(&mut app);
+        app.forms.value.as_mut().unwrap().edited = "Keep this typed value".into();
+        app.forms.draft.as_mut().unwrap().edited.tooltip = "Keep these properties".into();
+        assert!(app.pending_form_edits(first_tab));
+        let before_save = app.tabs[0].session.as_ref().unwrap().source.clone();
+        app.save_dialog(&ctx);
+        assert!(!app.saving, "save must not omit unapplied inspector edits");
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().source, before_save);
+        assert!(app.pending_form_edits(first_tab));
+        app.request_close(Some(first_tab), &ctx);
+        assert!(
+            app.close_intent.is_none(),
+            "close must first resolve inspector drafts"
+        );
+        assert_eq!(app.tabs.len(), 1);
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|(message, _)| message.contains("form"))
+        );
+        frame(&mut app);
+        app.forms.selected = Some((second.id, second.widgets[0].id));
+        frame(&mut app);
+        assert_eq!(app.forms.saved_values.len(), 1);
+        assert_eq!(app.forms.saved_properties.len(), 1);
+        assert!(app.forms.value.as_ref().unwrap().edited.is_empty());
+        app.forms.selected = Some((first.id, first.widgets[0].id));
+        frame(&mut app);
+        assert_eq!(
+            app.forms.value.as_ref().unwrap().edited,
+            "Keep this typed value"
+        );
+        assert_eq!(
+            app.forms.draft.as_ref().unwrap().edited.tooltip,
+            "Keep these properties"
+        );
+
+        // Object IDs/revisions can be identical in another PDF. They must not
+        // cause the first document's inspector draft to appear in the second.
+        app.open_memory(PathBuf::from("Drafts B.pdf"), bytes, &ctx);
+        settle(&mut app);
+        app.forms.selected = Some((first.id, first.widgets[0].id));
+        frame(&mut app);
+        assert!(app.forms.value.as_ref().unwrap().edited.is_empty());
+        assert!(app.forms.draft.as_ref().unwrap().edited.tooltip.is_empty());
+        assert!(app.pending_form_edits(first_tab));
+        assert!(!app.pending_form_edits(app.tabs[1].id));
+        assert!(app.focus_pending_form_edits(first_tab));
+        settle(&mut app);
+        assert_eq!(app.forms.selected, Some((first.id, first.widgets[0].id)));
+        assert_eq!(
+            app.forms.value.as_ref().unwrap().edited,
+            "Keep this typed value"
+        );
+        app.clear_form_drafts(first_tab);
+        assert!(!app.pending_form_edits(first_tab));
+    }
+
+    #[test]
+    fn rapid_form_drag_keeps_its_drawn_size() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.open_memory(
+            PathBuf::from("Fast form.pdf"),
+            convert::blank(595., 842.).unwrap(),
+            &ctx,
+        );
+        app.editor.mode = editing::Mode::Forms;
+        app.tabs[0].zoom = Zoom::Page;
+        let frame = |app: &mut Viewer, events| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1200., 900.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+            );
+        };
+        let settle = |app: &mut Viewer| {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                frame(app, vec![]);
+                if !app.content.busy
+                    && app.fresh_inspection().is_some()
+                    && app.forms.pending_edit.is_none()
+                {
+                    break;
+                }
+                assert!(std::time::Instant::now() < until);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            for _ in 0..3 {
+                frame(app, vec![]);
+            }
+        };
+        settle(&mut app);
+        let page = ctx
+            .read_response(egui::Id::new((app.tabs[0].id, 0_usize, "form_page")))
+            .unwrap()
+            .rect;
+        let from = page.min + vec2(100., 100.) * app.tabs[0].scale;
+        let to = page.min + vec2(330., 140.) * app.tabs[0].scale;
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            pressed,
+            button: egui::PointerButton::Primary,
+            modifiers: egui::Modifiers::NONE,
+        };
+        app.forms.tool = Some(FieldType::Text);
+        // An input backend can deliver the last movement and release together.
+        frame(&mut app, vec![egui::Event::PointerMoved(from)]);
+        frame(&mut app, vec![button(from, true)]);
+        frame(
+            &mut app,
+            vec![egui::Event::PointerMoved(to), button(to, false)],
+        );
+        settle(&mut app);
+        let fields = app.fresh_inspection().unwrap().designed.as_ref().unwrap();
+        assert_eq!(fields.len(), 1, "a quick drag creates its field");
+        for (a, b) in fields[0].widgets[0]
+            .rect
+            .iter()
+            .zip([100., 100., 330., 140.])
+        {
+            assert!((a - b).abs() < 1.5, "{:?}", fields[0].widgets[0].rect);
+        }
+        // The canvas control is keyboard-focusable; moving it does not require
+        // pointer precision and does not interpret the arrow as text input.
+        let before_nudge = fields[0].widgets[0].rect[0];
+        let id = egui::Id::new((
+            app.tabs[0].id,
+            0_usize,
+            "form_widget",
+            fields[0].widgets[0].id,
+        ));
+        ctx.memory_mut(|m| m.request_focus(id));
+        frame(&mut app, vec![]);
+        frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        settle(&mut app);
+        let fields = app.fresh_inspection().unwrap().designed.as_ref().unwrap();
+        assert!((fields[0].widgets[0].rect[0] - before_nudge - 1.).abs() < 0.1);
+    }
 
     #[test]
     fn fields_are_drawn_placed_moved_and_deleted_on_the_page() {

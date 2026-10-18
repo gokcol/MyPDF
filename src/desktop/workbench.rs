@@ -1340,6 +1340,92 @@ mod tests {
         (app, ctx)
     }
     #[test]
+    fn translation_attachment_preserves_pending_image_crop_without_mutation() {
+        let (mut app, ctx) = fixture();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(8, 6, image::Rgba([30, 120, 190, 255]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let image = Annotation::new(
+            0,
+            [100., 100., 300., 250.],
+            Kind::Image {
+                png: Arc::new(png.into_inner()),
+            },
+            Default::default(),
+        );
+        app.tabs[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .commit(vec![image.clone()])
+            .unwrap();
+        selection::set(&mut app.tabs[0], &mut app.editor, vec![image.id.clone()]);
+        app.start_crop(&ctx);
+        let expected_crop = [0.2, 0.1, 0.85, 0.9];
+        app.workbench.crop.as_mut().unwrap().rect = expected_crop;
+        let crop_key = app.workbench.crop.as_ref().unwrap().key;
+        let session = app.tabs[0].session.as_ref().unwrap();
+        let revision = session.revision();
+        let source = session.source.clone();
+        let before = session.annotations.clone();
+        let undo_count = session.history().0;
+        let error = app
+            .attach_translation_note(
+                &ctx,
+                translation_note::Request {
+                    tab: app.tabs[0].id,
+                    revision,
+                    page: 0,
+                    anchor: None,
+                    source_object: None,
+                    source_language: "English".into(),
+                    target_language: "Turkish".into(),
+                    text: "Belge çevirisi.".into(),
+                },
+            )
+            .expect_err("attachment must not invalidate an unfinished image crop");
+        assert!(error.to_lowercase().contains("crop"), "{error}");
+        let session = app.tabs[0].session.as_ref().unwrap();
+        assert_eq!(session.revision(), revision);
+        assert_eq!(session.source.as_ref(), source.as_ref());
+        assert_eq!(session.annotations, before);
+        assert_eq!(session.history().0, undo_count);
+        let frame = |app: &mut Viewer| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1000., 800.))),
+                    ..Default::default()
+                },
+                |ctx| app.workbench_windows(ctx),
+            );
+        };
+        for _ in 0..2 {
+            frame(&mut app);
+        }
+        let crop = app
+            .workbench
+            .crop
+            .as_ref()
+            .expect("crop must survive revision validation on the next frame");
+        assert_eq!(crop.key, crop_key);
+        assert_eq!(crop.rect, expected_crop);
+        assert_eq!(crop.original, image);
+        // The user's unfinished crop is still applicable and undoable.
+        app.workbench.crop.as_mut().unwrap().apply = true;
+        frame(&mut app);
+        assert!(app.workbench.crop.is_none());
+        assert_eq!(
+            app.tabs[0].session.as_ref().unwrap().annotations[0]
+                .object
+                .crop,
+            Some(expected_crop)
+        );
+        app.editor_undo(false);
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().annotations, before);
+    }
+
+    #[test]
     fn canvas_crop_rotated_flipped_image_commits_once_and_undo_restores_pixels() {
         let (mut app, ctx) = fixture();
         let mut png = std::io::Cursor::new(Vec::new());

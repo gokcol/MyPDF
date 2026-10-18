@@ -1,6 +1,6 @@
 ﻿; The MyPDF installer for 64-bit Windows, built with Inno Setup 6 by the
 ; "Windows build" workflow:
-;   ISCC /DAppVersion=0.95.0 /DSource=pack\MyPDF /O<folder> /F<file name> MyPDF.iss
+;   ISCC /DAppVersion=1.2.0 /DSource=pack\MyPDF /O<folder> /F<file name> MyPDF.iss
 ; It installs for the current user without asking for administrator rights
 ; (or for everyone, if chosen), adds a Start menu entry and an uninstaller,
 ; and, when ticked, lists MyPDF in the "Open with" menu for PDF files.
@@ -62,6 +62,11 @@ Source: "{#Source}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Source}\LICENSE-MIT"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Source}\LICENSE-APACHE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Source}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
+; The bridge statically links CTranslate2/SentencePiece and the MSVC runtime.
+; These explicit entries make a missing runtime or its notices a build failure.
+Source: "{#Source}\translation\mypdf_ct2.dll"; DestDir: "{app}\translation"; Flags: ignoreversion
+Source: "{#Source}\translation\mypdf_ct2.dll.sha256"; DestDir: "{app}\translation"; Flags: ignoreversion
+Source: "{#Source}\translation\licenses\*"; DestDir: "{app}\translation\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\MyPDF"; Filename: "{app}\MyPDF.exe"
