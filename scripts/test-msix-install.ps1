@@ -28,6 +28,7 @@ $token = [guid]::NewGuid().ToString('N')
 Set-Content $sentinel $token -Encoding ascii
 $cert = $null
 $installed = $null
+$runtimeHost = $null
 try {
     $cert = New-SelfSignedCertificate -Type Custom -Subject $info.publisher -KeyUsage DigitalSignature `
         -CertStoreLocation 'Cert:\CurrentUser\My' -HashAlgorithm SHA256 -NotAfter (Get-Date).AddDays(1) `
@@ -48,7 +49,93 @@ try {
     $manifest = Get-AppxPackageManifest -Package $installed.PackageFullName
     if ($manifest.Package.Applications.Application.Id -ne 'MyPDF') { throw 'Missing desktop application registration.' }
     if (-not (Test-Path (Join-Path $installed.InstallLocation 'MyPDF.exe'))) { throw 'Packaged executable missing.' }
-    & (Join-Path $PSScriptRoot 'test-translation-runtime.ps1') -RuntimeDirectory (Join-Path $installed.InstallLocation 'translation')
+    # Exercise WindowsApps code with the installed app's package identity;
+    # an unrelated PowerShell host may lack permission to map the DLL for execution.
+    $runtimeResult = Join-Path $scratch 'runtime-result.json'
+    $runtimeStarted = Join-Path $scratch 'runtime-started.json'
+    $runtimeConfig = [ordered]@{
+        packageFullName = $installed.PackageFullName
+        runtimeDirectory = Join-Path $installed.InstallLocation 'translation'
+        smokeScript = Join-Path $PSScriptRoot 'test-translation-runtime.ps1'
+        resultPath = $runtimeResult
+        startedPath = $runtimeStarted
+    } | ConvertTo-Json -Compress
+    $runtimeConfig64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($runtimeConfig))
+    $runtimeCommand = @'
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$config = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__CONFIG__')) | ConvertFrom-Json
+$process = [Diagnostics.Process]::GetCurrentProcess()
+@{ pid = $PID; startTicks = $process.StartTime.ToUniversalTime().Ticks } |
+    ConvertTo-Json -Compress | Set-Content ($config.startedPath + '.tmp') -Encoding utf8
+Move-Item ($config.startedPath + '.tmp') $config.startedPath
+$result = [ordered]@{ success = $false; packageFullName = $null; error = $null }
+try {
+    Add-Type @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class MyPDFPackageIdentity {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, ExactSpelling=true)]
+    static extern int GetCurrentPackageFullName(ref uint length, StringBuilder name);
+    public static string Read() {
+        uint length = 0;
+        int code = GetCurrentPackageFullName(ref length, null);
+        if (code != 122) throw new Win32Exception(code);
+        var name = new StringBuilder(checked((int)length));
+        code = GetCurrentPackageFullName(ref length, name);
+        if (code != 0) throw new Win32Exception(code);
+        return name.ToString();
+    }
+}
+"@
+    $result.packageFullName = [MyPDFPackageIdentity]::Read()
+    if ($result.packageFullName -cne $config.packageFullName) {
+        throw 'Runtime smoke host does not have the expected installed package identity.'
+    }
+    & $config.smokeScript -RuntimeDirectory $config.runtimeDirectory
+    $result.success = $true
+} catch {
+    $result.error = $_.Exception.Message
+} finally {
+    $result | ConvertTo-Json -Compress | Set-Content ($config.resultPath + '.tmp') -Encoding utf8
+    Move-Item ($config.resultPath + '.tmp') $config.resultPath
+}
+'@
+    $runtimeCommand = $runtimeCommand.Replace('__CONFIG__', $runtimeConfig64)
+    $runtimeCommand64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($runtimeCommand))
+    Invoke-CommandInDesktopPackage -PackageFamilyName $installed.PackageFamilyName -AppId 'MyPDF' `
+        -Command "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -Args "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $runtimeCommand64" `
+        -PreventBreakaway
+    $deadline = [DateTime]::UtcNow.AddSeconds(120)
+    while (-not (Test-Path $runtimeResult) -and [DateTime]::UtcNow -lt $deadline) {
+        if (-not $runtimeHost -and (Test-Path $runtimeStarted)) {
+            $started = Get-Content $runtimeStarted -Raw -Encoding utf8 | ConvertFrom-Json
+            $candidate = Get-Process -Id $started.pid -ErrorAction SilentlyContinue
+            if ($candidate) {
+                try {
+                    if ($candidate.StartTime.ToUniversalTime().Ticks -eq $started.startTicks) {
+                        $runtimeHost = $candidate
+                    }
+                } catch {
+                    # The short-lived host may exit between lookup and inspection.
+                    # Its atomic result file remains the authoritative outcome.
+                }
+            }
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    if (-not (Test-Path $runtimeResult)) { throw 'Installed package runtime smoke check timed out.' }
+    $runtimeCheck = Get-Content $runtimeResult -Raw -Encoding utf8 | ConvertFrom-Json
+    if (-not $runtimeCheck.success -or $runtimeCheck.packageFullName -cne $installed.PackageFullName) {
+        throw "Installed package runtime smoke check failed: $($runtimeCheck.error)"
+    }
+    if ($runtimeHost -and -not $runtimeHost.WaitForExit(10000)) {
+        throw 'Installed package runtime smoke host did not exit.'
+    }
+    Write-Host 'PASS installed translation runtime: package identity, checksum, dependency load, exports, and ABI.'
     Write-Host "PASS package installation: $($installed.PackageFullName)"
     Remove-AppxPackage -Package $installed.PackageFullName
     $installed = $null
@@ -57,6 +144,7 @@ try {
     if ((Get-FileHash $package.FullName -Algorithm SHA256).Hash -ne $originalHash) { throw 'Unsigned upload artifact was modified.' }
     Write-Host 'PASS uninstall, existing-data preservation, and unchanged unsigned submission artifact.'
 } finally {
+    if ($runtimeHost -and -not $runtimeHost.HasExited) { $runtimeHost.Kill(); $runtimeHost.WaitForExit(10000) | Out-Null }
     if ($installed) { Remove-AppxPackage -Package $installed.PackageFullName }
     if ($cert) {
         Remove-Item "Cert:\LocalMachine\TrustedPeople\$($cert.Thumbprint)" -ErrorAction SilentlyContinue
