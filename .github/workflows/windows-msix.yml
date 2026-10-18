@@ -46,7 +46,8 @@ permissions:
   contents: read
 jobs:
   package:
-    runs-on: windows-latest
+    # Native translation uses the Visual Studio 17 2022 generator.
+    runs-on: windows-2022
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
