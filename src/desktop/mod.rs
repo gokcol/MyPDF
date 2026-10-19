@@ -2875,8 +2875,14 @@ mod tests {
         );
         let text_box = ctx.read_response(text_id).unwrap().rect;
         assert!(
-            text_box.min.distance(point) < 1.,
-            "Text must start at the clicked point"
+            (text_box.left() - point.x).abs() < 1.
+                && (ctx.data(|data| data
+                    .get_temp::<f32>(egui::Id::new("new_text_first_line_center"))
+                    .unwrap())
+                    - point.y)
+                    .abs()
+                    < 2.,
+            "The first text line must be centered at the clicked point"
         );
         app.show_home();
         assert!(app.home.visible && app.tabs.len() == 1);

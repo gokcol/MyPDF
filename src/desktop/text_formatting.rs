@@ -321,6 +321,7 @@ pub(super) fn layout(
         _ => egui::Align::LEFT,
     };
     job.justify = alignment == Alignment::Justified;
+    job.sections[0].format.line_height = Some(font.size * 1.3);
     if !spans.is_empty() {
         job.sections.clear();
         for s in rich_text::edited(source, text, spans) {
