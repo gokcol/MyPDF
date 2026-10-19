@@ -94,7 +94,18 @@ impl Look {
     }
 }
 
-pub(super) type PreviewResult = Result<TextureHandle, String>;
+#[derive(Clone)]
+pub(super) struct SignaturePreview {
+    pub texture: TextureHandle,
+    pub bounds: [f32; 4],
+}
+impl std::ops::Deref for SignaturePreview {
+    type Target = TextureHandle;
+    fn deref(&self) -> &Self::Target {
+        &self.texture
+    }
+}
+pub(super) type PreviewResult = Result<SignaturePreview, String>;
 
 pub(super) struct ManagerState {
     pub selected: Option<String>,
@@ -106,10 +117,10 @@ pub(super) struct ManagerState {
     pending: HashSet<u64>,
     queued: std::collections::VecDeque<(u64, DesktopSigningRequest, egui::Context)>,
     active: usize,
-    last_previews: HashMap<String, TextureHandle>,
+    last_previews: HashMap<String, SignaturePreview>,
     slot_keys: HashMap<String, u64>,
-    tx: mpsc::Sender<(u64, Result<Vec<u8>, String>)>,
-    rx: mpsc::Receiver<(u64, Result<Vec<u8>, String>)>,
+    tx: mpsc::Sender<(u64, Result<signing::SignatureAppearance, String>)>,
+    rx: mpsc::Receiver<(u64, Result<signing::SignatureAppearance, String>)>,
     /// The signature that receives the next image added to the library.
     pub adopt_into: Option<String>,
     /// The "Create my digital ID" form.
@@ -158,18 +169,21 @@ impl ManagerState {
             if self.previews.len() > 96 {
                 self.previews.clear();
             }
-            let texture = result.and_then(|png| {
-                let image = mypdf_milestone0::assets::decode_png(&png)
+            let texture = result.and_then(|appearance| {
+                let image = mypdf_milestone0::assets::decode_png(&appearance.png)
                     .map_err(|e| format!("{e:#}"))?
                     .into_rgba8();
-                Ok(ctx.load_texture(
-                    format!("signature_preview_{key:016x}"),
-                    egui::ColorImage::from_rgba_unmultiplied(
-                        [image.width() as usize, image.height() as usize],
-                        &image,
+                Ok(SignaturePreview {
+                    bounds: appearance.bounds,
+                    texture: ctx.load_texture(
+                        format!("signature_preview_{key:016x}"),
+                        egui::ColorImage::from_rgba_unmultiplied(
+                            [image.width() as usize, image.height() as usize],
+                            &image,
+                        ),
+                        egui::TextureOptions::LINEAR,
                     ),
-                    egui::TextureOptions::LINEAR,
-                ))
+                })
             });
             self.previews.insert(key, texture);
         }
@@ -220,7 +234,7 @@ impl ManagerState {
             self.active += 1;
             let tx = self.tx.clone();
             std::thread::spawn(move || {
-                let result = std::panic::catch_unwind(|| signing::signature_artwork(&request))
+                let result = std::panic::catch_unwind(|| signing::signature_appearance(&request))
                     .map_err(|_| "The preview could not be drawn.".to_string())
                     .and_then(|r| r.map_err(|e| format!("{e:#}")));
                 let _ = tx.send((key, result));
@@ -268,13 +282,8 @@ fn request_key(request: &DesktopSigningRequest) -> u64 {
     serde_json::to_string(&request.text_style)
         .unwrap_or_default()
         .hash(&mut h);
-    request.transform.rotation.to_bits().hash(&mut h);
-    request.transform.image_overlay.hash(&mut h);
-    request.transform.image_opacity.to_bits().hash(&mut h);
-    request
-        .transform
-        .image_insets
-        .map(f32::to_bits)
+    serde_json::to_string(&request.transform)
+        .unwrap_or_default()
         .hash(&mut h);
     format!("{:?}{:?}", request.background, request.layout).hash(&mut h);
     request
@@ -284,7 +293,7 @@ fn request_key(request: &DesktopSigningRequest) -> u64 {
         .hash(&mut h);
     request
         .rect
-        .map(|r| [(r[2] - r[0]).round() as i32, (r[3] - r[1]).round() as i32])
+        .map(|r| [(r[2] - r[0]).to_bits(), (r[3] - r[1]).to_bits()])
         .hash(&mut h);
     h.finish()
 }
@@ -355,6 +364,47 @@ pub(super) fn status(entry: &Entry) -> (String, ui::Tone) {
         Some((_, date)) => (format!("Ready · valid until {date}"), ui::Tone::Success),
         None => ("Ready".into(), ui::Tone::Success),
     }
+}
+
+/// Explicit spacing overrides the legacy layout only when the user changes it.
+fn spacing_control(ui: &mut egui::Ui, label: &str, value: &mut Option<f32>, max: f32) {
+    ui.push_id(label, |ui| {
+        ui.horizontal(|ui| {
+            ui.add_sized(vec2(110., 24.), egui::Label::new(label));
+            ui.spacing_mut().slider_width = (ui.available_width() - 90.).clamp(30., 100.);
+            let mut points = value.unwrap_or(8.);
+            if ui
+                .add(egui::Slider::new(&mut points, 0. ..=max).show_value(false))
+                .on_hover_text(format!("{label} in PDF points; 0 removes this spacing"))
+                .changed()
+            {
+                *value = Some(points);
+            }
+            egui::ComboBox::from_id_salt("presets")
+                .width(76.)
+                .selected_text(value.map_or_else(|| "Automatic".into(), |v| format!("{v:.1} pt")))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(value, None, "Automatic (original layout)");
+                    for v in [0., 2., 4., 6., 8., 12., 16., 24., 32., 48.] {
+                        if v <= max {
+                            ui.selectable_value(value, Some(v), format!("{v} pt"));
+                        }
+                    }
+                    ui.separator();
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut points)
+                                .range(0. ..=max)
+                                .speed(0.25)
+                                .suffix(" pt"),
+                        )
+                        .changed()
+                    {
+                        *value = Some(points);
+                    }
+                });
+        });
+    });
 }
 
 /// Four independent inside edges, stored as percentages so resizing keeps the composition.
@@ -1094,6 +1144,33 @@ impl DigitalState {
                         .has_focus();
                     });
                 });
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut signature.transform.fit_to_content, "Fit box to content")
+                        .on_hover_text("Trim empty outer space without stretching the image or text. The page preview and saved signature use the same fitted box.");
+                });
+                spacing_control(
+                    ui,
+                    "Outer padding",
+                    &mut signature.transform.outer_padding,
+                    32.,
+                );
+                ui.add_enabled_ui(
+                    signature.asset_id.is_some()
+                        && !signature.transform.image_overlay
+                        && (signature.show_name
+                            || signature.show_date
+                            || !signature.note.trim().is_empty()),
+                    |ui| {
+                        spacing_control(
+                            ui,
+                            "Image–text gap",
+                            &mut signature.transform.image_text_gap,
+                            48.,
+                        );
+                    },
+                )
+                .response
+                .on_hover_text("The gap applies when the image is beside the details.");
                 egui::CollapsingHeader::new("Text appearance & position")
                     .default_open(compact)
                     .show(ui, |ui| {
@@ -2386,6 +2463,15 @@ mod preview_stability_tests {
         let image = request_key(&request);
         request.text_style.insets[3] = 15.;
         assert_ne!(image, request_key(&request));
+        let previous = request_key(&request);
+        request.transform.outer_padding = Some(0.);
+        assert_ne!(previous, request_key(&request));
+        let previous = request_key(&request);
+        request.transform.image_text_gap = Some(12.);
+        assert_ne!(previous, request_key(&request));
+        let previous = request_key(&request);
+        request.transform.fit_to_content = true;
+        assert_ne!(previous, request_key(&request));
     }
     #[test]
     fn rapid_changes_keep_last_preview_and_bound_render_workers() {

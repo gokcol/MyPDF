@@ -310,6 +310,12 @@ pub struct AppearanceTransform {
     pub image_opacity: f32,
     /// Insets as percentages of the image area: left, top, right, bottom.
     pub image_insets: [f32; 4],
+    /// None preserves the padding used by earlier saved designs; otherwise PDF points.
+    pub outer_padding: Option<f32>,
+    /// Space between the image and details in PDF points; None keeps the legacy split.
+    pub image_text_gap: Option<f32>,
+    /// Trim the visible signature rectangle around its rendered content and padding.
+    pub fit_to_content: bool,
 }
 impl Default for AppearanceTransform {
     fn default() -> Self {
@@ -318,6 +324,9 @@ impl Default for AppearanceTransform {
             image_overlay: false,
             image_opacity: 1.,
             image_insets: [0.; 4],
+            outer_padding: None,
+            image_text_gap: None,
+            fit_to_content: false,
         }
     }
 }
@@ -414,7 +423,31 @@ fn signing_time_label() -> String {
     format!("{} {:02}:{:02} UTC", now.date(), now.hour(), now.minute())
 }
 
+/// Appearance pixels and their bounds relative to the originally drawn box.
+#[derive(Clone, Debug)]
+pub struct SignatureAppearance {
+    pub png: Vec<u8>,
+    pub bounds: [f32; 4],
+}
+impl SignatureAppearance {
+    pub fn page_rect(&self, rect: [f32; 4]) -> [f32; 4] {
+        appearance_page_rect(self.bounds, rect)
+    }
+}
+pub fn appearance_page_rect(bounds: [f32; 4], rect: [f32; 4]) -> [f32; 4] {
+    let (w, h) = (rect[2] - rect[0], rect[3] - rect[1]);
+    [
+        rect[0] + bounds[0] * w,
+        rect[1] + bounds[1] * h,
+        rect[0] + bounds[2] * w,
+        rect[1] + bounds[3] * h,
+    ]
+}
 pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
+    Ok(signature_appearance(request)?.png)
+}
+
+pub fn signature_appearance(request: &DesktopSigningRequest) -> Result<SignatureAppearance> {
     use crate::annotations::{Annotation, Kind, Style};
     use lopdf::{Document, Object, Stream, dictionary};
     let rect = request
@@ -464,6 +497,20 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
             "Signature edge spacing must be between 0 and 45 percent"
         );
     }
+    ensure!(
+        request
+            .transform
+            .outer_padding
+            .is_none_or(|v| v.is_finite() && (0. ..=32.).contains(&v) && 2. * v < w && 2. * v < h),
+        "Outer padding must leave room inside the signature box (0–32 pt)"
+    );
+    ensure!(
+        request
+            .transform
+            .image_text_gap
+            .is_none_or(|v| v.is_finite() && (0. ..=48.).contains(&v)),
+        "Image–text gap must be between 0 and 48 pt"
+    );
     // A small box is laid out larger and scaled down as a whole, like an image,
     // so its details always fit and keep their proportions.
     let k = (160.0 / w).max(64.0 / h).max(1.0);
@@ -501,9 +548,6 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
             },
         );
         Ok(raster.into_png()?)
-    };
-    let render = |marks: Vec<Annotation>, transparent: bool| -> Result<Vec<u8>> {
-        render_pdf(crate::annotations::export(&base, &marks)?, transparent)
     };
     // Fit the rotated artwork in its allotted area without rotating the details
     // or the background. Ink coordinates remain normalized inside this rectangle.
@@ -555,6 +599,95 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
         })
         .into_iter()
         .collect();
+    let render = |marks: Vec<Annotation>, transparent: bool| -> Result<SignatureAppearance> {
+        if !request.transform.fit_to_content {
+            let mut all = backdrop.clone();
+            all.extend(marks);
+            return Ok(SignatureAppearance {
+                png: render_pdf(crate::annotations::export(&base, &all)?, transparent)?,
+                bounds: [0., 0., 1., 1.],
+            });
+        }
+        // Measure only the artwork, never the fill/frame. Keep its page position and
+        // scale unchanged when trimming, and use the same bounds in preview and signing.
+        let ink = crate::assets::decode_png(&render_pdf(
+            crate::annotations::export(&base, &marks)?,
+            true,
+        )?)?
+        .into_rgba8();
+        let (pw, ph) = ink.dimensions();
+        let mut bounds = [pw, ph, 0, 0];
+        for (x, y, pixel) in ink.enumerate_pixels() {
+            if pixel[3] > 0 {
+                bounds = [
+                    bounds[0].min(x),
+                    bounds[1].min(y),
+                    bounds[2].max(x + 1),
+                    bounds[3].max(y + 1),
+                ];
+            }
+        }
+        let pad = request.transform.outer_padding.unwrap_or(2.) * k;
+        let (px, py) = (
+            (pad * pw as f32 / w).ceil() as u32,
+            (pad * ph as f32 / h).ceil() as u32,
+        );
+        if bounds[2] > bounds[0] && bounds[3] > bounds[1] {
+            bounds = [
+                bounds[0].saturating_sub(px),
+                bounds[1].saturating_sub(py),
+                bounds[2].saturating_add(px).min(pw),
+                bounds[3].saturating_add(py).min(ph),
+            ];
+        } else {
+            bounds = [0, 0, pw, ph];
+        }
+        let normalized = [
+            bounds[0] as f32 / pw as f32,
+            bounds[1] as f32 / ph as f32,
+            bounds[2] as f32 / pw as f32,
+            bounds[3] as f32 / ph as f32,
+        ];
+        let image = if backdrop.is_empty() {
+            ink
+        } else {
+            let mut all = backdrop.clone();
+            for mark in &mut all {
+                let edge = if background == Background::Framed {
+                    0.5
+                } else {
+                    0.
+                };
+                mark.rect = [
+                    normalized[0] * w + edge,
+                    normalized[1] * h + edge,
+                    normalized[2] * w - edge,
+                    normalized[3] * h - edge,
+                ];
+            }
+            all.extend(marks);
+            crate::assets::decode_png(&render_pdf(
+                crate::annotations::export(&base, &all)?,
+                transparent,
+            )?)?
+            .into_rgba8()
+        };
+        let cropped = image::imageops::crop_imm(
+            &image,
+            bounds[0],
+            bounds[1],
+            bounds[2] - bounds[0],
+            bounds[3] - bounds[1],
+        )
+        .to_image();
+        let mut png = std::io::Cursor::new(vec![]);
+        image::DynamicImage::ImageRgba8(cropped).write_to(&mut png, image::ImageFormat::Png)?;
+        Ok(SignatureAppearance {
+            png: png.into_inner(),
+            bounds: normalized,
+        })
+    };
+    let padding = request.transform.outer_padding.map(|p| p * k);
     let mut lines = vec![];
     if request.layout != AppearanceLayout::ImageOnly {
         if request.show_name {
@@ -593,10 +726,17 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
             .context("Choose what the signature shows: your name, the date, a note or an image")?;
         artwork.validate()?;
         if request.transform.image_opacity == 0. {
-            return render(backdrop, transparent);
+            return render(vec![], transparent);
         }
-        let [left, top, right, bottom] =
-            inset([2., 2., w - 2., h - 2.], request.transform.image_insets);
+        let [left, top, right, bottom] = inset(
+            [
+                padding.unwrap_or(2.),
+                padding.unwrap_or(2.),
+                w - padding.unwrap_or(2.),
+                h - padding.unwrap_or(2.),
+            ],
+            request.transform.image_insets,
+        );
         let (available_w, available_h) = (right - left, bottom - top);
         let aw = available_w.min(available_h * artwork.aspect);
         let ah = aw / artwork.aspect;
@@ -612,30 +752,36 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
         if matches!(artwork.kind, Kind::Text { .. } | Kind::Stamp { .. }) {
             style.font_size = style.font_size.min((ah - 4.0) / 1.25).max(1.0);
         }
-        let mut marks = backdrop.clone();
-        marks.push(rotate_image(
+        let marks = vec![rotate_image(
             Annotation::new(0, [x, y, x + aw, y + ah], artwork.kind.clone(), style),
             available_w,
             available_h,
-        )?);
+        )?];
         return render(marks, transparent);
     }
-    let mut annotations = backdrop;
+    let mut annotations = vec![];
     let artwork = request.artwork.as_ref().filter(|_| {
         request.layout == AppearanceLayout::ImageAndDetails && request.transform.image_opacity > 0.
     });
     let mut overlay = None;
     let left = if let Some(artwork) = artwork {
         artwork.validate()?;
+        let p = padding.unwrap_or(8.);
+        let custom_spacing = padding.is_some() || request.transform.image_text_gap.is_some();
+        let gap = request
+            .transform
+            .image_text_gap
+            .map_or(w * 0.02, |g| g * k)
+            .min((w - 2. * p) * 0.5);
         let image_right = if request.transform.image_overlay {
-            w - 8.
+            w - p
+        } else if custom_spacing {
+            p + (w - 2. * p - gap) * 0.34
         } else {
             w * 0.34
         };
-        let [left, top, right, bottom] = inset(
-            [8., 8., image_right, h - 8.],
-            request.transform.image_insets,
-        );
+        let [left, top, right, bottom] =
+            inset([p, p, image_right, h - p], request.transform.image_insets);
         let (available_w, available_h) = (right - left, bottom - top);
         let aw = available_w.min(available_h * artwork.aspect);
         let ah = aw / artwork.aspect;
@@ -656,19 +802,26 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
         )?;
         if request.transform.image_overlay {
             overlay = Some(image);
-            8.
+            p
         } else {
             annotations.push(image);
-            w * 0.36
+            if custom_spacing {
+                image_right + gap
+            } else {
+                w * 0.36
+            }
         }
     } else {
-        8.0
+        padding.unwrap_or(8.)
     };
     // Move details independently from the image; shrink text only when needed to fit.
     let text_style = &request.text_style;
     let x = (left + w * text_style.offset[0] / 100.).clamp(0., w - 16.);
-    let y = (4. + h * text_style.offset[1] / 100.).clamp(0., h - 8.);
-    let [x, y, right, bottom] = inset([x, y, w - 5., h - 2.], text_style.insets);
+    let y = (padding.unwrap_or(4.) + h * text_style.offset[1] / 100.).clamp(0., h - 8.);
+    let [x, y, right, bottom] = inset(
+        [x, y, w - padding.unwrap_or(5.), h - padding.unwrap_or(2.)],
+        text_style.insets,
+    );
     let width = (right - x).max(1.);
     let height = (bottom - y).max(1.);
     let font = text_style.font()?;
@@ -754,8 +907,9 @@ pub async fn sign_custom(
                 && rect[3] <= h,
             "Signature rectangle must fit within the displayed page"
         );
-        let png = signature_artwork(request)?;
-        let image = crate::assets::decode_png(&png)?.into_rgba8();
+        let appearance = signature_appearance(request)?;
+        let rect = appearance.page_rect(rect);
+        let image = crate::assets::decode_png(&appearance.png)?.into_rgba8();
         use hayro::hayro_syntax::page::Rotation;
         let image = match page.rotation() {
             Rotation::None => image,

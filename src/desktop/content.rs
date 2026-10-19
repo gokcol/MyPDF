@@ -353,7 +353,10 @@ impl ContentState {
         let x = point[0].clamp(0., (size.width - 10.).max(0.));
         let w = 240_f32.min(size.width - x);
         let h = (self.new_size * 2.6).min(size.height);
-        self.new_rect = [x, point[1].clamp(0., (size.height - h).max(0.)), w, h];
+        // The I-beam click anchors the first line's center, not the top of its
+        // line box. Keep the same page-space rectangle for editing and saving.
+        let top = point[1] - self.new_size * 1.3 / 2.;
+        self.new_rect = [x, top.clamp(0., (size.height - h).max(0.)), w, h];
         self.new_initial_rect = Some(self.new_rect);
         self.focus_new_text = true;
         self.show_text_inspector = true;
@@ -3062,7 +3065,7 @@ pub(super) fn overlay(
                 let text_id = egui::Id::new((tab.id, page, "inline_new_text"));
                 let retained_selection = context::secondary_selection(ui.ctx(), text_id);
                 let mut edit = egui::TextEdit::multiline(&mut state.new_text)
-                    .margin(ui::FIELD_MARGIN)
+                    .font(font.clone())
                     .id(text_id)
                     .text_color(color)
                     .frame(false)
@@ -3074,6 +3077,15 @@ pub(super) fn overlay(
                     .hint_text("Type here")
                     .layouter(&mut layouter)
                     .show(ui);
+                #[cfg(test)]
+                if let Some(row) = edit.galley.rows.first() {
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new("new_text_first_line_center"),
+                            edit.galley_pos.y + row.rect().center().y,
+                        )
+                    });
+                }
                 context::restore_secondary_selection(&mut edit, retained_selection);
                 context::text_menu(
                     &mut edit,
@@ -3701,6 +3713,114 @@ mod tests {
     }
 
     #[test]
+    fn add_text_click_centers_the_first_line_at_every_zoom() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let id = app.tabs[0].id;
+        for scale in [0.75, 1., 2.] {
+            for size in [12., 24.] {
+                app.content = ContentState::new();
+                app.content.new_size = size;
+                app.content.add_target = Some((id, 0));
+                let page_rect = Rect::from_min_size(pos2(30., 40.), vec2(595., 842.) * scale);
+                let click = page_rect.min + vec2(70., 120.) * scale;
+                let frame = |app: &mut Viewer, events| {
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                pos2(0., 0.),
+                                vec2(1500., 1900.),
+                            )),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                overlay(
+                                    &mut app.content,
+                                    editing::Mode::Edit,
+                                    &app.tabs[0],
+                                    ui,
+                                    0,
+                                    page_rect,
+                                    scale,
+                                );
+                            });
+                        },
+                    );
+                };
+                frame(&mut app, vec![]);
+                for pressed in [true, false] {
+                    frame(
+                        &mut app,
+                        vec![
+                            egui::Event::PointerMoved(click),
+                            egui::Event::PointerButton {
+                                pos: click,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: Default::default(),
+                            },
+                        ],
+                    );
+                }
+                assert!(app.content.new_placed);
+                frame(&mut app, vec![]);
+                let center = || {
+                    ctx.data(|data| {
+                        data.get_temp::<f32>(egui::Id::new("new_text_first_line_center"))
+                            .unwrap()
+                    })
+                };
+                assert!(
+                    (center() - click.y).abs() <= 2.,
+                    "empty: size={size}, zoom={scale}: {} vs {}",
+                    center(),
+                    click.y
+                );
+                frame(&mut app, vec![egui::Event::Text("Hello".into())]);
+                frame(&mut app, vec![]);
+                assert_eq!(app.content.new_text, "Hello");
+                assert!(
+                    (center() - click.y).abs() <= 2.,
+                    "typed: size={size}, zoom={scale}: {} vs {}",
+                    center(),
+                    click.y
+                );
+                assert!((app.content.new_rect[0] - 70.).abs() < 0.1);
+                let rect = app.content.new_rect;
+                let committed = content::add_text(
+                    &app.tabs[0].session.as_ref().unwrap().source,
+                    1,
+                    "Hello",
+                    rect,
+                    size,
+                    [0.; 3],
+                )
+                .unwrap();
+                let run = mypdf_milestone0::text_geometry::runs(&committed, 1)
+                    .unwrap()
+                    .remove(0);
+                let bounds = run.rect.unwrap();
+                assert!(
+                    bounds[1] < 120. && bounds[3] > 120.,
+                    "saved line must straddle the click: {bounds:?}"
+                );
+            }
+        }
+        app.content
+            .place_text(id, 0, [2., 0.], app.tabs[0].pages[0]);
+        assert_eq!(app.content.new_rect[1], 0.);
+    }
+
+    #[test]
     fn text_drag_keeps_final_release_position_for_coalesced_input() {
         for new_text in [false, true] {
             for event_mode in 0..3 {
@@ -3801,7 +3921,10 @@ mod tests {
                     );
                 }
                 let (actual, initial) = if new_text {
-                    (app.content.new_rect, [50., 70.])
+                    (
+                        app.content.new_rect,
+                        [50., 70. - app.content.new_size * 1.3 / 2.],
+                    )
                 } else {
                     let draft = app.content.existing.as_ref().expect("drag keeps editor");
                     let InlineTarget::Block(block) = &draft.target else {
@@ -5030,7 +5153,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(app.content.new_placed && app.content.new_text.is_empty());
-        assert_eq!(app.content.new_rect[1], 600.);
+        assert_eq!(
+            app.content.new_rect[1] + app.content.new_size * 1.3 / 2.,
+            600.
+        );
         assert!(
             lopdf::Document::load_mem(&app.tabs[0].session.as_ref().unwrap().source)
                 .unwrap()

@@ -4,7 +4,7 @@ Effective date: 18 October 2026
 
 This policy covers MyPDF (OG), the Microsoft Store edition of MyPDF by
 Orhan Gökçöl, and the MyPDF desktop application distributed through the project's
-GitHub releases. It describes the behavior in version 1.3.0.
+GitHub releases. It describes the behavior in version 1.3.1.
 
 ## Information processed on your device
 

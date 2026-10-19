@@ -579,6 +579,13 @@ impl PdfSigner {
                 if let Ok(ap) = sig_field_dict.get(b"AP") {
                     field.set("AP", ap.clone());
                 }
+                // MyPDF: an explicitly fitted visible appearance must use its
+                // matching rectangle, or a reader stretches it to the old field.
+                if self.options.visible_signature.is_some() {
+                    if let Ok(rect) = sig_field_dict.get(b"Rect") {
+                        field.set("Rect", rect.clone());
+                    }
+                }
                 let flags = field.get(b"F").and_then(Object::as_i64).unwrap_or(0);
                 field.set("F", Object::Integer(flags | 4 | 128));
                 doc.objects.insert(existing, Object::Dictionary(field));

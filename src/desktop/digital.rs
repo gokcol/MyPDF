@@ -1321,7 +1321,12 @@ impl Viewer {
             .manager
             .preview_for(ctx, &format!("page:{tab}"), &request)?
             .ok()?;
-        Some((tab, request.page, request.rect?, texture))
+        Some((
+            tab,
+            request.page,
+            signing::appearance_page_rect(texture.bounds, request.rect?),
+            texture.texture,
+        ))
     }
 
     pub(super) fn digital_window(&mut self, ctx: &egui::Context) {
@@ -3970,6 +3975,28 @@ mod tests {
             }
             assert!(app.tabs[0].document_view.unwrap().0.width() > 200.);
         }
+        let old_texture = app.live_signature_preview(&ctx).unwrap().3.id();
+        app.digital.signatures[0].transform.fit_to_content = true;
+        app.digital.signatures[0].transform.outer_padding = Some(2.);
+        loop {
+            app.digital.manager.receive(&ctx);
+            if let Some((_, _, rect, texture)) = app.live_signature_preview(&ctx)
+                && texture.id() != old_texture
+            {
+                assert!(rect[0] >= 120. && rect[1] >= 230. && rect[2] <= 420. && rect[3] <= 330.);
+                assert!(rect[3] - rect[1] < 75., "live fit: {rect:?}");
+                // Cached fitted geometry is relative to the box, so moving a
+                // draft reuses the texture without leaving its preview behind.
+                app.digital.request.rect = Some([130., 250., 430., 350.]);
+                let moved = app.live_signature_preview(&ctx).unwrap();
+                assert_eq!(moved.3.id(), texture.id());
+                assert!((moved.2[0] - rect[0] - 10.).abs() < 0.01);
+                assert!((moved.2[1] - rect[1] - 20.).abs() < 0.01);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert_eq!(app.tabs[0].bytes, bytes);
         assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), revision);
         app.digital.open = false;
@@ -4175,6 +4202,9 @@ mod tests {
             image_overlay: true,
             image_opacity: 0.45,
             image_insets: [3., 4., 5., 6.],
+            outer_padding: Some(4.),
+            image_text_gap: Some(6.),
+            fit_to_content: true,
         };
         state
             .signatures

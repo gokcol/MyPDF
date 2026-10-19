@@ -1,3 +1,4 @@
+use hayro::hayro_interpret::TransformExt;
 use mypdf_milestone0::{annotations as ann, document, identity, signing};
 use std::sync::OnceLock;
 use underskrift::CryptoSigner;
@@ -928,4 +929,192 @@ fn signature_inside_edges_keep_text_and_rotated_images_within_their_regions() {
     // Pre-existing saved signatures retain their previous spacing.
     let legacy: signing::AppearanceTransform = serde_json::from_str("{}").unwrap();
     assert_eq!(legacy.image_insets, [0.; 4]);
+}
+
+#[test]
+fn signature_fit_trims_the_box_without_scaling_ink_and_keeps_the_background() {
+    use signing::{Background, DesktopSigningRequest};
+    let mut request = DesktopSigningRequest {
+        rect: Some([30., 40., 330., 190.]),
+        name: "Orhan Gökçöl".into(),
+        show_date: false,
+        background: Background::Clear,
+        ..Default::default()
+    };
+    request.transform.outer_padding = Some(4.);
+    let before = signing::signature_appearance(&request).unwrap();
+    assert_eq!(before.bounds, [0., 0., 1., 1.]);
+    request.transform.fit_to_content = true;
+    let fitted = signing::signature_appearance(&request).unwrap();
+    let rect = fitted.page_rect(request.rect.unwrap());
+    assert!(
+        rect[2] - rect[0] < 260. && rect[3] - rect[1] < 60.,
+        "{rect:?}"
+    );
+    let original = image::load_from_memory(&before.png).unwrap().into_rgba8();
+    let tight = image::load_from_memory(&fitted.png).unwrap().into_rgba8();
+    let left = (fitted.bounds[0] * original.width() as f32).round() as u32;
+    let top = (fitted.bounds[1] * original.height() as f32).round() as u32;
+    for (x, y, pixel) in tight.enumerate_pixels() {
+        assert_eq!(
+            pixel,
+            original.get_pixel(left + x, top + y),
+            "Ink must not shift or stretch"
+        );
+    }
+    for background in [Background::Tinted, Background::White, Background::Framed] {
+        request.background = background;
+        let filled = signing::signature_appearance(&request).unwrap();
+        assert_eq!(
+            filled.bounds, fitted.bounds,
+            "Fill must not prevent fitting"
+        );
+        let image = image::load_from_memory(&filled.png).unwrap().into_rgba8();
+        assert!(image.get_pixel(image.width() / 2, 2)[3] > 200);
+    }
+    request.background = Background::Clear;
+    request.transform.outer_padding = Some(0.);
+    let zero = signing::signature_appearance(&request).unwrap();
+    let zero_image = image::load_from_memory(&zero.png).unwrap();
+    assert!(zero_image.width() < tight.width() && zero_image.height() < tight.height());
+    let old: signing::AppearanceTransform = serde_json::from_str("{}").unwrap();
+    assert!(!old.fit_to_content && old.outer_padding.is_none() && old.image_text_gap.is_none());
+    for value in [f32::NAN, -1., 100.] {
+        request.transform.outer_padding = Some(value);
+        assert!(signing::signature_appearance(&request).is_err());
+    }
+}
+
+#[test]
+fn signature_image_text_gap_and_padding_change_the_composition() {
+    let mut png = std::io::Cursor::new(vec![]);
+    image::RgbaImage::from_pixel(80, 80, image::Rgba([255, 0, 0, 255]))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let mut request = signing::DesktopSigningRequest {
+        rect: Some([0., 0., 360., 160.]),
+        name: "Signer".into(),
+        show_date: false,
+        artwork: Some(
+            mypdf_milestone0::assets::Asset::from_image_bytes("Square", &png.into_inner()).unwrap(),
+        ),
+        background: signing::Background::Clear,
+        ..Default::default()
+    };
+    request.transform.outer_padding = Some(0.);
+    let measure = |request: &signing::DesktopSigningRequest| {
+        let image = image::load_from_memory(&signing::signature_artwork(request).unwrap())
+            .unwrap()
+            .into_rgba8();
+        let red = image
+            .enumerate_pixels()
+            .filter(|(_, _, p)| p[3] > 128 && p[0] > 240 && p[1] < 20)
+            .map(|(x, _, _)| x)
+            .max()
+            .unwrap();
+        let text = image
+            .enumerate_pixels()
+            .filter(|(_, _, p)| p[3] > 128 && p[0] < 100)
+            .map(|(x, _, _)| x)
+            .min()
+            .unwrap();
+        text as i32 - red as i32
+    };
+    request.transform.image_text_gap = Some(0.);
+    let zero = measure(&request);
+    request.transform.image_text_gap = Some(24.);
+    assert!(
+        measure(&request) > zero + 40,
+        "A 24 pt gap adds about 48 render pixels"
+    );
+    request.transform.image_overlay = true;
+    let over = signing::signature_artwork(&request).unwrap();
+    request.transform.image_text_gap = Some(0.);
+    assert_eq!(
+        over,
+        signing::signature_artwork(&request).unwrap(),
+        "Overlay ignores beside-only gap"
+    );
+    request.transform.image_text_gap = Some(f32::INFINITY);
+    assert!(signing::signature_artwork(&request).is_err());
+}
+
+#[tokio::test]
+async fn fitted_signature_widget_uses_the_same_rectangle_as_the_live_appearance() {
+    let signer = identity::FileSigner::load(&id().pkcs12, PASSWORD, None).unwrap();
+    for rotation in [0, 90, 180, 270] {
+        let mut bytes = source(rotation);
+        let mut request = signing::DesktopSigningRequest {
+            field: format!("Fitted{rotation}"),
+            rect: Some([60., 80., 360., 230.]),
+            name: "Fitted signer".into(),
+            show_date: false,
+            background: signing::Background::Tinted,
+            ..Default::default()
+        };
+        request.transform.fit_to_content = true;
+        request.transform.outer_padding = Some(4.);
+        let expected = signing::signature_appearance(&request)
+            .unwrap()
+            .page_rect(request.rect.unwrap());
+        // Also cover fitting an existing AcroForm signature widget.
+        if rotation == 0 {
+            use mypdf_milestone0::form_design::{self, FieldType, Properties};
+            let properties = Properties::new(FieldType::Signature, &request.field);
+            bytes = form_design::add(
+                &bytes,
+                0,
+                request.rect.unwrap(),
+                FieldType::Signature,
+                &properties,
+            )
+            .unwrap()
+            .0;
+        }
+        let signed = signing::sign_custom(&bytes, &signer, &request)
+            .await
+            .unwrap();
+        assert!(signing::verify(&signed, None).unwrap()[0].digest_matches);
+        let pdf = hayro::hayro_syntax::Pdf::new(bytes).unwrap();
+        let expected = pdf.pages()[0]
+            .initial_transform(true)
+            .to_kurbo()
+            .inverse()
+            .transform_rect_bbox(hayro::kurbo::Rect::new(
+                expected[0] as f64,
+                expected[1] as f64,
+                expected[2] as f64,
+                expected[3] as f64,
+            ));
+        let doc = lopdf::Document::load_mem(&signed).unwrap();
+        let widget = doc
+            .objects
+            .values()
+            .filter_map(|o| o.as_dict().ok())
+            .find(|d| {
+                d.get(b"T")
+                    .and_then(lopdf::Object::as_str)
+                    .is_ok_and(|name| name == request.field.as_bytes())
+                    && d.has(b"Rect")
+            })
+            .unwrap();
+        let actual: Vec<f32> = widget
+            .get(b"Rect")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_float().unwrap())
+            .collect();
+        for (actual, expected) in
+            actual
+                .into_iter()
+                .zip([expected.x0, expected.y0, expected.x1, expected.y1])
+        {
+            assert!(
+                (actual as f64 - expected).abs() < 0.05,
+                "rotation={rotation}: {actual} vs {expected}"
+            );
+        }
+    }
 }
