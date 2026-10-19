@@ -313,6 +313,7 @@ const COMMANDS: &[(&str, &str, &str)] = &[
         "draw sign handwriting",
     ),
     ("Digital signature", "sign", "certificate keychain sign"),
+    ("Settings", "settings", "preferences signatures ink digital rename delete default"),
     ("Recognize text (OCR)", "ocr", "scan searchable"),
     ("Watermark", "watermark", "background"),
     ("Header and footer", "hf_text", "page numbering"),
@@ -516,7 +517,7 @@ impl Viewer {
             "merge_files" => self.merge_files(ctx),
             "visual_signature" => {
                 self.editor.mode = editing::Mode::Annotate;
-                self.editor.signature_open = true;
+                self.editor.choose_signature();
             }
             "object_background" => self.selected_image_background(),
             "crop_object" => self.start_crop(ctx),
@@ -686,7 +687,7 @@ impl Viewer {
                 .frame(egui::Frame::new().fill(theme::paper()).inner_margin(8.))
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label("Click a page to place the copied artwork");
+                        ui.label("Move the preview to your chosen spot, then click to place");
                         if ui.button("Original position").clicked() {
                             self.place_pending_original();
                         }

@@ -239,6 +239,11 @@ enum SignatureInput {
     Image,
 }
 
+struct SignaturePlacement {
+    key: (u64, u64, usize),
+    point: [f32; 2],
+}
+
 pub(super) struct EditorState {
     pub hide_guides: bool,
     background: Option<background::Draft>,
@@ -250,6 +255,9 @@ pub(super) struct EditorState {
     pub(super) snapping: bool,
     pub library_open: bool,
     pub signature_open: bool,
+    signature_placement: Option<SignaturePlacement>,
+    pub(super) signature_manage_only: bool,
+    signature_picker: bool,
     pub asset_busy: bool,
     pub library: Option<Library>,
     library_error: Option<String>,
@@ -274,7 +282,7 @@ pub(super) struct EditorState {
     pub annotation_sidebar: bool,
     asset_name: String,
     asset_details: Option<Asset>,
-    removed_asset: Option<Asset>,
+    pub(super) removed_asset: Option<Asset>,
     pub(super) library_tab: String,
     library_query: String,
     stamp_source: usize,
@@ -362,6 +370,9 @@ impl EditorState {
             snapping: true,
             library_open: false,
             signature_open: false,
+            signature_placement: None,
+            signature_manage_only: false,
+            signature_picker: false,
             asset_busy: false,
             library,
             library_error,
@@ -420,7 +431,19 @@ impl EditorState {
             ..Default::default()
         };
     }
-    fn add_asset(&mut self, asset: Asset) -> Result<(), String> {
+    pub(super) fn open_signature(&mut self) {
+        self.signature_placement = None;
+        self.signature_manage_only = false;
+        self.signature_picker = false;
+        self.signature_open = true;
+    }
+
+    pub(super) fn choose_signature(&mut self) {
+        self.open_signature();
+        self.signature_picker = true;
+    }
+
+    pub(super) fn add_asset(&mut self, asset: Asset) -> Result<(), String> {
         let library = self.library.as_mut().ok_or_else(|| {
             self.library_error
                 .clone()
@@ -627,7 +650,7 @@ pub(super) fn color_palette(ui: &mut egui::Ui, current: &mut [f32; 3]) -> bool {
     });
     changed
 }
-fn property_slider(
+pub(super) fn property_slider(
     ui: &mut egui::Ui,
     label: &str,
     value: &mut f32,
@@ -1885,63 +1908,6 @@ impl Viewer {
             self.status = Some(("Select an unlocked image layer first".into(), false));
         }
     }
-    /// The Sign tab of the main toolbar, with its menu of ways to sign.
-    pub(super) fn sign_menu(&mut self, ui: &mut egui::Ui, compact: bool) {
-        let mut button = ActionButton::new(Icon::Sign, "Sign")
-            .dropdown()
-            .tab()
-            .selected(self.editor.mode == Mode::Sign);
-        if compact {
-            button = button.compact();
-        }
-        let response = ui.add(button);
-        let mut action = None;
-        let mut quick = false;
-        egui::Popup::menu(&response).show(|ui| {
-                ui.set_min_width(205.);
-                if ui
-                    .add(ActionButton::new(Icon::Sign, "Quick Sign"))
-                    .on_hover_text("Drag a box on the page to sign with your default digital ID")
-                    .clicked()
-                {
-                    quick = true;
-                    ui.close();
-                }
-                if ui
-                    .add(ActionButton::new(Icon::Pen, "Signature"))
-                    .on_hover_text("Draw or type a visual signature")
-                    .clicked()
-                {
-                    action = Some(false);
-                    ui.close();
-                }
-                if ui
-                    .add(ActionButton::new(Icon::Shield, "Digital Signature"))
-                    .on_hover_text("Pick the area on the page, then sign with a certificate from .p12/.pfx or macOS Keychain")
-                    .clicked()
-                {
-                    action = Some(true);
-                    ui.close();
-                }
-            });
-        if quick {
-            self.quick_sign();
-        }
-        if let Some(digital) = action
-            && self.apply_pending_annotation()
-        {
-            self.editor.library_open = false;
-            self.inspector = true;
-            if digital {
-                self.editor.signature_open = false;
-                self.sign_in_area();
-            } else {
-                self.digital.open = false;
-                self.editor.mode = Mode::Annotate;
-                self.editor.signature_open = true;
-            }
-        }
-    }
     pub(super) fn apply_pending_annotation(&mut self) -> bool {
         self.editor.property_edit = None;
         let Some(tab) = self.tabs.get_mut(self.active) else {
@@ -2279,8 +2245,7 @@ impl Viewer {
                             }
                             ui.separator();
                             for (icon, label, key) in [
-                                (Icon::Pen, "My signatures…", "appearance"),
-                                (Icon::Shield, "Digital IDs…", "identities"),
+                                (Icon::Pen, "Signature", "visual_signature"),
                                 (Icon::Form, "Sign with options…", "sign"),
                                 (Icon::Check, "Validate signatures…", "validate"),
                             ] {
@@ -3151,7 +3116,7 @@ impl Viewer {
                             .add(ActionButton::new(Icon::Sign, "Signature…"))
                             .clicked()
                         {
-                            self.editor.signature_open = true;
+                            self.editor.open_signature();
                             ui.close();
                         }
                     });
@@ -3435,19 +3400,7 @@ impl Viewer {
                 });
             self.editor.library_open = open;
             if let Some(asset) = place {
-                self.editor.placed = Some(asset);
-                if !matches!(self.editor.mode, Mode::Annotate | Mode::Draw) {
-                    self.editor.mode = Mode::Annotate;
-                }
-                self.editor.tool = Tool::Asset;
-                if let Some(tab) = self.tabs.get_mut(self.active) {
-                    tab.selected_annotation = None;
-                }
-                self.editor.draft = None;
-                self.status = Some((
-                    "Click or drag on a page to place the selected asset".into(),
-                    false,
-                ));
+                self.begin_asset_placement(asset);
             }
             if let Some(i) = remove
                 && let Some(library) = &mut self.editor.library
@@ -3529,8 +3482,118 @@ impl Viewer {
             3.2,
         ));
         self.editor.signature_name = "My signature".into();
-        self.editor.signature_open = true;
+        self.editor.open_signature();
     }
+    pub(super) fn paste_signature_image(&mut self) {
+        self.import_signature_clipboard(clipboard::read());
+    }
+
+    pub(super) fn import_signature_clipboard(&mut self, clip: clipboard::Clip) {
+        if self.editor.signature_busy || self.editor.background.is_some() {
+            return;
+        }
+        match clip {
+            clipboard::Clip::Image(bytes, _) => {
+                match Asset::from_image_bytes("My signature", &bytes) {
+                    Ok(asset) => {
+                        self.editor.signature_image = Some(asset);
+                        self.editor.signature_input = SignatureInput::Image;
+                        self.editor.signature_error = None;
+                    }
+                    Err(e) => self.editor.signature_error = Some(format!("{e:#}")),
+                }
+            }
+            _ => {
+                self.editor.signature_error = Some(
+                    "Copy an image first, then choose Paste image. You can also use Choose image…"
+                        .into(),
+                )
+            }
+        }
+    }
+
+    pub(super) fn signature_image_paste_active(&self, ctx: &egui::Context) -> bool {
+        self.editor.signature_open
+            && self.editor.signature_input == SignatureInput::Image
+            && self.editor.background.is_none()
+            && !ctx.wants_keyboard_input()
+    }
+
+    fn begin_asset_placement(&mut self, asset: Asset) {
+        let Some(tab) = self
+            .tabs
+            .get_mut(self.active)
+            .filter(|t| t.session.as_ref().is_some_and(|s| s.editable))
+        else {
+            self.status = Some((
+                "Saved in your library. Open an editable PDF to place it.".into(),
+                false,
+            ));
+            return;
+        };
+        let page = tab.pages[tab.page];
+        let width = 180_f32
+            .min(page.width * 0.6)
+            .min(page.height * 0.6 * asset.aspect);
+        let mut mark = Annotation::new(
+            tab.page,
+            [0., 0., width, width / asset.aspect],
+            asset.kind.clone(),
+            asset.style.clone(),
+        );
+        mark.asset_id = Some(asset.id.clone());
+        selection::set(tab, &mut self.editor, vec![]);
+        self.editor.placed = Some(asset);
+        self.editor.mode = Mode::Draw;
+        self.editor.tool = Tool::Select;
+        self.editor.draft = None;
+        self.editor.library_open = false;
+        self.workbench.paste = Some(vec![mark]);
+        self.status = Some(("Move the preview to your chosen spot and click. Drag to adjust; use a corner to resize. Escape cancels.".into(), false));
+    }
+
+    pub(super) fn signature_here(&mut self, key: (u64, u64, usize), point: [f32; 2]) {
+        self.digital.open = false;
+        self.digital.adopt_asset = false;
+        self.editor.library_open = false;
+        self.editor.open_signature();
+        self.editor.signature_placement = Some(SignaturePlacement { key, point });
+        self.editor.signature_picker = true;
+    }
+
+    pub(super) fn place_saved_signature(&mut self, asset: Asset) {
+        let Some(target) = self.editor.signature_placement.take() else {
+            self.begin_asset_placement(asset);
+            return;
+        };
+        let Some(index) = self.tabs.iter().position(|t| {
+            t.id == target.key.0
+                && target.key.2 < t.pages.len()
+                && t.session
+                    .as_ref()
+                    .is_some_and(|s| s.editable && s.revision() == target.key.1)
+        }) else {
+            self.status = Some(("The document changed or closed. Your signature is saved in the library; choose its placement again.".into(), false));
+            return;
+        };
+        self.active = index;
+        self.tabs[index].jump(target.key.2);
+        self.begin_asset_placement(asset);
+        if let Some(marks) = self.workbench.paste.take() {
+            let tab = &mut self.tabs[index];
+            let marks =
+                workbench::positioned(&marks, target.key.2, target.point, tab.pages[target.key.2]);
+            if workbench::place(&mut self.editor, tab, marks, &mut self.status) {
+                self.editor.mode = Mode::Annotate;
+                self.status = Some((
+                    "Signature placed · Drag to move, use a corner to resize · Undo to remove"
+                        .into(),
+                    false,
+                ));
+            }
+        }
+    }
+
     pub(super) fn editor_windows(&mut self, ctx: &egui::Context) {
         self.asset_details_window(ctx);
         self.svg_window(ctx);
@@ -3538,7 +3601,23 @@ impl Viewer {
             let mut open = true;
             let mut save = false;
             let mut choose = false;
+            let mut paste = false;
             let mut cancel = false;
+            let assets = self
+                .editor
+                .library
+                .as_ref()
+                .map(|l| l.entries.clone())
+                .unwrap_or_default();
+            let saved = self.digital.ink_assets(&assets);
+            let mut manage = false;
+            let mut picked = None;
+            let can_place = !self.digital.adopt_asset
+                && !self.editor.signature_manage_only
+                && self
+                    .tabs
+                    .get(self.active)
+                    .is_some_and(|t| t.session.as_ref().is_some_and(|s| s.editable));
             egui::Window::new("Handwritten signature")
                 .collapsible(false).open(&mut open)
                 .resizable([true, false])
@@ -3546,10 +3625,28 @@ impl Viewer {
                 .max_width(ui::dialog_width(ctx, 640.))
                 .show(ctx, |ui| {
                     ui::dialog_body(ui, "signature_editor_body", 460., |ui| {
+                    if self.editor.signature_picker {
+                        ui.label("Choose a saved signature, then place it on the page.");
+                        ui.horizontal_wrapped(|ui| {
+                            for asset in &saved {
+                                ui.vertical(|ui| {
+                                    if digital::artwork_card(ui, &mut self.editor, asset, false) { picked = Some(asset.clone()); }
+                                    if self.digital.ink_is_default(&asset.id) { ui.weak("★ Default"); }
+                                });
+                            }
+                        });
+                        if saved.is_empty() { ui.weak("No ink signatures saved yet. Create one in Settings."); }
+                        manage = ui.add(ActionButton::new(Icon::Settings, "Manage signatures in Settings…")).clicked();
+                        return;
+                    }
                     ui.label(if self.digital.adopt_asset {
                         "Draw, type, or import the image for your digital signature."
+                    } else if self.editor.signature_manage_only {
+                        "Save your signature here, then choose it when signing a PDF."
+                    } else if self.editor.signature_placement.is_some() {
+                        "Your signature will be placed where you right-clicked."
                     } else {
-                        "Add a handwritten signature to your document."
+                        "Create your signature, then click on the page to place it."
                     });
                     ui.horizontal(|ui| {
                         for (mode, label) in [(SignatureInput::Draw, "Draw"), (SignatureInput::Type, "Type"), (SignatureInput::Image, "Image")] {
@@ -3575,7 +3672,11 @@ impl Viewer {
                                     self.editor.background = Some(background::Draft::new(background::Target::Signature, png.clone()));
                                 }
                             }
-                            choose = ui.add_enabled(!self.editor.signature_busy, ActionButton::new(Icon::Import, "Choose image…")).clicked();
+                            ui.horizontal(|ui| {
+                                choose = ui.add_enabled(!self.editor.signature_busy, ActionButton::new(Icon::Import, "Choose image…")).clicked();
+                                paste = ui.add_enabled(!self.editor.signature_busy, ActionButton::new(Icon::Paste, "Paste image")).on_hover_text("Copy an image from another app, then paste it here").clicked();
+                            });
+                            ui.weak(if cfg!(target_os = "macos") { "Copy an image, then click Paste image or press ⌘V." } else { "Copy an image, then click Paste image or press Ctrl+V." });
                             ui.weak("PNG or JPEG · Transparent PNG keeps the page visible behind your signature.");
                             if self.editor.signature_busy { ui.spinner(); }
                             if let Some(error) = &self.editor.signature_error { ui.colored_label(theme::danger(), error); }
@@ -3587,11 +3688,19 @@ impl Viewer {
                     self.editor.text_editing |= r.has_focus();
                     });
                     ui::dialog_footer(ui, |ui| {
+                        if !self.editor.signature_picker {
                         save = ui.add_enabled(!self.editor.signature_busy && (self.editor.signature_input != SignatureInput::Image || self.editor.signature_image.is_some()),
-                            ActionButton::new(Icon::Save, "Save signature").primary()).clicked();
+                            ActionButton::new(Icon::Save, if can_place { "Save & place" } else { "Save signature" }).primary()).clicked();
+                        }
                         if ui.add(ActionButton::new(Icon::Close, "Cancel")).clicked() { cancel = true; }
                     });
                 });
+            if manage {
+                self.editor.signature_open = false;
+                self.digital.open = true;
+                self.digital.panel = digital::Panel::Ink;
+                return;
+            }
             if self.editor.background.is_none()
                 && !egui::Popup::is_any_open(ctx)
                 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
@@ -3599,6 +3708,13 @@ impl Viewer {
                 cancel = true;
             }
             self.editor.signature_open = open && !cancel;
+            if let Some(asset) = picked.filter(|_| self.editor.signature_open) {
+                self.editor.signature_open = false;
+                self.place_saved_signature(asset);
+            }
+            if paste && self.editor.signature_open {
+                self.paste_signature_image();
+            }
             if choose
                 && let Some(path) = self.native_pick(
                     rfd::FileDialog::new()
@@ -3659,20 +3775,21 @@ impl Viewer {
                         })
                     }
                 };
-                if let Some(asset) = asset {
+                if let Some(mut asset) = asset {
+                    asset.signature = true;
                     match self.editor.add_asset(asset.clone()) {
                         Ok(()) if self.digital.adopt_asset => {
                             // digital_events adopts it as the signature appearance.
                             self.editor.signature_open = false;
                         }
                         Ok(()) => {
-                            self.editor.placed = Some(asset);
                             self.editor.signature_open = false;
-                            self.editor.library_open = true;
-                            self.status = Some((
-                                "Signature saved locally. Use Place to add it to a page.".into(),
-                                false,
-                            ));
+                            if self.editor.signature_manage_only {
+                                self.digital.open = true;
+                                self.digital.panel = digital::Panel::Ink;
+                            } else {
+                                self.place_saved_signature(asset);
+                            }
                         }
                         Err(e) => self.status = Some((e, true)),
                     }
@@ -3681,6 +3798,9 @@ impl Viewer {
                         Some(("Draw, type, or choose a signature image first".into(), true));
                 }
             }
+        }
+        if !self.editor.signature_open {
+            self.editor.signature_placement = None;
         }
     }
     pub(super) fn unfinished_edit(&mut self, target: Option<u64>) -> bool {
@@ -4328,6 +4448,351 @@ mod tests {
             selection::transformed(&group, selection::Transform::Rotate(90.))
         );
     }
+    #[test]
+    fn signature_placement_uses_real_viewer_canvas_without_invisible_redaction_interception() {
+        use eframe::App;
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        let frame = |app: &mut Viewer, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1200., 820.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+            )
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.tabs[0].session.is_none() {
+            let _ = frame(&mut app, vec![]);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let asset = Asset::new(
+            "Placement test",
+            Kind::Text {
+                text: "Signature".into(),
+            },
+            Style::default(),
+            3.,
+        );
+        app.begin_asset_placement(asset);
+        for _ in 0..4 {
+            let _ = frame(&mut app, vec![]);
+        }
+        let viewport = app.tabs[0].document_view.unwrap().0;
+        let point = viewport.min + vec2(viewport.width() / 2., 100.);
+        for pressed in [None, Some(true), Some(false)] {
+            let mut events = vec![egui::Event::PointerMoved(point)];
+            if let Some(pressed) = pressed {
+                events.push(egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+            let _ = frame(&mut app, events);
+        }
+        assert!(
+            app.workbench.paste.is_none(),
+            "The page must accept the placement click"
+        );
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().annotations.len(), 1);
+        app.editor_undo(false);
+        assert!(app.tabs[0].session.as_ref().unwrap().annotations.is_empty());
+    }
+
+    #[test]
+    fn signature_settings_save_without_placing_and_picker_reuses_the_saved_artwork() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.tabs[0].session.is_none() {
+            test_frame(&mut app, &ctx, vec![]);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        app.action("settings", &ctx);
+        for _ in 0..3 { test_frame(&mut app, &ctx, vec![]); }
+        test_click(&mut app, &ctx, "New ink signature…");
+        assert!(app.editor.signature_manage_only);
+        app.editor.signature_input = SignatureInput::Type;
+        app.editor.signature_typed = "A. Signer".into();
+        app.editor.signature_name = "Office ink".into();
+        for _ in 0..3 {
+            test_frame(&mut app, &ctx, vec![]);
+        }
+        test_click(&mut app, &ctx, "Save signature");
+        assert!(app.workbench.paste.is_none());
+        assert!(app.tabs[0].session.as_ref().unwrap().annotations.is_empty());
+        assert!(app.digital.open && app.digital.panel == digital::Panel::Ink);
+        let asset = app
+            .editor
+            .library
+            .as_ref()
+            .unwrap()
+            .entries
+            .last()
+            .unwrap()
+            .clone();
+        assert!(asset.signature);
+        app.digital.open = false;
+        let key = (
+            app.tabs[0].id,
+            app.tabs[0].session.as_ref().unwrap().revision(),
+            0,
+        );
+        app.signature_here(key, [70., 90.]);
+        for _ in 0..3 {
+            test_frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.editor.signature_picker);
+        test_click(&mut app, &ctx, "Office ink");
+        assert!(!app.editor.signature_open);
+        let marks = &app.tabs[0].session.as_ref().unwrap().annotations;
+        assert_eq!(marks.len(), 1);
+        assert_eq!(&marks[0].rect[..2], &[70., 90.]);
+        assert_eq!(marks[0].asset_id.as_ref(), Some(&asset.id));
+        app.action("settings", &ctx);
+        for _ in 0..3 { test_frame(&mut app, &ctx, vec![]); }
+        test_click(&mut app, &ctx, "Make default");
+        assert!(app.digital.ink_is_default(&asset.id));
+        test_click(&mut app, &ctx, "Delete…");
+        for _ in 0..3 { test_frame(&mut app, &ctx, vec![]); }
+        test_click(&mut app, &ctx, "Cancel");
+        for _ in 0..3 { test_frame(&mut app, &ctx, vec![]); }
+        assert!(app.editor.library.as_ref().unwrap().entries.iter().any(|a| a.id == asset.id));
+        test_click(&mut app, &ctx, "Delete…");
+        for _ in 0..3 { test_frame(&mut app, &ctx, vec![]); }
+        test_click(&mut app, &ctx, "Delete");
+        assert!(!app.editor.library.as_ref().unwrap().entries.iter().any(|a| a.id == asset.id));
+        assert!(!app.digital.ink_is_default(&asset.id));
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().annotations.len(), 1, "Deleting library artwork must preserve placed signatures");
+    }
+
+    #[test]
+    fn signature_clipboard_preview_keeps_alpha_and_rejects_non_images() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        let bytes = clipboard::png(200, 80, &vec![128; 200 * 80 * 4]).unwrap();
+        let before = app.editor.library.as_ref().unwrap().entries.len();
+        app.editor.signature_open = true;
+        app.editor.signature_input = SignatureInput::Image;
+        for _ in 0..3 {
+            test_frame(&mut app, &ctx, vec![]);
+        }
+        clipboard::set_for_test(clipboard::Clip::Image(bytes.clone(), [200, 80]));
+        test_click(&mut app, &ctx, "Paste image");
+        let asset = app.editor.signature_image.clone().unwrap();
+        assert_eq!(asset.aspect, 2.5);
+        let Kind::Image { png } = &asset.kind else {
+            panic!("Not an image")
+        };
+        assert_eq!(
+            assets::decode_png(png)
+                .unwrap()
+                .to_rgba8()
+                .get_pixel(0, 0)
+                .0,
+            [128; 4]
+        );
+        assert_eq!(app.editor.library.as_ref().unwrap().entries.len(), before);
+        clipboard::set_for_test(clipboard::Clip::Text("Not an image".into()));
+        app.paste_signature_image();
+        assert!(app.editor.signature_error.is_some());
+        assert_eq!(app.editor.signature_image, Some(asset));
+        clipboard::set_for_test(clipboard::Clip::Image(bytes, [200, 80]));
+        // A copied image must paste even while the library-name field owns focus.
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("signature_name_focus")));
+        app.action("paste", &ctx);
+        assert!(app.editor.signature_error.is_none());
+        assert!(app.workbench.paste.is_none());
+        for _ in 0..3 {
+            test_frame(&mut app, &ctx, vec![]);
+        }
+        test_click(&mut app, &ctx, "Cancel");
+        assert!(!app.editor.signature_open);
+        assert_eq!(app.editor.library.as_ref().unwrap().entries.len(), before);
+    }
+
+    #[test]
+    fn signature_save_and_place_uses_clicked_position_and_supports_undo_save_and_cancel() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.tabs[0].session.is_none() {
+            test_frame(&mut app, &ctx, vec![]);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        app.editor.mode = Mode::Sign;
+        app.editor.signature_open = true;
+        let bytes = clipboard::png(200, 80, &vec![128; 200 * 80 * 4]).unwrap();
+        // Exercise the real MyPDF Copy -> clipboard image -> Signature path.
+        assert!(
+            app.copy_artwork(
+                &ctx,
+                vec![Annotation::new(
+                    0,
+                    [0., 0., 200., 80.],
+                    Kind::Image {
+                        png: Arc::new(bytes)
+                    },
+                    Style::default()
+                )]
+            )
+            .is_some()
+        );
+        app.paste_signature_image();
+        assert!(app.editor.signature_image.is_some());
+        for _ in 0..3 {
+            test_frame(&mut app, &ctx, vec![]);
+        }
+        test_click(&mut app, &ctx, "Save & place");
+        assert!(!app.editor.signature_open);
+        assert!(!app.editor.library_open);
+        assert!(app.workbench.paste.is_some());
+        assert!(app.tabs[0].session.as_ref().unwrap().annotations.is_empty());
+        let rect = Rect::from_min_size(pos2(0., 0.), vec2(600., 600.));
+        for pressed in [None, Some(true), Some(false)] {
+            let mut events = vec![egui::Event::PointerMoved(pos2(160., 170.))];
+            if let Some(pressed) = pressed {
+                events.push(egui::Event::PointerButton {
+                    pos: pos2(160., 170.),
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        workbench::paste_overlay(
+                            &mut app.workbench,
+                            &mut app.editor,
+                            &mut app.tabs[0],
+                            ui,
+                            0,
+                            rect,
+                            1.,
+                            &mut app.status,
+                        );
+                    });
+                },
+            );
+        }
+        assert!(app.workbench.paste.is_none());
+        let s = app.tabs[0].session.as_mut().unwrap();
+        assert_eq!(s.annotations.len(), 1);
+        assert_eq!(s.annotations[0].rect, [160., 170., 340., 242.]);
+        let placed = s.annotations.clone();
+        s.undo();
+        assert!(s.annotations.is_empty());
+        s.redo();
+        assert_eq!(s.annotations, placed);
+        let saved = lopdf::Document::load_mem(&s.snapshot_bytes().unwrap()).unwrap();
+        assert_eq!(ann::load(&saved), placed);
+        let asset = app.editor.placed.clone().unwrap();
+        app.begin_asset_placement(asset);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                app.workbench_keys(ctx);
+            },
+        );
+        assert!(app.workbench.paste.is_none());
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().annotations, placed);
+    }
+
+    #[test]
+    fn signature_context_confirmation_places_at_anchor_and_cancel_discards_anchor() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.tabs[0].session.is_none() {
+            test_frame(&mut app, &ctx, vec![]);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let key = (
+            app.tabs[0].id,
+            app.tabs[0].session.as_ref().unwrap().revision(),
+            0,
+        );
+        // Creation lives in Settings; the completed signature can still use an
+        // explicit right-click placement anchor.
+        app.signature_here(key, [120., 230.]);
+        app.editor.signature_picker = false;
+        app.editor.signature_input = SignatureInput::Type;
+        app.editor.signature_typed = "Test signature".into();
+        for _ in 0..3 {
+            test_frame(&mut app, &ctx, vec![]);
+        }
+        test_click(&mut app, &ctx, "Save & place");
+        assert!(!app.editor.signature_open);
+        assert!(app.workbench.paste.is_none());
+        assert!(app.editor.signature_placement.is_none());
+        let s = app.tabs[0].session.as_mut().unwrap();
+        assert_eq!(s.annotations.len(), 1);
+        assert_eq!(s.annotations[0].rect, [120., 230., 300., 290.]);
+        s.undo();
+        assert!(s.annotations.is_empty());
+        s.redo();
+        assert_eq!(s.annotations.len(), 1);
+        let key = (
+            app.tabs[0].id,
+            app.tabs[0].session.as_ref().unwrap().revision(),
+            0,
+        );
+        app.signature_here(key, [320., 330.]);
+        for _ in 0..3 {
+            test_frame(&mut app, &ctx, vec![]);
+        }
+        test_click(&mut app, &ctx, "Cancel");
+        assert!(app.editor.signature_placement.is_none());
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().annotations.len(), 1);
+        // A changed document must not receive a signature using a stale menu target.
+        app.signature_here(key, [320., 330.]);
+        app.tabs[0].session.as_mut().unwrap().undo();
+        let asset = app
+            .editor
+            .library
+            .as_ref()
+            .unwrap()
+            .entries
+            .last()
+            .unwrap()
+            .clone();
+        app.place_saved_signature(asset);
+        assert!(app.tabs[0].session.as_ref().unwrap().annotations.is_empty());
+        assert!(app.workbench.paste.is_none());
+        assert!(app.status.as_ref().unwrap().0.contains("document changed"));
+    }
+
     #[test]
     fn signature_image_is_previewed_then_saved_only_on_confirmation() {
         let ctx = egui::Context::default();

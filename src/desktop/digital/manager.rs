@@ -88,6 +88,9 @@ pub(super) type PreviewResult = Result<TextureHandle, String>;
 
 pub(super) struct ManagerState {
     pub selected: Option<String>,
+    ink_selected: Option<String>,
+    ink_name: String,
+    ink_delete: bool,
     /// Rendered previews by what they show, shared by cards and editors.
     previews: HashMap<u64, PreviewResult>,
     pending: HashSet<u64>,
@@ -115,6 +118,9 @@ impl ManagerState {
         let (tx, rx) = mpsc::channel();
         Self {
             selected: None,
+            ink_selected: None,
+            ink_name: String::new(),
+            ink_delete: false,
             previews: HashMap::new(),
             pending: HashSet::new(),
             tx,
@@ -684,9 +690,12 @@ impl DigitalState {
             // Quick Sign keeps working with the next signature.
             self.default_signature = self.signatures.first().map(|s| s.id.clone());
         }
-        if self.manager.selected.as_deref() == Some(id) {
-            self.manager.selected = self.default_signature.clone();
+        if self.manager.selected.as_ref().is_none_or(|selected| self.signature(selected).is_none()) {
+            self.manager.selected = self.default_signature.clone()
+                .filter(|selected| self.signature(selected).is_some())
+                .or_else(|| self.signatures.first().map(|s| s.id.clone()));
         }
+        self.manager.confirm_delete = None;
         if self.manager.sign_with.as_deref() == Some(id) {
             self.manager.sign_with = None;
         }
@@ -796,20 +805,37 @@ impl DigitalState {
         };
         let mut signature = before.clone();
         let mut typing = false;
-        let mut remove = false;
-        let mut duplicate = false;
         let mut make_default = false;
         ui::section(ui, "Edit signature", |ui| {
             ui.spacing_mut().item_spacing.y = 12.;
-            typing |= ui::field(ui, "Name", |ui| {
-                text_field(
-                    ui,
-                    &mut signature.name,
-                    "For example: Work, Initials, Approval",
-                    80,
-                )
-            })
-            .has_focus();
+            ui::field(ui, "Name", |ui| {
+                ui.horizontal(|ui| {
+                    let response = ui.add(egui::TextEdit::singleline(&mut signature.name)
+                        .desired_width((ui.available_width() - 110.).max(80.))
+                        .hint_text("For example: Work, Initials, Approval").char_limit(80));
+                    typing |= response.has_focus();
+                    if ui.add_enabled(!signature.name.trim().is_empty(), ActionButton::new(Icon::Pen, "Rename")).clicked() {
+                        signature.name = signature.name.trim().to_owned();
+                        response.surrender_focus();
+                        typing = false;
+                    }
+                });
+            });
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                if self.default_signature.as_ref() == Some(&id) {
+                    let (r, _) = ui.allocate_exact_size(vec2(16., 16.), egui::Sense::hover());
+                    ui::draw_icon(ui.painter(), r, Icon::Star, theme::warning());
+                    ui.label(RichText::new("Used by Quick Sign").color(theme::ink()));
+                } else {
+                    make_default = ui
+                        .add(ActionButton::new(Icon::Star, "Use for Quick Sign"))
+                        .on_hover_text("Quick Sign signs with this signature in one step")
+                        .clicked();
+                }
+
+            });
+
             self.signs_with(ui, &mut signature, action);
             ui::field(ui, "Show on the signature", |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -926,28 +952,6 @@ impl DigitalState {
                         .color(theme::muted()),
                 );
             });
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                if self.default_signature.as_ref() == Some(&id) {
-                    let (r, _) = ui.allocate_exact_size(vec2(16., 16.), egui::Sense::hover());
-                    ui::draw_icon(ui.painter(), r, Icon::Star, theme::warning());
-                    ui.label(RichText::new("Used by Quick Sign").color(theme::ink()));
-                } else {
-                    make_default = ui
-                        .add(ActionButton::new(Icon::Star, "Use for Quick Sign"))
-                        .on_hover_text("Quick Sign signs with this signature in one step")
-                        .clicked();
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    remove = ui
-                        .add(ActionButton::new(Icon::Trash, "Delete…").tint(theme::danger()))
-                        .clicked();
-                    duplicate = ui
-                        .add(ActionButton::new(Icon::Copy, "Duplicate"))
-                        .on_hover_text("Start a new signature from this one")
-                        .clicked();
-                });
-            });
         });
         editor.text_editing |= typing;
         if signature != before {
@@ -962,16 +966,24 @@ impl DigitalState {
         if make_default {
             self.make_default(&id);
         }
-        if duplicate {
-            self.duplicate_signature(&id);
-        }
-        if remove {
-            self.manager.confirm_delete = Some(id.clone());
-        }
-        self.confirm_delete(ui.ctx());
+
     }
 
-    pub(super) fn save_if_dirty(&mut self) {
+    pub(super) fn signature_actions(&mut self, ui: &mut egui::Ui) {
+        let selected = self.manager.selected.clone().filter(|id| self.signature(id).is_some())
+            .or_else(|| self.signatures.first().map(|s| s.id.clone()));
+        if let Some(id) = selected {
+            if ui.add(ActionButton::new(Icon::Trash, "Delete…").tint(theme::danger())).clicked() {
+                self.manager.confirm_delete = Some(id.clone());
+            }
+            if ui.add(ActionButton::new(Icon::Copy, "Duplicate")).clicked() {
+                self.save_if_dirty();
+                self.duplicate_signature(&id);
+            }
+        }
+    }
+
+    pub(in crate::desktop) fn save_if_dirty(&mut self) {
         if self.manager.dirty {
             self.commit_signatures();
         }
@@ -1130,13 +1142,15 @@ impl DigitalState {
         });
     }
 
-    fn confirm_delete(&mut self, ctx: &egui::Context) {
+    pub(super) fn confirm_delete(&mut self, ctx: &egui::Context) {
         let Some(id) = self.manager.confirm_delete.clone() else {
             return;
         };
-        let name = self
-            .signature(&id)
-            .map_or_else(String::new, |s| s.name.clone());
+        let Some(signature) = self.signature(&id) else {
+            self.manager.confirm_delete = None;
+            return;
+        };
+        let name = signature.name.clone();
         match ui::confirmation(
             ctx,
             "delete_signature",
@@ -1574,5 +1588,180 @@ mod tests {
                 "{label} is outside the viewport: {rect:?}"
             );
         }
+    }
+}
+
+impl DigitalState {
+    pub(in crate::desktop) fn ink_assets(&self, assets: &[Asset]) -> Vec<Asset> {
+        let mut choices: Vec<_> = assets
+            .iter()
+            .filter(|a| {
+                a.signature
+                    || matches!(a.kind, mypdf_milestone0::annotations::Kind::Ink { .. })
+                    || a.name.to_lowercase().contains("signature")
+                    || self
+                        .signatures
+                        .iter()
+                        .any(|s| s.asset_id.as_deref() == Some(&a.id))
+            })
+            .cloned()
+            .collect();
+        choices.sort_by_key(|a| self.default_ink.as_deref() != Some(&a.id));
+        choices
+    }
+    pub(in crate::desktop) fn ink_is_default(&self, id: &str) -> bool {
+        self.default_ink.as_deref() == Some(id)
+    }
+
+    pub(super) fn confirm_ink_delete(&mut self, ctx: &egui::Context, editor: &mut editing::EditorState) {
+        if !self.manager.ink_delete { return; }
+        let asset = editor.library.as_ref().and_then(|l| l.entries.iter().find(|a| Some(&a.id) == self.manager.ink_selected.as_ref())).cloned();
+        let Some(asset) = asset else { self.manager.ink_delete = false; return; };
+        let decision = ui::confirmation(ctx, "delete_ink_signature", &format!("Delete “{}”?", asset.name),
+            "This removes the saved ink signature from your library. Copies already placed in PDFs stay unchanged.",
+            &[("Delete", ui::DialogTone::Destructive), ("Cancel", ui::DialogTone::Secondary)], 1);
+        if let Some(choice) = decision {
+            self.manager.ink_delete = false;
+            if choice == 0 && let Some(library) = &mut editor.library
+                && let Some(i) = library.entries.iter().position(|a| a.id == asset.id) {
+                let removed = library.entries.remove(i);
+                if let Err(e) = library.save() {
+                    library.entries.insert(i, removed);
+                    self.error = Some(format!("{e:#}"));
+                } else {
+                    editor.removed_asset = Some(removed);
+                    self.manager.ink_selected = None;
+                    if self.ink_is_default(&asset.id) {
+                        self.default_ink = None;
+                        if let Err(e) = self.save_catalogue() { self.error = Some(format!("{e:#}")); }
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn ink_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        editor: &mut editing::EditorState,
+        assets: &[Asset],
+        can_place: bool,
+    ) -> Option<Asset> {
+        ui.heading("Ink signatures");
+        ui.weak("Drawn, typed or image signatures. These are visual marks, without a digital certificate.");
+        let choices = self.ink_assets(assets);
+        if self
+            .manager
+            .ink_selected
+            .as_ref()
+            .is_none_or(|id| !choices.iter().any(|a| &a.id == id))
+        {
+            self.manager.ink_selected = choices.first().map(|a| a.id.clone());
+            self.manager.ink_name = choices.first().map(|a| a.name.clone()).unwrap_or_default();
+            self.manager.ink_delete = false;
+        }
+        ui.horizontal_wrapped(|ui| {
+            for asset in &choices {
+                ui.vertical(|ui| {
+                    if artwork_card(
+                        ui,
+                        editor,
+                        asset,
+                        self.manager.ink_selected.as_ref() == Some(&asset.id),
+                    ) {
+                        self.manager.ink_selected = Some(asset.id.clone());
+                        self.manager.ink_name = asset.name.clone();
+                        self.manager.ink_delete = false;
+                    }
+                    if self.ink_is_default(&asset.id) {
+                        ui.weak("★ Default");
+                    }
+                });
+            }
+        });
+        let mut place = None;
+        if let Some(asset) = choices
+            .iter()
+            .find(|a| Some(&a.id) == self.manager.ink_selected.as_ref())
+        {
+            ui.separator();
+            ui.horizontal(|ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.manager.ink_name)
+                        .hint_text("Signature name")
+                        .char_limit(200),
+                );
+                editor.text_editing |= response.has_focus();
+                if ui
+                    .add_enabled(
+                        !self.manager.ink_name.trim().is_empty(),
+                        ActionButton::new(Icon::Save, "Rename"),
+                    )
+                    .clicked()
+                {
+                    let mut updated = asset.clone();
+                    updated.name = self.manager.ink_name.trim().into();
+                    updated.signature = true;
+                    if let Err(e) = editor.add_asset(updated) {
+                        self.error = Some(e);
+                    }
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        can_place,
+                        ActionButton::new(Icon::Sign, "Place signature").primary(),
+                    )
+                    .clicked()
+                {
+                    place = Some(asset.clone());
+                }
+                if ui
+                    .add_enabled(
+                        !self.ink_is_default(&asset.id),
+                        ActionButton::new(Icon::Star, "Make default"),
+                    )
+                    .clicked()
+                {
+                    self.default_ink = Some(asset.id.clone());
+                    if let Err(e) = self.save_catalogue() {
+                        self.error = Some(format!("{e:#}"));
+                    }
+                }
+                if ui.add(ActionButton::new(Icon::Trash, "Delete…").tint(theme::danger())).clicked() {
+                    self.manager.ink_delete = true;
+                }
+            });
+
+        } else {
+            ui.weak(
+                "Create your first signature below, or choose artwork already in your library.",
+            );
+        }
+        ui.separator();
+        if ui
+            .add(ActionButton::new(Icon::Plus, "New ink signature…"))
+            .clicked()
+        {
+            self.adopt_asset = false;
+            editor.open_signature();
+            editor.signature_manage_only = true;
+        }
+        ui.menu_button("Use existing artwork…", |ui| {
+            for asset in assets {
+                if ui.button(&asset.name).clicked() {
+                    let mut asset = asset.clone();
+                    asset.signature = true;
+                    self.manager.ink_selected = Some(asset.id.clone());
+                    self.manager.ink_name = asset.name.clone();
+                    if let Err(e) = editor.add_asset(asset) {
+                        self.error = Some(e);
+                    }
+                    ui.close();
+                }
+            }
+        });
+        place
     }
 }

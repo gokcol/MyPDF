@@ -189,7 +189,7 @@ pub(super) fn panel(
             });
         ui.horizontal(|ui| {
             egui::ComboBox::from_id_salt("font_style")
-                .width((ui.available_width() - 90.).max(90.))
+                .width(ui.available_width())
                 .selected_text(current.style())
                 .show_ui(ui, |ui| {
                     for (index, face) in fonts
@@ -202,14 +202,25 @@ pub(super) fn panel(
                         }
                     }
                 });
-            if ui
-                .add(egui::DragValue::new(size).range(4.0..=144.).suffix(" pt"))
-                .on_hover_text("Font size")
-                .changed()
-            {
-                changes.push(Change::Size(*size));
+        });
+        let old_size = *size;
+        editing::property_slider(ui, "Font size", size, 4.0..=144., " pt");
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("font_size_presets")
+                .selected_text("Common sizes")
+                .width((ui.available_width() - 80.).max(90.))
+                .show_ui(ui, |ui| {
+                    for value in [6., 8., 9., 10., 10.5, 11., 12., 14., 16., 18., 20., 24., 28., 32., 36., 48., 60., 72., 96., 144.] {
+                        ui.selectable_value(size, value, format!("{value} pt"));
+                    }
+                });
+            for (icon, label, delta) in [(Icon::Minus, "Decrease font size", -1.), (Icon::Plus, "Increase font size", 1.)] {
+                if control(ui, label, ActionButton::new(icon, label).compact()).clicked() {
+                    *size = (*size + delta).clamp(4., 144.);
+                }
             }
         });
+        if *size != old_size { changes.push(Change::Size(*size)); }
         ui.horizontal(|ui| {
             if control(
                 ui,
@@ -935,6 +946,7 @@ mod tests {
         frame(vec![]);
         for id in [
             egui::Id::new(("text_style_control", "italic")),
+            egui::Id::new(("text_style_control", "Increase font size")),
             egui::Id::new(("color_swatch", "Coral")),
         ] {
             let rect = ctx.data(|d| d.get_temp::<Rect>(id)).unwrap();
@@ -964,6 +976,9 @@ mod tests {
             .unwrap();
         assert!(face.italic);
         assert_eq!(spans[1].color, [0.9, 0.29, 0.29]);
+        assert_eq!(spans[1].size, 17.);
+        assert_eq!(spans[0].size, 16.);
+        assert_eq!(spans[2].size, 16.);
         assert_eq!(spans[0].color, [0.; 3]);
         assert_eq!(spans[2].color, [0.; 3]);
     }
