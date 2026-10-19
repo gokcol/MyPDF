@@ -49,7 +49,7 @@ fn shortcut(action: &str) -> Option<egui::KeyboardShortcut> {
         };
     let (modifiers, key) = match action {
         "copy" | "copy_text" | "copy_image" | "object_copy" => (M::COMMAND, Key::C),
-        "cut" | "object_cut" => (M::COMMAND, Key::X),
+        "cut" | "object_cut" | "cut_image" => (M::COMMAND, Key::X),
         "paste" | "paste_here" => (M::COMMAND, Key::V),
         "paste_original" => (M::COMMAND | M::SHIFT, Key::V),
         "all" | "all_text" => (M::COMMAND, Key::A),
@@ -117,7 +117,7 @@ pub(in crate::desktop) fn consume_action(ctx: &egui::Context, action: &str) -> b
     })
 }
 fn items(target: &Target, editable: bool) -> Vec<Item> {
-    match target {
+    let mut entries = match target {
         Target::PendingText => vec![
             item("Finish text edit", "finish_text", true),
             item("Cancel text edit", "cancel_text", true),
@@ -139,6 +139,7 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
         Target::Image(_) => vec![
             item("Image properties…", "image_properties", true),
             item("Copy image", "copy_image", true),
+            item("Cut image", "cut_image", editable),
             item("Replace image…", "replace_image", editable),
             item("Remove background…", "image_background", editable),
             item("Delete image", "delete_image", editable),
@@ -221,13 +222,22 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
             item("Fit width", "fit_width", true),
             item("Fit page", "fit_page", true),
         ],
+    };
+    if !matches!(target, Target::PendingText) {
+        entries.extend([
+            item("Sign in ink", "add_signature_here", editable),
+            item("Digital Sign", "digital_sign_here", true),
+            item("Quick Sign", "quick_sign_here", true),
+            item("Manage Signs", "manage_signs", true),
+        ]);
     }
+    entries
 }
 fn action_icon(action: &str, label: &str) -> Icon {
     match action {
         "copy" | "copy_text" | "copy_artwork_text" | "copy_image" | "object_copy"
         | "object_duplicate" => Icon::Copy,
-        "cut" | "object_cut" => Icon::Cut,
+        "cut" | "object_cut" | "cut_image" => Icon::Cut,
         "paste" | "paste_here" | "paste_original" => Icon::Paste,
         "delete" | "delete_image" | "object_delete" => Icon::Trash,
         "highlight" => Icon::Highlight,
@@ -239,6 +249,10 @@ fn action_icon(action: &str, label: &str) -> Icon {
         "cancel" | "cancel_text" => Icon::Close,
         "edit_text_here" | "add_text_here" => Icon::Text,
         "add_image" | "replace_image" | "image_properties" => Icon::FieldImage,
+        "add_signature_here" => Icon::Pen,
+        "quick_sign_here" => Icon::Sign,
+        "manage_signs" => Icon::Settings,
+        "digital_sign_here" => Icon::Shield,
         "image_background" | "object_background" => Icon::Sparkle,
         "crop_object" | "copy_region" => Icon::Crop,
         "rotate_right" => Icon::RotateRight,
@@ -266,6 +280,9 @@ fn menu_layout(ui: &mut egui::Ui, width: f32) {
 }
 fn submenu(action: &str) -> Option<(&'static str, Icon)> {
     match action {
+        "add_signature_here" | "digital_sign_here" | "quick_sign_here" | "manage_signs" => {
+            Some(("Sign", Icon::Sign))
+        }
         "rotate_right" | "rotate_left" | "flip_horizontal" | "flip_vertical" => {
             Some(("Transform", Icon::RotateRight))
         }
@@ -602,7 +619,7 @@ pub(in crate::desktop) fn page_menu(
                 })
                 .collect::<Vec<_>>();
             if state.context.group.is_some() {
-                labels.push(("Back to object actions", None));
+                labels.push(("Back to actions", None));
             }
             let width = ui::menu_width(ui, labels);
             menu_layout(ui, width);
@@ -613,7 +630,7 @@ pub(in crate::desktop) fn page_menu(
                     if let Some(group) = state.context.group {
                         if ui
                             .add(
-                                ui::MenuItem::new(Icon::Left, "Back to object actions")
+                                ui::MenuItem::new(Icon::Left, "Back to actions")
                                     .width(width),
                             )
                             .clicked()
@@ -971,7 +988,7 @@ impl Viewer {
     ) -> bool {
         let aliases: &[&str] = match action {
             "copy" => &["object_copy", "copy_text", "copy_image"],
-            "cut" => &["object_cut"],
+            "cut" => &["object_cut", "cut_image"],
             "select_all" => &["all_text"],
             "paste" => &["paste_here"],
             "paste_original" => &["paste_original"],
@@ -1068,11 +1085,15 @@ impl Viewer {
                 | "text_area"
                 | "add_text_here"
                 | "add_image"
+                | "add_signature_here"
+                | "digital_sign_here"
+                | "quick_sign_here"
                 | "copy_region"
                 | "image_properties"
                 | "replace_image"
                 | "image_background"
                 | "delete_image"
+                | "cut_image"
                 | "object_properties"
         ) {
             self.redaction.active = false;
@@ -1267,6 +1288,12 @@ impl Viewer {
                 self.content.area_mode = true;
                 self.inspector = true;
             }
+            "digital_sign_here" => self.sign_in_area(),
+            "quick_sign_here" => self.quick_sign(),
+            "manage_signs" => self.action("settings", ctx),
+            "add_signature_here" => {
+                self.signature_here(menu.key, menu.point);
+            }
             "add_text_here" => {
                 self.editor.mode = editing::Mode::Edit;
                 self.content.image_mode = false;
@@ -1356,8 +1383,8 @@ impl Viewer {
                     }
                 }
             }
-            "image_properties" | "copy_image" | "replace_image" | "image_background"
-            | "delete_image" => {
+            "image_properties" | "copy_image" | "cut_image" | "replace_image"
+            | "image_background" | "delete_image" => {
                 if let Target::Image(image) = menu.target {
                     self.editor.mode = editing::Mode::Edit;
                     self.content.image_mode = true;
@@ -1399,14 +1426,14 @@ impl Viewer {
                                 }
                             }
                         }
-                        "copy_image" => {
+                        "copy_image" | "cut_image" => {
                             match content::image_png(
                                 &self.tabs[index].session.as_ref().unwrap().source,
                                 menu.key.2 as u32 + 1,
                                 image.index,
                             ) {
                                 Ok(png) => {
-                                    self.copy_artwork(
+                                    let copied = self.copy_artwork(
                                         ctx,
                                         vec![Annotation::new(
                                             menu.key.2,
@@ -1415,6 +1442,16 @@ impl Viewer {
                                             Default::default(),
                                         )],
                                     );
+                                    if copied.is_some() && action == "cut_image" {
+                                        self.content_change(
+                                            ctx,
+                                            Edit::Image {
+                                                page: menu.key.2 as u32 + 1,
+                                                index: image.index,
+                                                edit: content::ImageEdit::Delete,
+                                            },
+                                        );
+                                    }
                                 }
                                 Err(e) => self.status = Some((e.to_string(), true)),
                             }
@@ -1698,6 +1735,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
+                theme::sync(ctx.theme());
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let r = Rect::from_min_size(pos2(20., 20.), vec2(500., 500.));
                     overlay(
@@ -1773,6 +1811,136 @@ mod tests {
         click(app, ctx, b.center(), egui::PointerButton::Primary);
         app.context_commands(ctx);
         frame(app, ctx, vec![]);
+    }
+    #[test]
+    fn annotate_and_edit_page_menus_offer_signature_at_the_clicked_point() {
+        for mode in [editing::Mode::Annotate, editing::Mode::Edit] {
+            let (mut app, ctx) = fixture();
+            app.editor.mode = mode;
+            frame(&mut app, &ctx, vec![]);
+            frame(&mut app, &ctx, vec![]);
+            click(
+                &mut app,
+                &ctx,
+                pos2(260., 260.),
+                egui::PointerButton::Secondary,
+            );
+            menu_click(&mut app, &ctx, "Sign");
+            menu_click(&mut app, &ctx, "Sign in ink");
+            assert!(app.editor.signature_open);
+            assert!(app.tabs[0].session.as_ref().unwrap().annotations.is_empty());
+        }
+        assert!(!commands(&Target::Page, false).contains(&"add_signature_here"));
+    }
+
+    #[test]
+    fn sign_submenu_routes_digital_quick_and_settings_without_changing_pdf() {
+        for label in ["Digital Sign", "Quick Sign", "Manage Signs"] {
+            let (mut app, ctx) = fixture();
+            frame(&mut app, &ctx, vec![]);
+            click(&mut app, &ctx, pos2(260., 260.), egui::PointerButton::Secondary);
+            menu_click(&mut app, &ctx, "Sign");
+            let bounds = ctx.data(|d| d.get_temp::<HashMap<String, Rect>>(
+                egui::Id::new("context_test_bounds"))).unwrap();
+            let labels = ["Sign in ink", "Digital Sign", "Quick Sign", "Manage Signs"];
+            for pair in labels.windows(2) {
+                assert!(bounds[pair[0]].center().y < bounds[pair[1]].center().y);
+            }
+            menu_click(&mut app, &ctx, label);
+            match label {
+                "Digital Sign" => {
+                    assert!(!app.digital.open);
+                    assert!(!app.digital.quick);
+                    assert!(app.editor.tool == editing::Tool::SignArea);
+                    assert!(app.editor.mode == editing::Mode::Sign);
+                }
+                "Quick Sign" => {
+                    assert!(app.digital.open);
+                    assert!(app.digital.panel == digital::Panel::Signatures);
+                }
+                _ => {
+                    assert!(app.digital.open);
+                    assert!(app.digital.panel == digital::Panel::Ink);
+                }
+            }
+            assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
+        }
+        let drawing = Annotation::new(0, [10., 10., 20., 20.], Kind::Rectangle, Default::default());
+        for target in [Target::Page, Target::Artwork(vec![drawing])] {
+            let signs: Vec<_> = items(&target, true).into_iter()
+                .filter(|i| submenu(i.action).is_some_and(|g| g.0 == "Sign"))
+                .map(|i| i.label).collect();
+            assert_eq!(signs, ["Sign in ink", "Digital Sign", "Quick Sign", "Manage Signs"]);
+        }
+        assert!(items(&Target::PendingText, true).iter().all(|i| submenu(i.action).is_none()));
+    }
+
+    #[test]
+    fn sign_menu_items_are_readable_in_both_themes() {
+        // WCAG contrast between two colors.
+        fn contrast(a: Color32, b: Color32) -> f32 {
+            let luminance = |c: Color32| {
+                let ch = |v: u8| {
+                    let v = v as f32 / 255.;
+                    if v <= 0.03928 {
+                        v / 12.92
+                    } else {
+                        ((v + 0.055) / 1.055).powf(2.4)
+                    }
+                };
+                0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+            };
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        }
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let (mut app, ctx) = fixture();
+            ctx.set_theme(theme);
+            frame(&mut app, &ctx, vec![]);
+            click(&mut app, &ctx, pos2(260., 260.), egui::PointerButton::Secondary);
+            menu_click(&mut app, &ctx, "Sign");
+            for _ in 0..30 {
+                frame(&mut app, &ctx, vec![]);
+            }
+            let shapes = frame(&mut app, &ctx, vec![]).shapes;
+            for label in ["Sign in ink", "Digital Sign", "Quick Sign", "Manage Signs"] {
+                let (index, text) = shapes
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, s)| match &s.shape {
+                        egui::Shape::Text(t) if t.galley.text() == label => Some((i, t.clone())),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("{label} is in the open menu ({theme:?})"));
+                let color = text.override_text_color.unwrap_or_else(|| {
+                    text.galley
+                        .job
+                        .sections
+                        .first()
+                        .map_or(text.fallback_color, |s| s.format.color)
+                });
+                let area = text.visual_bounding_rect();
+                // The surface right under the label: the last opaque fill drawn before it.
+                fn fill(shape: &egui::Shape, area: Rect) -> Option<Color32> {
+                    match shape {
+                        egui::Shape::Vec(shapes) => shapes.iter().rev().find_map(|s| fill(s, area)),
+                        egui::Shape::Rect(r) if r.fill.a() == 255 && r.rect.contains_rect(area) => {
+                            Some(r.fill)
+                        }
+                        _ => None,
+                    }
+                }
+                let background = shapes[..index]
+                    .iter()
+                    .rev()
+                    .find_map(|s| fill(&s.shape, area))
+                    .expect("the menu background");
+                assert!(
+                    contrast(color, background) >= 4.5,
+                    "{label} in {theme:?}: {color:?} on {background:?}"
+                );
+            }
+        }
     }
     #[test]
     fn drawing_menu_stays_compact_and_transform_submenu_remains_actionable() {
@@ -2047,7 +2215,34 @@ mod tests {
         assert!(!commands(&target, true).contains(&"crop_object"));
         run_command(&mut app, &ctx, target, "copy_image");
         assert!(app.editor.marks_clip.is_some());
+        let clipboard::Clip::Image(copied, size) = clipboard::read() else {
+            panic!("Copy image did not publish pixels")
+        };
+        assert_eq!(size, [2, 2]);
+        assert_eq!(
+            content::decode_image(&copied).unwrap().get_pixel(0, 0).0,
+            [0, 90, 240, 255]
+        );
         assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
+        assert!(!commands(&Target::Image(images[0].clone()), false).contains(&"cut_image"));
+        run_command(
+            &mut app,
+            &ctx,
+            Target::Image(images[0].clone()),
+            "cut_image",
+        );
+        assert!(matches!(clipboard::read(), clipboard::Clip::Image(..)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.content.busy {
+            app.content_events(&ctx);
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let s = app.tabs[0].session.as_mut().unwrap();
+        assert!(content::images(&s.source, 1).unwrap().is_empty());
+        s.undo();
+        assert_eq!(content::images(&s.source, 1).unwrap().len(), 1);
     }
     #[test]
     fn translation_actions_follow_text_or_page_context_even_for_read_only_documents() {

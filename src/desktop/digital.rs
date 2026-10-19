@@ -16,6 +16,7 @@ use manager::{Look, ManagerState, SavedSignature};
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Panel {
     Signatures,
+    Ink,
     Identities,
     Sign,
     Validate,
@@ -52,6 +53,8 @@ struct Catalogue {
     signatures: Vec<SavedSignature>,
     #[serde(default)]
     default_signature: Option<String>,
+    #[serde(default)]
+    default_ink: Option<String>,
     /// Written with saved signatures: the old appearance is not migrated again.
     #[serde(default)]
     signatures_managed: bool,
@@ -328,6 +331,7 @@ pub(super) struct DigitalState {
     /// Saved signatures; the default one drives Quick Sign.
     signatures: Vec<SavedSignature>,
     default_signature: Option<String>,
+    default_ink: Option<String>,
     manager: ManagerState,
     /// The default signature's look, applied to each signing request.
     look: Look,
@@ -390,6 +394,7 @@ impl DigitalState {
             appearance,
             mut signatures,
             mut default_signature,
+            default_ink,
             signatures_managed,
         } = contents;
         // Earlier versions kept one appearance and a default certificate:
@@ -491,6 +496,7 @@ impl DigitalState {
             create_trust: cfg!(any(target_os = "macos", target_os = "windows")),
             signatures,
             default_signature,
+            default_ink,
             manager: ManagerState::new(),
             look: Look::default(),
             target_field: None,
@@ -629,6 +635,7 @@ impl DigitalState {
             },
             signatures: self.signatures.clone(),
             default_signature: self.default_signature.clone(),
+            default_ink: self.default_ink.clone(),
             signatures_managed: true,
         })?;
         anyhow::ensure!(
@@ -996,9 +1003,7 @@ impl Viewer {
     }
     pub(super) fn digital_events(&mut self, ctx: &egui::Context) {
         #[cfg(all(not(test), any(target_os = "macos", target_os = "windows")))]
-        if !self.digital.scan_started
-            || self.digital.open && !self.digital.was_open && !self.digital.scanning
-        {
+        if !self.digital.scan_started && !self.digital.scanning {
             self.digital.refresh_store(ctx, None);
         }
         if self.digital.open && !self.digital.was_open {
@@ -1257,9 +1262,9 @@ impl Viewer {
             self.digital.save_if_dirty();
             return;
         }
-        let mut quick = false;
         let mut close = false;
         let mut can_sign = false;
+        let mut ink_place = None;
         let active = self.tabs.get(self.active);
         let mut open = true;
         let mut action = None;
@@ -1269,7 +1274,8 @@ impl Viewer {
             .as_ref()
             .map(|l| l.entries.clone())
             .unwrap_or_default();
-        egui::Window::new("Signatures")
+        let settings = !matches!(self.digital.panel, Panel::Sign | Panel::Validate);
+        egui::Window::new(if settings { "Settings" } else { "Digital Signature" })
             .id(egui::Id::new("digital_window"))
             .open(&mut open)
             .collapsible(false)
@@ -1278,20 +1284,17 @@ impl Viewer {
             .max_width(ui::dialog_width(ctx, 900.))
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 10.;
-                const PANELS: [(Panel, &str); 5] = [
-                    (Panel::Signatures, "My signatures"),
-                    (Panel::Identities, "Digital IDs"),
-                    (Panel::Sign, "Sign"),
-                    (Panel::Validate, "Validate"),
-                    (Panel::Trusted, "Trusted"),
-                ];
-                let current = PANELS
-                    .iter()
-                    .position(|(p, _)| *p == self.digital.panel)
-                    .unwrap_or(0);
-                if let Some(i) = ui::segmented(ui, &PANELS.map(|(_, name)| name), current) {
+                let panels: &[(Panel, &str)] = if settings {
+                    &[(Panel::Ink, "Ink signatures"), (Panel::Signatures, "Digital signatures"),
+                      (Panel::Identities, "Digital IDs"), (Panel::Trusted, "Trusted")]
+                } else {
+                    &[(Panel::Sign, "Sign"), (Panel::Validate, "Validate")]
+                };
+                let current = panels.iter().position(|(p, _)| *p == self.digital.panel).unwrap_or(0);
+                let labels: Vec<&str> = panels.iter().map(|(_, name)| *name).collect();
+                if let Some(i) = ui::segmented(ui, &labels, current) {
                     self.digital.save_if_dirty();
-                    self.digital.panel = PANELS[i].0;
+                    self.digital.panel = panels[i].0;
                     self.digital.error = None;
                     self.digital.message.clear();
                 }
@@ -1321,6 +1324,9 @@ impl Viewer {
                     ui::callout(ui, ui::Tone::Danger, error);
                 }
                 ui.add_enabled_ui(!self.digital.busy, |ui| match self.digital.panel {
+                    Panel::Ink => {
+                        ink_place = self.digital.ink_panel(ui, &mut self.editor, &assets, active.is_some_and(|t| t.session.as_ref().is_some_and(|s| s.editable)));
+                    }
                     Panel::Signatures => {
                         self.digital.signatures_panel(ui, &mut self.editor, &assets, &mut action);
                     }
@@ -1723,7 +1729,7 @@ impl Viewer {
                                 }
                                 if caps.needs_signing_preparation {
                                     if caps.signed {
-                                        ui::callout(ui, ui::Tone::Danger, "This signed PDF uses xref streams. It cannot be rewritten for this writer.");
+                                        ui::callout(ui, ui::Tone::Danger, "MyPDF cannot add another digital signature to this already-signed PDF format yet. This is a document-format limitation, not a certificate error. Use the unsigned original, or an editor that can append a signature to this file; rewriting it would invalidate its existing signatures.");
                                     } else {
                                         ui.checkbox(&mut self.digital.prepare, "Prepare an unsigned signing copy (required for this PDF)");
                                     }
@@ -1933,12 +1939,12 @@ impl Viewer {
                 });
                 });
                 ui::dialog_footer(ui, |ui| {
+                    if !settings && ui.add(ActionButton::new(Icon::Settings, "Signature Settings…").compact()).clicked() {
+                        self.digital.panel = Panel::Signatures;
+                    }
                     match self.digital.panel {
                         Panel::Sign if ui.add_enabled(!self.digital.busy && can_sign, ActionButton::new(Icon::Sign, "Sign and save a copy…").primary()).clicked() => action = Some(Action::Sign),
-                        Panel::Signatures if !self.digital.signatures.is_empty() => {
-                            quick = ui.add_enabled(!self.digital.busy && active.is_some_and(|t| t.bytes.is_some()), ActionButton::new(Icon::Sign, "Quick Sign").primary())
-                                .on_hover_text("Drag a box on the page to sign with the starred signature").clicked();
-                        }
+                        Panel::Signatures => self.digital.signature_actions(ui),
                         Panel::Validate if ui.add_enabled(!self.digital.busy && active.is_some_and(|t| t.bytes.is_some()), ActionButton::new(Icon::Shield, "Validate signatures").primary()).clicked() => action = Some(Action::Verify),
                         _ => {}
                     }
@@ -1946,9 +1952,6 @@ impl Viewer {
                 });
             });
         open &= !close;
-        if quick {
-            self.quick_sign();
-        }
         if !open {
             self.digital.save_if_dirty();
             self.digital.sign_password = Zeroizing::new(String::new());
@@ -1958,6 +1961,15 @@ impl Viewer {
             self.digital.export = None;
         }
         self.digital.open = open;
+        if self.digital.open {
+            self.digital.confirm_delete(ctx);
+            self.digital.confirm_ink_delete(ctx, &mut self.editor);
+        }
+        if let Some(asset) = ink_place {
+            self.digital.open = false;
+            self.home.visible = false;
+            self.place_saved_signature(asset);
+        }
         if let Some(action) = action {
             self.digital_action(action, ctx);
         }
@@ -2095,9 +2107,9 @@ impl Viewer {
                 "Certification restrictions are unsupported; this PDF cannot be extended here.",
             ),
             Some(c) if c.encrypted => Some("Encrypted PDFs cannot be signed here."),
-            Some(c) if c.signed && c.needs_signing_preparation => {
-                Some("This signed PDF uses xref streams. It cannot be rewritten for this writer.")
-            }
+            Some(c) if c.signed && c.needs_signing_preparation => Some(
+                "MyPDF cannot add another digital signature to this already-signed PDF format yet. This is a document-format limitation, not a certificate error. Use the unsigned original, or an editor that can append a signature to this file; rewriting it would invalidate its existing signatures.",
+            ),
             None => Some("The document is still loading."),
             _ => None,
         };
@@ -2184,6 +2196,7 @@ impl Viewer {
         self.digital.selected = Some(entry.id.clone());
         self.digital.request.name = entry.signer_name();
         self.digital.open = false;
+        self.home.visible = false;
         self.digital.quick = true;
         match target {
             // A form's signature field: its name and box, no drawing needed.
@@ -2197,7 +2210,7 @@ impl Viewer {
                 self.editor.start_signature_rectangle();
             }
         }
-        self.status = None;
+        self.status = Some(("Drag a box, or click anywhere on the page, to use your default digital signature · Esc cancels".into(), false));
     }
     /// Sign the placed box at once, next to the original as “Name-signed.pdf”.
     fn quick_sign_now(&mut self, ctx: &egui::Context) {
@@ -2474,7 +2487,7 @@ impl Viewer {
             Action::DrawArtwork => {
                 self.editor.last_added = None;
                 self.digital.adopt_asset = true;
-                self.editor.signature_open = true;
+                self.editor.open_signature();
             }
             Action::TrustAdd(der) => match self.digital.trust.add(&der) {
                 Ok(_) => {
@@ -2796,7 +2809,7 @@ impl DigitalState {
 }
 
 /// A selectable library artwork tile. Returns true when clicked.
-fn artwork_card(
+pub(super) fn artwork_card(
     ui: &mut egui::Ui,
     editor: &mut editing::EditorState,
     asset: &mypdf_milestone0::assets::Asset,
@@ -3107,6 +3120,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_signature_survives_unavailable_store_and_ink_default_is_independent() {
+        let temp = tempfile::tempdir().unwrap();
+        let made = identity::create("Default persistence", "test-only-passphrase", true).unwrap();
+        let mut entry = Entry::file(
+            temp.path().join("example.p12"),
+            identity::inspect_pkcs12(&made.pkcs12, "test-only-passphrase")
+                .unwrap()
+                .remove(0),
+        );
+        entry.source = Source::Keychain {
+            path: None,
+            fingerprint: entry.info.sha256.clone(),
+        };
+        let mut state = DigitalState::at(temp.path().into());
+        state.remember(entry.clone());
+        let id = state.add_signature(Some(entry.reference()));
+        state.default_ink = Some("a".repeat(32));
+        state.save_catalogue().unwrap();
+        state.reconcile_store(None, vec![]);
+        assert_eq!(state.default_signature().unwrap().id, id);
+        assert_eq!(state.default_identity, Some(entry.reference()));
+        state.save_catalogue().unwrap();
+        let mut restored = DigitalState::at(temp.path().into());
+        assert_eq!(restored.default_signature().unwrap().id, id);
+        assert_eq!(restored.default_ink, Some("a".repeat(32)));
+        restored.reconcile_store(None, vec![entry.clone()]);
+        assert_eq!(restored.selected, Some(entry.id));
+        assert_eq!(restored.default_signature().unwrap().id, id);
+    }
+
+    #[test]
     fn certificate_purpose_uses_declared_usage_not_its_display_name() {
         use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair};
         let cert = |purposes| {
@@ -3173,7 +3217,7 @@ mod tests {
                     }
                 }
             }
-            for label in ["My signatures", "Digital IDs", primary, "Close"] {
+            for label in ["Sign", "Validate", "Signature Settings…", primary, "Close"] {
                 let rect = bounds
                     .get(label)
                     .unwrap_or_else(|| panic!("Missing {label}"));
@@ -3840,6 +3884,7 @@ mod tests {
     #[test]
     fn the_signatures_window_creates_edits_and_deletes_signatures() {
         use eframe::App;
+        for dimensions in [vec2(1100., 900.), vec2(720., 480.)] {
         let temp = tempfile::tempdir().unwrap();
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -3849,7 +3894,7 @@ mod tests {
         let frame = |app: &mut Viewer, events: Vec<egui::Event>| {
             ctx.run(
                 egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1100., 900.))),
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), dimensions)),
                     events,
                     ..Default::default()
                 },
@@ -3945,7 +3990,7 @@ mod tests {
         );
         click(&mut app, "Date and time", true);
         assert!(!app.digital.signatures[0].show_date);
-        click(&mut app, "Duplicate", true);
+        click(&mut app, "Duplicate", false);
         assert_eq!(app.digital.signatures.len(), 2);
         assert_eq!(app.digital.signatures[1].name, "My signature copy");
         assert_eq!(
@@ -3958,7 +4003,7 @@ mod tests {
             app.digital.default_signature.as_deref(),
             Some(copy.as_str())
         );
-        click(&mut app, "Delete…", true);
+        click(&mut app, "Delete…", false);
         assert_eq!(
             app.digital.manager.confirm_delete.as_deref(),
             Some(copy.as_str())
@@ -3969,8 +4014,18 @@ mod tests {
             app.digital.default_signature.as_deref(),
             Some(first.as_str())
         );
+        click(&mut app, "Delete…", false);
+        assert_eq!(app.digital.manager.confirm_delete.as_deref(), Some(first.as_str()));
+        click(&mut app, "Cancel", false);
+        assert_eq!(app.digital.signatures.len(), 1);
+        assert!(app.digital.manager.confirm_delete.is_none());
+        click(&mut app, "Delete…", false);
+        click(&mut app, "Delete", false);
+        assert!(app.digital.signatures.is_empty());
+        assert!(app.digital.default_signature.is_none());
         let reloaded = DigitalState::at(temp.path().join("profile"));
         assert_eq!(reloaded.signatures, app.digital.signatures);
+        }
     }
     #[test]
     fn catalogue_contains_only_public_metadata_and_detects_other_writers() {

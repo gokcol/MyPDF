@@ -696,6 +696,21 @@ impl Viewer {
         }
     }
     fn action(&mut self, action: &str, ctx: &egui::Context) {
+        if action == "settings" {
+            self.digital.save_if_dirty();
+            self.digital.open = true;
+            self.digital.panel = digital::Panel::Ink;
+            return;
+        }
+        if action == "paste" && self.editor.signature_open {
+            let clip = clipboard::read();
+            if matches!(clip, clipboard::Clip::Image(..)) || !ctx.wants_keyboard_input() {
+                self.import_signature_clipboard(clip);
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            }
+            return;
+        }
         if self.context_native_action(action, ctx) {
             return;
         }
@@ -1040,6 +1055,22 @@ impl Viewer {
             && !self.editor.text_editing
     }
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
+            self.action("settings", ctx);
+            return;
+        }
+        if self.editor.signature_open {
+            if self.signature_image_paste_active(ctx)
+                && ctx.input_mut(|i| {
+                    let paste = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)));
+                    i.events.retain(|e| !matches!(e, egui::Event::Paste(_)));
+                    paste || i.consume_key(egui::Modifiers::COMMAND, egui::Key::V)
+                })
+            {
+                self.paste_signature_image();
+            }
+            return;
+        }
         if self.context_shortcuts(ctx) {
             return;
         }
@@ -1232,7 +1263,7 @@ impl Viewer {
                     {
                         action = Some("home");
                     }
-                    let available = (ui.available_width() - 112.).max(40.);
+                    let available = (ui.available_width() - 148.).max(40.);
                     let selected = (!self.home.visible)
                         .then(|| self.tabs.get(self.active).map(|t| t.id))
                         .flatten();
@@ -1321,6 +1352,10 @@ impl Viewer {
                     {
                         action = Some("open");
                     }
+                    if ui.add(ActionButton::new(Icon::Settings, "Settings").compact())
+                        .on_hover_text(if cfg!(target_os = "macos") { "Settings · ⌘," } else { "Settings · Ctrl+," }).clicked() {
+                        action = Some("settings");
+                    }
                     if let Some(choice) = ui::theme_menu(ui) {
                         action = Some(choice);
                     }
@@ -1343,26 +1378,22 @@ impl Viewer {
             )
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.x = 4.;
-                const MODES: [(editing::Mode, Icon, &str); 8] = [
+                const MODES: [(editing::Mode, Icon, &str); 7] = [
                     (editing::Mode::Read, Icon::Read, "Read"),
                     (editing::Mode::Annotate, Icon::Pen, "Annotate"),
                     (editing::Mode::Edit, Icon::Text, "Edit"),
                     (editing::Mode::Draw, Icon::Shapes, "Draw"),
                     (editing::Mode::Forms, Icon::Form, "Forms"),
-                    (editing::Mode::Sign, Icon::Sign, "Sign"),
                     (editing::Mode::Pages, Icon::Library, "Pages"),
                     (editing::Mode::Convert, Icon::Export, "Export"),
                 ];
                 let track_width = |ui: &egui::Ui, compact: bool| {
                     MODES
                         .iter()
-                        .map(|(mode, icon, label)| {
+                        .map(|(_, icon, label)| {
                             let mut b = ActionButton::new(*icon, label).tab();
                             if compact {
                                 b = b.compact();
-                            }
-                            if *mode == editing::Mode::Sign {
-                                b = b.dropdown();
                             }
                             b.width(ui)
                         })
@@ -1401,10 +1432,6 @@ impl Viewer {
                     ui.add_space(centered.min(room).max(8.));
                     ui::segment_track(ui, |ui| {
                         for (mode, icon, label) in MODES {
-                            if mode == editing::Mode::Sign {
-                                self.sign_menu(ui, compact);
-                                continue;
-                            }
                             let button = ActionButton::new(icon, label)
                                 .tab()
                                 .selected(self.editor.mode == mode);
@@ -2016,7 +2043,7 @@ impl Viewer {
                         if !placing && !self.content.paused && !self.organizer.busy {
                             content::page_menu(&mut self.content, &mut self.editor, tab, ui, page, page_rect, scale);
                         }
-                        if self.content.paused {
+                        if self.redaction.active && self.editor.mode == editing::Mode::Edit && !placing {
                             redaction::overlay(&mut self.redaction, tab, ui, page, page_rect, scale);
                         }
                         if matches!(self.editor.mode, editing::Mode::Read | editing::Mode::Sign)
@@ -2686,210 +2713,23 @@ mod tests {
     }
 
     #[test]
-    fn sign_menu_items_are_readable_in_both_themes() {
-        // WCAG contrast between two colors.
-        fn contrast(a: Color32, b: Color32) -> f32 {
-            let luminance = |c: Color32| {
-                let ch = |v: u8| {
-                    let v = v as f32 / 255.;
-                    if v <= 0.03928 {
-                        v / 12.92
-                    } else {
-                        ((v + 0.055) / 1.055).powf(2.4)
-                    }
-                };
-                0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
-            };
-            let (a, b) = (luminance(a), luminance(b));
-            (a.max(b) + 0.05) / (a.min(b) + 0.05)
-        }
-        for theme in [egui::Theme::Light, egui::Theme::Dark] {
-            let ctx = egui::Context::default();
-            ctx.enable_accesskit();
-            let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
-            ctx.set_theme(theme);
-            app.new_blank(&ctx);
-            until(&mut app, &ctx, |a| a.tabs[0].session.is_some());
-            app.editor.mode = editing::Mode::Edit;
-            let run = |app: &mut Viewer, events: Vec<egui::Event>| {
-                ctx.run(
-                    egui::RawInput {
-                        screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1200., 760.))),
-                        events,
-                        ..Default::default()
-                    },
-                    |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
-                )
-            };
-            let output = run(&mut app, vec![]);
-            let sign = output
-                .platform_output
-                .accesskit_update
-                .unwrap()
-                .nodes
-                .into_iter()
-                .find(|(_, n)| n.label() == Some("Sign"))
-                .and_then(|(_, n)| n.bounds())
-                .expect("the Sign menu button");
-            let at = pos2(
-                ((sign.x0 + sign.x1) / 2.) as f32,
-                ((sign.y0 + sign.y1) / 2.) as f32,
+    fn main_ribbon_leaves_signing_in_context_menu() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        until(&mut app, &ctx, |a| a.tabs[0].session.is_some());
+        for mode in [editing::Mode::Read, editing::Mode::Annotate, editing::Mode::Edit, editing::Mode::Draw] {
+            app.editor.mode = mode;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1100., 760.))),
+                    ..Default::default()
+                },
+                |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
             );
-            for pressed in [true, false] {
-                run(
-                    &mut app,
-                    vec![
-                        egui::Event::PointerMoved(at),
-                        egui::Event::PointerButton {
-                            pos: at,
-                            button: egui::PointerButton::Primary,
-                            pressed,
-                            modifiers: egui::Modifiers::NONE,
-                        },
-                    ],
-                );
-            }
-            // Let the menu finish fading in.
-            for _ in 0..30 {
-                run(&mut app, vec![]);
-            }
-            let shapes = run(&mut app, vec![]).shapes;
-            for label in ["Quick Sign", "Signature", "Digital Signature"] {
-                let (index, text) = shapes
-                    .iter()
-                    .enumerate()
-                    .find_map(|(i, s)| match &s.shape {
-                        egui::Shape::Text(t) if t.galley.text() == label => Some((i, t.clone())),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| panic!("{label} is in the open menu ({theme:?})"));
-                let color = text.override_text_color.unwrap_or_else(|| {
-                    text.galley
-                        .job
-                        .sections
-                        .first()
-                        .map_or(text.fallback_color, |s| s.format.color)
-                });
-                let area = text.visual_bounding_rect();
-                // The surface right under the label: the last opaque fill drawn before it.
-                fn fill(shape: &egui::Shape, area: Rect) -> Option<Color32> {
-                    match shape {
-                        egui::Shape::Vec(shapes) => shapes.iter().rev().find_map(|s| fill(s, area)),
-                        egui::Shape::Rect(r) if r.fill.a() == 255 && r.rect.contains_rect(area) => {
-                            Some(r.fill)
-                        }
-                        _ => None,
-                    }
-                }
-                let background = shapes[..index]
-                    .iter()
-                    .rev()
-                    .find_map(|s| fill(&s.shape, area))
-                    .expect("the menu background");
-                assert!(
-                    contrast(color, background) >= 4.5,
-                    "{label} in {theme:?}: {color:?} on {background:?}"
-                );
-            }
-        }
-    }
-    #[test]
-    fn sign_ribbon_menu_routes_visual_and_certificate_signatures() {
-        for digital in [false, true] {
-            let ctx = egui::Context::default();
-            ctx.enable_accesskit();
-            let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
-            app.new_blank(&ctx);
-            until(&mut app, &ctx, |a| a.tabs[0].session.is_some());
-            app.editor.mode = editing::Mode::Draw;
-            let bounds = |app: &mut Viewer, label: &str, last: bool| {
-                let output = ctx.run(
-                    egui::RawInput {
-                        screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1100., 760.))),
-                        ..Default::default()
-                    },
-                    |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
-                );
-                let nodes = output.platform_output.accesskit_update.unwrap().nodes;
-                let matches: Vec<_> = nodes
-                    .iter()
-                    .filter(|(_, n)| n.label() == Some(label))
-                    .collect();
-                let n = if last {
-                    matches.last()
-                } else {
-                    matches.first()
-                }
-                .unwrap_or_else(|| panic!("missing {label}"));
-                let r = n.1.bounds().unwrap();
-                pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32)
-            };
-            let click = |app: &mut Viewer, p| {
-                for pressed in [true, false] {
-                    frame(
-                        app,
-                        &ctx,
-                        vec![
-                            egui::Event::PointerMoved(p),
-                            egui::Event::PointerButton {
-                                pos: p,
-                                button: egui::PointerButton::Primary,
-                                pressed,
-                                modifiers: egui::Modifiers::NONE,
-                            },
-                        ],
-                    );
-                }
-            };
-            for _ in 0..3 {
-                frame(&mut app, &ctx, vec![]);
-            }
-            // One Sign menu, in the main toolbar; Annotate and Draw have none of their own.
-            for mode in [editing::Mode::Draw, editing::Mode::Annotate] {
-                app.editor.mode = mode;
-                let output = ctx.run(
-                    egui::RawInput {
-                        screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1100., 760.))),
-                        ..Default::default()
-                    },
-                    |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
-                );
-                let signs = output
-                    .platform_output
-                    .accesskit_update
-                    .unwrap()
-                    .nodes
-                    .iter()
-                    .filter(|(_, n)| n.label() == Some("Sign"))
-                    .count();
-                assert_eq!(signs, 1, "{mode:?}");
-            }
-            let sign = bounds(&mut app, "Sign", false);
-            click(&mut app, sign);
-            for _ in 0..3 {
-                frame(&mut app, &ctx, vec![]);
-            }
-            let visual = bounds(&mut app, "Signature", false);
-            let certificate = bounds(&mut app, "Digital Signature", false);
-            assert!(
-                certificate.y > visual.y,
-                "menu order is Signature, then Digital Signature"
-            );
-            click(&mut app, if digital { certificate } else { visual });
-            // Digital Signature asks for the area first; the window opens after it.
-            assert!(!app.digital.open);
-            assert_eq!(app.editor.signature_open, !digital);
-            if digital {
-                assert!(app.editor.tool == editing::Tool::SignArea);
-                assert!(app.editor.mode == editing::Mode::Sign);
-            } else {
-                assert!(app.editor.mode == editing::Mode::Annotate);
-            }
-            assert_eq!(
-                app.tabs[0].session.as_ref().unwrap().revision(),
-                0,
-                "opening a menu never signs or changes the document"
-            );
+            assert!(!output.platform_output.accesskit_update.unwrap().nodes.iter()
+                .any(|(_, n)| n.label() == Some("Sign")), "{mode:?}");
         }
     }
     #[test]
@@ -3406,7 +3246,7 @@ mod tests {
             let nodes = output.platform_output.accesskit_update.unwrap().nodes;
             let mut previous = 0.;
             for label in [
-                "Read", "Annotate", "Edit", "Draw", "Forms", "Sign", "Pages", "Export",
+                "Read", "Annotate", "Edit", "Draw", "Forms", "Pages", "Export",
             ] {
                 let node = &nodes
                     .iter()

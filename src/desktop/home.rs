@@ -231,7 +231,7 @@ impl Viewer {
                         (Icon::Highlight, "Annotate", "Highlight & comment", Color32::from_rgb(250, 160, 20), HomeAction::Mode(editing::Mode::Annotate)),
                         (Icon::Library, "Manage Pages", "Reorder, rotate, crop", Color32::from_rgb(18, 172, 150), HomeAction::Mode(editing::Mode::Pages)),
                         (Icon::Import, "Files to PDF", "Images, Word, Markdown", Color32::from_rgb(244, 84, 84), HomeAction::Import),
-                        (Icon::Sign, "Sign PDF", "Signatures & certificates", Color32::from_rgb(132, 88, 246), HomeAction::Mode(editing::Mode::Sign)),
+                        (Icon::Sign, "Sign PDF", "Place an ink or digital signature", Color32::from_rgb(132, 88, 246), HomeAction::Mode(editing::Mode::Sign)),
                         (Icon::Blank, "New Blank PDF", "Start from scratch", Color32::from_rgb(14, 150, 230), HomeAction::Blank),
                     ];
                     let columns = if ui.available_width() >= 960. { 6 } else { 3 };
@@ -909,6 +909,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+    #[test]
+    fn settings_opens_without_a_document() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.action("settings", &ctx);
+        assert!(app.digital.open && app.home.visible && app.tabs.is_empty());
+        assert!(app.digital.panel == digital::Panel::Ink);
+    }
+
     #[test]
     fn home_cards_are_accessible_responsive_and_new_blank_opens_a_document() {
         for width in [720., 1200.] {

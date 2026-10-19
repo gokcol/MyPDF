@@ -103,6 +103,8 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
                 }),
             ),
             &P::separator(),
+            &item("settings", "Settings…", Code::Comma, Modifiers::empty()),
+            &P::separator(),
             &P::hide(None),
             &P::hide_others(None),
             &P::show_all(None),
@@ -301,8 +303,7 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
         true,
         &[
             &MenuItem::with_id("quick_sign", "Quick Sign", true, None),
-            &MenuItem::with_id("appearance", "My Signatures…", true, None),
-            &MenuItem::with_id("identities", "Digital IDs…", true, None),
+            &MenuItem::with_id("settings", "Signature Settings…", true, None),
             &MenuItem::with_id("sign", "Sign with Options…", true, None),
             &MenuItem::with_id("validate", "Validate Signatures…", true, None),
         ],

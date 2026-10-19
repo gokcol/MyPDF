@@ -1749,7 +1749,7 @@ impl Viewer {
                             *sign = Some((field.name.clone(), widget.page, widget.rect));
                         }
                         ui.label(
-                            RichText::new("Uses your starred signature from Sign → My Signatures.")
+                            RichText::new("Uses your default signature from Settings → Digital signatures.")
                                 .size(11.5)
                                 .color(theme::muted()),
                         );

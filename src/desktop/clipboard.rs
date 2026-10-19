@@ -4,6 +4,7 @@ use super::*;
 use mypdf_milestone0::annotations::{Annotation, Kind};
 
 /// What the system clipboard holds.
+#[cfg_attr(test, derive(Clone))]
 pub(super) enum Clip {
     Text(String),
     /// PNG bytes and pixel size.
@@ -58,6 +59,170 @@ pub(super) fn png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
 pub(super) struct MarksClip {
     marks: Vec<Annotation>,
     marker: String,
+    image: Option<ImageClip>,
+}
+
+struct ImageClip {
+    sequence: Option<u64>,
+    fingerprint: String,
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
+fn sequence() -> Option<u64> {
+    // NSPasteboard owns the general pasteboard; no retained pointer escapes.
+    unsafe {
+        let board: *mut objc2::runtime::AnyObject =
+            objc2::msg_send![objc2::class!(NSPasteboard), generalPasteboard];
+        if board.is_null() {
+            return None;
+        }
+        let count: isize = objc2::msg_send![board, changeCount];
+        Some(count as u64)
+    }
+}
+#[cfg(all(not(test), target_os = "windows"))]
+fn sequence() -> Option<u64> {
+    let count = unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() };
+    (count != 0).then_some(count as u64)
+}
+#[cfg(any(test, not(any(target_os = "macos", target_os = "windows"))))]
+fn sequence() -> Option<u64> {
+    None
+}
+
+fn fingerprint(image: &image::RgbaImage) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(image.width().to_le_bytes());
+    hash.update(image.height().to_le_bytes());
+    hash.update(image.as_raw());
+    format!("{:x}", hash.finalize())
+}
+
+#[cfg(not(test))]
+fn write_image(image: &image::RgbaImage) -> anyhow::Result<()> {
+    let mut clipboard = arboard::Clipboard::new()?;
+    clipboard.set_image(arboard::ImageData {
+        width: image.width() as usize,
+        height: image.height() as usize,
+        bytes: std::borrow::Cow::Borrowed(image.as_raw()),
+    })?;
+    Ok(())
+}
+#[cfg(test)]
+thread_local! {
+    static FAIL_IMAGE_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+fn write_image(image: &image::RgbaImage) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !FAIL_IMAGE_WRITE.with(|f| f.replace(false)),
+        "Clipboard unavailable"
+    );
+    set_for_test(Clip::Image(
+        png(image.width(), image.height(), image.as_raw()).unwrap(),
+        [image.width(), image.height()],
+    ));
+    Ok(())
+}
+
+impl MarksClip {
+    fn matches(&self, clip: &Clip) -> bool {
+        match clip {
+            Clip::Text(text) => self.image.is_none() && text == &self.marker,
+            Clip::Empty => self.image.is_none(),
+            Clip::Image(bytes, _) => self.image.as_ref().is_some_and(|own| {
+                if let Some(written) = own.sequence {
+                    return sequence() == Some(written);
+                }
+                mypdf_milestone0::content::decode_image(bytes)
+                    .is_ok_and(|pixels| fingerprint(&pixels) == own.fingerprint)
+            }),
+        }
+    }
+}
+
+/// Image-only copies keep original pixels when possible. More complex selections
+/// use their PDF appearances on a transparent canvas, never a page screenshot.
+fn image_for_clipboard(marks: &[Annotation]) -> anyhow::Result<image::RgbaImage> {
+    use mypdf_milestone0::{annotations, assets, object_tools};
+    for mark in marks {
+        mark.validate()?;
+    }
+    if let [mark] = marks
+        && matches!(mark.kind, Kind::Image { .. })
+        && !mark.style.image_border
+        && mark.rotation.rem_euclid(90.) == 0.
+    {
+        let mut pixels = assets::decode_png(&object_tools::image_appearance(mark)?)?.into_rgba8();
+        if mark.flip_x {
+            image::imageops::flip_horizontal_in_place(&mut pixels);
+        }
+        if mark.flip_y {
+            image::imageops::flip_vertical_in_place(&mut pixels);
+        }
+        pixels = match mark.rotation.rem_euclid(360.) as u32 {
+            90 => image::imageops::rotate90(&pixels),
+            180 => image::imageops::rotate180(&pixels),
+            270 => image::imageops::rotate270(&pixels),
+            _ => pixels,
+        };
+        for pixel in pixels.pixels_mut() {
+            pixel[3] = (pixel[3] as f32 * mark.style.opacity).round() as u8;
+        }
+        return Ok(pixels);
+    }
+    let bounds = selection::union_bounds(marks.iter());
+    let (w, h) = (bounds[2] - bounds[0], bounds[3] - bounds[1]);
+    anyhow::ensure!(
+        w.is_finite() && h.is_finite() && w > 0. && h > 0.,
+        "Invalid image bounds"
+    );
+    let mut document = lopdf::Document::load_mem(&mypdf_milestone0::convert::blank(72., 72.)?)?;
+    let page = document.get_pages()[&1];
+    document.get_object_mut(page)?.as_dict_mut()?.set(
+        "MediaBox",
+        vec![
+            0.into(),
+            0.into(),
+            lopdf::Object::Real(w),
+            lopdf::Object::Real(h),
+        ],
+    );
+    let mut base = Vec::new();
+    document.save_to(&mut base)?;
+    let marks: Vec<_> = marks
+        .iter()
+        .map(|a| {
+            let mut a = a.clone();
+            a.page = 0;
+            a.object.hidden = false;
+            a.rect = [
+                a.rect[0] - bounds[0],
+                a.rect[1] - bounds[1],
+                a.rect[2] - bounds[0],
+                a.rect[3] - bounds[1],
+            ];
+            a
+        })
+        .collect();
+    let pdf = hayro::hayro_syntax::Pdf::new(annotations::export(&base, &marks)?)
+        .map_err(|e| anyhow::anyhow!("Could not render copied artwork: {e:?}"))?;
+    let scale = 2_f32
+        .min(4096. / w.max(h))
+        .min((16_000_000. / (w * h)).sqrt());
+    let raster = hayro::render(
+        &pdf.pages()[0],
+        &hayro::RenderCache::new(),
+        &hayro::hayro_interpret::InterpreterSettings::default(),
+        &hayro::RenderSettings::default(),
+        &hayro::PixmapSettings {
+            x_scale: scale,
+            y_scale: scale,
+            bg_color: hayro::vello_cpu::color::palette::css::TRANSPARENT,
+        },
+    );
+    Ok(image::load_from_memory(&raster.into_png()?)?.into_rgba8())
 }
 
 /// A box of `size` points centered on the page, shrunk to fit `room` of it.
@@ -155,26 +320,44 @@ impl Viewer {
             if n == 1 { "" } else { "s" },
             tab.name()
         );
+        let image = if marks.iter().any(|a| matches!(a.kind, Kind::Image { .. })) {
+            let copied = image_for_clipboard(&marks).and_then(|pixels| {
+                write_image(&pixels)?;
+                Ok(ImageClip {
+                    sequence: sequence(),
+                    fingerprint: fingerprint(&pixels),
+                })
+            });
+            match copied {
+                Ok(image) => Some(image),
+                Err(e) => {
+                    self.status = Some((
+                        format!("Could not copy image: {e:#}. The document was not changed."),
+                        true,
+                    ));
+                    return None;
+                }
+            }
+        } else {
+            ctx.copy_text(marker.clone());
+            None
+        };
         self.editor.marks_clip = Some(MarksClip {
             marks,
             marker: marker.clone(),
+            image,
         });
-        ctx.copy_text(marker);
         Some(n)
     }
 
     /// Paste marks, or an image or text from another app, on the current page.
     pub(super) fn paste(&mut self, ctx: &egui::Context) {
         let clip = read();
-        let ours = match &clip {
-            Clip::Text(text) => self
-                .editor
-                .marks_clip
-                .as_ref()
-                .is_some_and(|m| m.marker == *text),
-            Clip::Empty => self.editor.marks_clip.is_some(),
-            Clip::Image(..) => false,
-        };
+        let ours = self
+            .editor
+            .marks_clip
+            .as_ref()
+            .is_some_and(|m| m.matches(&clip));
         if ours {
             self.paste_marks();
             return;
@@ -216,11 +399,7 @@ impl Viewer {
                 .editor
                 .marks_clip
                 .as_ref()
-                .is_some_and(|m| match &clip {
-                    Clip::Text(t) => t == &m.marker,
-                    Clip::Empty => true,
-                    _ => false,
-                });
+                .is_some_and(|m| m.matches(&clip));
             if !ours {
                 self.status = Some(("Copy artwork in MyPDF first".into(), false));
                 return;
@@ -354,6 +533,118 @@ impl Viewer {
 mod tests {
     use super::*;
     use eframe::App;
+
+    fn image_fixture() -> (Viewer, egui::Context, Annotation) {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.open_memory(
+            PathBuf::from("Clipboard test.pdf"),
+            mypdf_milestone0::convert::blank(595., 842.).unwrap(),
+            &ctx,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let bytes = png(2, 1, &[240, 20, 10, 128, 10, 20, 240, 255]).unwrap();
+        let mark = Annotation::new(
+            0,
+            [100., 100., 300., 200.],
+            Kind::Image {
+                png: Arc::new(bytes),
+            },
+            Default::default(),
+        );
+        app.tabs[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .commit(vec![mark.clone()])
+            .unwrap();
+        selection::set(&mut app.tabs[0], &mut app.editor, vec![mark.id.clone()]);
+        (app, ctx, mark)
+    }
+
+    #[test]
+    fn image_copy_exports_pixels_and_internal_paste_keeps_editable_original() {
+        let (mut app, ctx, original) = image_fixture();
+        assert!(app.copy_marks(&ctx, false));
+        let Clip::Image(bytes, size) = read() else {
+            panic!("Copy must publish an image, not a marker")
+        };
+        assert_eq!(size, [2, 1]);
+        assert_eq!(
+            mypdf_milestone0::content::decode_image(&bytes)
+                .unwrap()
+                .as_raw(),
+            &[240, 20, 10, 128, 10, 20, 240, 255]
+        );
+        assert!(!ctx.output(|o| {
+            o.commands
+                .iter()
+                .any(|c| matches!(c, egui::OutputCommand::CopyText(_)))
+        }));
+        set_for_test(Clip::Image(bytes, size));
+        app.paste(&ctx);
+        let draft = &app.workbench.paste.as_ref().unwrap()[0];
+        assert_eq!(draft.rect, original.rect);
+        assert_eq!(draft.kind, original.kind);
+        assert_ne!(draft.id, original.id);
+        app.workbench.paste = None;
+        set_for_test(Clip::Image(png(1, 1, &[9, 8, 7, 255]).unwrap(), [1, 1]));
+        app.paste(&ctx);
+        assert_ne!(app.workbench.paste.as_ref().unwrap()[0].kind, original.kind);
+        app.workbench.paste = None;
+        set_for_test(Clip::Empty);
+        app.paste(&ctx);
+        assert!(
+            app.workbench.paste.is_none(),
+            "An empty clipboard must not resurrect old images"
+        );
+    }
+
+    #[test]
+    fn image_cut_requires_successful_clipboard_write_and_undo_restores_original() {
+        let (mut app, ctx, original) = image_fixture();
+        FAIL_IMAGE_WRITE.with(|f| f.set(true));
+        assert!(!app.copy_marks(&ctx, true));
+        assert_eq!(
+            app.tabs[0].session.as_ref().unwrap().annotations,
+            vec![original.clone()]
+        );
+        assert!(app.status.as_ref().unwrap().1);
+        assert!(app.copy_marks(&ctx, true));
+        assert!(matches!(read(), Clip::Image(..)));
+        let s = app.tabs[0].session.as_mut().unwrap();
+        assert!(s.annotations.is_empty());
+        s.undo();
+        assert_eq!(s.annotations, vec![original]);
+    }
+
+    #[test]
+    fn copied_image_appearance_preserves_crop_transform_opacity_and_transparency() {
+        let (_, _, mut mark) = image_fixture();
+        mark.flip_x = true;
+        mark.rotation = 90.;
+        mark.style.opacity = 0.5;
+        let pixels = image_for_clipboard(&[mark.clone()]).unwrap();
+        assert_eq!(pixels.dimensions(), (1, 2));
+        assert_eq!(pixels.get_pixel(0, 0).0, [10, 20, 240, 128]);
+        assert_eq!(pixels.get_pixel(0, 1).0, [240, 20, 10, 64]);
+        mark.object.crop = Some([0., 0., 0.5, 1.]);
+        assert_eq!(
+            image_for_clipboard(&[mark.clone()]).unwrap().dimensions(),
+            (1, 1)
+        );
+        mark.object.crop = None;
+        mark.rotation = 30.;
+        mark.style.image_border = true;
+        let pixels = image_for_clipboard(&[mark]).unwrap();
+        assert_eq!(pixels.get_pixel(0, 0)[3], 0);
+        assert!(pixels.pixels().any(|p| p[3] > 0));
+    }
 
     #[test]
     fn marks_images_and_text_paste_onto_pages_of_any_open_pdf() {

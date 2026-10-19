@@ -490,16 +490,12 @@ mod tests {
             &ctx,
             vec![egui::Event::PointerMoved(copy), button(copy, true)],
         );
-        let output = frame(&mut app, &ctx, vec![button(copy, false)]);
-        let marker = output
-            .platform_output
-            .commands
-            .iter()
-            .find_map(|c| match c {
-                egui::OutputCommand::CopyText(text) => Some(text.clone()),
-                _ => None,
-            })
-            .expect("Copy image writes the object clipboard marker");
+        frame(&mut app, &ctx, vec![button(copy, false)]);
+        let clip = crate::desktop::clipboard::read();
+        assert!(
+            matches!(clip, Clip::Image(..)),
+            "Copy region must expose actual image pixels"
+        );
         assert!(app.content.region.draft.is_none());
         let s = app.tabs[0].session.as_ref().unwrap();
         assert!(s.annotations.is_empty());
@@ -510,7 +506,7 @@ mod tests {
         app.tabs[0].page = 1;
         app.editor.mode = editing::Mode::Read;
         app.editor.tool = editing::Tool::Rectangle;
-        set_for_test(Clip::Text(marker));
+        set_for_test(clip.clone());
         app.action("paste", &ctx);
         app.place_pending_original();
         assert_eq!(app.editor.mode, editing::Mode::Draw);
@@ -528,14 +524,8 @@ mod tests {
         s.commit(vec![styled.clone()]).unwrap();
         selection::set(&mut app.tabs[0], &mut app.editor, vec![styled.id.clone()]);
         app.action("copy", &ctx);
-        let marker = ctx
-            .output(|o| {
-                o.commands.iter().rev().find_map(|c| match c {
-                    egui::OutputCommand::CopyText(text) => Some(text.clone()),
-                    _ => None,
-                })
-            })
-            .unwrap();
+        let clip = crate::desktop::clipboard::read();
+        assert!(matches!(clip, Clip::Image(..)));
 
         let destination = convert::blank(600., 800.).unwrap();
         app.open_memory(PathBuf::from("Destination.pdf"), destination, &ctx);
@@ -549,7 +539,7 @@ mod tests {
         app.tabs.remove(0);
         app.active = 0;
         app.editor.mode = editing::Mode::Read;
-        set_for_test(Clip::Text(marker.clone()));
+        set_for_test(clip.clone());
         app.action("paste", &ctx);
         app.place_pending_original();
         let s = app.tabs[0].session.as_mut().unwrap();
@@ -574,7 +564,7 @@ mod tests {
         let s = app.tabs[0].session.as_mut().unwrap();
         let revision = s.revision();
         s.editable = false;
-        set_for_test(Clip::Text(marker));
+        set_for_test(clip.clone());
         app.paste(&ctx);
         let s = app.tabs[0].session.as_ref().unwrap();
         assert_eq!(s.revision(), revision);

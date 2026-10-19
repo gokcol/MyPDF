@@ -108,21 +108,13 @@ impl KeychainSigner {
         let certificate = identity.certificate()?.to_der();
         crate::identity::check_certificate(&certificate)?;
         let algorithm = crate::identity::algorithm(&certificate)?;
-        let signer = Self {
+        // Verify the real signature below instead of signing a probe here.
+        // A probe requests private-key authorization twice for one user action.
+        Ok(Self {
             key: identity.private_key()?,
             certificate,
             algorithm,
-        };
-        let digest = crate::identity::digest_bytes(
-            signer.digest_algorithm(),
-            b"MyPDF native Keychain identity binding check",
-        );
-        crate::identity::verify_hash(
-            signer.certificate_der(),
-            &digest,
-            &signer.sign_hash(&digest)?,
-        )?;
-        Ok(signer)
+        })
     }
 }
 impl CryptoSigner for KeychainSigner {
@@ -153,9 +145,13 @@ impl CryptoSigner for KeychainSigner {
                 ));
             }
         };
-        self.key.create_signature(alg, hash).map_err(|e| {
+        let signature = self.key.create_signature(alg, hash).map_err(|e| {
             CryptoError::SigningFailed(format!("Keychain authorization/signing failed: {e}"))
-        })
+        })?;
+        crate::identity::verify_hash(&self.certificate, hash, &signature).map_err(|e| {
+            CryptoError::SigningFailed(format!("Keychain signature verification failed: {e}"))
+        })?;
+        Ok(signature)
     }
 }
 

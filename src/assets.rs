@@ -99,6 +99,10 @@ pub fn import_artwork(path: &Path) -> Result<Arc<Vec<u8>>> {
     } else {
         decode_png(&bytes)?
     };
+    normalize_image(image)
+}
+
+fn normalize_image(image: DynamicImage) -> Result<Arc<Vec<u8>>> {
     let image = if image.width().max(image.height()) > 2048 {
         image.thumbnail(2048, 2048)
     } else {
@@ -124,6 +128,8 @@ pub struct Asset {
     #[serde(default)]
     pub stamp: bool,
     #[serde(default)]
+    pub signature: bool,
+    #[serde(default)]
     pub favorite: bool,
     #[serde(default)]
     pub folder: String,
@@ -133,6 +139,19 @@ pub struct Asset {
     pub last_used: i64,
 }
 impl Asset {
+    /// Import clipboard artwork with the same limits and alpha handling as files.
+    pub fn from_image_bytes(name: &str, bytes: &[u8]) -> Result<Self> {
+        let png = normalize_image(decode_png(bytes)?)?;
+        let image = decode_png(&png)?;
+        let asset = Self::new(
+            name,
+            Kind::Image { png },
+            Style::default(),
+            image.width() as f32 / image.height() as f32,
+        );
+        asset.validate()?;
+        Ok(asset)
+    }
     /// Normalize a local signature/artwork image, preserving alpha and aspect ratio.
     pub fn from_image(path: &Path) -> Result<Self> {
         let png = import_artwork(path)?;
@@ -154,6 +173,7 @@ impl Asset {
             style,
             aspect,
             stamp: false,
+            signature: false,
             favorite: false,
             folder: String::new(),
             tags: String::new(),

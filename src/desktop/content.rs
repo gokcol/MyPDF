@@ -39,6 +39,7 @@ struct BlockDraft {
     initial_origin: [f32; 2],
     layout: Vec<mypdf_milestone0::rich_text::LineLayout>,
     preserve_layout: bool,
+    initial_layout: Vec<mypdf_milestone0::rich_text::LineLayout>,
 }
 #[derive(Clone)]
 struct InlineText {
@@ -61,6 +62,7 @@ impl InlineText {
             || matches!(&self.target, InlineTarget::Block(b)
                 if self.rect[2] != b.initial.3
                     || b.spans != b.initial_spans
+                    || b.layout != b.initial_layout
                     || [self.rect[0], self.rect[1]] != b.initial_origin
                     || b.alignment != Alignment::Left
                     || b.preserve_layout == b.layout.is_empty())
@@ -1444,17 +1446,19 @@ impl Viewer {
             let color=Color32::from_rgb((rgb[0]*255.) as u8,(rgb[1]*255.) as u8,(rgb[2]*255.) as u8);
             ui.painter().text(sample.center(),egui::Align2::CENTER_CENTER,"Sample",self.content.text_font(self.content.new_size.clamp(18.,32.)),color);
             ui.add_space(10.);
+            egui::ScrollArea::vertical().id_salt("new_text_properties_scroll").show(ui, |ui| {
             ui.add_enabled_ui(editable,|ui| {
                 formatting::panel(ui, &self.content.new_text, &mut self.content.new_spans, &self.content.new_selection,
                     &mut self.content.new_font, &mut self.content.new_size, &mut self.content.new_color, &mut self.content.new_alignment);
                 ui.add_space(8.);
                 if self.content.new_placed {
                     egui::CollapsingHeader::new("Position & size").show(ui,|ui| {
-                        egui::Grid::new("new_text_dimensions").show(ui,|ui| {
-                            for (name,v) in ["Left","Top","Width","Height"].into_iter().zip(&mut self.content.new_rect) {
-                                let label=ui.label(name); ui.add(egui::DragValue::new(v).speed(1.).range(0.0..=14400.)).labelled_by(label.id); ui.end_row();
+                        if let Some(page) = self.tabs.get(self.active).and_then(|t| t.pages.get(t.page)) {
+                            for (index, name) in ["Left", "Top", "Width", "Height"].into_iter().enumerate() {
+                                let max = match index { 0 => (page.width-self.content.new_rect[2]).max(0.), 1 => (page.height-self.content.new_rect[3]).max(0.), 2 => (page.width-self.content.new_rect[0]).max(10.), _ => (page.height-self.content.new_rect[1]).max(4.) };
+                                editing::property_slider(ui, name, &mut self.content.new_rect[index], (if index == 2 {10.} else if index == 3 {4.} else {0.})..=max, " pt");
                             }
-                        });
+                        }
                     });
                     ui.horizontal(|ui| {
                         if ui.add_enabled(!self.content.new_text.trim().is_empty(),ActionButton::new(Icon::Check,"Done").primary()).clicked() { self.content.new_commit=true; }
@@ -1464,6 +1468,7 @@ impl Viewer {
             });
             ui.add_space(8.);
             ui.label(RichText::new(if self.content.new_placed { "Type on the page. Drag the top handle to move; drag the circles to resize. Click elsewhere on the page or press ⌘Return to finish." } else { "Click anywhere on a page and start typing." }).size(12.).color(theme::muted()));
+            });
         });
     }
     pub(super) fn finish_new_text(&mut self, ctx: &egui::Context) {
@@ -1911,6 +1916,26 @@ impl Viewer {
                                     block.alignment = Alignment::Left;
                                 }
                                 ui.label(RichText::new("Keeps line breaks, indentation and paragraph gaps. Turn off for evenly spaced lines.").small().color(theme::muted()));
+                                if block.preserve_layout && let Some(first) = block.layout.first_mut() {
+                                    let maximum = (draft.rect[2] - draft.rect[0] - draft.size).max(0.);
+                                    editing::property_slider(ui, "First line indent", &mut first.left, 0.0..=maximum, " pt");
+                                }
+                                if block.preserve_layout && block.layout.len() > 1 && let Some(page) = page_size {
+                                    let first = block.layout[0].baseline;
+                                    let last = block.layout.last().unwrap().baseline;
+                                    let gaps = (block.layout.len() - 1) as f32;
+                                    let mut spacing = (last - first) / gaps;
+                                    let max = ((page.height - draft.rect[1] - first - draft.size * 0.3) / gaps).max(1.);
+                                    let before = spacing;
+                                    let maximum = max.min(144.).max(spacing);
+                                    editing::property_slider(ui, "Line spacing", &mut spacing, 1.0..=maximum, " pt");
+                                    if (spacing-before).abs() > 0.001 {
+                                        scale_line_spacing(&mut block.layout, spacing);
+                                        draft.rect[3] = (draft.rect[1] + block.layout.last().unwrap().baseline + draft.size * 0.3).min(page.height);
+                                    }
+                                    ui.weak("Adjusts all lines in this region; paragraph gaps stay proportional.");
+                                }
+
                                 ui.add_space(8.);
                                 ui.separator();
                                 ui::caption(ui, "Position & size");
@@ -1920,17 +1945,13 @@ impl Viewer {
                                     let mut width = draft.rect[2] - x;
                                     let height = draft.rect[3] - y;
                                     let mut changed = false;
-                                    egui::Grid::new("block_text_dimensions").num_columns(2).spacing(vec2(16.,10.)).show(ui, |ui| {
-                                        for (label, value, maximum) in [("Left", &mut x, (page.width-width).max(0.)), ("Top", &mut y, (page.height-height).max(0.)), ("Width", &mut width, (page.width-draft.rect[0]).max(1.))] {
-                                            let minimum = if label == "Width" {1.} else {0.};
-                                            let label = ui.label(label);
-                                            changed |= ui.add(egui::DragValue::new(value).speed(0.5).range(minimum..=maximum).suffix(" pt")).labelled_by(label.id).changed();
-                                            ui.end_row();
-                                        }
-                                        ui.label("Height");
-                                        ui.label(RichText::new(format!("{height:.1} pt · Auto")).color(theme::muted()));
-                                        ui.end_row();
-                                    });
+                                    for (label, value, maximum) in [("Left", &mut x, (page.width-width).max(0.)), ("Top", &mut y, (page.height-height).max(0.)), ("Width", &mut width, (page.width-draft.rect[0]).max(1.))] {
+                                        let minimum = if label == "Width" {1.} else {0.};
+                                        let old = *value;
+                                        editing::property_slider(ui, label, value, minimum..=maximum, " pt");
+                                        changed |= old != *value;
+                                    }
+                                    ui.weak(format!("Height: {height:.1} pt · Auto"));
                                     if changed { draft.rect = [x, y, (x+width).min(page.width), (y+height).min(page.height)]; }
                                 }
                                 ui.label(RichText::new("Narrower widths wrap long lines. Height grows as you type.").small().color(theme::muted()));
@@ -2231,6 +2252,7 @@ fn selected_block(
             alignment: Alignment::Left,
             initial: (font, size, first.color, right),
             initial_origin: [x, y],
+            initial_layout: layout.clone(),
             layout,
             preserve_layout,
         })),
@@ -2242,6 +2264,17 @@ fn selected_block(
         font: first.font,
         focus: true,
     })
+}
+
+/// Keep indentation and paragraph-gap proportions when changing baseline spacing.
+fn scale_line_spacing(layout: &mut [mypdf_milestone0::rich_text::LineLayout], spacing: f32) {
+    if layout.len() < 2 || !spacing.is_finite() || spacing <= 0. { return; }
+    let first = layout[0].baseline;
+    let old = (layout.last().unwrap().baseline - first) / (layout.len() - 1) as f32;
+    if old <= 0. { return; }
+    for line in layout {
+        line.baseline = first + (line.baseline-first) * spacing / old;
+    }
 }
 
 /// Start or finish rendering the page without a block's words; the texture once ready.
@@ -3175,6 +3208,30 @@ pub(super) fn overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn spacing_adjustment_preserves_indents_and_is_written_to_pdf() {
+        use mypdf_milestone0::{rich_text::{self, LineLayout}, text_geometry};
+        let text = "First line\nSecond line\nThird line";
+        let mut layout = vec![
+            LineLayout { start: 0, left: 0., baseline: 20. },
+            LineLayout { start: 11, left: 12., baseline: 40. },
+            LineLayout { start: 23, left: 0., baseline: 80. },
+        ];
+        scale_line_spacing(&mut layout, 45.);
+        assert_eq!(layout.iter().map(|l| l.baseline).collect::<Vec<_>>(), vec![20., 50., 110.]);
+        assert_eq!(layout[1].left, 12.);
+        let spans = vec![formatting::span(0, 12., [0.; 3], text.len())];
+        let pdf = rich_text::add_positioned(&convert::blank(595.,842.).unwrap(), 1, text, [40.,60.,400.,150.], &spans, &layout).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spacing.pdf");
+        std::fs::write(&path, pdf).unwrap();
+        let reopened = text_geometry::runs(&std::fs::read(path).unwrap(), 1).unwrap();
+        for (run, expected) in reopened.iter().zip([80.,110.,170.]) {
+            assert!((run.layout.as_ref().unwrap().origin[1] - expected).abs() < 0.1);
+        }
+        assert_eq!(reopened.len(), 3);
+    }
+
     #[test]
     fn translation_selection_is_scoped_to_its_inline_document_page_and_revision() {
         use egui::text::{CCursor, CCursorRange};
