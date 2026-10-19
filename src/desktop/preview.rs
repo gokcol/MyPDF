@@ -271,6 +271,7 @@ const SCENES: &[&str] = &[
     "DigitalIds",
     "MySignatures",
     "MySignaturesEditor",
+    "MySignaturesPlacement",
     "NewDigitalId",
     "SignDocument",
     "QuickPrompt",
@@ -630,6 +631,21 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
             assert!(std::time::Instant::now() < deadline);
             preview.capture(&mut app, &ctx);
             std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if collection == "MySignaturesPlacement" {
+            app.editor.mode = editing::Mode::Sign;
+            app.editor.tool = editing::Tool::SignArea;
+            app.editor.pending_sign_rect = Some((app.tabs[0].id, 0, [80., 310., 380., 410.]));
+            app.digital_events(&ctx);
+            app.editor.tool = editing::Tool::Select;
+            app.digital.panel = digital::Panel::Signatures;
+            app.sidebar = false;
+            preview.capture(&mut app, &ctx);
+            while !app.digital.previews_ready() {
+                assert!(std::time::Instant::now() < deadline);
+                preview.capture(&mut app, &ctx);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
         if collection == "MySignaturesEditor" {
             // Scroll the window down to the editor.

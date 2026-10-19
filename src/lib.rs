@@ -31,6 +31,7 @@ pub mod recovery;
 pub mod redact;
 pub mod review;
 pub mod security;
+pub mod signature_art;
 pub mod signature_edit;
 pub mod signing;
 pub mod stroke;

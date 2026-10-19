@@ -10,6 +10,7 @@ pub(in crate::desktop) struct State {
     command: Option<(&'static str, Menu)>,
     pub cancel_text: bool,
 }
+
 #[derive(Clone)]
 struct Menu {
     key: Key,
@@ -117,7 +118,7 @@ pub(in crate::desktop) fn consume_action(ctx: &egui::Context, action: &str) -> b
     })
 }
 fn items(target: &Target, editable: bool) -> Vec<Item> {
-    let mut entries = match target {
+    match target {
         Target::PendingText => vec![
             item("Finish text edit", "finish_text", true),
             item("Cancel text edit", "cancel_text", true),
@@ -218,21 +219,10 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
             item("Add image…", "add_image", editable),
             item("Copy region…", "copy_region", editable),
             item("Select all page text", "all_text", true),
-            item("Translate page…", "translate_page", true),
-            item("Fit width", "fit_width", true),
-            item("Fit page", "fit_page", true),
         ],
-    };
-    if !matches!(target, Target::PendingText) {
-        entries.extend([
-            item("Sign in ink", "add_signature_here", editable),
-            item("Digital Sign", "digital_sign_here", true),
-            item("Quick Sign", "quick_sign_here", true),
-            item("Manage Signs", "manage_signs", true),
-        ]);
     }
-    entries
 }
+
 fn action_icon(action: &str, label: &str) -> Icon {
     match action {
         "copy" | "copy_text" | "copy_artwork_text" | "copy_image" | "object_copy"
@@ -244,15 +234,11 @@ fn action_icon(action: &str, label: &str) -> Icon {
         "underline" => Icon::Underline,
         "strikeout" => Icon::Strikeout,
         "all" | "all_text" | "text_area" => Icon::TextArea,
-        "translate_selection" | "translate_text" | "translate_page" => Icon::Translate,
+        "translate_selection" | "translate_text" => Icon::Translate,
         "done" | "finish_text" => Icon::Check,
         "cancel" | "cancel_text" => Icon::Close,
         "edit_text_here" | "add_text_here" => Icon::Text,
         "add_image" | "replace_image" | "image_properties" => Icon::FieldImage,
-        "add_signature_here" => Icon::Pen,
-        "quick_sign_here" => Icon::Sign,
-        "manage_signs" => Icon::Settings,
-        "digital_sign_here" => Icon::Shield,
         "image_background" | "object_background" => Icon::Sparkle,
         "crop_object" | "copy_region" => Icon::Crop,
         "rotate_right" => Icon::RotateRight,
@@ -265,7 +251,6 @@ fn action_icon(action: &str, label: &str) -> Icon {
         "lock" => Icon::Lock,
         "review_comments" => Icon::Note,
         "repeat_objects" => Icon::Library,
-        "fit_width" | "fit_page" => Icon::Guides,
         "group_objects" => Icon::Group,
         "ungroup_objects" => Icon::Ungroup,
         "copy_format" | "paste_format" | "saved_styles" => Icon::Format,
@@ -280,9 +265,6 @@ fn menu_layout(ui: &mut egui::Ui, width: f32) {
 }
 fn submenu(action: &str) -> Option<(&'static str, Icon)> {
     match action {
-        "add_signature_here" | "digital_sign_here" | "quick_sign_here" | "manage_signs" => {
-            Some(("Sign", Icon::Sign))
-        }
         "rotate_right" | "rotate_left" | "flip_horizontal" | "flip_vertical" => {
             Some(("Transform", Icon::RotateRight))
         }
@@ -629,10 +611,7 @@ pub(in crate::desktop) fn page_menu(
                 .show(ui, |ui| {
                     if let Some(group) = state.context.group {
                         if ui
-                            .add(
-                                ui::MenuItem::new(Icon::Left, "Back to actions")
-                                    .width(width),
-                            )
+                            .add(ui::MenuItem::new(Icon::Left, "Back to actions").width(width))
                             .clicked()
                         {
                             state.context.group = None;
@@ -680,7 +659,6 @@ pub(in crate::desktop) fn page_menu(
                                 | "object_delete"
                                 | "delete_image"
                                 | "add_text_here"
-                                | "fit_width"
                         ) {
                             ui.separator();
                         }
@@ -1085,9 +1063,6 @@ impl Viewer {
                 | "text_area"
                 | "add_text_here"
                 | "add_image"
-                | "add_signature_here"
-                | "digital_sign_here"
-                | "quick_sign_here"
                 | "copy_region"
                 | "image_properties"
                 | "replace_image"
@@ -1151,7 +1126,6 @@ impl Viewer {
                     }
                 }
             }
-            "translate_page" => self.translate_page(ctx),
             "review_comments" => {
                 self.review.open = true;
                 if let Target::Artwork(m) = &menu.target {
@@ -1287,12 +1261,6 @@ impl Viewer {
                 self.content.image_mode = false;
                 self.content.area_mode = true;
                 self.inspector = true;
-            }
-            "digital_sign_here" => self.sign_in_area(),
-            "quick_sign_here" => self.quick_sign(),
-            "manage_signs" => self.action("settings", ctx),
-            "add_signature_here" => {
-                self.signature_here(menu.key, menu.point);
             }
             "add_text_here" => {
                 self.editor.mode = editing::Mode::Edit;
@@ -1813,135 +1781,20 @@ mod tests {
         frame(app, ctx, vec![]);
     }
     #[test]
-    fn annotate_and_edit_page_menus_offer_signature_at_the_clicked_point() {
-        for mode in [editing::Mode::Annotate, editing::Mode::Edit] {
-            let (mut app, ctx) = fixture();
-            app.editor.mode = mode;
-            frame(&mut app, &ctx, vec![]);
-            frame(&mut app, &ctx, vec![]);
-            click(
-                &mut app,
-                &ctx,
-                pos2(260., 260.),
-                egui::PointerButton::Secondary,
-            );
-            menu_click(&mut app, &ctx, "Sign");
-            menu_click(&mut app, &ctx, "Sign in ink");
-            assert!(app.editor.signature_open);
-            assert!(app.tabs[0].session.as_ref().unwrap().annotations.is_empty());
-        }
-        assert!(!commands(&Target::Page, false).contains(&"add_signature_here"));
-    }
-
-    #[test]
-    fn sign_submenu_routes_digital_quick_and_settings_without_changing_pdf() {
-        for label in ["Digital Sign", "Quick Sign", "Manage Signs"] {
-            let (mut app, ctx) = fixture();
-            frame(&mut app, &ctx, vec![]);
-            click(&mut app, &ctx, pos2(260., 260.), egui::PointerButton::Secondary);
-            menu_click(&mut app, &ctx, "Sign");
-            let bounds = ctx.data(|d| d.get_temp::<HashMap<String, Rect>>(
-                egui::Id::new("context_test_bounds"))).unwrap();
-            let labels = ["Sign in ink", "Digital Sign", "Quick Sign", "Manage Signs"];
-            for pair in labels.windows(2) {
-                assert!(bounds[pair[0]].center().y < bounds[pair[1]].center().y);
-            }
-            menu_click(&mut app, &ctx, label);
-            match label {
-                "Digital Sign" => {
-                    assert!(!app.digital.open);
-                    assert!(!app.digital.quick);
-                    assert!(app.editor.tool == editing::Tool::SignArea);
-                    assert!(app.editor.mode == editing::Mode::Sign);
-                }
-                "Quick Sign" => {
-                    assert!(app.digital.open);
-                    assert!(app.digital.panel == digital::Panel::Signatures);
-                }
-                _ => {
-                    assert!(app.digital.open);
-                    assert!(app.digital.panel == digital::Panel::Ink);
-                }
-            }
-            assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
-        }
+    fn signing_actions_are_absent_from_context_menus() {
         let drawing = Annotation::new(0, [10., 10., 20., 20.], Kind::Rectangle, Default::default());
-        for target in [Target::Page, Target::Artwork(vec![drawing])] {
-            let signs: Vec<_> = items(&target, true).into_iter()
-                .filter(|i| submenu(i.action).is_some_and(|g| g.0 == "Sign"))
-                .map(|i| i.label).collect();
-            assert_eq!(signs, ["Sign in ink", "Digital Sign", "Quick Sign", "Manage Signs"]);
+        for target in [
+            Target::Page,
+            Target::PendingText,
+            Target::Artwork(vec![drawing]),
+        ] {
+            for entry in items(&target, true) {
+                assert!(!entry.label.contains("Sign"));
+                assert!(!entry.action.contains("sign"));
+            }
         }
-        assert!(items(&Target::PendingText, true).iter().all(|i| submenu(i.action).is_none()));
     }
 
-    #[test]
-    fn sign_menu_items_are_readable_in_both_themes() {
-        // WCAG contrast between two colors.
-        fn contrast(a: Color32, b: Color32) -> f32 {
-            let luminance = |c: Color32| {
-                let ch = |v: u8| {
-                    let v = v as f32 / 255.;
-                    if v <= 0.03928 {
-                        v / 12.92
-                    } else {
-                        ((v + 0.055) / 1.055).powf(2.4)
-                    }
-                };
-                0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
-            };
-            let (a, b) = (luminance(a), luminance(b));
-            (a.max(b) + 0.05) / (a.min(b) + 0.05)
-        }
-        for theme in [egui::Theme::Light, egui::Theme::Dark] {
-            let (mut app, ctx) = fixture();
-            ctx.set_theme(theme);
-            frame(&mut app, &ctx, vec![]);
-            click(&mut app, &ctx, pos2(260., 260.), egui::PointerButton::Secondary);
-            menu_click(&mut app, &ctx, "Sign");
-            for _ in 0..30 {
-                frame(&mut app, &ctx, vec![]);
-            }
-            let shapes = frame(&mut app, &ctx, vec![]).shapes;
-            for label in ["Sign in ink", "Digital Sign", "Quick Sign", "Manage Signs"] {
-                let (index, text) = shapes
-                    .iter()
-                    .enumerate()
-                    .find_map(|(i, s)| match &s.shape {
-                        egui::Shape::Text(t) if t.galley.text() == label => Some((i, t.clone())),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| panic!("{label} is in the open menu ({theme:?})"));
-                let color = text.override_text_color.unwrap_or_else(|| {
-                    text.galley
-                        .job
-                        .sections
-                        .first()
-                        .map_or(text.fallback_color, |s| s.format.color)
-                });
-                let area = text.visual_bounding_rect();
-                // The surface right under the label: the last opaque fill drawn before it.
-                fn fill(shape: &egui::Shape, area: Rect) -> Option<Color32> {
-                    match shape {
-                        egui::Shape::Vec(shapes) => shapes.iter().rev().find_map(|s| fill(s, area)),
-                        egui::Shape::Rect(r) if r.fill.a() == 255 && r.rect.contains_rect(area) => {
-                            Some(r.fill)
-                        }
-                        _ => None,
-                    }
-                }
-                let background = shapes[..index]
-                    .iter()
-                    .rev()
-                    .find_map(|s| fill(&s.shape, area))
-                    .expect("the menu background");
-                assert!(
-                    contrast(color, background) >= 4.5,
-                    "{label} in {theme:?}: {color:?} on {background:?}"
-                );
-            }
-        }
-    }
     #[test]
     fn drawing_menu_stays_compact_and_transform_submenu_remains_actionable() {
         for dark in [false, true] {
@@ -2245,7 +2098,7 @@ mod tests {
         assert_eq!(content::images(&s.source, 1).unwrap().len(), 1);
     }
     #[test]
-    fn translation_actions_follow_text_or_page_context_even_for_read_only_documents() {
+    fn context_translation_stays_with_text_and_omits_page_and_zoom_actions() {
         use mypdf_milestone0::viewer::{GlyphBox, PageText};
         let (mut app, _) = fixture();
         app.tabs[0].text[0] = Some(Arc::new(PageText {
@@ -2264,7 +2117,9 @@ mod tests {
         assert!(!selected.contains(&"translate_page"));
         assert!(!selected.contains(&"highlight"));
         let page = commands(&Target::Page, false);
-        assert!(page.contains(&"translate_page"));
+        for removed in ["translate_page", "fit_width", "fit_page"] {
+            assert!(!page.contains(&removed));
+        }
         assert!(!page.contains(&"translate_selection"));
         let drawing = Annotation::new(
             0,
@@ -2286,7 +2141,7 @@ mod tests {
             Default::default(),
         );
         assert!(commands(&Target::Artwork(vec![text]), false).contains(&"translate_text"));
-        for action in ["translate_selection", "translate_text", "translate_page"] {
+        for action in ["translate_selection", "translate_text"] {
             assert!(matches!(action_icon(action, ""), Icon::Translate));
             assert!(
                 shortcut(action).is_none(),

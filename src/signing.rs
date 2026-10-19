@@ -299,6 +299,77 @@ impl Background {
     }
 }
 
+/// Composition controls shared by saved signatures and their rendered appearance.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AppearanceTransform {
+    /// Clockwise artwork rotation. Details and background remain upright.
+    pub rotation: f32,
+    /// Draw the artwork over the details instead of beside them.
+    pub image_overlay: bool,
+    pub image_opacity: f32,
+    /// Insets as percentages of the image area: left, top, right, bottom.
+    pub image_insets: [f32; 4],
+}
+impl Default for AppearanceTransform {
+    fn default() -> Self {
+        Self {
+            rotation: 0.,
+            image_overlay: false,
+            image_opacity: 1.,
+            image_insets: [0.; 4],
+        }
+    }
+}
+
+/// Text controls are saved with the signature, using family names portable between computers.
+#[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SignatureTextStyle {
+    pub offset: [f32; 2],
+    /// Insets as percentages of the details area: left, top, right, bottom.
+    pub insets: [f32; 4],
+    pub family: String,
+    pub bold: bool,
+    pub italic: bool,
+    pub size: f32,
+    pub color: [f32; 3],
+    pub alignment: u8,
+}
+impl Default for SignatureTextStyle {
+    fn default() -> Self {
+        Self {
+            offset: [0., 0.],
+            insets: [0.; 4],
+            family: String::new(),
+            bold: false,
+            italic: false,
+            size: 11.,
+            color: [0.12, 0.19, 0.18],
+            alignment: 0,
+        }
+    }
+}
+impl SignatureTextStyle {
+    pub fn font(&self) -> Result<std::path::PathBuf> {
+        crate::text_style::fonts()
+            .iter()
+            .find(|f| {
+                (self.family.is_empty() || f.family == self.family)
+                    && f.bold == self.bold
+                    && f.italic == self.italic
+            })
+            .or_else(|| {
+                crate::text_style::fonts()
+                    .iter()
+                    .find(|f| f.family == self.family)
+            })
+            .map(|f| f.path.clone())
+            .map(Ok)
+            .unwrap_or_else(crate::document::default_font)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DesktopSigningRequest {
     pub field: String,
@@ -309,6 +380,8 @@ pub struct DesktopSigningRequest {
     pub location: String,
     pub artwork: Option<crate::assets::Asset>,
     pub layout: AppearanceLayout,
+    pub transform: AppearanceTransform,
+    pub text_style: SignatureTextStyle,
     /// "Digitally signed by …" with the signer's name.
     pub show_name: bool,
     /// The signing date and time.
@@ -326,6 +399,8 @@ impl Default for DesktopSigningRequest {
             location: String::new(),
             artwork: None,
             layout: AppearanceLayout::default(),
+            transform: AppearanceTransform::default(),
+            text_style: SignatureTextStyle::default(),
             show_name: true,
             show_date: true,
             background: Background::Auto,
@@ -358,6 +433,37 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
         request.name.len() <= 200 && request.reason.len() <= 1000 && request.location.len() <= 300,
         "Signature appearance details are too long"
     );
+    ensure!(
+        request.transform.rotation.is_finite()
+            && request.transform.rotation.abs() <= 360.
+            && request.transform.image_opacity.is_finite()
+            && (0.0..=1.0).contains(&request.transform.image_opacity),
+        "Invalid signature rotation or image opacity"
+    );
+    ensure!(
+        request
+            .text_style
+            .offset
+            .iter()
+            .all(|v| v.is_finite() && v.abs() <= 100.)
+            && request.text_style.size.is_finite()
+            && (1. ..=72.).contains(&request.text_style.size)
+            && request
+                .text_style
+                .color
+                .iter()
+                .all(|v| v.is_finite() && (0. ..=1.).contains(v))
+            && request.text_style.alignment <= 2,
+        "Invalid signature text settings"
+    );
+    for insets in [request.transform.image_insets, request.text_style.insets] {
+        ensure!(
+            insets
+                .iter()
+                .all(|v| v.is_finite() && (0. ..=45.).contains(v)),
+            "Signature edge spacing must be between 0 and 45 percent"
+        );
+    }
     // A small box is laid out larger and scaled down as a whole, like an image,
     // so its details always fit and keep their proportions.
     let k = (160.0 / w).max(64.0 / h).max(1.0);
@@ -376,7 +482,7 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
     doc.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceTable;
     let mut base = vec![];
     doc.save_to(&mut base)?;
-    let render = |bytes: Vec<u8>, transparent: bool| -> Result<Vec<u8>> {
+    let render_pdf = |bytes: Vec<u8>, transparent: bool| -> Result<Vec<u8>> {
         let pdf = hayro::hayro_syntax::Pdf::new(bytes)
             .map_err(|e| anyhow::anyhow!("Signature appearance: {e:?}"))?;
         let raster = hayro::render(
@@ -396,6 +502,32 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
         );
         Ok(raster.into_png()?)
     };
+    let render = |marks: Vec<Annotation>, transparent: bool| -> Result<Vec<u8>> {
+        render_pdf(crate::annotations::export(&base, &marks)?, transparent)
+    };
+    // Fit the rotated artwork in its allotted area without rotating the details
+    // or the background. Ink coordinates remain normalized inside this rectangle.
+    let rotate_image =
+        |mut mark: Annotation, available_w: f32, available_h: f32| -> Result<Annotation> {
+            let (sin, cos) = request.transform.rotation.to_radians().sin_cos();
+            let [x, y, right, bottom] = mark.rect;
+            let (aw, ah) = (right - x, bottom - y);
+            let fit = (available_w / (aw * cos.abs() + ah * sin.abs()))
+                .min(available_h / (aw * sin.abs() + ah * cos.abs()))
+                .min(1.);
+            let (cx, cy) = ((x + right) / 2., (y + bottom) / 2.);
+            mark.rect = [
+                cx - aw * fit / 2.,
+                cy - ah * fit / 2.,
+                cx + aw * fit / 2.,
+                cy + ah * fit / 2.,
+            ];
+            mark.rotation = request.transform.rotation;
+            if matches!(mark.kind, Kind::Text { .. } | Kind::Stamp { .. }) {
+                mark.style.font_size = (mark.style.font_size * fit).max(1.);
+            }
+            fit_text(&base, mark)
+        };
     let background = match request.background {
         Background::Auto if request.layout == AppearanceLayout::ImageOnly => Background::Clear,
         Background::Auto => Background::Framed,
@@ -444,6 +576,15 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
             }
         }
     }
+    let inset = |[x, y, r, b]: [f32; 4], edges: [f32; 4]| {
+        let (width, height) = (r - x, b - y);
+        [
+            x + width * edges[0] / 100.,
+            y + height * edges[1] / 100.,
+            r - width * edges[2] / 100.,
+            b - height * edges[3] / 100.,
+        ]
+    };
     // With no details to show, the image fills the box on its own.
     if request.layout == AppearanceLayout::ImageOnly || lines.is_empty() {
         let artwork = request
@@ -451,67 +592,117 @@ pub fn signature_artwork(request: &DesktopSigningRequest) -> Result<Vec<u8>> {
             .as_ref()
             .context("Choose what the signature shows: your name, the date, a note or an image")?;
         artwork.validate()?;
-        // Fit the artwork inside the box, keeping its proportions.
-        let (aw, ah) = if (w - 4.0) / (h - 4.0) > artwork.aspect {
-            ((h - 4.0) * artwork.aspect, h - 4.0)
-        } else {
-            (w - 4.0, (w - 4.0) / artwork.aspect)
-        };
-        let (x, y) = ((w - aw) / 2.0, (h - ah) / 2.0);
+        if request.transform.image_opacity == 0. {
+            return render(backdrop, transparent);
+        }
+        let [left, top, right, bottom] =
+            inset([2., 2., w - 2., h - 2.], request.transform.image_insets);
+        let (available_w, available_h) = (right - left, bottom - top);
+        let aw = available_w.min(available_h * artwork.aspect);
+        let ah = aw / artwork.aspect;
+        let (x, y) = (
+            left + (available_w - aw) / 2.,
+            top + (available_h - ah) / 2.,
+        );
         let mut style = artwork.style.clone();
+        style.opacity *= request.transform.image_opacity;
+        if !matches!(artwork.kind, Kind::Image { .. }) {
+            style.opacity = style.opacity.max(0.01);
+        }
         if matches!(artwork.kind, Kind::Text { .. } | Kind::Stamp { .. }) {
             style.font_size = style.font_size.min((ah - 4.0) / 1.25).max(1.0);
         }
         let mut marks = backdrop.clone();
-        marks.push(fit_text(
-            &base,
+        marks.push(rotate_image(
             Annotation::new(0, [x, y, x + aw, y + ah], artwork.kind.clone(), style),
+            available_w,
+            available_h,
         )?);
-        return render(crate::annotations::export(&base, &marks)?, transparent);
+        return render(marks, transparent);
     }
     let mut annotations = backdrop;
-    let artwork = request
-        .artwork
-        .as_ref()
-        .filter(|_| request.layout == AppearanceLayout::ImageAndDetails);
+    let artwork = request.artwork.as_ref().filter(|_| {
+        request.layout == AppearanceLayout::ImageAndDetails && request.transform.image_opacity > 0.
+    });
+    let mut overlay = None;
     let left = if let Some(artwork) = artwork {
         artwork.validate()?;
-        let aw = (w * 0.34 - 8.0).min((h - 16.0) * artwork.aspect);
+        let image_right = if request.transform.image_overlay {
+            w - 8.
+        } else {
+            w * 0.34
+        };
+        let [left, top, right, bottom] = inset(
+            [8., 8., image_right, h - 8.],
+            request.transform.image_insets,
+        );
+        let (available_w, available_h) = (right - left, bottom - top);
+        let aw = available_w.min(available_h * artwork.aspect);
         let ah = aw / artwork.aspect;
-        let x = 8.0 + (w * 0.34 - 8.0 - aw) / 2.0;
-        let y = (h - ah) / 2.0;
+        let x = left + (available_w - aw) / 2.;
+        let y = top + (available_h - ah) / 2.;
         let mut style = artwork.style.clone();
+        style.opacity *= request.transform.image_opacity;
+        if !matches!(artwork.kind, Kind::Image { .. }) {
+            style.opacity = style.opacity.max(0.01);
+        }
         if matches!(artwork.kind, Kind::Text { .. } | Kind::Stamp { .. }) {
             style.font_size = style.font_size.min((ah - 8.0) / 1.25).max(1.0);
         }
-        annotations.push(fit_text(
-            &base,
+        let image = rotate_image(
             Annotation::new(0, [x, y, x + aw, y + ah], artwork.kind.clone(), style),
-        )?);
-        w * 0.36
+            available_w,
+            available_h,
+        )?;
+        if request.transform.image_overlay {
+            overlay = Some(image);
+            8.
+        } else {
+            annotations.push(image);
+            w * 0.36
+        }
     } else {
         8.0
     };
-    // The details shrink until they fit whatever box was drawn; nothing is clipped or hidden.
-    annotations.push(fit_text(
-        &base,
-        Annotation::new(
-            0,
-            [left, 4.0, w - 5.0, h - 4.0],
-            Kind::Text {
-                text: lines.join("\n"),
-            },
-            Style {
-                font_size: 11.0,
-                color: [0.12, 0.19, 0.18],
-                ..Default::default()
-            },
-        ),
-    )?);
-    render(
-        crate::annotations::export(&base, &annotations)?,
-        transparent,
-    )
+    // Move details independently from the image; shrink text only when needed to fit.
+    let text_style = &request.text_style;
+    let x = (left + w * text_style.offset[0] / 100.).clamp(0., w - 16.);
+    let y = (4. + h * text_style.offset[1] / 100.).clamp(0., h - 8.);
+    let [x, y, right, bottom] = inset([x, y, w - 5., h - 2.], text_style.insets);
+    let width = (right - x).max(1.);
+    let height = (bottom - y).max(1.);
+    let font = text_style.font()?;
+    let mut size = text_style.size;
+    let (source, text_height) = loop {
+        match crate::signature_art::lettering(
+            &lines.join("\n"),
+            &font,
+            size,
+            text_style.color,
+            width,
+            text_style.alignment,
+        ) {
+            Ok((source, text_height)) if text_height <= height => break (source, text_height),
+            result if size <= 1. => {
+                result?;
+                anyhow::bail!("Move the text farther inside the signature box");
+            }
+            _ => size = (size * 0.9).max(1.),
+        }
+    };
+    annotations.push(Annotation::new(
+        0,
+        [x, y, x + width, y + text_height],
+        Kind::Svg {
+            source,
+            tint: false,
+        },
+        Style::default(),
+    ));
+    if let Some(image) = overlay {
+        annotations.push(image);
+    }
+    render(annotations, transparent)
 }
 
 /// Shrink a text or stamp mark until it fits its box; other marks are kept as they are.

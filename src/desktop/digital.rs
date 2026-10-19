@@ -1145,6 +1145,12 @@ impl Viewer {
                         s.mark_saved(revision);
                     }
                     self.open(path.clone(), ctx);
+                    self.digital.open = false;
+                    self.digital.quick = false;
+                    self.digital.quick_prompt = false;
+                    self.digital.sign_password = Zeroizing::new(String::new());
+                    self.editor.pending_sign_rect = None;
+                    self.editor.select_tool(editing::Tool::Select);
                     self.digital.document = None;
                     self.digital.report = None;
                     self.digital.panel = Panel::Validate;
@@ -1253,6 +1259,71 @@ impl Viewer {
             }
         }
     }
+    pub(super) fn digital_docked(&self) -> bool {
+        self.digital.open
+            && self.digital.visible
+            && matches!(self.digital.panel, Panel::Sign | Panel::Signatures)
+            && self.editor.mode == editing::Mode::Sign
+            && !self.home.visible
+            && self.zen.is_none()
+            && self.comparison.is_none()
+            && self.active_document_ready()
+            && self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| Some(t.id) == self.digital.document)
+            && self.digital.request.rect.is_some()
+    }
+
+    pub(super) fn live_signature_preview(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<(u64, usize, [f32; 4], TextureHandle)> {
+        if !self.digital_docked() {
+            return None;
+        }
+        let assets = self
+            .editor
+            .library
+            .as_ref()
+            .map(|l| l.entries.as_slice())
+            .unwrap_or(&[]);
+        let mut request = if self.digital.panel == Panel::Signatures {
+            let signature = self
+                .digital
+                .manager
+                .selected
+                .as_ref()
+                .and_then(|id| self.digital.signature(id))?;
+            let mut request = self.digital.signature_request(signature, assets);
+            if !self.digital.request.reason.trim().is_empty() {
+                request.reason = self.digital.request.reason.clone();
+            }
+            request.location = self.digital.request.location.clone();
+            request
+        } else {
+            let mut request = self.digital.request.clone();
+            request.artwork = self
+                .digital
+                .asset_id
+                .as_ref()
+                .and_then(|id| assets.iter().find(|a| &a.id == id))
+                .cloned();
+            request.layout = self.digital.layout;
+            self.digital.look.apply(&mut request);
+            request
+        };
+        request.page = self.digital.request.page;
+        request.rect = self.digital.request.rect;
+        let tab = self.digital.document?;
+        let texture = self
+            .digital
+            .manager
+            .preview_for(ctx, &format!("page:{tab}"), &request)?
+            .ok()?;
+        Some((tab, request.page, request.rect?, texture))
+    }
+
     pub(super) fn digital_window(&mut self, ctx: &egui::Context) {
         self.quick_sign_prompt(ctx);
         if let Some(action) = self.digital.new_id_dialog(ctx, &mut self.editor) {
@@ -1275,60 +1346,89 @@ impl Viewer {
             .map(|l| l.entries.clone())
             .unwrap_or_default();
         let settings = !matches!(self.digital.panel, Panel::Sign | Panel::Validate);
-        egui::Window::new(if settings { "Settings" } else { "Digital Signature" })
-            .id(egui::Id::new("digital_window"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable([true, false])
-            .default_width(ui::dialog_width(ctx, 640.))
-            .max_width(ui::dialog_width(ctx, 900.))
-            .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 10.;
-                let panels: &[(Panel, &str)] = if settings {
-                    &[(Panel::Ink, "Ink signatures"), (Panel::Signatures, "Digital signatures"),
-                      (Panel::Identities, "Digital IDs"), (Panel::Trusted, "Trusted")]
+        let docked = self.digital_docked();
+        let mut body = |ui: &mut egui::Ui| {
+            ui.spacing_mut().item_spacing.y = 6.;
+            let panels: &[(Panel, &str)] = if settings {
+                &[
+                    (Panel::Ink, "Ink signatures"),
+                    (Panel::Signatures, "Digital signatures"),
+                    (Panel::Identities, "Digital IDs"),
+                    (Panel::Trusted, "Trusted"),
+                ]
+            } else {
+                &[(Panel::Sign, "Sign"), (Panel::Validate, "Validate")]
+            };
+            let current = panels
+                .iter()
+                .position(|(p, _)| *p == self.digital.panel)
+                .unwrap_or(0);
+            let labels: Vec<&str> = panels.iter().map(|(_, name)| *name).collect();
+            if !docked && let Some(i) = ui::segmented(ui, &labels, current) {
+                self.digital.save_if_dirty();
+                self.digital.panel = panels[i].0;
+                self.digital.error = None;
+                self.digital.message.clear();
+            }
+            let preview_top = ui.cursor().top();
+            if self.digital.panel == Panel::Signatures {
+                self.digital.pinned_preview(ui, &assets, docked);
+            }
+            let preview_height = ui.cursor().top() - preview_top;
+            ui::dialog_body(
+                ui,
+                "digital_manager_body",
+                if docked {
+                    (ui.available_height() - 105.).max(80.)
                 } else {
-                    &[(Panel::Sign, "Sign"), (Panel::Validate, "Validate")]
-                };
-                let current = panels.iter().position(|(p, _)| *p == self.digital.panel).unwrap_or(0);
-                let labels: Vec<&str> = panels.iter().map(|(_, name)| *name).collect();
-                if let Some(i) = ui::segmented(ui, &labels, current) {
-                    self.digital.save_if_dirty();
-                    self.digital.panel = panels[i].0;
-                    self.digital.error = None;
-                    self.digital.message.clear();
-                }
-                ui::dialog_body(ui, "digital_manager_body", 560., |ui| {
-                if self.digital.busy {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(RichText::new("Working… Your files are not changed.").color(theme::muted()));
+                    (ctx.content_rect().height() - 240. - preview_height).clamp(80., 560.)
+                },
+                |ui| {
+                    #[cfg(test)]
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new("digital_manager_geometry"),
+                            (ui.clip_rect(), ui.min_rect().top()),
+                        )
                     });
-                }
-                for error in [&self.digital.error, &self.digital.catalogue_error]
-                    .into_iter()
-                    .flatten()
-                {
-                    ui::callout(ui, ui::Tone::Danger, error);
-                }
-                if !self.digital.message.is_empty() {
-                    ui::callout(ui, ui::Tone::Success, &self.digital.message);
-                }
-                if self.digital.scanning {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(RichText::new("Looking for digital IDs, cards and tokens…").color(theme::muted()));
-                    });
-                }
-                if let Some(error) = &self.digital.store_error {
-                    ui::callout(ui, ui::Tone::Danger, error);
-                }
-                ui.add_enabled_ui(!self.digital.busy, |ui| match self.digital.panel {
+                    if self.digital.busy {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new("Working… Your files are not changed.")
+                                    .color(theme::muted()),
+                            );
+                        });
+                    }
+                    for error in [&self.digital.error, &self.digital.catalogue_error]
+                        .into_iter()
+                        .flatten()
+                    {
+                        ui::callout(ui, ui::Tone::Danger, error);
+                    }
+                    if !self.digital.message.is_empty() {
+                        ui::callout(ui, ui::Tone::Success, &self.digital.message);
+                    }
+                    if self.digital.scanning {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new("Looking for digital IDs, cards and tokens…")
+                                    .color(theme::muted()),
+                            );
+                        });
+                    }
+                    if let Some(error) = &self.digital.store_error {
+                        ui::callout(ui, ui::Tone::Danger, error);
+                    }
+                    ui.add_enabled_ui(!self.digital.busy, |ui| match self.digital.panel {
                     Panel::Ink => {
+                        self.sign_tools.placement_settings(ui, true);
                         ink_place = self.digital.ink_panel(ui, &mut self.editor, &assets, active.is_some_and(|t| t.session.as_ref().is_some_and(|s| s.editable)));
                     }
                     Panel::Signatures => {
-                        self.digital.signatures_panel(ui, &mut self.editor, &assets, &mut action);
+                        if !docked { self.sign_tools.placement_settings(ui, false); }
+                        self.digital.signatures_panel(ui, &mut self.editor, &assets, &mut action, docked);
                     }
                     Panel::Identities => {
                         self.digital.identities_panel(ui, &mut self.editor, &mut action);
@@ -1541,7 +1641,7 @@ impl Viewer {
                                 ui.spacing_mut().item_spacing = vec2(10., 10.);
                                 for signature in self.digital.signatures.clone() {
                                     let request = self.digital.signature_request(&signature, &assets);
-                                    let preview = self.digital.manager.preview(ui.ctx(), &request);
+                                    let preview = self.digital.manager.preview_for(ui.ctx(), &format!("card:{}", signature.id), &request);
                                     let ready = self.digital.signer_of(&signature).is_some()
                                         && signature.layout().is_some();
                                     if manager::signature_card(
@@ -1622,7 +1722,7 @@ impl Viewer {
                             request.layout = self.digital.layout;
                             self.digital.look.apply(&mut request);
                             if let Some([l, t, r, b]) = request.rect {
-                                let preview = self.digital.manager.preview(ui.ctx(), &request);
+                                let preview = self.digital.manager.preview_for(ui.ctx(), "placed_signature", &request);
                                 match &preview {
                                     Some(Err(e)) => ui::callout(ui, ui::Tone::Warning, e),
                                     _ => {
@@ -1937,20 +2037,83 @@ impl Viewer {
                         }
                     }
                 });
-                });
-                ui::dialog_footer(ui, |ui| {
-                    if !settings && ui.add(ActionButton::new(Icon::Settings, "Signature Settings…").compact()).clicked() {
-                        self.digital.panel = Panel::Signatures;
+                },
+            );
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                if !settings
+                    && ui
+                        .add(ActionButton::new(Icon::Settings, "Signature Settings…").compact())
+                        .clicked()
+                {
+                    self.digital.manager.selected = self.digital.manager.sign_with.clone();
+                    self.digital.panel = Panel::Signatures;
+                }
+                if docked && settings && ui.button("Back to signing").clicked() {
+                    self.digital.save_if_dirty();
+                    if let Some(id) = self.digital.manager.selected.clone() {
+                        self.digital.use_signature(&id);
                     }
-                    match self.digital.panel {
-                        Panel::Sign if ui.add_enabled(!self.digital.busy && can_sign, ActionButton::new(Icon::Sign, "Sign and save a copy…").primary()).clicked() => action = Some(Action::Sign),
-                        Panel::Signatures => self.digital.signature_actions(ui),
-                        Panel::Validate if ui.add_enabled(!self.digital.busy && active.is_some_and(|t| t.bytes.is_some()), ActionButton::new(Icon::Shield, "Validate signatures").primary()).clicked() => action = Some(Action::Verify),
-                        _ => {}
+                    self.digital.panel = Panel::Sign;
+                }
+                match self.digital.panel {
+                    Panel::Sign
+                        if ui
+                            .add_enabled(
+                                !self.digital.busy && can_sign,
+                                ActionButton::new(Icon::Sign, "Sign and save a copy…").primary(),
+                            )
+                            .clicked() =>
+                    {
+                        action = Some(Action::Sign)
                     }
-                    close = ui.add_enabled(!self.digital.busy, ActionButton::new(Icon::Close, "Close")).clicked();
-                });
+                    Panel::Signatures => self.digital.signature_actions(ui),
+                    Panel::Validate
+                        if ui
+                            .add_enabled(
+                                !self.digital.busy && active.is_some_and(|t| t.bytes.is_some()),
+                                ActionButton::new(Icon::Shield, "Validate signatures").primary(),
+                            )
+                            .clicked() =>
+                    {
+                        action = Some(Action::Verify)
+                    }
+                    _ => {}
+                }
+                close = ui
+                    .add_enabled(!self.digital.busy, ActionButton::new(Icon::Close, "Close"))
+                    .clicked();
             });
+        };
+        if docked {
+            let max_width = (ctx.content_rect().width() * 0.48).clamp(390., 620.);
+            egui::SidePanel::right("digital_properties")
+                .default_width(470_f32.min(max_width))
+                .width_range(390. ..=max_width)
+                .show(ctx, |ui| {
+                    ui.heading(if settings {
+                        "Signature appearance"
+                    } else {
+                        "Digital signature"
+                    });
+                    ui.weak("Live preview on the page · not applied until signing");
+                    ui.separator();
+                    body(ui);
+                });
+        } else {
+            egui::Window::new(if settings {
+                "Settings"
+            } else {
+                "Digital Signature"
+            })
+            .id(egui::Id::new("digital_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable([true, false])
+            .default_width(ui::dialog_width(ctx, 640.))
+            .max_width(ui::dialog_width(ctx, 900.))
+            .show(ctx, body);
+        }
         open &= !close;
         if !open {
             self.digital.save_if_dirty();
@@ -2212,6 +2375,13 @@ impl Viewer {
         }
         self.status = Some(("Drag a box, or click anywhere on the page, to use your default digital signature · Esc cancels".into(), false));
     }
+    /// Ribbon Quick Sign always asks for a region, even after using a form field.
+    pub(super) fn quick_sign_in_area(&mut self) {
+        self.digital.quick = false;
+        self.digital.target_field = None;
+        self.quick_sign();
+    }
+
     /// Sign the placed box at once, next to the original as “Name-signed.pdf”.
     fn quick_sign_now(&mut self, ctx: &egui::Context) {
         let Some(tab) = self.tabs.get(self.active) else {
@@ -3550,155 +3720,327 @@ mod tests {
     #[test]
     fn quick_sign_places_a_box_and_saves_a_verified_copy_beside_the_original() {
         use eframe::App;
-        let temp = tempfile::tempdir().unwrap();
-        let passphrase = "synthetic-quick-passphrase";
-        let created = identity::create("Quick Signer", passphrase, true).unwrap();
-        let file = temp.path().join("quick.p12");
-        std::fs::write(&file, &created.pkcs12).unwrap();
-        let imported = identity::inspect_pkcs12(&created.pkcs12, passphrase)
-            .unwrap()
-            .remove(0);
-        let entry = Entry::file(file, imported);
-        let pdf = temp.path().join("Contract.pdf");
-        let font = mypdf_milestone0::document::default_font().unwrap();
-        std::fs::write(&pdf, mypdf_milestone0::document::fixture(&font).unwrap()).unwrap();
-        // An earlier signed copy is never replaced; the next free name is used.
-        std::fs::write(temp.path().join("Contract-signed.pdf"), b"keep").unwrap();
+        for drag_region in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let passphrase = "synthetic-quick-passphrase";
+            let created = identity::create("Quick Signer", passphrase, true).unwrap();
+            let file = temp.path().join("quick.p12");
+            std::fs::write(&file, &created.pkcs12).unwrap();
+            let imported = identity::inspect_pkcs12(&created.pkcs12, passphrase)
+                .unwrap()
+                .remove(0);
+            let entry = Entry::file(file, imported);
+            let pdf = temp.path().join("Contract.pdf");
+            let font = mypdf_milestone0::document::default_font().unwrap();
+            std::fs::write(&pdf, mypdf_milestone0::document::fixture(&font).unwrap()).unwrap();
+            // An earlier signed copy is never replaced; the next free name is used.
+            std::fs::write(temp.path().join("Contract-signed.pdf"), b"keep").unwrap();
 
-        let ctx = egui::Context::default();
-        let mut app = Viewer::new(
-            &eframe::CreationContext::_new_kittest(ctx.clone()),
-            vec![pdf],
-        );
-        app.digital = DigitalState::at(temp.path().join("profile"));
-        let frame = |app: &mut Viewer, events: Vec<egui::Event>| {
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1100., 760.))),
-                    events,
-                    ..Default::default()
-                },
-                |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+            let ctx = egui::Context::default();
+            let mut app = Viewer::new(
+                &eframe::CreationContext::_new_kittest(ctx.clone()),
+                vec![pdf],
             );
-        };
-        let until = |app: &mut Viewer, ready: &dyn Fn(&Viewer) -> bool| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            while !ready(app) {
-                assert!(std::time::Instant::now() < deadline, "timed out");
-                frame(app, vec![]);
-                std::thread::sleep(std::time::Duration::from_millis(10));
+            app.digital = DigitalState::at(temp.path().join("profile"));
+            let frame = |app: &mut Viewer, events: Vec<egui::Event>| {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1100., 760.))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+                );
+            };
+            let until = |app: &mut Viewer, ready: &dyn Fn(&Viewer) -> bool| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !ready(app) {
+                    assert!(std::time::Instant::now() < deadline, "timed out");
+                    frame(app, vec![]);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            };
+            until(&mut app, &|a| a.tabs[0].capabilities.is_some());
+
+            // Without a default ID, Quick Sign explains what it needs instead of guessing.
+            app.quick_sign();
+            assert!(app.digital.open && app.digital.panel == Panel::Signatures);
+            assert!(app.digital.error.is_some() && !app.digital.quick);
+            app.digital.open = false;
+            app.digital.remember(entry.clone());
+            let signature = app.digital.add_signature(Some(entry.reference()));
+            let edit = |app: &mut Viewer, change: &dyn Fn(&mut SavedSignature)| {
+                let saved = app
+                    .digital
+                    .signatures
+                    .iter_mut()
+                    .find(|s| s.id == signature)
+                    .unwrap();
+                change(saved);
+                app.digital.commit_signatures();
+            };
+            // A signature that shows nothing asks for something to show.
+            edit(&mut app, &|s| {
+                s.show_name = false;
+                s.show_date = false;
+            });
+            app.quick_sign();
+            assert!(app.digital.panel == Panel::Signatures && !app.digital.quick);
+            assert!(app.digital.error.as_deref().unwrap().contains("shows"));
+            edit(&mut app, &|s| {
+                s.show_name = true;
+                s.show_date = true;
+                s.note = "Approved".into();
+                s.background = signing::Background::Tinted;
+            });
+            app.digital.open = false;
+            app.digital.error = None;
+
+            if drag_region {
+                app.action("sign_quick", &ctx);
+            } else {
+                app.quick_sign();
             }
-        };
-        until(&mut app, &|a| a.tabs[0].capabilities.is_some());
-
-        // Without a default ID, Quick Sign explains what it needs instead of guessing.
-        app.quick_sign();
-        assert!(app.digital.open && app.digital.panel == Panel::Signatures);
-        assert!(app.digital.error.is_some() && !app.digital.quick);
-        app.digital.open = false;
-        app.digital.remember(entry.clone());
-        let signature = app.digital.add_signature(Some(entry.reference()));
-        let edit = |app: &mut Viewer, change: &dyn Fn(&mut SavedSignature)| {
-            let saved = app
-                .digital
-                .signatures
-                .iter_mut()
-                .find(|s| s.id == signature)
-                .unwrap();
-            change(saved);
-            app.digital.commit_signatures();
-        };
-        // A signature that shows nothing asks for something to show.
-        edit(&mut app, &|s| {
-            s.show_name = false;
-            s.show_date = false;
-        });
-        app.quick_sign();
-        assert!(app.digital.panel == Panel::Signatures && !app.digital.quick);
-        assert!(app.digital.error.as_deref().unwrap().contains("shows"));
-        edit(&mut app, &|s| {
-            s.show_name = true;
-            s.show_date = true;
-            s.note = "Approved".into();
-            s.background = signing::Background::Tinted;
-        });
-        app.digital.open = false;
-        app.digital.error = None;
-
-        app.quick_sign();
-        assert!(app.digital.quick);
-        assert!(
-            app.editor.tool == editing::Tool::SignArea && app.editor.mode == editing::Mode::Sign
-        );
-        for _ in 0..3 {
-            frame(&mut app, vec![]);
-        }
-        let page = ctx
-            .read_response(egui::Id::new((app.tabs[0].id, 0_usize, "page_actions")))
-            .unwrap()
-            .rect;
-        // Keep the click visible at first-page Fit Width, which is larger
-        // than fitting to this fixture's wider, rotated second page.
-        let at = page.min + vec2(300., 250.) * app.tabs[0].scale;
-        for pressed in [true, false] {
+            assert!(app.digital.quick && !app.digital.open);
+            assert!(app.editor.pending_sign_rect.is_none());
+            assert!(app.editor.tool == editing::Tool::SignArea);
+            for _ in 0..3 {
+                frame(&mut app, vec![]);
+            }
+            let page = ctx
+                .read_response(egui::Id::new((app.tabs[0].id, 0_usize, "page_actions")))
+                .unwrap()
+                .rect;
+            let start = if drag_region {
+                vec2(180., 214.)
+            } else {
+                vec2(300., 250.)
+            };
+            let end = if drag_region { vec2(420., 286.) } else { start };
+            let start = page.min + start * app.tabs[0].scale;
+            let end = page.min + end * app.tabs[0].scale;
             frame(
                 &mut app,
                 vec![
-                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerMoved(start),
                     egui::Event::PointerButton {
-                        pos: at,
+                        pos: start,
                         button: egui::PointerButton::Primary,
-                        pressed,
+                        pressed: true,
                         modifiers: egui::Modifiers::NONE,
                     },
                 ],
             );
+            frame(&mut app, vec![egui::Event::PointerMoved(end)]);
+            frame(
+                &mut app,
+                vec![egui::Event::PointerButton {
+                    pos: end,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            // A click places a default box centered on it; a .p12 asks for its passphrase.
+            let r = app.digital.request.rect.unwrap();
+            assert!((r[2] - r[0] - 240.).abs() < 0.01 && (r[3] - r[1] - 72.).abs() < 0.01);
+            assert!(
+                ((r[0] + r[2]) / 2. - 300.).abs() < 0.5 && ((r[1] + r[3]) / 2. - 250.).abs() < 0.5,
+                "{r:?} page {page:?} scale {}",
+                app.tabs[0].scale
+            );
+            assert!(app.digital.quick_prompt);
+            app.digital.sign_password = Zeroizing::new(passphrase.into());
+            app.digital.quick_prompt = false;
+            app.digital.open = true;
+            app.quick_sign_now(&ctx);
+            until(&mut app, &|a| a.tabs.len() == 2 && !a.digital.busy);
+            assert!(!app.digital.open && !app.digital.quick_prompt && !app.digital.quick);
+            assert!(app.editor.pending_sign_rect.is_none());
+
+            let signed = temp.path().join("Contract-signed 2.pdf");
+            assert!(signed.is_file(), "{:?}", app.digital.error);
+            assert_eq!(
+                std::fs::read(temp.path().join("Contract-signed.pdf")).unwrap(),
+                b"keep"
+            );
+            let report = signing::verify(&std::fs::read(&signed).unwrap(), None).unwrap();
+            assert_eq!(report.len(), 1);
+            assert!(
+                report[0].crypto_valid && report[0].digest_matches && report[0].byte_range_valid
+            );
+            assert!(
+                app.status
+                    .as_ref()
+                    .is_some_and(|(m, error)| !error && m.contains("Contract-signed 2.pdf"))
+            );
+
+            // The signature's note is the reason, unless one was typed for this signing.
+            let doc = lopdf::Document::load_mem(&std::fs::read(&signed).unwrap()).unwrap();
+            let reasons: Vec<String> = doc
+                .objects
+                .values()
+                .filter_map(|o| o.as_dict().ok()?.get(b"Reason").ok()?.as_str().ok())
+                .map(|r| String::from_utf8_lossy(r).into_owned())
+                .collect();
+            assert_eq!(reasons, ["Approved"]);
+            // Signatures are remembered across launches.
+            let reloaded = DigitalState::at(temp.path().join("profile"));
+            let saved = reloaded.default_signature().unwrap();
+            assert_eq!(saved.note, "Approved");
+            assert_eq!(saved.background, signing::Background::Tinted);
+            assert_eq!(reloaded.look.note, "Approved");
         }
-        // A click places a default box centered on it; a .p12 asks for its passphrase.
-        let r = app.digital.request.rect.unwrap();
-        assert!((r[2] - r[0] - 240.).abs() < 0.01 && (r[3] - r[1] - 72.).abs() < 0.01);
-        assert!(
-            ((r[0] + r[2]) / 2. - 300.).abs() < 0.5 && ((r[1] + r[3]) / 2. - 250.).abs() < 0.5,
-            "{r:?} page {page:?} scale {}",
-            app.tabs[0].scale
-        );
-        assert!(app.digital.quick_prompt);
-        app.digital.sign_password = Zeroizing::new(passphrase.into());
-        app.digital.quick_prompt = false;
-        app.quick_sign_now(&ctx);
-        until(&mut app, &|a| a.tabs.len() == 2 && !a.digital.busy);
-
-        let signed = temp.path().join("Contract-signed 2.pdf");
-        assert!(signed.is_file(), "{:?}", app.digital.error);
-        assert_eq!(
-            std::fs::read(temp.path().join("Contract-signed.pdf")).unwrap(),
-            b"keep"
-        );
-        let report = signing::verify(&std::fs::read(&signed).unwrap(), None).unwrap();
-        assert_eq!(report.len(), 1);
-        assert!(report[0].crypto_valid && report[0].digest_matches && report[0].byte_range_valid);
-        assert!(
-            app.status
-                .as_ref()
-                .is_some_and(|(m, error)| !error && m.contains("Contract-signed 2.pdf"))
-        );
-
-        // The signature's note is the reason, unless one was typed for this signing.
-        let doc = lopdf::Document::load_mem(&std::fs::read(&signed).unwrap()).unwrap();
-        let reasons: Vec<String> = doc
-            .objects
-            .values()
-            .filter_map(|o| o.as_dict().ok()?.get(b"Reason").ok()?.as_str().ok())
-            .map(|r| String::from_utf8_lossy(r).into_owned())
-            .collect();
-        assert_eq!(reasons, ["Approved"]);
-        // Signatures are remembered across launches.
-        let reloaded = DigitalState::at(temp.path().join("profile"));
-        let saved = reloaded.default_signature().unwrap();
-        assert_eq!(saved.note, "Approved");
-        assert_eq!(saved.background, signing::Background::Tinted);
-        assert_eq!(reloaded.look.note, "Approved");
     }
+    #[test]
+    fn placed_signature_preview_tracks_edits_without_changing_the_document() {
+        use eframe::App;
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.digital = DigitalState::at(temp.path().join("profile"));
+        app.new_blank(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.home.visible = false;
+        app.sidebar = false;
+        app.editor.mode = editing::Mode::Sign;
+        let id = app.digital.add_signature(None);
+        app.digital.signatures[0].show_date = false;
+        app.digital.use_signature(&id);
+        app.digital.open = true;
+        app.digital.panel = Panel::Signatures;
+        app.digital.visible = true;
+        app.digital.document = Some(app.tabs[0].id);
+        app.digital.request.rect = Some([120., 230., 420., 330.]);
+        let bytes = app.tabs[0].bytes.clone();
+        let revision = app.tabs[0].session.as_ref().unwrap().revision();
+        assert!(app.digital_docked());
+        let wait_preview = |app: &mut Viewer, old: Option<egui::TextureId>| loop {
+            app.digital.manager.receive(&ctx);
+            if let Some((tab, page, rect, texture)) = app.live_signature_preview(&ctx)
+                && Some(texture.id()) != old
+            {
+                assert_eq!(tab, app.tabs[0].id);
+                assert_eq!(page, 0);
+                assert_eq!(rect, [120., 230., 420., 330.]);
+                break texture.id();
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let original = wait_preview(&mut app, None);
+        app.digital.signatures[0].text_style.insets = [10., 20., 5., 5.];
+        app.digital.signatures[0].text_style.color = [0.8, 0.1, 0.2];
+        wait_preview(&mut app, Some(original));
+        // The dock leaves the PDF a separate canvas; its pinned actions remain reachable.
+        for size in [vec2(1280., 900.), vec2(900., 650.)] {
+            for _ in 0..4 {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(pos2(0., 0.), size)),
+                        ..Default::default()
+                    },
+                    |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+                );
+                for label in ["Back to signing", "Close"] {
+                    let nodes = &output
+                        .platform_output
+                        .accesskit_update
+                        .as_ref()
+                        .unwrap()
+                        .nodes;
+                    let bounds = nodes
+                        .iter()
+                        .find(|(_, n)| n.label() == Some(label))
+                        .unwrap()
+                        .1
+                        .bounds()
+                        .unwrap();
+                    assert!(
+                        bounds.x0 >= 0. && bounds.x1 <= size.x as f64 && bounds.y1 <= size.y as f64,
+                        "{label}: {bounds:?}"
+                    );
+                }
+            }
+            assert!(app.tabs[0].document_view.unwrap().0.width() > 200.);
+        }
+        assert_eq!(app.tabs[0].bytes, bytes);
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), revision);
+        app.digital.open = false;
+        assert!(app.live_signature_preview(&ctx).is_none());
+        app.digital.open = true;
+        app.digital.document = Some(u64::MAX);
+        assert!(app.live_signature_preview(&ctx).is_none());
+    }
+
+    #[test]
+    fn default_ink_places_without_picker_and_supports_undo_redo() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut asset = mypdf_milestone0::assets::Asset::new(
+            "Test signature",
+            mypdf_milestone0::annotations::Kind::Ink {
+                strokes: vec![vec![[0., 0.], [1., 1.]]],
+            },
+            Default::default(),
+            3.,
+        );
+        asset.signature = true;
+        app.editor.library =
+            Some(mypdf_milestone0::assets::Library::open(temp.path().into()).unwrap());
+        app.editor
+            .library
+            .as_mut()
+            .unwrap()
+            .put(asset.clone())
+            .unwrap();
+        app.digital.default_ink = Some(asset.id.clone());
+        let key = (
+            app.tabs[0].id,
+            app.tabs[0].session.as_ref().unwrap().revision(),
+            0,
+        );
+        app.signature_here(key, [120., 230.]);
+        app.place_default_ink_signature();
+        assert!(!app.editor.signature_open && !app.digital.open);
+        let session = app.tabs[0].session.as_mut().unwrap();
+        assert_eq!(session.annotations.len(), 1);
+        assert_eq!(
+            session.annotations[0].asset_id.as_deref(),
+            Some(asset.id.as_str())
+        );
+        assert_eq!(&session.annotations[0].rect[..2], &[120., 230.]);
+        session.undo();
+        assert!(session.annotations.is_empty());
+        session.redo();
+        assert_eq!(session.annotations.len(), 1);
+        // Ribbon defaults arm a movable preview and keep the Sign tab active.
+        app.editor.mode = editing::Mode::Sign;
+        app.start_ink_signature();
+        app.place_default_ink_signature();
+        assert!(!app.editor.signature_open && !app.digital.open);
+        assert!(app.editor.mode == editing::Mode::Sign);
+        assert_eq!(
+            app.workbench.paste.as_ref().unwrap()[0].asset_id.as_deref(),
+            Some(asset.id.as_str())
+        );
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().annotations.len(), 1);
+    }
+
     #[test]
     fn the_old_appearance_becomes_a_signature_and_signatures_persist() {
         let temp = tempfile::tempdir().unwrap();
@@ -3822,6 +4164,70 @@ mod tests {
         assert!(app.digital.system_trust.get(&other.der) == Some(&true));
     }
     #[test]
+    fn signature_transform_persists_and_updates_preview_and_quick_sign_look() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut state = DigitalState::at(temp.path().into());
+        let id = state.add_signature(None);
+        let original = state.signature_request(state.signature(&id).unwrap(), &[]);
+        let transform = signing::AppearanceTransform {
+            rotation: 37.,
+            image_overlay: true,
+            image_opacity: 0.45,
+            image_insets: [3., 4., 5., 6.],
+        };
+        state
+            .signatures
+            .iter_mut()
+            .find(|s| s.id == id)
+            .unwrap()
+            .transform = transform;
+        let text_style = signing::SignatureTextStyle {
+            offset: [12., 8.],
+            insets: [7., 8., 9., 10.],
+            family: "Arial".into(),
+            bold: true,
+            italic: true,
+            size: 14.,
+            color: [0.2, 0.3, 0.6],
+            alignment: 1,
+        };
+        state
+            .signatures
+            .iter_mut()
+            .find(|s| s.id == id)
+            .unwrap()
+            .text_style = text_style.clone();
+        state.commit_signatures();
+        let mut restored = DigitalState::at(temp.path().into());
+        restored.apply_default_signature();
+        let changed = restored.signature_request(restored.signature(&id).unwrap(), &[]);
+        assert_eq!(changed.transform, transform);
+        assert_eq!(changed.text_style, text_style);
+        let mut signing_request = DesktopSigningRequest::default();
+        restored.look.apply(&mut signing_request);
+        assert_eq!(signing_request.transform, transform);
+        assert_eq!(signing_request.text_style, text_style);
+        restored.manager.preview(&ctx, &original);
+        restored.manager.preview(&ctx, &changed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !restored.manager.idle() {
+            assert!(std::time::Instant::now() < deadline);
+            restored.manager.receive(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            restored.manager.drawn(),
+            2,
+            "appearance changes invalidate cached preview"
+        );
+        assert!(restored.manager.failures().is_empty());
+        let legacy: SavedSignature =
+            serde_json::from_str(r#"{"name":"Legacy signature"}"#).unwrap();
+        assert_eq!(legacy.transform, signing::AppearanceTransform::default());
+    }
+
+    #[test]
     fn previews_draw_every_background_with_and_without_an_image() {
         use mypdf_milestone0::annotations::{Kind, Style};
         let ctx = egui::Context::default();
@@ -3882,149 +4288,240 @@ mod tests {
         );
     }
     #[test]
+    fn signature_preview_stays_pinned_when_settings_scroll() {
+        for dimensions in [vec2(1100., 900.), vec2(720., 480.)] {
+            let temp = tempfile::tempdir().unwrap();
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+            app.digital = DigitalState::at(temp.path().join("profile"));
+            app.digital.add_signature(None);
+            app.digital.open = true;
+            app.digital.panel = Panel::Signatures;
+            let mut time = 0.;
+            let mut frame = |app: &mut Viewer, events| {
+                time += 0.1;
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(pos2(0., 0.), dimensions)),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| app.digital_window(ctx),
+                )
+            };
+            let bounds = |output: &egui::FullOutput, label| {
+                output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .find(|(_, n)| n.label() == Some(label))
+                    .unwrap_or_else(|| panic!("missing {label}"))
+                    .1
+                    .bounds()
+                    .unwrap()
+            };
+            for _ in 0..6 {
+                frame(&mut app, vec![]);
+            }
+            let output = frame(&mut app, vec![]);
+            let pinned = ctx
+                .data(|d| d.get_temp::<Rect>(egui::Id::new("signature_pinned_preview_rect")))
+                .unwrap();
+            let close = bounds(&output, "Close");
+            let (viewport, content_top) = ctx
+                .data(|d| d.get_temp::<(Rect, f32)>(egui::Id::new("digital_manager_geometry")))
+                .unwrap();
+            let pointer = viewport.center();
+            for _ in 0..16 {
+                frame(
+                    &mut app,
+                    vec![
+                        egui::Event::PointerMoved(pointer),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: vec2(0., -60.),
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            let output = frame(&mut app, vec![]);
+            assert_eq!(
+                ctx.data(|d| d.get_temp::<Rect>(egui::Id::new("signature_pinned_preview_rect")))
+                    .unwrap(),
+                pinned
+            );
+            assert_eq!(bounds(&output, "Close"), close);
+            assert!(
+                ctx.data(|d| d.get_temp::<(Rect, f32)>(egui::Id::new("digital_manager_geometry")))
+                    .unwrap()
+                    .1
+                    < content_top - 20.,
+                "The properties must actually scroll"
+            );
+            assert!(pinned.top() > 0. && (pinned.bottom() as f64) < close.y0);
+            assert!(
+                close.y1 <= dimensions.y as f64,
+                "actions stay visible on short windows"
+            );
+        }
+    }
+
+    #[test]
     fn the_signatures_window_creates_edits_and_deletes_signatures() {
         use eframe::App;
         for dimensions in [vec2(1100., 900.), vec2(720., 480.)] {
-        let temp = tempfile::tempdir().unwrap();
-        let ctx = egui::Context::default();
-        ctx.enable_accesskit();
-        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
-        app.digital = DigitalState::at(temp.path().join("profile"));
-        app.digital.open = true;
-        let frame = |app: &mut Viewer, events: Vec<egui::Event>| {
-            ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), dimensions)),
-                    events,
-                    ..Default::default()
-                },
-                |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
-            )
-        };
-        // Scroll the window until the control is in view, then click it.
-        let click = |app: &mut Viewer, label: &str, in_window: bool| {
-            let mut at = None;
-            let mut stable = None::<egui::Pos2>;
-            for _ in 0..60 {
-                let output = frame(app, vec![]);
-                let nodes = output.platform_output.accesskit_update.unwrap().nodes;
-                let r = nodes
-                    .iter()
-                    .find(|(_, n)| n.label() == Some(label))
-                    .unwrap_or_else(|| panic!("no “{label}”"))
-                    .1
-                    .bounds()
-                    .unwrap();
-                let center = pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32);
-                let window = ctx
-                    .memory(|m| m.area_rect(egui::Id::new("digital_window")))
-                    .unwrap();
-                // The title tabs and action footer are pinned; scrolling content
-                // must be inside the body, not merely somewhere in the window.
-                let body_top = nodes
-                    .iter()
-                    .find(|(_, n)| n.label() == Some("My signatures"))
-                    .and_then(|(_, n)| n.bounds())
-                    .map_or(window.top() + 70., |r| r.y1 as f32 + 12.);
-                let body_bottom = nodes
-                    .iter()
-                    .find(|(_, n)| n.label() == Some("Close"))
-                    .and_then(|(_, n)| n.bounds())
-                    .map_or(window.bottom() - 65., |r| r.y0 as f32 - 22.);
-                if !in_window || (r.y0 as f32 >= body_top && r.y1 as f32 <= body_bottom - 16.) {
-                    // Animated scrolling must settle before the click lands.
-                    if stable.is_some_and(|last| last.distance(center) < 0.5) {
-                        at = Some(center);
-                        break;
+            let temp = tempfile::tempdir().unwrap();
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+            app.digital = DigitalState::at(temp.path().join("profile"));
+            app.digital.open = true;
+            let frame = |app: &mut Viewer, events: Vec<egui::Event>| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(pos2(0., 0.), dimensions)),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+                )
+            };
+            // Scroll the window until the control is in view, then click it.
+            let click = |app: &mut Viewer, label: &str, in_window: bool| {
+                let mut at = None;
+                let mut stable = None::<egui::Pos2>;
+                for _ in 0..60 {
+                    let output = frame(app, vec![]);
+                    let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+                    let r = nodes
+                        .iter()
+                        .find(|(_, n)| n.label() == Some(label))
+                        .unwrap_or_else(|| panic!("no “{label}”"))
+                        .1
+                        .bounds()
+                        .unwrap();
+                    let center = pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32);
+                    let window = ctx
+                        .memory(|m| m.area_rect(egui::Id::new("digital_window")))
+                        .unwrap();
+                    // The title tabs and action footer are pinned; scrolling content
+                    // must be inside the body, not merely somewhere in the window.
+                    let (viewport, _) = ctx
+                        .data(|d| {
+                            d.get_temp::<(Rect, f32)>(egui::Id::new("digital_manager_geometry"))
+                        })
+                        .unwrap();
+                    let body_top = viewport.top() + 1.;
+                    let body_bottom = viewport.bottom() - 1.;
+                    if !in_window || (r.y0 as f32 >= body_top && r.y1 as f32 <= body_bottom - 1.) {
+                        // Animated scrolling must settle before the click lands.
+                        if stable.is_some_and(|last| last.distance(center) < 0.5) {
+                            at = Some(center);
+                            break;
+                        }
+                        stable = Some(center);
+                        continue;
                     }
-                    stable = Some(center);
-                    continue;
+                    stable = None;
+                    let body_center = pos2(window.center().x, (body_top + body_bottom) / 2.);
+                    let step =
+                        ((body_bottom - body_top - (r.y1 - r.y0) as f32) * 0.5).clamp(8., 60.);
+                    let delta = if center.y > body_center.y {
+                        -step
+                    } else {
+                        step
+                    };
+                    frame(
+                        app,
+                        vec![
+                            egui::Event::PointerMoved(body_center),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: vec2(0., delta),
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
                 }
-                stable = None;
-                let body_center = pos2(window.center().x, (body_top + body_bottom) / 2.);
-                let delta = if center.y > body_center.y { -60. } else { 60. };
-                frame(
-                    app,
-                    vec![
-                        egui::Event::PointerMoved(body_center),
-                        egui::Event::MouseWheel {
-                            unit: egui::MouseWheelUnit::Point,
-                            delta: vec2(0., delta),
-                            modifiers: egui::Modifiers::NONE,
-                        },
-                    ],
-                );
+                let at = at.unwrap_or_else(|| panic!("“{label}” stays out of view"));
+                for pressed in [true, false] {
+                    frame(
+                        app,
+                        vec![
+                            egui::Event::PointerMoved(at),
+                            egui::Event::PointerButton {
+                                pos: at,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                }
+                frame(app, vec![]);
+            };
+            for _ in 0..3 {
+                frame(&mut app, vec![]);
             }
-            let at = at.unwrap_or_else(|| panic!("“{label}” stays out of view"));
-            for pressed in [true, false] {
-                frame(
-                    app,
-                    vec![
-                        egui::Event::PointerMoved(at),
-                        egui::Event::PointerButton {
-                            pos: at,
-                            button: egui::PointerButton::Primary,
-                            pressed,
-                            modifiers: egui::Modifiers::NONE,
-                        },
-                    ],
-                );
-            }
-            frame(app, vec![]);
-        };
-        for _ in 0..3 {
-            frame(&mut app, vec![]);
-        }
-        // First run: one button creates the first signature, which Quick Sign uses.
-        click(&mut app, "Create a signature", true);
-        assert_eq!(app.digital.signatures.len(), 1);
-        let first = app.digital.signatures[0].id.clone();
-        assert_eq!(
-            app.digital.default_signature.as_deref(),
-            Some(first.as_str())
-        );
-        click(&mut app, "Soft tint", true);
-        assert_eq!(
-            app.digital.signatures[0].background,
-            signing::Background::Tinted
-        );
-        click(&mut app, "Date and time", true);
-        assert!(!app.digital.signatures[0].show_date);
-        click(&mut app, "Duplicate", false);
-        assert_eq!(app.digital.signatures.len(), 2);
-        assert_eq!(app.digital.signatures[1].name, "My signature copy");
-        assert_eq!(
-            app.digital.signatures[1].background,
-            signing::Background::Tinted
-        );
-        click(&mut app, "Use for Quick Sign", true);
-        let copy = app.digital.signatures[1].id.clone();
-        assert_eq!(
-            app.digital.default_signature.as_deref(),
-            Some(copy.as_str())
-        );
-        click(&mut app, "Delete…", false);
-        assert_eq!(
-            app.digital.manager.confirm_delete.as_deref(),
-            Some(copy.as_str())
-        );
-        click(&mut app, "Delete", false);
-        assert_eq!(app.digital.signatures.len(), 1);
-        assert_eq!(
-            app.digital.default_signature.as_deref(),
-            Some(first.as_str())
-        );
-        click(&mut app, "Delete…", false);
-        assert_eq!(app.digital.manager.confirm_delete.as_deref(), Some(first.as_str()));
-        click(&mut app, "Cancel", false);
-        assert_eq!(app.digital.signatures.len(), 1);
-        assert!(app.digital.manager.confirm_delete.is_none());
-        click(&mut app, "Delete…", false);
-        click(&mut app, "Delete", false);
-        assert!(app.digital.signatures.is_empty());
-        assert!(app.digital.default_signature.is_none());
-        let reloaded = DigitalState::at(temp.path().join("profile"));
-        assert_eq!(reloaded.signatures, app.digital.signatures);
+            // First run: one button creates the first signature, which Quick Sign uses.
+            click(&mut app, "Create a signature", true);
+            assert_eq!(app.digital.signatures.len(), 1);
+            let first = app.digital.signatures[0].id.clone();
+            assert_eq!(
+                app.digital.default_signature.as_deref(),
+                Some(first.as_str())
+            );
+            click(&mut app, "Soft tint", true);
+            assert_eq!(
+                app.digital.signatures[0].background,
+                signing::Background::Tinted
+            );
+            click(&mut app, "Date and time", true);
+            assert!(!app.digital.signatures[0].show_date);
+            click(&mut app, "Duplicate", false);
+            assert_eq!(app.digital.signatures.len(), 2);
+            assert_eq!(app.digital.signatures[1].name, "My signature copy");
+            assert_eq!(
+                app.digital.signatures[1].background,
+                signing::Background::Tinted
+            );
+            click(&mut app, "Use for Quick Sign", true);
+            let copy = app.digital.signatures[1].id.clone();
+            assert_eq!(
+                app.digital.default_signature.as_deref(),
+                Some(copy.as_str())
+            );
+            click(&mut app, "Delete…", false);
+            assert_eq!(
+                app.digital.manager.confirm_delete.as_deref(),
+                Some(copy.as_str())
+            );
+            click(&mut app, "Delete", false);
+            assert_eq!(app.digital.signatures.len(), 1);
+            assert_eq!(
+                app.digital.default_signature.as_deref(),
+                Some(first.as_str())
+            );
+            click(&mut app, "Delete…", false);
+            assert_eq!(
+                app.digital.manager.confirm_delete.as_deref(),
+                Some(first.as_str())
+            );
+            click(&mut app, "Cancel", false);
+            assert_eq!(app.digital.signatures.len(), 1);
+            assert!(app.digital.manager.confirm_delete.is_none());
+            click(&mut app, "Delete…", false);
+            click(&mut app, "Delete", false);
+            assert!(app.digital.signatures.is_empty());
+            assert!(app.digital.default_signature.is_none());
+            let reloaded = DigitalState::at(temp.path().join("profile"));
+            assert_eq!(reloaded.signatures, app.digital.signatures);
         }
     }
     #[test]

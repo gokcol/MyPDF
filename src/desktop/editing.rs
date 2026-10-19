@@ -234,6 +234,7 @@ impl Default for SvgEditor {
 }
 #[derive(Clone, Copy, PartialEq)]
 enum SignatureInput {
+    Name,
     Draw,
     Type,
     Image,
@@ -290,6 +291,12 @@ pub(super) struct EditorState {
     builtins: Vec<assets::BuiltinAsset>,
     signature_name: String,
     signature_typed: String,
+    signature_name_style: usize,
+    signature_flourish: bool,
+    signature_ink_color: [f32; 3],
+    signature_ink_width: f32,
+    signature_generated: Option<Result<Asset, String>>,
+    signature_generated_key: String,
     signature_input: SignatureInput,
     signature_image: Option<Asset>,
     signature_error: Option<String>,
@@ -402,6 +409,12 @@ impl EditorState {
             builtins: assets::builtin_assets(),
             signature_name: "My handwritten signature".into(),
             signature_typed: String::new(),
+            signature_name_style: 0,
+            signature_flourish: true,
+            signature_ink_color: [0.1, 0.14, 0.18],
+            signature_ink_width: 2.,
+            signature_generated: None,
+            signature_generated_key: String::new(),
             signature_input: SignatureInput::Draw,
             signature_image: None,
             signature_error: None,
@@ -1679,7 +1692,7 @@ pub(super) fn page_interaction(
         editor.pressed = None;
     }
     if matches!(editor.mode, Mode::Annotate | Mode::Draw) && !editable && response.hovered() {
-        response.on_hover_text("This signed PDF is protected. Choose “Edit anyway…” in the signature bar to annotate it; signatures stay valid for what they signed.");
+        response.on_hover_text("This signed PDF is protected. Choose “Enable editing…” in the signature bar to annotate it; signatures stay valid for what they signed.");
     }
 }
 /// Preserve intermediate stylus/mouse samples delivered together in one frame.
@@ -1802,7 +1815,10 @@ fn draw_signature_pad(ui: &mut egui::Ui, editor: &mut EditorState) -> Rect {
                     .iter()
                     .map(|p| rect.min + vec2(p[0] * rect.width(), p[1] * rect.height()))
                     .collect(),
-                Stroke::new(2.0, theme::ink()),
+                Stroke::new(
+                    editor.signature_ink_width,
+                    color(editor.signature_ink_color, 1.),
+                ),
             ));
         }
     }
@@ -2197,6 +2213,9 @@ impl Viewer {
                                     {
                                         self.editor.select_tool(tool);
                                         self.editor.library_open = false;
+                                        if let Some(tab) = self.tabs.get_mut(self.active) {
+                                            tab.signatures.panel = false;
+                                        }
                                     }
                                 }
                                 ui.separator();
@@ -2234,29 +2253,7 @@ impl Viewer {
                                 );
                             });
                         } else if self.editor.mode == Mode::Sign {
-                            if ui
-                                .add(ActionButton::new(Icon::Sign, "Quick Sign").primary())
-                                .on_hover_text(
-                                    "Drag a box on the page to sign with your default digital ID",
-                                )
-                                .clicked()
-                            {
-                                action = Some("quick_sign");
-                            }
-                            ui.separator();
-                            for (icon, label, key) in [
-                                (Icon::Pen, "Signature", "visual_signature"),
-                                (Icon::Form, "Sign with options…", "sign"),
-                                (Icon::Check, "Validate signatures…", "validate"),
-                            ] {
-                                let button = ActionButton::new(icon, label);
-                                if ui
-                                    .add(if compact { button.compact() } else { button })
-                                    .clicked()
-                                {
-                                    action = Some(key);
-                                }
-                            }
+                            action = self.signing_ribbon(ui);
                         } else {
                             ui.label(
                                 RichText::new("Read, annotate, sign, or organize your pages.")
@@ -3544,7 +3541,9 @@ impl Viewer {
         mark.asset_id = Some(asset.id.clone());
         selection::set(tab, &mut self.editor, vec![]);
         self.editor.placed = Some(asset);
-        self.editor.mode = Mode::Draw;
+        if self.editor.mode != Mode::Sign {
+            self.editor.mode = Mode::Draw;
+        }
         self.editor.tool = Tool::Select;
         self.editor.draft = None;
         self.editor.library_open = false;
@@ -3552,13 +3551,38 @@ impl Viewer {
         self.status = Some(("Move the preview to your chosen spot and click. Drag to adjust; use a corner to resize. Escape cancels.".into(), false));
     }
 
+    #[cfg(test)]
     pub(super) fn signature_here(&mut self, key: (u64, u64, usize), point: [f32; 2]) {
+        self.start_ink_signature();
+        self.editor.signature_placement = Some(SignaturePlacement { key, point });
+    }
+
+    pub(super) fn start_ink_signature(&mut self) {
         self.digital.open = false;
         self.digital.adopt_asset = false;
         self.editor.library_open = false;
         self.editor.open_signature();
-        self.editor.signature_placement = Some(SignaturePlacement { key, point });
+        self.editor.signature_error = None;
         self.editor.signature_picker = true;
+    }
+
+    pub(super) fn place_default_ink_signature(&mut self) {
+        let asset = self.editor.library.as_ref().and_then(|library| {
+            library
+                .entries
+                .iter()
+                .find(|asset| self.digital.ink_is_default(&asset.id))
+                .cloned()
+        });
+        if let Some(asset) = asset {
+            self.editor.signature_open = false;
+            self.place_saved_signature(asset);
+        } else {
+            self.editor.signature_error = Some(
+                "Choose a default ink signature in Settings. You can select a signature below for now."
+                    .into(),
+            );
+        }
     }
 
     pub(super) fn place_saved_signature(&mut self, asset: Asset) {
@@ -3627,6 +3651,7 @@ impl Viewer {
                     ui::dialog_body(ui, "signature_editor_body", 460., |ui| {
                     if self.editor.signature_picker {
                         ui.label("Choose a saved signature, then place it on the page.");
+                        if let Some(error) = &self.editor.signature_error { ui.colored_label(theme::danger(), error); }
                         ui.horizontal_wrapped(|ui| {
                             for asset in &saved {
                                 ui.vertical(|ui| {
@@ -3649,18 +3674,50 @@ impl Viewer {
                         "Create your signature, then click on the page to place it."
                     });
                     ui.horizontal(|ui| {
-                        for (mode, label) in [(SignatureInput::Draw, "Draw"), (SignatureInput::Type, "Type"), (SignatureInput::Image, "Image")] {
+                        for (mode, label) in [(SignatureInput::Draw, "Draw by hand"), (SignatureInput::Name, "From name"), (SignatureInput::Type, "Type"), (SignatureInput::Image, "Image")] {
                             ui.selectable_value(&mut self.editor.signature_input, mode, label);
                         }
                     });
                     ui.add_space(8.);
+                    if self.editor.signature_input != SignatureInput::Image {
+                        ui::color_swatch(ui, &mut self.editor.signature_ink_color, "Ink color");
+                    }
                     match self.editor.signature_input {
+                        SignatureInput::Name => {
+                            let r = ui.add(egui::TextEdit::singleline(&mut self.editor.signature_typed).margin(ui::FIELD_MARGIN).hint_text("Your full name").char_limit(200));
+                            self.editor.text_editing |= r.has_focus();
+                            ui.horizontal_wrapped(|ui| {
+                                for (i, label) in mypdf_milestone0::signature_art::NAME_STYLES.iter().enumerate() {
+                                    ui.selectable_value(&mut self.editor.signature_name_style, i, *label);
+                                }
+                            });
+                            ui.checkbox(&mut self.editor.signature_flourish, "Add a flourish");
+                            let key = format!("{}:{}:{}:{:?}", self.editor.signature_typed, self.editor.signature_name_style, self.editor.signature_flourish, self.editor.signature_ink_color);
+                            if key != self.editor.signature_generated_key {
+                                self.editor.signature_generated_key = key;
+                                self.editor.signature_generated = Some(mypdf_milestone0::signature_art::from_name(&self.editor.signature_typed, self.editor.signature_name_style, self.editor.signature_flourish, self.editor.signature_ink_color).map_err(|e| format!("{e:#}")));
+                            }
+                            if let Some(result) = self.editor.signature_generated.clone() {
+                                match result {
+                                    Ok(asset) => {
+                                        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 150.), egui::Sense::hover());
+                                        ui.painter().rect_filled(rect, 10., Color32::WHITE);
+                                        paint_asset(&mut self.editor, ctx, ui.painter(), rect.shrink(16.), &asset);
+                                    }
+                                    Err(error) => { ui.weak(error); }
+                                }
+                            }
+                            ui.weak("Choose a style for your name, then save it for reuse. Created locally on this device.");
+                        }
                         SignatureInput::Type => {
                             let r = ui.add(egui::TextEdit::singleline(&mut self.editor.signature_typed)
                                 .margin(ui::FIELD_MARGIN).hint_text("Signature text").char_limit(200));
                             self.editor.text_editing |= r.has_focus();
                         }
-                        SignatureInput::Draw => { draw_signature_pad(ui, &mut self.editor); },
+                        SignatureInput::Draw => {
+                            ui.add(egui::Slider::new(&mut self.editor.signature_ink_width, 0.5..=8.).text("Pen width"));
+                            draw_signature_pad(ui, &mut self.editor);
+                        },
                         SignatureInput::Image => {
                             if let Some(asset) = self.editor.signature_image.clone() {
                                 let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 150.), egui::Sense::hover());
@@ -3733,6 +3790,17 @@ impl Viewer {
             }
             if save {
                 let asset = match self.editor.signature_input {
+                    SignatureInput::Name => self
+                        .editor
+                        .signature_generated
+                        .as_ref()
+                        .and_then(|a| a.as_ref().ok())
+                        .cloned()
+                        .map(|mut asset| {
+                            asset.id = format!("{:032x}", rand::random::<u128>());
+                            asset.name = self.editor.signature_name.clone();
+                            asset
+                        }),
                     SignatureInput::Image => {
                         self.editor.signature_image.clone().map(|mut asset| {
                             asset.id = format!("{:032x}", rand::random::<u128>());
@@ -3767,7 +3835,8 @@ impl Viewer {
                                 kind,
                                 Style {
                                     font_size: 24.,
-                                    color: [0.1, 0.14, 0.18],
+                                    color: self.editor.signature_ink_color,
+                                    width: self.editor.signature_ink_width,
                                     ..Default::default()
                                 },
                                 3.,
@@ -4518,15 +4587,23 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         app.action("settings", &ctx);
-        for _ in 0..3 { test_frame(&mut app, &ctx, vec![]); }
+        for _ in 0..3 {
+            test_frame(&mut app, &ctx, vec![]);
+        }
         test_click(&mut app, &ctx, "New ink signature…");
         assert!(app.editor.signature_manage_only);
-        app.editor.signature_input = SignatureInput::Type;
+        app.editor.signature_input = SignatureInput::Name;
         app.editor.signature_typed = "A. Signer".into();
         app.editor.signature_name = "Office ink".into();
         for _ in 0..3 {
             test_frame(&mut app, &ctx, vec![]);
         }
+        for style in ["Flowing", "Personal", "Swift"] {
+            test_click(&mut app, &ctx, style);
+            test_frame(&mut app, &ctx, vec![]);
+            assert!(app.editor.signature_generated.as_ref().unwrap().is_ok());
+        }
+        assert_eq!(app.editor.signature_name_style, 5);
         test_click(&mut app, &ctx, "Save signature");
         assert!(app.workbench.paste.is_none());
         assert!(app.tabs[0].session.as_ref().unwrap().annotations.is_empty());
@@ -4541,6 +4618,7 @@ mod tests {
             .unwrap()
             .clone();
         assert!(asset.signature);
+        assert!(matches!(asset.kind, Kind::Svg { .. }));
         app.digital.open = false;
         let key = (
             app.tabs[0].id,
@@ -4559,20 +4637,48 @@ mod tests {
         assert_eq!(&marks[0].rect[..2], &[70., 90.]);
         assert_eq!(marks[0].asset_id.as_ref(), Some(&asset.id));
         app.action("settings", &ctx);
-        for _ in 0..3 { test_frame(&mut app, &ctx, vec![]); }
+        for _ in 0..3 {
+            test_frame(&mut app, &ctx, vec![]);
+        }
         test_click(&mut app, &ctx, "Make default");
         assert!(app.digital.ink_is_default(&asset.id));
         test_click(&mut app, &ctx, "Delete…");
-        for _ in 0..3 { test_frame(&mut app, &ctx, vec![]); }
+        for _ in 0..3 {
+            test_frame(&mut app, &ctx, vec![]);
+        }
         test_click(&mut app, &ctx, "Cancel");
-        for _ in 0..3 { test_frame(&mut app, &ctx, vec![]); }
-        assert!(app.editor.library.as_ref().unwrap().entries.iter().any(|a| a.id == asset.id));
+        for _ in 0..3 {
+            test_frame(&mut app, &ctx, vec![]);
+        }
+        assert!(
+            app.editor
+                .library
+                .as_ref()
+                .unwrap()
+                .entries
+                .iter()
+                .any(|a| a.id == asset.id)
+        );
         test_click(&mut app, &ctx, "Delete…");
-        for _ in 0..3 { test_frame(&mut app, &ctx, vec![]); }
+        for _ in 0..3 {
+            test_frame(&mut app, &ctx, vec![]);
+        }
         test_click(&mut app, &ctx, "Delete");
-        assert!(!app.editor.library.as_ref().unwrap().entries.iter().any(|a| a.id == asset.id));
+        assert!(
+            !app.editor
+                .library
+                .as_ref()
+                .unwrap()
+                .entries
+                .iter()
+                .any(|a| a.id == asset.id)
+        );
         assert!(!app.digital.ink_is_default(&asset.id));
-        assert_eq!(app.tabs[0].session.as_ref().unwrap().annotations.len(), 1, "Deleting library artwork must preserve placed signatures");
+        assert_eq!(
+            app.tabs[0].session.as_ref().unwrap().annotations.len(),
+            1,
+            "Deleting library artwork must preserve placed signatures"
+        );
     }
 
     #[test]

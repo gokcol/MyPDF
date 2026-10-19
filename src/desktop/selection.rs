@@ -146,6 +146,7 @@ pub(super) fn set(tab: &mut Tab, editor: &mut EditorState, mut ids: Vec<String>)
     ids.retain(|id| seen.insert(id.clone()));
     if !ids.is_empty() {
         editor.text_selection = None;
+        tab.signatures.panel = false;
     }
     editor.property_edit = None;
     editor.group_edit = None;

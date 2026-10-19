@@ -413,11 +413,13 @@ pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: 
     };
     match icon {
         Icon::Settings => {
-            let gear: Vec<[f32; 2]> = (0..=48).map(|i| {
-                let angle = i as f32 * std::f32::consts::TAU / 48.;
-                let radius = if i % 6 < 3 { 0.44 } else { 0.33 };
-                [0.5 + radius * angle.cos(), 0.5 + radius * angle.sin()]
-            }).collect();
+            let gear: Vec<[f32; 2]> = (0..=48)
+                .map(|i| {
+                    let angle = i as f32 * std::f32::consts::TAU / 48.;
+                    let radius = if i % 6 < 3 { 0.44 } else { 0.33 };
+                    [0.5 + radius * angle.cos(), 0.5 + radius * angle.sin()]
+                })
+                .collect();
             line(&gear);
             line(&arc([0.5, 0.5], 0.14, 0., 360.));
         }

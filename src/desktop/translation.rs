@@ -549,6 +549,11 @@ impl Viewer {
                 selection.text(tab)
             })
     }
+    pub(super) fn open_translation_panel(&mut self) {
+        self.translation.open();
+        self.inspector = true;
+    }
+
     pub(super) fn translate_selection(&mut self, ctx: &egui::Context) {
         let text = self.current_translation_selection(ctx);
         if let Some(text) = text {
@@ -815,6 +820,10 @@ impl Viewer {
                     if close.clicked() { state.open = false; state.cancel(); state.clear_document(); }
                 });
             });
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(has_selection, ActionButton::new(Icon::TextArea,"Selection")).clicked() { translate_selection = true; }
+                if ui.add_enabled(has_page, ActionButton::new(Icon::Document,"Translate page")).clicked() { translate_page = true; }
+            });
             ui.horizontal(|ui| { pill(ui, "On-device", theme::accent()); ui.small("No cloud fallback"); });
             #[cfg(target_os="windows")]
             ui.small("CTranslate2 · Offline language packs");
@@ -876,10 +885,6 @@ impl Viewer {
                 }
                 if let Some(message) = &state.message { ui.label(message); }
                 ui.separator();
-                ui.horizontal_wrapped(|ui| {
-                    if ui.add_enabled(has_selection, ActionButton::new(Icon::TextArea,"Selection")).clicked() { translate_selection = true; }
-                    if ui.add_enabled(has_page, ActionButton::new(Icon::Document,"This page")).clicked() { translate_page = true; }
-                });
                 if let Some(source) = &state.source {
                     ui.small(&source.label);
                     egui::CollapsingHeader::new("Original text").default_open(false).show(ui, |ui| { readonly_text(ui,"translation_original", &source.text, 7); });

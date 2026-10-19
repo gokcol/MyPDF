@@ -22,6 +22,8 @@ pub(super) struct SavedSignature {
     /// A drawn, typed or imported image from the library.
     pub asset_id: Option<String>,
     pub background: Background,
+    pub transform: signing::AppearanceTransform,
+    pub text_style: signing::SignatureTextStyle,
 }
 impl Default for SavedSignature {
     fn default() -> Self {
@@ -35,6 +37,8 @@ impl Default for SavedSignature {
             note: String::new(),
             asset_id: None,
             background: Background::White,
+            transform: Default::default(),
+            text_style: Default::default(),
         }
     }
 }
@@ -59,6 +63,8 @@ pub(super) struct Look {
     pub show_date: bool,
     pub note: String,
     pub background: Background,
+    pub transform: signing::AppearanceTransform,
+    pub text_style: signing::SignatureTextStyle,
 }
 impl Look {
     pub fn of(signature: &SavedSignature) -> Self {
@@ -68,6 +74,8 @@ impl Look {
             show_date: signature.show_date,
             note: signature.note.clone(),
             background: signature.background,
+            transform: signature.transform,
+            text_style: signature.text_style.clone(),
         }
     }
     /// Apply to a request whose name is the certificate holder's.
@@ -78,6 +86,8 @@ impl Look {
         request.show_name = self.show_name;
         request.show_date = self.show_date;
         request.background = self.background;
+        request.transform = self.transform;
+        request.text_style = self.text_style.clone();
         if request.reason.trim().is_empty() {
             request.reason = self.note.trim().to_owned();
         }
@@ -94,6 +104,10 @@ pub(super) struct ManagerState {
     /// Rendered previews by what they show, shared by cards and editors.
     previews: HashMap<u64, PreviewResult>,
     pending: HashSet<u64>,
+    queued: std::collections::VecDeque<(u64, DesktopSigningRequest, egui::Context)>,
+    active: usize,
+    last_previews: HashMap<String, TextureHandle>,
+    slot_keys: HashMap<String, u64>,
     tx: mpsc::Sender<(u64, Result<Vec<u8>, String>)>,
     rx: mpsc::Receiver<(u64, Result<Vec<u8>, String>)>,
     /// The signature that receives the next image added to the library.
@@ -123,6 +137,10 @@ impl ManagerState {
             ink_delete: false,
             previews: HashMap::new(),
             pending: HashSet::new(),
+            queued: Default::default(),
+            active: 0,
+            last_previews: HashMap::new(),
+            slot_keys: HashMap::new(),
             tx,
             rx,
             adopt_into: None,
@@ -136,6 +154,7 @@ impl ManagerState {
     pub fn receive(&mut self, ctx: &egui::Context) {
         for (key, result) in self.rx.try_iter().collect::<Vec<_>>() {
             self.pending.remove(&key);
+            self.active = self.active.saturating_sub(1);
             if self.previews.len() > 96 {
                 self.previews.clear();
             }
@@ -154,6 +173,7 @@ impl ManagerState {
             });
             self.previews.insert(key, texture);
         }
+        self.start_previews();
     }
     /// Whether every requested preview has been drawn.
     #[cfg(test)]
@@ -182,9 +202,23 @@ impl ManagerState {
             return Some(found.clone());
         }
         if self.pending.insert(key) {
+            if self.queued.len() >= 96
+                && let Some((old, _, _)) = self.queued.pop_front()
+            {
+                self.pending.remove(&old);
+            }
+            self.queued.push_back((key, request.clone(), ctx.clone()));
+            self.start_previews();
+        }
+        None
+    }
+    fn start_previews(&mut self) {
+        while self.active < 2 {
+            let Some((key, request, wake)) = self.queued.pop_front() else {
+                break;
+            };
+            self.active += 1;
             let tx = self.tx.clone();
-            let wake = ctx.clone();
-            let request = request.clone();
             std::thread::spawn(move || {
                 let result = std::panic::catch_unwind(|| signing::signature_artwork(&request))
                     .map_err(|_| "The preview could not be drawn.".to_string())
@@ -193,7 +227,33 @@ impl ManagerState {
                 wake.request_repaint();
             });
         }
-        None
+    }
+    pub fn preview_for(
+        &mut self,
+        ctx: &egui::Context,
+        slot: &str,
+        request: &DesktopSigningRequest,
+    ) -> Option<PreviewResult> {
+        let key = request_key(request);
+        if let Some(old) = self.slot_keys.insert(slot.into(), key)
+            && old != key
+            && let Some(i) = self.queued.iter().position(|(k, _, _)| *k == old)
+        {
+            self.queued.remove(i);
+            self.pending.remove(&old);
+        }
+        if self.slot_keys.len() > 128 {
+            self.slot_keys.retain(|k, _| k == slot);
+            self.last_previews.retain(|k, _| k == slot);
+        }
+        match self.preview(ctx, request) {
+            Some(Ok(texture)) => {
+                self.last_previews.insert(slot.into(), texture.clone());
+                Some(Ok(texture))
+            }
+            Some(Err(error)) => Some(Err(error)),
+            None => self.last_previews.get(slot).cloned().map(Ok),
+        }
     }
 }
 
@@ -205,6 +265,17 @@ fn request_key(request: &DesktopSigningRequest) -> u64 {
     request.location.hash(&mut h);
     request.show_name.hash(&mut h);
     request.show_date.hash(&mut h);
+    serde_json::to_string(&request.text_style)
+        .unwrap_or_default()
+        .hash(&mut h);
+    request.transform.rotation.to_bits().hash(&mut h);
+    request.transform.image_overlay.hash(&mut h);
+    request.transform.image_opacity.to_bits().hash(&mut h);
+    request
+        .transform
+        .image_insets
+        .map(f32::to_bits)
+        .hash(&mut h);
     format!("{:?}{:?}", request.background, request.layout).hash(&mut h);
     request
         .artwork
@@ -284,6 +355,52 @@ pub(super) fn status(entry: &Entry) -> (String, ui::Tone) {
         Some((_, date)) => (format!("Ready · valid until {date}"), ui::Tone::Success),
         None => ("Ready".into(), ui::Tone::Success),
     }
+}
+
+/// Four independent inside edges, stored as percentages so resizing keeps the composition.
+fn edge_spacing(ui: &mut egui::Ui, id: &str, edges: &mut [f32; 4]) {
+    ui.push_id(id, |ui| {
+        let slider_width = ((ui.available_width() - 12.) / 2. - 120.).clamp(24., 64.);
+        egui::Grid::new("edges")
+            .num_columns(2)
+            .spacing(vec2(12., 4.))
+            .show(ui, |ui| {
+                for (index, label) in [(0, "Left"), (2, "Right"), (1, "Top"), (3, "Bottom")] {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.;
+                        ui.spacing_mut().slider_width = slider_width;
+                        ui.add_sized(vec2(42., 24.), egui::Label::new(label));
+                        ui.add(egui::Slider::new(&mut edges[index], 0. ..=45.).show_value(false))
+                            .on_hover_text(format!("{label} edge spacing"));
+                        egui::ComboBox::from_id_salt(index)
+                            .width(56.)
+                            .selected_text(format!("{:.1}%", edges[index]))
+                            .show_ui(ui, |ui| {
+                                for value in [0., 2., 5., 10., 15., 20., 25., 30., 40., 45.] {
+                                    ui.selectable_value(
+                                        &mut edges[index],
+                                        value,
+                                        format!("{value}%"),
+                                    );
+                                }
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    ui.label("Exact");
+                                    ui.add(
+                                        egui::DragValue::new(&mut edges[index])
+                                            .range(0. ..=45.)
+                                            .speed(0.25)
+                                            .suffix("%"),
+                                    );
+                                });
+                            });
+                    });
+                    if index == 2 || index == 3 {
+                        ui.end_row();
+                    }
+                }
+            });
+    });
 }
 
 /// Paint a preview texture inside `rect`, keeping its proportions.
@@ -690,8 +807,15 @@ impl DigitalState {
             // Quick Sign keeps working with the next signature.
             self.default_signature = self.signatures.first().map(|s| s.id.clone());
         }
-        if self.manager.selected.as_ref().is_none_or(|selected| self.signature(selected).is_none()) {
-            self.manager.selected = self.default_signature.clone()
+        if self
+            .manager
+            .selected
+            .as_ref()
+            .is_none_or(|selected| self.signature(selected).is_none())
+        {
+            self.manager.selected = self
+                .default_signature
+                .clone()
                 .filter(|selected| self.signature(selected).is_some())
                 .or_else(|| self.signatures.first().map(|s| s.id.clone()));
         }
@@ -746,6 +870,54 @@ impl DigitalState {
         self.manager.sign_with = Some(signature.id);
     }
 
+    /// Outside the scrolling form, so adjusting lower controls never hides the result.
+    pub(super) fn pinned_preview(&mut self, ui: &mut egui::Ui, assets: &[Asset], placed: bool) {
+        let signature = self
+            .manager
+            .selected
+            .as_ref()
+            .and_then(|id| self.signature(id))
+            .or_else(|| self.default_signature())
+            .or_else(|| self.signatures.first())
+            .cloned();
+        let Some(signature) = signature else {
+            return;
+        };
+        let mut request = self.signature_request(&signature, assets);
+        if placed {
+            request.rect = self.request.rect;
+            if !self.request.reason.trim().is_empty() {
+                request.reason = self.request.reason.clone();
+            }
+            request.location = self.request.location.clone();
+        }
+        let preview = self
+            .manager
+            .preview_for(ui.ctx(), "pinned_signature", &request);
+        ui.label(
+            RichText::new("Live signature preview")
+                .size(12.)
+                .color(theme::muted()),
+        );
+        let height = (ui.ctx().content_rect().height() * 0.12).clamp(56., 96.);
+        let (rect, response) =
+            ui.allocate_exact_size(vec2(ui.available_width(), height), egui::Sense::hover());
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(egui::Id::new("signature_pinned_preview_rect"), rect)
+        });
+        paint_preview(
+            ui,
+            rect,
+            preview.as_ref(),
+            signature.background == Background::Clear,
+        );
+        if let Some(Err(error)) = preview {
+            response.on_hover_text(error);
+        }
+        ui.separator();
+    }
+
     /// My signatures: cards for each saved signature, then the editor.
     pub(super) fn signatures_panel(
         &mut self,
@@ -753,6 +925,7 @@ impl DigitalState {
         editor: &mut editing::EditorState,
         assets: &[Asset],
         action: &mut Option<Action>,
+        compact: bool,
     ) {
         if self.signatures.is_empty() {
             self.first_signature(ui);
@@ -769,34 +942,66 @@ impl DigitalState {
                 .clone()
                 .or_else(|| self.signatures.first().map(|s| s.id.clone()));
         }
-        ui.label(
+        let ctx = ui.ctx().clone();
+        if compact {
+            let selected_name = self
+                .manager
+                .selected
+                .as_ref()
+                .and_then(|id| self.signature(id))
+                .map(|s| s.name.as_str())
+                .unwrap_or("Signature");
+            egui::ComboBox::from_id_salt("placed_signature_choice")
+                .selected_text(selected_name)
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for signature in self.signatures.clone() {
+                        if ui
+                            .selectable_label(
+                                self.manager.selected.as_ref() == Some(&signature.id),
+                                &signature.name,
+                            )
+                            .clicked()
+                        {
+                            self.save_if_dirty();
+                            self.manager.selected = Some(signature.id);
+                        }
+                    }
+                });
+        } else {
+            ui.label(
             RichText::new("A signature is your digital ID plus how it looks on the page. The one with a star is used by Quick Sign.")
                 .color(theme::muted()),
         );
-        let ctx = ui.ctx().clone();
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(10., 10.);
-            for signature in self.signatures.clone() {
-                let request = self.signature_request(&signature, assets);
-                let preview = self.manager.preview(&ctx, &request);
-                let selected = self.manager.selected.as_ref() == Some(&signature.id);
-                let default = self.default_signature.as_ref() == Some(&signature.id);
-                let ready = self.signer_of(&signature).is_some() && signature.layout().is_some();
-                if signature_card(ui, &signature, preview.as_ref(), default, selected, ready)
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(10., 10.);
+                for signature in self.signatures.clone() {
+                    let request = self.signature_request(&signature, assets);
+                    let preview =
+                        self.manager
+                            .preview_for(&ctx, &format!("card:{}", signature.id), &request);
+                    let selected = self.manager.selected.as_ref() == Some(&signature.id);
+                    let default = self.default_signature.as_ref() == Some(&signature.id);
+                    let ready =
+                        self.signer_of(&signature).is_some() && signature.layout().is_some();
+                    if signature_card(ui, &signature, preview.as_ref(), default, selected, ready)
+                        .clicked()
+                    {
+                        self.save_if_dirty();
+                        self.manager.selected = Some(signature.id.clone());
+                    }
+                }
+                if new_card(ui, vec2(148., 104.), "New signature")
+                    .on_hover_text(
+                        "Create another signature, for example initials or a company stamp",
+                    )
                     .clicked()
                 {
                     self.save_if_dirty();
-                    self.manager.selected = Some(signature.id.clone());
+                    self.add_signature(None);
                 }
-            }
-            if new_card(ui, vec2(148., 104.), "New signature")
-                .on_hover_text("Create another signature, for example initials or a company stamp")
-                .clicked()
-            {
-                self.save_if_dirty();
-                self.add_signature(None);
-            }
-        });
+            });
+        }
         let Some(id) = self.manager.selected.clone() else {
             return;
         };
@@ -806,76 +1011,218 @@ impl DigitalState {
         let mut signature = before.clone();
         let mut typing = false;
         let mut make_default = false;
-        ui::section(ui, "Edit signature", |ui| {
-            ui.spacing_mut().item_spacing.y = 12.;
-            ui::field(ui, "Name", |ui| {
-                ui.horizontal(|ui| {
-                    let response = ui.add(egui::TextEdit::singleline(&mut signature.name)
-                        .desired_width((ui.available_width() - 110.).max(80.))
-                        .hint_text("For example: Work, Initials, Approval").char_limit(80));
-                    typing |= response.has_focus();
-                    if ui.add_enabled(!signature.name.trim().is_empty(), ActionButton::new(Icon::Pen, "Rename")).clicked() {
-                        signature.name = signature.name.trim().to_owned();
-                        response.surrender_focus();
-                        typing = false;
-                    }
-                });
-            });
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                if self.default_signature.as_ref() == Some(&id) {
-                    let (r, _) = ui.allocate_exact_size(vec2(16., 16.), egui::Sense::hover());
-                    ui::draw_icon(ui.painter(), r, Icon::Star, theme::warning());
-                    ui.label(RichText::new("Used by Quick Sign").color(theme::ink()));
-                } else {
-                    make_default = ui
-                        .add(ActionButton::new(Icon::Star, "Use for Quick Sign"))
-                        .on_hover_text("Quick Sign signs with this signature in one step")
-                        .clicked();
-                }
+        ui::section(
+            ui,
+            if compact {
+                "Appearance"
+            } else {
+                "Edit signature"
+            },
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 6.;
+                ui.spacing_mut().slider_width = 120.;
+                egui::CollapsingHeader::new("Saved signature details")
+                    .default_open(!compact)
+                    .show(ui, |ui| {
+                        ui::field(ui, "Name", |ui| {
+                            ui.horizontal(|ui| {
+                                let response = ui.add(
+                                    egui::TextEdit::singleline(&mut signature.name)
+                                        .desired_width((ui.available_width() - 110.).max(80.))
+                                        .hint_text("For example: Work, Initials, Approval")
+                                        .char_limit(80),
+                                );
+                                typing |= response.has_focus();
+                                if ui
+                                    .add_enabled(
+                                        !signature.name.trim().is_empty(),
+                                        ActionButton::new(Icon::Pen, "Rename"),
+                                    )
+                                    .clicked()
+                                {
+                                    signature.name = signature.name.trim().to_owned();
+                                    response.surrender_focus();
+                                    typing = false;
+                                }
+                            });
+                        });
+                        ui.separator();
+                        ui.horizontal_wrapped(|ui| {
+                            if self.default_signature.as_ref() == Some(&id) {
+                                let (r, _) =
+                                    ui.allocate_exact_size(vec2(16., 16.), egui::Sense::hover());
+                                ui::draw_icon(ui.painter(), r, Icon::Star, theme::warning());
+                                ui.label(RichText::new("Used by Quick Sign").color(theme::ink()));
+                            } else {
+                                make_default = ui
+                                    .add(ActionButton::new(Icon::Star, "Use for Quick Sign"))
+                                    .on_hover_text(
+                                        "Quick Sign signs with this signature in one step",
+                                    )
+                                    .clicked();
+                            }
+                        });
 
-            });
-
-            self.signs_with(ui, &mut signature, action);
-            ui::field(ui, "Show on the signature", |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.checkbox(&mut signature.show_name, "Your name");
-                    ui.checkbox(&mut signature.show_date, "Date and time");
-                });
-                if signature.show_name {
-                    let certificate = self.signer_of(&signature).map_or_else(
-                        || "The name in your digital ID".to_owned(),
-                        Entry::signer_name,
-                    );
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Name shown").color(theme::muted()));
-                        typing |= text_field(ui, &mut signature.display_name, &certificate, 200)
-                            .on_hover_text("Leave empty to use the name in your digital ID")
-                            .has_focus();
+                        self.signs_with(ui, &mut signature, action);
                     });
-                }
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Note").color(theme::muted()));
-                    typing |=
-                        text_field(ui, &mut signature.note, "Optional, such as “Approved”", 300)
-                            .has_focus();
+                ui::field(ui, "Show on the signature", |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut signature.show_name, "Your name");
+                        ui.checkbox(&mut signature.show_date, "Date and time");
+                    });
+                    if signature.show_name {
+                        let certificate = self.signer_of(&signature).map_or_else(
+                            || "The name in your digital ID".to_owned(),
+                            Entry::signer_name,
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Name shown").color(theme::muted()));
+                            typing |=
+                                text_field(ui, &mut signature.display_name, &certificate, 200)
+                                    .on_hover_text("Leave empty to use the name in your digital ID")
+                                    .has_focus();
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Note").color(theme::muted()));
+                        typing |= text_field(
+                            ui,
+                            &mut signature.note,
+                            "Optional, such as “Approved”",
+                            300,
+                        )
+                        .has_focus();
+                    });
                 });
-            });
-            ui::field(ui, "Image", |ui| {
+                egui::CollapsingHeader::new("Text appearance & position")
+                    .default_open(compact)
+                    .show(ui, |ui| {
+                        let style = &mut signature.text_style;
+                        ui.spacing_mut().item_spacing = vec2(6., 4.);
+                        ui.spacing_mut().interact_size.y = 24.;
+                        ui.spacing_mut().button_padding.y = 3.;
+                        ui.horizontal_wrapped(|ui| {
+                            egui::ComboBox::from_id_salt("signature_text_family")
+                                .width(130.)
+                                .selected_text(if style.family.is_empty() {
+                                    "Default font"
+                                } else {
+                                    &style.family
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut style.family,
+                                        String::new(),
+                                        "Default font",
+                                    );
+                                    let mut families = std::collections::BTreeSet::new();
+                                    for font in mypdf_milestone0::text_style::fonts() {
+                                        if families.insert(&font.family) {
+                                            ui.selectable_value(
+                                                &mut style.family,
+                                                font.family.clone(),
+                                                &font.family,
+                                            );
+                                        }
+                                    }
+                                });
+                            ui.add(
+                                egui::DragValue::new(&mut style.size)
+                                    .range(6. ..=36.)
+                                    .speed(0.25)
+                                    .suffix(" pt"),
+                            )
+                            .on_hover_text("Font size: drag to adjust or click to type");
+                            ui.menu_button("▾", |ui| {
+                                for size in
+                                    [6., 8., 9., 10., 11., 12., 14., 16., 18., 24., 30., 36.]
+                                {
+                                    if ui
+                                        .selectable_label(style.size == size, format!("{size} pt"))
+                                        .clicked()
+                                    {
+                                        style.size = size;
+                                        ui.close();
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text("Common font sizes");
+                            ui::color_swatch(ui, &mut style.color, "Signature text color");
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.toggle_value(&mut style.bold, RichText::new("B").strong())
+                                .on_hover_text("Bold");
+                            ui.toggle_value(&mut style.italic, RichText::new("I").italics())
+                                .on_hover_text("Italic");
+                            ui.separator();
+                            for (index, label) in ["Left", "Center", "Right"].iter().enumerate() {
+                                ui.selectable_value(&mut style.alignment, index as u8, *label);
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().slider_width = 64.;
+                            ui.label("X").on_hover_text("Horizontal position");
+                            ui.add(
+                                egui::Slider::new(&mut style.offset[0], -100. ..=100.).suffix("%"),
+                            )
+                            .on_hover_text("Horizontal position within the signature box");
+                            ui.label("Y").on_hover_text("Vertical position");
+                            ui.add(
+                                egui::Slider::new(&mut style.offset[1], -100. ..=100.).suffix("%"),
+                            )
+                            .on_hover_text("Vertical position within the signature box");
+                        });
+                        ui.label("Text edge spacing");
+                        edge_spacing(ui, "text_edges", &mut style.insets);
+                    });
+                egui::CollapsingHeader::new("Image artwork").default_open(!compact).show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = vec2(8., 8.);
                     if no_image_card(ui, signature.asset_id.is_none()) {
                         signature.asset_id = None;
                     }
-                    // Newest first: a just-drawn signature is easy to find.
-                    for asset in assets.iter().rev().take(11) {
+                    // General library artwork is only offered when explicitly requested.
+                    for asset in assets.iter().rev().filter(|a| self.is_signature_image(a)) {
                         let selected = signature.asset_id.as_ref() == Some(&asset.id);
                         if artwork_card(ui, editor, asset, selected) {
                             signature.asset_id = Some(asset.id.clone());
                         }
                     }
                 });
+                ui.weak("Saved signature artwork. Choose from library to use another image, stamp or drawing.");
                 ui.horizontal_wrapped(|ui| {
+                    ui.menu_button("Choose from library…", |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(240.)
+                            .show(ui, |ui| {
+                                for asset in assets {
+                                    if ui
+                                        .selectable_label(
+                                            signature.asset_id.as_ref() == Some(&asset.id),
+                                            &asset.name,
+                                        )
+                                        .clicked()
+                                    {
+                                        signature.asset_id = Some(asset.id.clone());
+                                        ui.close();
+                                    }
+                                }
+                                if assets.is_empty() {
+                                    ui.weak("Your library is empty.");
+                                }
+                            });
+                    });
+                    if let Some(asset) = assets
+                        .iter()
+                        .find(|a| signature.asset_id.as_ref() == Some(&a.id))
+                        && ui
+                            .add(ActionButton::new(Icon::Settings, "Manage image…"))
+                            .on_hover_text("Rename or delete this saved image in Ink signatures")
+                            .clicked()
+                    {
+                        self.manage_signature_image(asset);
+                    }
                     if ui
                         .add(ActionButton::new(Icon::Pen, "Draw or type…"))
                         .on_hover_text("Draw your handwritten signature, or type it")
@@ -909,50 +1256,96 @@ impl DigitalState {
                     }
                 });
             });
-            ui::field(ui, "Background", |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(8., 8.);
-                    for background in Background::CHOICES {
-                        if background_tile(ui, background, signature.background == background) {
-                            signature.background = background;
-                        }
-                    }
-                });
-            });
-            ui::field(ui, "Preview", |ui| {
-                if signature.layout().is_none() {
-                    ui::callout(
-                        ui,
-                        ui::Tone::Warning,
-                        "Choose what the signature shows: your name, the date, a note or an image.",
-                    );
-                    return;
+                if signature.asset_id.is_some() {
+                    ui::field(ui, "Image layout", |ui| {
+                        ui.add_enabled_ui(
+                            signature.show_name
+                                || signature.show_date
+                                || !signature.note.trim().is_empty(),
+                            |ui| {
+                                let selected = usize::from(signature.transform.image_overlay);
+                                if let Some(index) =
+                                    ui::segmented(ui, &["Beside details", "Over details"], selected)
+                                {
+                                    signature.transform.image_overlay = index == 1;
+                                }
+                            },
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut signature.transform.image_opacity, 0.0..=1.0)
+                                .text("Image opacity")
+                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.))
+                                .custom_parser(|s| {
+                                    s.trim()
+                                        .trim_end_matches('%')
+                                        .trim()
+                                        .parse::<f64>()
+                                        .ok()
+                                        .map(|v| v / 100.)
+                                }),
+                        );
+                    });
                 }
-                let request = self.signature_request(&signature, assets);
-                let preview = self.manager.preview(&ctx, &request);
-                let [_, _, w, h] = request.rect.unwrap_or([0., 0., 300., 90.]);
-                let width = ui.available_width().min(w * 1.4);
-                let (rect, _) =
-                    ui.allocate_exact_size(vec2(width, width * h / w), egui::Sense::hover());
-                ui.painter().rect_stroke(
-                    rect.expand(1.),
-                    6,
-                    Stroke::new(1., theme::line()),
-                    egui::StrokeKind::Outside,
-                );
-                paint_preview(
-                    ui,
-                    rect,
-                    preview.as_ref(),
-                    signature.background == Background::Clear,
-                );
-                ui.label(
-                    RichText::new("Signing adds the real date and time. You can resize the box when you place it.")
-                        .size(11.5)
-                        .color(theme::muted()),
-                );
-            });
-        });
+                ui.add_enabled_ui(signature.asset_id.is_some(), |ui| {
+                    ui.collapsing("Image rotation & edge spacing", |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add(ActionButton::new(Icon::RotateLeft, "−30°"))
+                                .clicked()
+                            {
+                                signature.transform.rotation =
+                                    (signature.transform.rotation + 150.).rem_euclid(360.) - 180.;
+                            }
+                            if ui
+                                .add(ActionButton::new(Icon::RotateRight, "+30°"))
+                                .clicked()
+                            {
+                                signature.transform.rotation =
+                                    (signature.transform.rotation + 210.).rem_euclid(360.) - 180.;
+                            }
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut signature.transform.rotation,
+                                    -180.0..=180.0,
+                                )
+                                .show_value(false),
+                            );
+                            egui::ComboBox::from_id_salt("image_rotation_presets")
+                                .width(66.)
+                                .selected_text(format!("{:.0}°", signature.transform.rotation))
+                                .show_ui(ui, |ui| {
+                                    for angle in [
+                                        -180., -90., -45., -30., -15., 0., 15., 30., 45., 90., 180.,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut signature.transform.rotation,
+                                            angle,
+                                            format!("{angle}°"),
+                                        );
+                                    }
+                                    ui.separator();
+                                    ui.add(
+                                        egui::DragValue::new(&mut signature.transform.rotation)
+                                            .range(-180. ..=180.)
+                                            .suffix("°"),
+                                    );
+                                });
+                        });
+                        edge_spacing(ui, "image_edges", &mut signature.transform.image_insets);
+                    });
+                });
+                ui::field(ui, "Background", |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = vec2(8., 8.);
+                        for background in Background::CHOICES {
+                            if background_tile(ui, background, signature.background == background) {
+                                signature.background = background;
+                            }
+                        }
+                    });
+                });
+            },
+        );
         editor.text_editing |= typing;
         if signature != before {
             if let Some(slot) = self.signatures.iter_mut().find(|s| s.id == id) {
@@ -960,20 +1353,26 @@ impl DigitalState {
             }
             self.manager.dirty = true;
         }
-        if self.manager.dirty && !typing {
+        if self.manager.dirty && !typing && !ui.input(|i| i.pointer.any_down()) {
             self.commit_signatures();
         }
         if make_default {
             self.make_default(&id);
         }
-
     }
 
     pub(super) fn signature_actions(&mut self, ui: &mut egui::Ui) {
-        let selected = self.manager.selected.clone().filter(|id| self.signature(id).is_some())
+        let selected = self
+            .manager
+            .selected
+            .clone()
+            .filter(|id| self.signature(id).is_some())
             .or_else(|| self.signatures.first().map(|s| s.id.clone()));
         if let Some(id) = selected {
-            if ui.add(ActionButton::new(Icon::Trash, "Delete…").tint(theme::danger())).clicked() {
+            if ui
+                .add(ActionButton::new(Icon::Trash, "Delete…").tint(theme::danger()))
+                .clicked()
+            {
                 self.manager.confirm_delete = Some(id.clone());
             }
             if ui.add(ActionButton::new(Icon::Copy, "Duplicate")).clicked() {
@@ -1592,6 +1991,19 @@ mod tests {
 }
 
 impl DigitalState {
+    fn is_signature_image(&self, asset: &Asset) -> bool {
+        asset.signature
+            || self
+                .signatures
+                .iter()
+                .any(|s| s.asset_id.as_deref() == Some(&asset.id))
+    }
+    fn manage_signature_image(&mut self, asset: &Asset) {
+        self.manager.ink_selected = Some(asset.id.clone());
+        self.manager.ink_name = asset.name.clone();
+        self.manager.ink_delete = false;
+        self.panel = Panel::Ink;
+    }
     pub(in crate::desktop) fn ink_assets(&self, assets: &[Asset]) -> Vec<Asset> {
         let mut choices: Vec<_> = assets
             .iter()
@@ -1613,29 +2025,100 @@ impl DigitalState {
         self.default_ink.as_deref() == Some(id)
     }
 
-    pub(super) fn confirm_ink_delete(&mut self, ctx: &egui::Context, editor: &mut editing::EditorState) {
-        if !self.manager.ink_delete { return; }
-        let asset = editor.library.as_ref().and_then(|l| l.entries.iter().find(|a| Some(&a.id) == self.manager.ink_selected.as_ref())).cloned();
-        let Some(asset) = asset else { self.manager.ink_delete = false; return; };
-        let decision = ui::confirmation(ctx, "delete_ink_signature", &format!("Delete “{}”?", asset.name),
-            "This removes the saved ink signature from your library. Copies already placed in PDFs stay unchanged.",
-            &[("Delete", ui::DialogTone::Destructive), ("Cancel", ui::DialogTone::Secondary)], 1);
+    fn delete_signature_image(
+        &mut self,
+        editor: &mut editing::EditorState,
+        id: &str,
+    ) -> Result<(), String> {
+        let library = editor.library.as_mut().ok_or("Library is unavailable")?;
+        let i = library
+            .entries
+            .iter()
+            .position(|a| a.id == id)
+            .ok_or("The image is no longer in the library")?;
+        let removed = library.entries.remove(i);
+        if let Err(error) = library.save() {
+            library.entries.insert(i, removed);
+            return Err(format!("Could not delete image: {error:#}"));
+        }
+        let previous = (
+            self.signatures.clone(),
+            self.default_ink.clone(),
+            self.asset_id.clone(),
+            self.layout,
+        );
+        for signature in &mut self.signatures {
+            if signature.asset_id.as_deref() == Some(id) {
+                signature.asset_id = None;
+            }
+        }
+        if self.default_ink.as_deref() == Some(id) {
+            self.default_ink = None;
+        }
+        if self.asset_id.as_deref() == Some(id) {
+            self.asset_id = None;
+            self.layout = AppearanceLayout::DetailsOnly;
+        }
+        if let Err(error) = self.save_catalogue() {
+            (
+                self.signatures,
+                self.default_ink,
+                self.asset_id,
+                self.layout,
+            ) = previous;
+            library.entries.insert(i, removed);
+            return match library.save() {
+                Ok(()) => Err(format!(
+                    "Could not update signature designs; image deletion was canceled: {error:#}"
+                )),
+                Err(restore) => Err(format!(
+                    "Could not save signature designs ({error:#}) or restore the image library ({restore:#}). The image is still available in this session."
+                )),
+            };
+        }
+        editor.removed_asset = Some(removed);
+        self.manager.ink_selected = None;
+        Ok(())
+    }
+
+    pub(super) fn confirm_ink_delete(
+        &mut self,
+        ctx: &egui::Context,
+        editor: &mut editing::EditorState,
+    ) {
+        if !self.manager.ink_delete {
+            return;
+        }
+        let asset = editor
+            .library
+            .as_ref()
+            .and_then(|l| {
+                l.entries
+                    .iter()
+                    .find(|a| Some(&a.id) == self.manager.ink_selected.as_ref())
+            })
+            .cloned();
+        let Some(asset) = asset else {
+            self.manager.ink_delete = false;
+            return;
+        };
+        let decision = ui::confirmation(
+            ctx,
+            "delete_ink_signature",
+            &format!("Delete “{}”?", asset.name),
+            "This removes the image from your library and from saved signature designs that use it. Copies already placed in PDFs stay unchanged.",
+            &[
+                ("Delete", ui::DialogTone::Destructive),
+                ("Cancel", ui::DialogTone::Secondary),
+            ],
+            1,
+        );
         if let Some(choice) = decision {
             self.manager.ink_delete = false;
-            if choice == 0 && let Some(library) = &mut editor.library
-                && let Some(i) = library.entries.iter().position(|a| a.id == asset.id) {
-                let removed = library.entries.remove(i);
-                if let Err(e) = library.save() {
-                    library.entries.insert(i, removed);
-                    self.error = Some(format!("{e:#}"));
-                } else {
-                    editor.removed_asset = Some(removed);
-                    self.manager.ink_selected = None;
-                    if self.ink_is_default(&asset.id) {
-                        self.default_ink = None;
-                        if let Err(e) = self.save_catalogue() { self.error = Some(format!("{e:#}")); }
-                    }
-                }
+            if choice == 0
+                && let Err(error) = self.delete_signature_image(editor, &asset.id)
+            {
+                self.error = Some(error);
             }
         }
     }
@@ -1729,11 +2212,13 @@ impl DigitalState {
                         self.error = Some(format!("{e:#}"));
                     }
                 }
-                if ui.add(ActionButton::new(Icon::Trash, "Delete…").tint(theme::danger())).clicked() {
+                if ui
+                    .add(ActionButton::new(Icon::Trash, "Delete…").tint(theme::danger()))
+                    .clicked()
+                {
                     self.manager.ink_delete = true;
                 }
             });
-
         } else {
             ui.weak(
                 "Create your first signature below, or choose artwork already in your library.",
@@ -1763,5 +2248,183 @@ impl DigitalState {
             }
         });
         place
+    }
+}
+
+#[cfg(test)]
+mod image_management_tests {
+    use super::*;
+    use mypdf_milestone0::annotations::{Kind, Style};
+
+    #[test]
+    fn image_choices_exclude_general_artwork_and_management_clears_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = DigitalState::at(temp.path().join("profile"));
+        let mut editor = editing::EditorState::new();
+        editor.library =
+            Some(mypdf_milestone0::assets::Library::open(temp.path().join("library")).unwrap());
+        let unrelated = Asset::new(
+            "Arrow coral",
+            Kind::Line {
+                start: [0., 0.5],
+                end: [1., 0.5],
+                arrow: true,
+            },
+            Style::default(),
+            3.,
+        );
+        let mut ink = Asset::new(
+            "My signature",
+            Kind::Ink {
+                strokes: vec![vec![[0., 0.], [1., 1.]]],
+            },
+            Style::default(),
+            3.,
+        );
+        ink.signature = true;
+        let imported = Asset::new("Company image", Kind::Rectangle, Style::default(), 3.);
+        for asset in [&unrelated, &ink, &imported] {
+            editor.add_asset(asset.clone()).unwrap();
+        }
+        state.signatures = vec![
+            SavedSignature {
+                asset_id: Some(imported.id.clone()),
+                ..Default::default()
+            },
+            SavedSignature {
+                asset_id: Some(imported.id.clone()),
+                ..Default::default()
+            },
+        ];
+        state.default_ink = Some(imported.id.clone());
+        state.asset_id = Some(imported.id.clone());
+        state.save_catalogue().unwrap();
+        assert!(!state.is_signature_image(&unrelated));
+        assert!(state.is_signature_image(&ink));
+        assert!(state.is_signature_image(&imported));
+        state.manage_signature_image(&imported);
+        assert!(state.panel == Panel::Ink);
+        assert_eq!(
+            state.manager.ink_selected.as_deref(),
+            Some(imported.id.as_str())
+        );
+        assert_eq!(state.manager.ink_name, "Company image");
+        let mut renamed = imported.clone();
+        renamed.name = "Company logo".into();
+        editor.add_asset(renamed).unwrap();
+        assert!(
+            state.is_signature_image(
+                editor
+                    .library
+                    .as_ref()
+                    .unwrap()
+                    .entries
+                    .iter()
+                    .find(|a| a.id == imported.id)
+                    .unwrap()
+            )
+        );
+        state
+            .delete_signature_image(&mut editor, &imported.id)
+            .unwrap();
+        let reloaded = DigitalState::at(temp.path().join("profile"));
+        assert!(reloaded.signatures.iter().all(|s| s.asset_id.is_none()));
+        assert!(reloaded.default_ink.is_none() && reloaded.asset_id.is_none());
+        assert!(
+            editor
+                .library
+                .as_ref()
+                .unwrap()
+                .entries
+                .iter()
+                .any(|a| a.id == unrelated.id)
+        );
+        // A second deletion remains possible after the first selected image disappears.
+        state.manage_signature_image(&ink);
+        state.delete_signature_image(&mut editor, &ink.id).unwrap();
+        assert_eq!(editor.library.as_ref().unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn image_deletion_rolls_back_if_signature_catalogue_changed_elsewhere() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = DigitalState::at(temp.path().join("profile"));
+        let mut editor = editing::EditorState::new();
+        editor.library =
+            Some(mypdf_milestone0::assets::Library::open(temp.path().join("library")).unwrap());
+        let asset = Asset::new("Saved ink", Kind::Rectangle, Style::default(), 2.);
+        editor.add_asset(asset.clone()).unwrap();
+        state.signatures = vec![SavedSignature {
+            asset_id: Some(asset.id.clone()),
+            ..Default::default()
+        }];
+        state.save_catalogue().unwrap();
+        std::fs::write(&state.catalogue, b"{}").unwrap();
+        assert!(
+            state
+                .delete_signature_image(&mut editor, &asset.id)
+                .is_err()
+        );
+        assert_eq!(
+            state.signatures[0].asset_id.as_deref(),
+            Some(asset.id.as_str())
+        );
+        let library = mypdf_milestone0::assets::Library::open(temp.path().join("library")).unwrap();
+        assert_eq!(library.entries, vec![asset]);
+    }
+}
+
+#[cfg(test)]
+mod preview_stability_tests {
+    use super::*;
+    #[test]
+    fn edge_spacing_invalidates_both_preview_caches() {
+        let mut request = DesktopSigningRequest::default();
+        let original = request_key(&request);
+        request.transform.image_insets[0] = 12.;
+        assert_ne!(original, request_key(&request));
+        let image = request_key(&request);
+        request.text_style.insets[3] = 15.;
+        assert_ne!(image, request_key(&request));
+    }
+    #[test]
+    fn rapid_changes_keep_last_preview_and_bound_render_workers() {
+        let ctx = egui::Context::default();
+        let mut manager = ManagerState::new();
+        let mut request = DesktopSigningRequest {
+            name: "Preview signer".into(),
+            show_date: false,
+            ..Default::default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let first = loop {
+            manager.receive(&ctx);
+            if let Some(Ok(texture)) = manager.preview_for(&ctx, "editor", &request) {
+                break texture;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        for angle in 1..100 {
+            request.transform.rotation = angle as f32;
+            let Some(Ok(shown)) = manager.preview_for(&ctx, "editor", &request) else {
+                panic!("Preview must never blank while updating")
+            };
+            assert_eq!(shown.id(), first.id());
+            assert!(manager.active <= 2);
+            assert!(
+                manager.queued.len() <= 1,
+                "only the latest unstarted preview should remain"
+            );
+        }
+        while !manager.idle() {
+            manager.receive(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let Some(Ok(latest)) = manager.preview_for(&ctx, "editor", &request) else {
+            panic!("latest preview")
+        };
+        assert_ne!(latest.id(), first.id());
     }
 }

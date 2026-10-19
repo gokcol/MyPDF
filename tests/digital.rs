@@ -97,6 +97,15 @@ async fn custom_appearance_signing_handles_all_page_rotations_and_unicode_metada
         let bytes = source(rotation);
         let request = signing::DesktopSigningRequest {
             field: format!("Rotated{rotation}"),
+            transform: signing::AppearanceTransform {
+                rotation: match rotation {
+                    0 => 0.,
+                    90 => 90.,
+                    180 => -90.,
+                    _ => 37.,
+                },
+                ..Default::default()
+            },
             page: 0,
             rect: Some([170.0, 370.0, 495.0, 490.0]),
             name: "İstanbul Test Signer".into(),
@@ -157,15 +166,15 @@ async fn custom_appearance_signing_handles_all_page_rotations_and_unicode_metada
             .unwrap()
             .into_rgb8();
         // A free page area now contains the signing text. Geometry is in displayed page coordinates.
-        let dark = (390..480)
-            .flat_map(|y| (185..480).map(move |x| (x, y)))
+        let dark = (370..490)
+            .flat_map(|y| (170..495).map(move |x| (x, y)))
             .filter(|&(x, y)| {
                 let p = img.get_pixel(x, y);
                 p[0] < 180 && p[1] < 180 && p[2] < 180
             })
             .count();
         assert!(
-            dark > 100,
+            dark > if rotation == 0 { 100 } else { 25 },
             "Appearance missing at rotation {rotation}: {dark}"
         );
     }
@@ -709,4 +718,214 @@ async fn a_form_signature_field_is_signed_in_place() {
             .await
             .is_err()
     );
+}
+
+#[test]
+fn signature_overlay_opacity_and_rotation_render_inside_the_box() {
+    use mypdf_milestone0::signing::{AppearanceLayout, Background, DesktopSigningRequest};
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbaImage::from_pixel(120, 40, image::Rgba([255, 0, 0, 255]))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let asset =
+        mypdf_milestone0::assets::Asset::from_image_bytes("Ink image", &png.into_inner()).unwrap();
+    let mut request = DesktopSigningRequest {
+        rect: Some([0., 0., 240., 80.]),
+        name: "Example signer".into(),
+        show_date: false,
+        artwork: Some(asset.clone()),
+        background: Background::Clear,
+        ..Default::default()
+    };
+    let render = |request: &DesktopSigningRequest| {
+        image::load_from_memory(&signing::signature_artwork(request).unwrap())
+            .unwrap()
+            .into_rgba8()
+    };
+    let beside = render(&request);
+    request.transform.image_overlay = true;
+    let overlay = render(&request);
+    let right_red = |image: &image::RgbaImage| {
+        image
+            .enumerate_pixels()
+            .filter(|(x, _, p)| *x > image.width() / 2 && p[0] > 220 && p[1] < 30 && p[3] > 220)
+            .count()
+    };
+    assert_eq!(right_red(&beside), 0);
+    assert!(
+        right_red(&overlay) > 1000,
+        "overlay image extends over the details"
+    );
+    assert_eq!(
+        overlay.get_pixel(240, 80).0,
+        [255, 0, 0, 255],
+        "image paints above text"
+    );
+    // Rotating the image must not move or raster-rescale the neighboring details.
+    request.transform.image_overlay = false;
+    request.transform.rotation = 37.;
+    let tilted = render(&request);
+    assert_ne!(beside, tilted);
+    for y in 0..beside.height() {
+        for x in 174..beside.width() {
+            assert_eq!(
+                beside.get_pixel(x, y),
+                tilted.get_pixel(x, y),
+                "details moved at {x},{y}"
+            );
+        }
+    }
+    request.artwork = None;
+    request.layout = AppearanceLayout::DetailsOnly;
+    let details_tilt = render(&request);
+    request.transform.rotation = 0.;
+    assert_eq!(details_tilt, render(&request));
+    request.artwork = Some(asset);
+    request.layout = AppearanceLayout::ImageOnly;
+    request.transform.image_opacity = 0.25;
+    let faded = render(&request);
+    assert!((60..=66).contains(&faded.get_pixel(240, 80)[3]));
+    request.transform.image_opacity = 1.;
+    request.transform.rotation = 90.;
+    let rotated = render(&request);
+    let bounds = rotated
+        .enumerate_pixels()
+        .filter(|(_, _, p)| p[3] > 128)
+        .fold((u32::MAX, u32::MAX, 0, 0), |(l, t, r, b), (x, y, _)| {
+            (l.min(x), t.min(y), r.max(x), b.max(y))
+        });
+    assert!(
+        bounds.3 - bounds.1 > (bounds.2 - bounds.0) * 2,
+        "landscape ink rotates upright: {bounds:?}"
+    );
+    for angle in [-90., 37., -37., 180.] {
+        request.transform.rotation = angle;
+        let image = render(&request);
+        assert_eq!(image.dimensions(), (480, 160));
+        assert!(image.pixels().any(|p| p[3] > 128));
+        assert_eq!(
+            image.get_pixel(0, 0)[3],
+            0,
+            "transparent corners at {angle}"
+        );
+    }
+    for background in [Background::White, Background::Tinted, Background::Framed] {
+        request.background = background;
+        request.transform.rotation = 0.;
+        let upright = render(&request);
+        request.transform.rotation = 37.;
+        let image = render(&request);
+        assert_eq!(
+            image.get_pixel(0, 0),
+            upright.get_pixel(0, 0),
+            "background stays upright"
+        );
+        assert!(image.pixels().any(|p| p[3] == 255));
+    }
+    request.transform.rotation = f32::NAN;
+    assert!(signing::signature_artwork(&request).is_err());
+    request.transform.rotation = 0.;
+    request.transform.image_opacity = 1.1;
+    assert!(signing::signature_artwork(&request).is_err());
+}
+
+#[test]
+fn signature_text_position_color_and_font_are_rendered_independently() {
+    let mut request = signing::DesktopSigningRequest {
+        name: "Orhan Gökçöl".into(),
+        show_date: false,
+        rect: Some([0., 0., 300., 100.]),
+        layout: signing::AppearanceLayout::DetailsOnly,
+        background: signing::Background::Clear,
+        ..Default::default()
+    };
+    let render = |r: &signing::DesktopSigningRequest| {
+        image::load_from_memory(&signing::signature_artwork(r).unwrap())
+            .unwrap()
+            .into_rgba8()
+    };
+    let bounds = |image: &image::RgbaImage| {
+        image
+            .enumerate_pixels()
+            .filter(|(_, _, p)| p[3] > 128)
+            .fold((u32::MAX, u32::MAX, 0, 0), |(l, t, r, b), (x, y, _)| {
+                (l.min(x), t.min(y), r.max(x), b.max(y))
+            })
+    };
+    let original = render(&request);
+    request.text_style.offset = [10., 20.];
+    request.text_style.color = [0.8, 0.1, 0.2];
+    let moved = render(&request);
+    let (a, b) = (bounds(&original), bounds(&moved));
+    assert!(b.0 > a.0 + 40 && b.1 > a.1 + 30, "{a:?} {b:?}");
+    assert!(
+        moved
+            .pixels()
+            .any(|p| p[0] > 180 && p[1] < 60 && p[3] > 200)
+    );
+    request.text_style.bold = true;
+    request.text_style.italic = true;
+    assert_ne!(moved, render(&request));
+    request.text_style.size = 18.;
+    request.text_style.alignment = 2;
+    assert_ne!(moved, render(&request));
+    request.text_style.offset[0] = f32::NAN;
+    assert!(signing::signature_artwork(&request).is_err());
+}
+
+#[test]
+fn signature_inside_edges_keep_text_and_rotated_images_within_their_regions() {
+    let mut request = signing::DesktopSigningRequest {
+        rect: Some([0., 0., 300., 100.]),
+        name: "Example signer".into(),
+        show_date: false,
+        background: signing::Background::Clear,
+        layout: signing::AppearanceLayout::ImageOnly,
+        ..Default::default()
+    };
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbaImage::from_pixel(120, 40, image::Rgba([255, 0, 0, 255]))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    request.artwork =
+        Some(mypdf_milestone0::assets::Asset::from_image_bytes("Ink", &png.into_inner()).unwrap());
+    let render = |r: &signing::DesktopSigningRequest| {
+        image::load_from_memory(&signing::signature_artwork(r).unwrap())
+            .unwrap()
+            .into_rgba8()
+    };
+    let bounds = |image: &image::RgbaImage| {
+        image
+            .enumerate_pixels()
+            .filter(|(_, _, p)| p[3] > 128)
+            .fold((u32::MAX, u32::MAX, 0, 0), |(l, t, r, b), (x, y, _)| {
+                (l.min(x), t.min(y), r.max(x), b.max(y))
+            })
+    };
+    let original = bounds(&render(&request));
+    request.transform.image_insets = [20., 15., 10., 25.];
+    for angle in [0., 30., -30., 137.] {
+        request.transform.rotation = angle;
+        let b = bounds(&render(&request));
+        assert!(
+            b.0 >= 120 && b.1 >= 30 && b.2 <= 540 && b.3 <= 150,
+            "{angle}: {b:?}"
+        );
+        assert_ne!(b, original);
+    }
+    request.artwork = None;
+    request.layout = signing::AppearanceLayout::DetailsOnly;
+    let original = bounds(&render(&request));
+    request.text_style.insets = [20., 15., 10., 25.];
+    let spaced = bounds(&render(&request));
+    assert!(spaced.0 > original.0 + 80 && spaced.1 > original.1 + 20);
+    assert!(spaced.2 < 540 && spaced.3 < 150, "{spaced:?}");
+    request.text_style.insets[0] = f32::NAN;
+    assert!(signing::signature_artwork(&request).is_err());
+    request.text_style.insets = [0.; 4];
+    request.transform.image_insets[2] = 90.;
+    assert!(signing::signature_artwork(&request).is_err());
+    // Pre-existing saved signatures retain their previous spacing.
+    let legacy: signing::AppearanceTransform = serde_json::from_str("{}").unwrap();
+    assert_eq!(legacy.image_insets, [0.; 4]);
 }

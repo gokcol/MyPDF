@@ -577,6 +577,78 @@ pub fn builtin_assets() -> Vec<BuiltinAsset> {
             asset,
         });
     }
+    // Append new artwork so existing built-in IDs (including saved stamp references) stay stable.
+    for (category, name, width, body) in [
+        (
+            "Symbols",
+            "Heart",
+            100.,
+            r##"<path d="M50 86 C35 73 9 55 9 32 C9 10 36 6 50 27 C64 6 91 10 91 32 C91 55 65 73 50 86Z"/>"##,
+        ),
+        (
+            "Symbols",
+            "Flag",
+            100.,
+            r##"<path d="M23 12V91 M25 16 C45 2 57 31 83 16 V58 C57 73 45 44 25 58" fill="none" stroke="#000" stroke-width="7" stroke-linejoin="round" stroke-linecap="round"/>"##,
+        ),
+        (
+            "Symbols",
+            "Lightbulb",
+            100.,
+            r##"<g fill="none" stroke="#000" stroke-width="6" stroke-linecap="round"><path d="M35 68 C35 56 22 53 22 34 A28 28 0 0 1 78 34 C78 53 65 56 65 68Z M36 79H64 M42 90H58 M43 40L50 48L57 40 M50 48V67"/></g>"##,
+        ),
+        (
+            "Symbols",
+            "Target",
+            100.,
+            r##"<g fill="none" stroke="#000" stroke-width="6"><circle cx="50" cy="50" r="39"/><circle cx="50" cy="50" r="23"/></g><circle cx="50" cy="50" r="8"/>"##,
+        ),
+        (
+            "Arrows",
+            "Curved sweep arrow",
+            160.,
+            r##"<path d="M12 82 C20 27 75 13 136 36 M116 12L141 37L111 52" fill="none" stroke="#000" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>"##,
+        ),
+        (
+            "Arrows",
+            "U-turn arrow",
+            160.,
+            r##"<path d="M25 84V44 C25 3 119 3 119 44V73 M95 57L119 84L143 57" fill="none" stroke="#000" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>"##,
+        ),
+        (
+            "Arrows",
+            "Dashed arrow",
+            160.,
+            r##"<path d="M12 50H135" fill="none" stroke="#000" stroke-width="7" stroke-dasharray="13 10"/><path d="M118 27L145 50L118 73" fill="none" stroke="#000" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>"##,
+        ),
+        (
+            "Arrows",
+            "Tapered arrow",
+            160.,
+            r##"<path d="M8 50L114 39L109 17L152 50L109 83L114 61Z"/>"##,
+        ),
+        (
+            "Arrows",
+            "Split arrow",
+            160.,
+            r##"<path d="M12 50H65 Q80 50 93 33L136 17 M65 50Q80 50 93 67L136 83 M114 12L142 15L134 41 M114 88L142 85L134 59" fill="none" stroke="#000" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>"##,
+        ),
+    ] {
+        let source = format!(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} 100">{body}</svg>"##
+        );
+        let mut asset = Asset::new(
+            name,
+            Kind::Svg { source, tint: true },
+            Style {
+                color: [0.12, 0.46, 0.83],
+                ..Default::default()
+            },
+            width / 100.,
+        );
+        asset.id = format!("b27a{:028x}", out.len());
+        out.push(BuiltinAsset { category, asset });
+    }
     out
 }
 fn stamp_width(text: &str) -> f32 {

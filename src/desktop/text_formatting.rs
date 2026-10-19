@@ -210,17 +210,25 @@ pub(super) fn panel(
                 .selected_text("Common sizes")
                 .width((ui.available_width() - 80.).max(90.))
                 .show_ui(ui, |ui| {
-                    for value in [6., 8., 9., 10., 10.5, 11., 12., 14., 16., 18., 20., 24., 28., 32., 36., 48., 60., 72., 96., 144.] {
+                    for value in [
+                        6., 8., 9., 10., 10.5, 11., 12., 14., 16., 18., 20., 24., 28., 32., 36.,
+                        48., 60., 72., 96., 144.,
+                    ] {
                         ui.selectable_value(size, value, format!("{value} pt"));
                     }
                 });
-            for (icon, label, delta) in [(Icon::Minus, "Decrease font size", -1.), (Icon::Plus, "Increase font size", 1.)] {
+            for (icon, label, delta) in [
+                (Icon::Minus, "Decrease font size", -1.),
+                (Icon::Plus, "Increase font size", 1.),
+            ] {
                 if control(ui, label, ActionButton::new(icon, label).compact()).clicked() {
                     *size = (*size + delta).clamp(4., 144.);
                 }
             }
         });
-        if *size != old_size { changes.push(Change::Size(*size)); }
+        if *size != old_size {
+            changes.push(Change::Size(*size));
+        }
         ui.horizontal(|ui| {
             if control(
                 ui,
