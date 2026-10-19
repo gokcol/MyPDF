@@ -828,7 +828,7 @@ impl Viewer {
             #[cfg(target_os="windows")]
             ui.small("CTranslate2 · Offline language packs");
             ui.add_space(8.);
-            egui::ScrollArea::vertical().id_salt("translation_scroll").show(ui, |ui| {
+            let _scroll = egui::ScrollArea::vertical().id_salt("translation_scroll").show(ui, |ui| {
                 if let Some(message) = &state.unsupported { ui.label(message); ui.separator(); }
                 let old_pair = (state.preferences.source.clone(), state.preferences.target.clone());
                 let available = state.unsupported.is_none() && !state.languages.is_empty();
@@ -959,6 +959,8 @@ impl Viewer {
                 #[cfg(target_os="macos")]
                 ui.small("Apple may collect language/usage metrics, but not the original or translated text. Language downloads require internet.");
             });
+            #[cfg(test)]
+            ctx.data_mut(|data| data.insert_temp(egui::Id::new("translation_scroll_viewport"), _scroll.inner_rect));
         });
         if translate_selection {
             self.translate_selection(ctx);
@@ -1170,7 +1172,15 @@ mod tests {
             frame(
                 &mut app,
                 vec![
-                    egui::Event::PointerMoved(pos2(1190., 150.)),
+                    // Scroll inside the actual content viewport, not the panel's
+                    // outer margin (which differs across platform styles).
+                    egui::Event::PointerMoved({
+                        let viewport = ctx.data(|data| {
+                            data.get_temp::<Rect>(egui::Id::new("translation_scroll_viewport"))
+                                .expect("translation scroll viewport")
+                        });
+                        viewport.left_top() + vec2(4., 4.)
+                    }),
                     egui::Event::MouseWheel {
                         unit: egui::MouseWheelUnit::Point,
                         delta: vec2(0., -100.),
