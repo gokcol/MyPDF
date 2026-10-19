@@ -313,7 +313,11 @@ const COMMANDS: &[(&str, &str, &str)] = &[
         "draw sign handwriting",
     ),
     ("Digital signature", "sign", "certificate keychain sign"),
-    ("Settings", "settings", "preferences signatures ink digital rename delete default"),
+    (
+        "Settings",
+        "settings",
+        "preferences signatures ink digital rename delete default",
+    ),
     ("Recognize text (OCR)", "ocr", "scan searchable"),
     ("Watermark", "watermark", "background"),
     ("Header and footer", "hf_text", "page numbering"),

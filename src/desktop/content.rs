@@ -2268,12 +2268,16 @@ fn selected_block(
 
 /// Keep indentation and paragraph-gap proportions when changing baseline spacing.
 fn scale_line_spacing(layout: &mut [mypdf_milestone0::rich_text::LineLayout], spacing: f32) {
-    if layout.len() < 2 || !spacing.is_finite() || spacing <= 0. { return; }
+    if layout.len() < 2 || !spacing.is_finite() || spacing <= 0. {
+        return;
+    }
     let first = layout[0].baseline;
     let old = (layout.last().unwrap().baseline - first) / (layout.len() - 1) as f32;
-    if old <= 0. { return; }
+    if old <= 0. {
+        return;
+    }
     for line in layout {
-        line.baseline = first + (line.baseline-first) * spacing / old;
+        line.baseline = first + (line.baseline - first) * spacing / old;
     }
 }
 
@@ -3210,23 +3214,49 @@ mod tests {
     use super::*;
     #[test]
     fn spacing_adjustment_preserves_indents_and_is_written_to_pdf() {
-        use mypdf_milestone0::{rich_text::{self, LineLayout}, text_geometry};
+        use mypdf_milestone0::{
+            rich_text::{self, LineLayout},
+            text_geometry,
+        };
         let text = "First line\nSecond line\nThird line";
         let mut layout = vec![
-            LineLayout { start: 0, left: 0., baseline: 20. },
-            LineLayout { start: 11, left: 12., baseline: 40. },
-            LineLayout { start: 23, left: 0., baseline: 80. },
+            LineLayout {
+                start: 0,
+                left: 0.,
+                baseline: 20.,
+            },
+            LineLayout {
+                start: 11,
+                left: 12.,
+                baseline: 40.,
+            },
+            LineLayout {
+                start: 23,
+                left: 0.,
+                baseline: 80.,
+            },
         ];
         scale_line_spacing(&mut layout, 45.);
-        assert_eq!(layout.iter().map(|l| l.baseline).collect::<Vec<_>>(), vec![20., 50., 110.]);
+        assert_eq!(
+            layout.iter().map(|l| l.baseline).collect::<Vec<_>>(),
+            vec![20., 50., 110.]
+        );
         assert_eq!(layout[1].left, 12.);
         let spans = vec![formatting::span(0, 12., [0.; 3], text.len())];
-        let pdf = rich_text::add_positioned(&convert::blank(595.,842.).unwrap(), 1, text, [40.,60.,400.,150.], &spans, &layout).unwrap();
+        let pdf = rich_text::add_positioned(
+            &convert::blank(595., 842.).unwrap(),
+            1,
+            text,
+            [40., 60., 400., 150.],
+            &spans,
+            &layout,
+        )
+        .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("spacing.pdf");
         std::fs::write(&path, pdf).unwrap();
         let reopened = text_geometry::runs(&std::fs::read(path).unwrap(), 1).unwrap();
-        for (run, expected) in reopened.iter().zip([80.,110.,170.]) {
+        for (run, expected) in reopened.iter().zip([80., 110., 170.]) {
             assert!((run.layout.as_ref().unwrap().origin[1] - expected).abs() < 0.1);
         }
         assert_eq!(reopened.len(), 3);

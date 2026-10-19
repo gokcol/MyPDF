@@ -26,9 +26,19 @@ pub(super) struct TabSignatures {
     pub views: Option<Overview>,
     pub selected: Option<String>,
     pub panel: bool,
+    panel_context: Option<(editing::Mode, editing::Tool, Option<String>)>,
     certificates: HashSet<String>,
 }
 impl TabSignatures {
+    pub(super) fn show_panel(&mut self, open: bool) {
+        self.panel = open;
+        self.panel_context = None;
+    }
+
+    pub(super) fn no_active_signatures(&self) -> bool {
+        matches!(&self.views, Some(Ok(views)) if views.iter().all(|v| !v.field.signed))
+    }
+
     fn signed(&self) -> Vec<&SignatureView> {
         match &self.views {
             Some(Ok(views)) => views.iter().filter(|v| v.field.signed).collect(),
@@ -171,7 +181,7 @@ pub(super) fn page_overlay(
     }
     if let Some(name) = clicked {
         tab.signatures.selected = Some(name);
-        tab.signatures.panel = true;
+        tab.signatures.show_panel(true);
     }
 }
 
@@ -249,8 +259,13 @@ impl Viewer {
         if let Some(rx) = &tab.signatures.job
             && let Ok(overview) = rx.try_recv()
         {
+            let had_active_signatures = !tab.signatures.signed().is_empty();
             tab.signatures.views = Some(overview);
             tab.signatures.job = None;
+            if had_active_signatures && tab.signatures.no_active_signatures() {
+                tab.signatures.panel = false;
+                tab.signatures.panel_context = None;
+            }
         }
         if !(tab.signed || tab.signed_original.is_some()) || tab.signatures.job.is_some() {
             return;
@@ -317,7 +332,7 @@ impl Viewer {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
-        if !(tab.signed || tab.signed_original.is_some()) {
+        if !(tab.signed || tab.signed_original.is_some()) || tab.signatures.no_active_signatures() {
             return;
         }
         let unlocked = tab.signed_original.is_some();
@@ -333,7 +348,7 @@ impl Viewer {
         let message = match (&tab.signatures.views, signed.as_slice()) {
             (None, _) => "Checking signatures…".to_owned(),
             (Some(Err(e)), _) => format!("Signatures could not be checked: {e}"),
-            (Some(Ok(_)), []) => "No applied signatures remain".to_owned(),
+            (Some(Ok(_)), []) => "No active digital signatures".to_owned(),
             (Some(Ok(_)), [one]) => format!(
                 "Signed by {} · {}",
                 signer_name(one),
@@ -375,7 +390,10 @@ impl Viewer {
                     ui.label(RichText::new(message).size(12.5).color(theme::ink()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         toggle = ui
-                            .add(ActionButton::new(Icon::Shield, "Signature panel").selected(tab.signatures.panel))
+                            .add(
+                                ActionButton::new(Icon::Shield, "Signature panel")
+                                    .selected(tab.signatures.panel),
+                            )
                             .clicked();
                         if unlocked {
                             ui.label(
@@ -385,18 +403,47 @@ impl Viewer {
                             );
                         } else {
                             unlock = ui
-                                .add(ActionButton::new(Icon::Pen, "Edit anyway…"))
-                                .on_hover_text("Edit this signed PDF; signatures stay valid for what they signed")
+                                .add(ActionButton::new(Icon::Pen, "Enable editing…"))
+                                .on_hover_text(
+                                    "Enable document editing; changes are saved as a new revision",
+                                )
                                 .clicked();
                         }
                     });
                 });
             });
         if toggle {
-            tab.signatures.panel = !tab.signatures.panel;
+            tab.signatures.show_panel(!tab.signatures.panel);
         }
         if unlock {
             self.signature_prompt = Some(Prompt::Unlock(tab.id));
+        }
+    }
+
+    /// Signature details yield to the next editing task instead of owning the inspector.
+    pub(super) fn sync_signature_panel(&mut self) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if !tab.signatures.panel {
+            tab.signatures.panel_context = None;
+            return;
+        }
+        let context = (
+            self.editor.mode,
+            self.editor.tool,
+            tab.selected_annotation.clone(),
+        );
+        if tab
+            .signatures
+            .panel_context
+            .as_ref()
+            .is_some_and(|old| old != &context)
+        {
+            tab.signatures.panel = false;
+            tab.signatures.panel_context = None;
+        } else {
+            tab.signatures.panel_context = Some(context);
         }
     }
 
@@ -412,6 +459,7 @@ impl Viewer {
             return;
         };
         let mut close = false;
+        let mut unlock = false;
         let mut jump = None;
         let mut trust = None;
         let mut export = None;
@@ -432,6 +480,9 @@ impl Viewer {
                             .clicked();
                     });
                 });
+                if tab.signed_original.is_none() && tab.signed {
+                    unlock = ui.add(ActionButton::new(Icon::Pen, "Enable editing…")).clicked();
+                }
                 egui::ScrollArea::vertical().id_salt("signature_details").show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 8.;
                     let state = &mut tab.signatures;
@@ -633,6 +684,9 @@ impl Viewer {
         if close {
             tab.signatures.panel = false;
         }
+        if unlock {
+            self.signature_prompt = Some(Prompt::Unlock(tab_id));
+        }
         if let Some(page) = jump {
             tab.jump(page);
         }
@@ -706,14 +760,20 @@ impl Viewer {
     }
 
     pub(super) fn signature_dialogs(&mut self, ctx: &egui::Context) {
+        let no_active = matches!(self.signature_prompt.as_ref(), Some(Prompt::Unlock(id))
+            if self.tabs.iter().find(|tab| tab.id == *id).is_some_and(|tab| tab.signatures.no_active_signatures()));
         match self.signature_prompt.take() {
             Some(Prompt::Unlock(id)) => match ui::confirmation(
                 ctx,
                 "unlock_signed_pdf",
-                "Edit this signed PDF?",
-                "Your changes are saved after the signed version, so each signature stays valid for what it signed. Readers will show that the document changed after signing.",
+                "Enable editing?",
+                if no_active {
+                    "This PDF has no active digital signatures, but retains earlier signature data. Your changes will be saved as a new revision, keeping the earlier file history intact."
+                } else {
+                    "Your changes are saved after the signed version. Existing signatures cover the earlier revision, not your new edits. Readers will show that the document changed after signing."
+                },
                 &[
-                    ("Edit Anyway", ui::DialogTone::Primary),
+                    ("Enable Editing", ui::DialogTone::Primary),
                     ("Cancel", ui::DialogTone::Secondary),
                 ],
                 1,
@@ -758,8 +818,7 @@ impl Viewer {
                 tab.bytes = None;
                 tab.refresh_document(ctx);
                 self.status = Some((
-                    "Editing a signed PDF • Save appends your changes after the signed version"
-                        .into(),
+                    "Editing enabled • Save appends your changes as a new revision".into(),
                     false,
                 ));
             }
@@ -995,8 +1054,185 @@ mod tests {
         let saved = Inputs::of(&app.tabs[0]).unwrap().effective().unwrap();
         assert!(saved.starts_with(&signed));
         assert!(signing::verify(&saved, None).unwrap().is_empty());
+        assert!(app.tabs[0].signatures.no_active_signatures());
+        assert!(
+            !app.tabs[0].signatures.panel,
+            "Removing the last signature closes its inspector"
+        );
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let before = ctx.available_rect();
+            app.signature_bar(ctx);
+            assert_eq!(
+                ctx.available_rect(),
+                before,
+                "No empty signature bar consumes page space"
+            );
+        });
         assert!(text(&saved).iter().any(|t| t == "Approved with changes"));
         app.editor_undo(false);
         until(&mut app, &|a| first(a) == Some((true, true, false)));
+        assert!(!app.tabs[0].signatures.no_active_signatures());
+    }
+
+    #[test]
+    fn unknown_or_failed_signature_checks_are_not_treated_as_unsigned() {
+        let mut state = TabSignatures::default();
+        assert!(!state.no_active_signatures());
+        state.views = Some(Err("Check failed".into()));
+        assert!(!state.no_active_signatures());
+        state.views = Some(Ok(vec![]));
+        assert!(state.no_active_signatures());
+    }
+    #[test]
+    fn signature_divider_click_and_drag_settle_without_layout_oscillation() {
+        for pixels_per_point in [1., 2.] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(pixels_per_point);
+            let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+            app.new_blank(&ctx);
+            let frame = |app: &mut Viewer, events: Vec<egui::Event>| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1200., 800.))),
+                        events,
+                        max_texture_side: Some(8192),
+                        ..Default::default()
+                    },
+                    |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+                )
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.tabs[0].session.is_none() {
+                frame(&mut app, vec![]);
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            app.tabs[0].signed = true;
+            app.tabs[0].signatures.views = Some(Ok(vec![]));
+            app.tabs[0].signatures.panel = true;
+            app.editor.mode = editing::Mode::Sign;
+            for _ in 0..5 {
+                frame(&mut app, vec![]);
+            }
+            let id = egui::Id::new("signature_panel").with("__resize");
+            let rect = || ctx.read_response(id).unwrap().rect;
+            let start = rect().center();
+            // The page scrollbar is immediately beside the resize handle.
+            for dx in [-8., -4., -1., 0., 1., 4., 8.] {
+                frame(
+                    &mut app,
+                    vec![egui::Event::PointerMoved(start + vec2(dx, 0.))],
+                );
+                let mut samples = Vec::new();
+                for _ in 0..40 {
+                    let output = frame(&mut app, vec![]);
+                    let tab = &app.tabs[0];
+                    samples.push((
+                        tab.document_view.unwrap(),
+                        output.platform_output.cursor_icon,
+                    ));
+                }
+                assert!(
+                    samples[10..].windows(2).all(|p| p[0] == p[1]),
+                    "Hover {dx} oscillated: {samples:?}"
+                );
+            }
+            for movement in [0., -40., 55.] {
+                let start = if movement == 0. {
+                    start
+                } else {
+                    rect().center()
+                };
+                frame(&mut app, vec![egui::Event::PointerMoved(start)]);
+                frame(
+                    &mut app,
+                    vec![egui::Event::PointerButton {
+                        pos: start,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+                let end = start + vec2(movement, 0.);
+                frame(&mut app, vec![egui::Event::PointerMoved(end)]);
+                let mut positions = Vec::new();
+                for _ in 0..16 {
+                    frame(&mut app, vec![]);
+                    positions.push(rect().center().x);
+                }
+                assert!(
+                    positions.windows(2).all(|p| (p[0] - p[1]).abs() < 0.1),
+                    "Held divider oscillated: {positions:?}"
+                );
+                frame(
+                    &mut app,
+                    vec![egui::Event::PointerButton {
+                        pos: end,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+                positions.clear();
+                for _ in 0..16 {
+                    frame(&mut app, vec![]);
+                    positions.push(rect().center().x);
+                }
+                assert!(
+                    positions.windows(2).all(|p| (p[0] - p[1]).abs() < 0.1),
+                    "Released divider oscillated: {positions:?}"
+                );
+                assert!(
+                    (rect().center().x - end.x).abs() <= 1.,
+                    "The divider must still follow a deliberate drag"
+                );
+            }
+        }
+    }
+    #[test]
+    fn signature_inspector_yields_to_mode_tool_and_object_selection() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        app.active = 0;
+        app.tabs[0].signed = true;
+        for change in 0..3 {
+            app.tabs[0].signatures.panel = true;
+            app.sync_signature_panel();
+            app.sync_signature_panel();
+            assert!(
+                app.signature_panel_open(),
+                "An unchanged context keeps explicit signature inspection open"
+            );
+            match change {
+                0 => app.editor.mode = editing::Mode::Draw,
+                1 => app.editor.tool = editing::Tool::Arrow,
+                _ => app.tabs[0].selected_annotation = Some("selected-arrow".into()),
+            }
+            app.sync_signature_panel();
+            assert!(!app.signature_panel_open());
+        }
+        app.tabs[0].signatures.panel = true;
+        app.sync_signature_panel();
+        assert!(
+            app.signature_panel_open(),
+            "Signature details can be reopened explicitly in any mode"
+        );
+        selection::set(
+            &mut app.tabs[0],
+            &mut app.editor,
+            vec!["selected-arrow".into()],
+        );
+        assert!(
+            !app.signature_panel_open(),
+            "Reselecting the same object also shows its properties"
+        );
+        app.tabs[0].signatures.show_panel(true);
+        app.editor.tool = editing::Tool::Select;
+        app.sync_signature_panel();
+        assert!(
+            app.signature_panel_open(),
+            "Explicit inspection establishes a fresh context"
+        );
     }
 }

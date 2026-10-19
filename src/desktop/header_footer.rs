@@ -158,7 +158,7 @@ impl Viewer {
         if !tab.session.as_ref().is_some_and(|s| s.editable) {
             self.status = Some((
                 if tab.signed {
-                    "This PDF is signed. Choose “Edit anyway…” in the signature bar first."
+                    "This PDF is signed. Choose “Enable editing…” in the signature bar first."
                 } else {
                     "This PDF is read-only."
                 }

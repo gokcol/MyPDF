@@ -29,6 +29,7 @@ mod review;
 mod save;
 mod selection;
 mod shrink;
+mod sign_tools;
 mod signatures;
 mod styles;
 mod text_selection;
@@ -308,6 +309,7 @@ pub struct Viewer {
     organizer: organize::Organizer,
     editor: editing::EditorState,
     digital: digital::DigitalState,
+    sign_tools: sign_tools::State,
     tabs: Vec<Tab>,
     active: usize,
     tab_revealed: Option<u64>,
@@ -380,6 +382,7 @@ impl Viewer {
             organizer: organize::Organizer::new(),
             editor: editing::EditorState::new(),
             digital: digital::DigitalState::new(),
+            sign_tools: sign_tools::State::default(),
             tabs: vec![],
             active: 0,
             tab_revealed: None,
@@ -751,6 +754,7 @@ impl Viewer {
             return;
         }
         match action {
+            "translation" => self.open_translation_panel(),
             "translate_selection" => self.translate_selection(ctx),
             "translate_page" => self.translate_page(ctx),
             "translation_languages" => self.translation_languages(ctx),
@@ -779,6 +783,14 @@ impl Viewer {
                 self.digital.open = true;
                 self.digital.panel = digital::Panel::Identities;
             }
+            "sign_manage" => {
+                self.workbench.paste = None;
+                self.editor.signature_open = false;
+                self.editor.pending_sign_rect = None;
+                self.editor.select_tool(editing::Tool::Select);
+                self.action("settings", ctx);
+            }
+            "sign_ink" | "sign_digital" | "sign_quick" => self.signing_ribbon_action(action),
             "quick_sign" => self.quick_sign(),
             "edit_text" | "edit_images" => {
                 self.editor.mode = editing::Mode::Edit;
@@ -1352,8 +1364,15 @@ impl Viewer {
                     {
                         action = Some("open");
                     }
-                    if ui.add(ActionButton::new(Icon::Settings, "Settings").compact())
-                        .on_hover_text(if cfg!(target_os = "macos") { "Settings · ⌘," } else { "Settings · Ctrl+," }).clicked() {
+                    if ui
+                        .add(ActionButton::new(Icon::Settings, "Settings").compact())
+                        .on_hover_text(if cfg!(target_os = "macos") {
+                            "Settings · ⌘,"
+                        } else {
+                            "Settings · Ctrl+,"
+                        })
+                        .clicked()
+                    {
                         action = Some("settings");
                     }
                     if let Some(choice) = ui::theme_menu(ui) {
@@ -1378,12 +1397,13 @@ impl Viewer {
             )
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.x = 4.;
-                const MODES: [(editing::Mode, Icon, &str); 7] = [
+                const MODES: [(editing::Mode, Icon, &str); 8] = [
                     (editing::Mode::Read, Icon::Read, "Read"),
                     (editing::Mode::Annotate, Icon::Pen, "Annotate"),
                     (editing::Mode::Edit, Icon::Text, "Edit"),
                     (editing::Mode::Draw, Icon::Shapes, "Draw"),
                     (editing::Mode::Forms, Icon::Form, "Forms"),
+                    (editing::Mode::Sign, Icon::Sign, "Sign"),
                     (editing::Mode::Pages, Icon::Library, "Pages"),
                     (editing::Mode::Convert, Icon::Export, "Export"),
                 ];
@@ -1402,8 +1422,8 @@ impl Viewer {
                         + 6.
                 };
                 let full = ui.available_width();
-                // File actions (left) and panel toggles (right) need about 290 points.
-                let compact = full < track_width(ui, false) + 320.;
+                // Reserve space for file actions and the search, translation and panel controls.
+                let compact = full < track_width(ui, false) + 356.;
                 ui.horizontal(|ui| {
                     for (icon, label, key) in [
                         (Icon::Blank, "New blank PDF", "new"),
@@ -1428,7 +1448,7 @@ impl Viewer {
                     let used = ui.min_rect().width();
                     let track = track_width(ui, compact);
                     let centered = (full - track) / 2. - used;
-                    let room = full - track - used - 150.;
+                    let room = full - track - used - 186.;
                     ui.add_space(centered.min(room).max(8.));
                     ui::segment_track(ui, |ui| {
                         for (mode, icon, label) in MODES {
@@ -1442,6 +1462,9 @@ impl Viewer {
                             {
                                 self.editor.mode = mode;
                                 self.editor.library_open = false;
+                                if let Some(tab) = self.tabs.get_mut(self.active) {
+                                    tab.signatures.panel = false;
+                                }
                             }
                         }
                     });
@@ -1471,6 +1494,17 @@ impl Viewer {
                             .clicked()
                         {
                             self.sidebar = !self.sidebar;
+                        }
+                        if ui
+                            .add(
+                                ActionButton::new(Icon::Translate, "Translate")
+                                    .compact()
+                                    .selected(self.translation.open),
+                            )
+                            .on_hover_text("Translate text or the current page on this device")
+                            .clicked()
+                        {
+                            action = Some("translation");
                         }
                         if ui
                             .add(ActionButton::new(Icon::Search, "Find").compact())
@@ -1620,17 +1654,17 @@ impl Viewer {
                         ui.label(RichText::new(label).size(11.5).color(theme::muted())).on_hover_text(if s.dirty() { "Your PDF has unsaved changes. Save writes a new PDF and switches to it; Save a Copy exports without changing this document." } else { "No unsaved document changes." });
                     }
                     if let Some(tab) = self.tabs.get_mut(self.active) {
-                        if tab.signed_original.is_some() {
+                        if tab.signed_original.is_some() && !tab.signatures.no_active_signatures() {
                             let pill = pill(ui, "Signed · editing", theme::warning())
                                 .on_hover_text("Edits are saved after the signed version, so signatures stay valid for what they signed. Click for signature details.");
                             if pill.interact(egui::Sense::click()).clicked() {
-                                tab.signatures.panel = true;
+                                tab.signatures.show_panel(true);
                             }
-                        } else if tab.signed {
+                        } else if tab.signed && !tab.signatures.no_active_signatures() {
                             let pill = pill(ui, "Signed PDF", theme::success())
-                                .on_hover_text("Existing digital signatures are preserved. Use “Edit anyway…” in the signature bar to edit. Click for signature details.");
+                                .on_hover_text("Existing digital signatures are preserved. Use “Enable editing…” in the signature bar to edit. Click for signature details.");
                             if pill.interact(egui::Sense::click()).clicked() {
-                                tab.signatures.panel = true;
+                                tab.signatures.show_panel(true);
                             }
                         } else if let Some(warning) = &tab.editing_warning {
                             pill(ui, "Read-only", theme::muted()).on_hover_text(warning);
@@ -1789,9 +1823,12 @@ impl Viewer {
         });
     }
     fn document(&mut self, ctx: &egui::Context) {
+        let preview = self.live_signature_preview(ctx);
         let mut error_action = None;
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::canvas()))
+            // Keep scrollbars and canvas hit testing clear of side-panel resize handles.
+            // The handles extend 5 pt into the canvas; scroll contents also have a clip margin.
+            .frame(egui::Frame::new().fill(theme::canvas()).inner_margin(egui::Margin::symmetric(8, 0)))
             .show(ctx, |ui| {
                 let Some(tab) = self.tabs.get_mut(self.active) else {
                     ui.vertical_centered(|ui| {
@@ -2051,6 +2088,15 @@ impl Viewer {
                         {
                             signatures::page_overlay(tab, ui, page, page_rect, scale);
                         }
+                        if let Some((target, target_page, [l, t, r, b], texture)) = &preview
+                            && *target == tab.id && *target_page == page {
+                            let rect = Rect::from_min_max(
+                                page_rect.min + vec2(*l, *t) * scale,
+                                page_rect.min + vec2(*r, *b) * scale);
+                            ui.painter().with_clip_rect(ui.clip_rect().intersect(page_rect)).image(
+                                texture.id(), rect, Rect::from_min_max(pos2(0., 0.), pos2(1., 1.)), Color32::WHITE);
+                            ui.painter().rect_stroke(rect, 0., Stroke::new(1., theme::accent()), egui::StrokeKind::Outside);
+                        }
                         workbench::reveal_overlay(&self.workbench,tab,ui,page,page_rect,scale);
                         if let Some(target) = navigate::link_overlay(tab, self.editor.mode, ui, page, page_rect, scale) {
                             follow = Some(target);
@@ -2215,6 +2261,7 @@ impl eframe::App for Viewer {
             self.signature_bar(ctx);
             self.workbench_bar(ctx);
         }
+        self.sync_signature_panel();
         self.sync_status_context();
         if let Some((status, true)) = &self.status {
             let status = status.clone();
@@ -2233,7 +2280,12 @@ impl eframe::App for Viewer {
             }
         }
         self.note_reader_requests(ctx);
-        let translation_visible = self.translation.open
+        let digital_docked = self.digital_docked();
+        if digital_docked {
+            self.digital_window(ctx);
+        }
+        let translation_visible = !digital_docked
+            && self.translation.open
             && self.inspector
             && self.zen.is_none()
             && self.comparison.is_none();
@@ -2255,10 +2307,16 @@ impl eframe::App for Viewer {
             }
             self.page_overview(ctx);
         } else {
-            self.sidebar(ctx);
-            if self.signature_panel_open() && !translation_visible {
+            if !digital_docked || ctx.available_rect().width() > 650. {
+                self.sidebar(ctx);
+            }
+            if self.signature_panel_open() && !translation_visible && !digital_docked {
                 self.signature_panel(ctx);
-            } else if self.inspector && self.workbench.crop.is_none() && !translation_visible {
+            } else if self.inspector
+                && self.workbench.crop.is_none()
+                && !translation_visible
+                && !digital_docked
+            {
                 if self.editor.mode == editing::Mode::Edit && self.redaction.active {
                     self.redaction_panel(ctx);
                 } else if self.editor.mode == editing::Mode::Forms {
@@ -2295,7 +2353,9 @@ impl eframe::App for Viewer {
         self.page_dialogs(ctx);
         self.digital_events(ctx);
         self.editor_windows(ctx);
-        self.digital_window(ctx);
+        if !digital_docked {
+            self.digital_window(ctx);
+        }
         self.background_window(ctx);
         self.image_region_window(ctx);
         self.workbench_windows(ctx);
@@ -2713,13 +2773,18 @@ mod tests {
     }
 
     #[test]
-    fn main_ribbon_leaves_signing_in_context_menu() {
+    fn main_ribbon_offers_signing_tab() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
         app.new_blank(&ctx);
         until(&mut app, &ctx, |a| a.tabs[0].session.is_some());
-        for mode in [editing::Mode::Read, editing::Mode::Annotate, editing::Mode::Edit, editing::Mode::Draw] {
+        for mode in [
+            editing::Mode::Read,
+            editing::Mode::Annotate,
+            editing::Mode::Edit,
+            editing::Mode::Draw,
+        ] {
             app.editor.mode = mode;
             let output = ctx.run(
                 egui::RawInput {
@@ -2728,8 +2793,16 @@ mod tests {
                 },
                 |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
             );
-            assert!(!output.platform_output.accesskit_update.unwrap().nodes.iter()
-                .any(|(_, n)| n.label() == Some("Sign")), "{mode:?}");
+            assert!(
+                output
+                    .platform_output
+                    .accesskit_update
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|(_, n)| n.label() == Some("Sign")),
+                "{mode:?}"
+            );
         }
     }
     #[test]
@@ -3230,6 +3303,69 @@ mod tests {
     }
 
     #[test]
+    fn translation_toolbar_opens_visible_page_action_without_editing_document() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        until(&mut app, &ctx, |a| a.tabs[0].session.is_some());
+        let mut button = None;
+        for _ in 0..3 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1100., 760.))),
+                    ..Default::default()
+                },
+                |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+            );
+            button = output
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .iter()
+                .find(|(_, n)| n.label() == Some("Translate"))
+                .and_then(|(_, n)| n.bounds());
+        }
+        let r = button.unwrap();
+        let pos = pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32);
+        for pressed in [true, false] {
+            frame(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(app.translation.open && app.inspector);
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1100., 760.))),
+                ..Default::default()
+            },
+            |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+        );
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let action = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Translate page"))
+            .unwrap();
+        let r = action.1.bounds().unwrap();
+        assert!(
+            r.y0 >= 0. && r.y1 < 250. && r.x1 <= 1100.,
+            "page action is visible at panel top: {r:?}"
+        );
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
+    }
+
+    #[test]
     fn responsive_mode_controls_have_accessible_labels_and_stay_in_bounds() {
         for width in [720., 1200.] {
             let ctx = egui::Context::default();
@@ -3246,7 +3382,7 @@ mod tests {
             let nodes = output.platform_output.accesskit_update.unwrap().nodes;
             let mut previous = 0.;
             for label in [
-                "Read", "Annotate", "Edit", "Draw", "Forms", "Pages", "Export",
+                "Read", "Annotate", "Edit", "Draw", "Forms", "Sign", "Pages", "Export",
             ] {
                 let node = &nodes
                     .iter()
@@ -3260,7 +3396,12 @@ mod tests {
                 );
                 previous = r.x1;
             }
-            for label in ["Toggle left panel", "Toggle right panel", "Find"] {
+            for label in [
+                "Toggle left panel",
+                "Toggle right panel",
+                "Find",
+                "Translate",
+            ] {
                 let r = nodes
                     .iter()
                     .find(|(_, n)| n.label() == Some(label))
