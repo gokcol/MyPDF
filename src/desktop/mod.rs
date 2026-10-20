@@ -40,6 +40,7 @@ mod translation;
 mod translation_note;
 mod ui;
 mod watermark;
+mod window_drag;
 mod workbench;
 mod workspace;
 mod zen;
@@ -296,6 +297,8 @@ pub struct Viewer {
 }
 impl Viewer {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> Self {
+        #[cfg(target_os = "macos")]
+        window_drag::configure(cc);
         editing::install_annotation_font(&cc.egui_ctx);
         ui::install_theme(&cc.egui_ctx);
         let (native_menu, menu_events) = menu::install(cc.egui_ctx.clone());
@@ -1218,14 +1221,24 @@ impl Viewer {
                     ui.spacing_mut().item_spacing.x = 4.;
                     #[cfg(target_os = "macos")]
                     ui.add_space(70.);
-                    let (mark, _) = ui.allocate_exact_size(vec2(22., 22.), egui::Sense::hover());
+                    let (mark, move_handle) =
+                        ui.allocate_exact_size(vec2(22., 22.), egui::Sense::drag());
                     ui::logo(ui.painter(), mark);
+                    if move_handle.drag_started() {
+                        self.tab_controls.request_window_drag();
+                    }
                     if ui.available_width() > 960. {
-                        ui.label(
-                            RichText::new("MyPDF")
-                                .font(ui::bold(ui, 14.))
-                                .color(theme::ink()),
+                        let move_handle = ui.add(
+                            egui::Label::new(
+                                RichText::new("MyPDF")
+                                    .font(ui::bold(ui, 14.))
+                                    .color(theme::ink()),
+                            )
+                            .sense(egui::Sense::drag()),
                         );
+                        if move_handle.drag_started() {
+                            self.tab_controls.request_window_drag();
+                        }
                     }
                     #[cfg(not(target_os = "macos"))]
                     ui.menu_button("Tools", |ui| {
@@ -2081,7 +2094,9 @@ impl Viewer {
 }
 
 impl eframe::App for Viewer {
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        #[cfg(target_os = "macos")]
+        window_drag::configure(frame);
         theme::sync(ctx.theme());
         self.tick += 1;
         if let Some(menu) = &self._native_menu {
@@ -2130,6 +2145,9 @@ impl eframe::App for Viewer {
         self.editor.text_editing = false;
         self.sync_status_context();
         self.toolbar(ctx);
+        if self.tab_controls.take_window_drag() {
+            window_drag::begin(frame, ctx);
+        }
         self.restore_reading_panels();
         if !self.home.visible
             && self.comparison.is_none()
