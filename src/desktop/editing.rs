@@ -4705,6 +4705,78 @@ mod tests {
     }
 
     #[test]
+    fn copied_ink_pastes_into_signature_creator_from_every_tab_with_name_focus() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let signature = Annotation::new(
+            0,
+            [100., 100., 300., 180.],
+            Kind::Ink {
+                strokes: vec![vec![[0.1, 0.8], [0.3, 0.1], [0.5, 0.7], [0.9, 0.2]]],
+            },
+            Style::default(),
+        );
+        app.tabs[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .commit(vec![signature.clone()])
+            .unwrap();
+        selection::set(
+            &mut app.tabs[0],
+            &mut app.editor,
+            vec![signature.id.clone()],
+        );
+        let library_count = app.editor.library.as_ref().unwrap().entries.len();
+        for input in [
+            SignatureInput::Draw,
+            SignatureInput::Name,
+            SignatureInput::Type,
+            SignatureInput::Image,
+        ] {
+            assert!(app.copy_marks(&ctx, false));
+            app.editor.signature_open = true;
+            app.editor.signature_input = input;
+            app.editor.signature_image = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::V,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::COMMAND,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.memory_mut(|m| m.request_focus(egui::Id::new("signature_name_focus")));
+                    app.shortcuts(ctx);
+                },
+            );
+            assert!(app.editor.signature_input == SignatureInput::Image);
+            assert!(app.editor.signature_image.is_some());
+            assert!(app.editor.signature_error.is_none());
+            assert!(app.workbench.paste.is_none());
+            assert_eq!(
+                app.editor.library.as_ref().unwrap().entries.len(),
+                library_count
+            );
+            assert_eq!(
+                app.tabs[0].session.as_ref().unwrap().annotations,
+                vec![signature.clone()]
+            );
+        }
+    }
+
+    #[test]
     fn signature_clipboard_preview_keeps_alpha_and_rejects_non_images() {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();

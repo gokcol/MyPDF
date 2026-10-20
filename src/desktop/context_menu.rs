@@ -9,6 +9,8 @@ pub(in crate::desktop) struct State {
     group: Option<&'static str>,
     command: Option<(&'static str, Menu)>,
     pub cancel_text: bool,
+    pub delete_text: bool,
+    image_paste: Option<clipboard::Clip>,
 }
 
 #[derive(Clone)]
@@ -117,9 +119,21 @@ pub(in crate::desktop) fn consume_action(ctx: &egui::Context, action: &str) -> b
         consumed
     })
 }
+
+pub(in crate::desktop) fn paste_requested(ctx: &egui::Context) -> bool {
+    ctx.input(|i| {
+        i.events.iter().any(|e| {
+            matches!(e, egui::Event::Paste(_))
+                || matches!(e, egui::Event::Key { key: egui::Key::V, pressed: true, modifiers, .. }
+                if modifiers.matches_exact(egui::Modifiers::COMMAND))
+        })
+    })
+}
+
 fn items(target: &Target, editable: bool) -> Vec<Item> {
     match target {
         Target::PendingText => vec![
+            item("Delete", "delete_text_box", editable),
             item("Finish text edit", "finish_text", true),
             item("Cancel text edit", "cancel_text", true),
         ],
@@ -229,7 +243,7 @@ fn action_icon(action: &str, label: &str) -> Icon {
         | "object_duplicate" => Icon::Copy,
         "cut" | "object_cut" | "cut_image" => Icon::Cut,
         "paste" | "paste_here" | "paste_original" => Icon::Paste,
-        "delete" | "delete_image" | "object_delete" => Icon::Trash,
+        "delete" | "delete_image" | "object_delete" | "delete_text_box" => Icon::Trash,
         "highlight" => Icon::Highlight,
         "underline" => Icon::Underline,
         "strikeout" => Icon::Strikeout,
@@ -341,7 +355,9 @@ fn target_at(
     p: [f32; 2],
     scale: f32,
 ) -> Target {
-    if state.pending_text().is_some() {
+    if state.pending_text().is_some()
+        || (state.new_placed && state.add_target == Some((tab.id, page)))
+    {
         return Target::PendingText;
     }
     if let Some(a) = editing::hit_annotation(tab, page, p, scale) {
@@ -714,7 +730,7 @@ pub(super) fn text_menu(
     text: &mut String,
     done: &mut bool,
     properties: &mut bool,
-    cancel: &mut bool,
+    context: &mut State,
 ) {
     use egui::text::{CCursor, CCursorRange};
     let ctx = output.response.ctx.clone();
@@ -734,6 +750,7 @@ pub(super) fn text_menu(
                 ("Translate selected text…", "translate_selection", selected),
                 ("Paste", "paste", true),
                 ("Delete selected text", "delete", selected),
+                ("Delete text box", "delete_text_box", true),
                 ("Select all text", "all", !text.is_empty()),
                 ("Text properties…", "properties", true),
                 ("Finish text edit", "done", true),
@@ -771,7 +788,8 @@ pub(super) fn text_menu(
     output.cursor_range = Some(range);
     match action {
         "done" => *done = true,
-        "cancel" => *cancel = true,
+        "cancel" => context.cancel_text = true,
+        "delete_text_box" => context.delete_text = true,
         "properties" => *properties = true,
         "translate_selection" => {
             let selection: String = text
@@ -804,6 +822,10 @@ pub(super) fn text_menu(
                 "cut" | "delete" => Some(String::new()),
                 "paste" => match clipboard::read() {
                     clipboard::Clip::Text(t) => Some(t),
+                    clip @ clipboard::Clip::Image(..) => {
+                        context.image_paste = Some(clip);
+                        None
+                    }
                     _ => None,
                 },
                 _ => None,
@@ -1012,6 +1034,12 @@ impl Viewer {
     }
 
     pub(in crate::desktop) fn context_commands(&mut self, ctx: &egui::Context) {
+        if let Some(clip) = self.content.context.image_paste.take() {
+            self.paste_image_over_text(ctx, clip);
+        }
+        if std::mem::take(&mut self.content.context.delete_text) {
+            self.delete_live_text(ctx);
+        }
         if std::mem::take(&mut self.content.context.cancel_text) {
             self.content.existing = None;
             self.content.next_existing = None;
@@ -1052,6 +1080,10 @@ impl Viewer {
         }
         if action == "cancel_text" {
             self.content.context.cancel_text = true;
+            return;
+        }
+        if action == "delete_text_box" {
+            self.delete_live_text(ctx);
             return;
         }
         if self.content.pending_text().is_some() {
@@ -1419,9 +1451,24 @@ impl Viewer {
                                                 edit: content::ImageEdit::Delete,
                                             },
                                         );
+                                    } else if copied.is_some() {
+                                        self.status = Some((
+                                            format!(
+                                                "Copied selected image · {} × {} pixels",
+                                                image.pixels[0], image.pixels[1]
+                                            ),
+                                            false,
+                                        ));
                                     }
                                 }
-                                Err(e) => self.status = Some((e.to_string(), true)),
+                                Err(e) => {
+                                    self.status = Some((
+                                        format!(
+                                            "Could not copy the selected image: {e}. The clipboard was not changed."
+                                        ),
+                                        true,
+                                    ))
+                                }
                             }
                         }
                         _ => {}
@@ -1781,6 +1828,120 @@ mod tests {
         frame(app, ctx, vec![]);
     }
     #[test]
+    fn empty_text_box_handle_menu_can_delete_placeholder() {
+        let (mut app, ctx) = fixture();
+        let tab = &app.tabs[0];
+        app.content.place_text(tab.id, 0, [50., 60.], tab.pages[0]);
+        let target = target_at(
+            &app.content,
+            &mut app.editor,
+            &mut app.tabs[0],
+            0,
+            [80., 51.],
+            1.,
+        );
+        assert!(matches!(target, Target::PendingText));
+        assert!(commands(&target, true).contains(&"delete_text_box"));
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let r = Rect::from_min_size(
+            pos2(20. + app.content.new_rect[0], 20. + app.content.new_rect[1]),
+            vec2(app.content.new_rect[2], app.content.new_rect[3]),
+        );
+        let handle = text_move_handle(r, Rect::from_min_size(pos2(20., 20.), vec2(500., 500.)));
+        click(
+            &mut app,
+            &ctx,
+            handle.center(),
+            egui::PointerButton::Secondary,
+        );
+        menu_click(&mut app, &ctx, "Delete");
+        assert!(!app.content.new_placed);
+        assert!(app.content.add_target.is_none());
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
+    }
+
+    #[test]
+    fn image_paste_from_live_text_menu_preserves_typed_text_and_is_undoable() {
+        for text in ["", "Keep this text"] {
+            let (mut app, ctx) = fixture();
+            let tab = &app.tabs[0];
+            app.content.place_text(tab.id, 0, [50., 60.], tab.pages[0]);
+            app.content.new_text = text.into();
+            frame(&mut app, &ctx, vec![]);
+            frame(&mut app, &ctx, vec![]);
+            clipboard::set_for_test(clipboard::Clip::Image(
+                clipboard::png(200, 80, &[0, 0, 200, 255].repeat(200 * 80)).unwrap(),
+                [200, 80],
+            ));
+            click(
+                &mut app,
+                &ctx,
+                pos2(110., 85.),
+                egui::PointerButton::Secondary,
+            );
+            menu_click(&mut app, &ctx, "Paste");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.content.busy {
+                app.content_events(&ctx);
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(app.content.pending_text().is_none());
+            assert!(!app.content.new_placed);
+            assert!(app.workbench.paste.is_some());
+            app.place_pending_original();
+            let session = app.tabs[0].session.as_mut().unwrap();
+            assert_eq!(session.annotations.len(), 1);
+            session.undo();
+            assert!(session.annotations.is_empty());
+            if !text.is_empty() {
+                assert!(
+                    mypdf_milestone0::text_geometry::runs(&session.source, 1)
+                        .unwrap()
+                        .iter()
+                        .any(|run| run.text == text)
+                );
+            }
+            session.redo();
+            assert_eq!(session.annotations.len(), 1);
+        }
+    }
+
+    #[test]
+    fn deleting_live_text_annotation_supports_undo_redo() {
+        let (mut app, ctx) = fixture();
+        let mark = Annotation::new(
+            0,
+            [50., 60., 250., 100.],
+            Kind::Text {
+                text: "Keep with Undo".into(),
+            },
+            Default::default(),
+        );
+        app.tabs[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .commit(vec![mark.clone()])
+            .unwrap();
+        run_command(
+            &mut app,
+            &ctx,
+            Target::Artwork(vec![mark.clone()]),
+            "edit_text_here",
+        );
+        assert!(app.content.existing.is_some());
+        run_command(&mut app, &ctx, Target::PendingText, "delete_text_box");
+        let session = app.tabs[0].session.as_mut().unwrap();
+        assert!(session.annotations.is_empty());
+        session.undo();
+        assert_eq!(session.annotations, vec![mark]);
+        session.redo();
+        assert!(session.annotations.is_empty());
+    }
+
+    #[test]
     fn signing_actions_are_absent_from_context_menus() {
         let drawing = Annotation::new(0, [10., 10., 20., 20.], Kind::Rectangle, Default::default());
         for target in [
@@ -2025,6 +2186,23 @@ mod tests {
         .unwrap();
         let png = clipboard::png(2, 2, &[0, 90, 240, 255].repeat(4)).unwrap();
         let source = content::add_image(&source, 1, [100., 200., 200., 300.], &png).unwrap();
+        let mut pdf = lopdf::Document::load_mem(&source).unwrap();
+        for object in pdf.objects.values_mut() {
+            if let Ok(stream) = object.as_stream_mut()
+                && stream
+                    .dict
+                    .get(b"Subtype")
+                    .and_then(lopdf::Object::as_name)
+                    .ok()
+                    == Some(b"Image")
+            {
+                stream.dict.set(
+                    "Decode",
+                    vec![0.into(), 1.into(), 0.into(), 1.into(), 0.into(), 1.into()],
+                );
+            }
+        }
+        let source = content::serialize(&mut pdf).unwrap();
         let runs = mypdf_milestone0::text_geometry::runs(&source, 1).unwrap();
         let r = runs[0].rect.unwrap();
         let images = content::images(&source, 1).unwrap();
@@ -2067,6 +2245,11 @@ mod tests {
         assert!(matches!(target, Target::Image(_)));
         assert!(commands(&target, true).contains(&"replace_image"));
         assert!(!commands(&target, true).contains(&"crop_object"));
+        // A previous screenshot must be replaced even for PDF Decode images.
+        clipboard::set_for_test(clipboard::Clip::Image(
+            clipboard::png(100, 80, &[255, 0, 0, 255].repeat(100 * 80)).unwrap(),
+            [100, 80],
+        ));
         run_command(&mut app, &ctx, target, "copy_image");
         assert!(app.editor.marks_clip.is_some());
         let clipboard::Clip::Image(copied, size) = clipboard::read() else {
