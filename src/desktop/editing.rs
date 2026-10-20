@@ -2424,6 +2424,18 @@ impl Viewer {
                                     }
                                 }
                             });
+                            ui.horizontal_wrapped(|ui| {
+                                for (axis, label) in [(0, "Equal horizontal gaps"), (1, "Equal vertical gaps")] {
+                                    if ui.add_enabled(marks.len() >= 3, egui::Button::new(label)).clicked() {
+                                        arranged = Some(selection::distributed(&marks, axis));
+                                    }
+                                }
+                                for (w,h,label) in [(true,false,"Same width"),(false,true,"Same height"),(true,true,"Same size")] {
+                                    if ui.button(label).on_hover_text("Match the first object in document order; keep centers in place").clicked() {
+                                        arranged = Some(selection::matched_size(&marks,w,h));
+                                    }
+                                }
+                            });
                             ui.separator();
                             ui.horizontal(|ui| {
                                 duplicate =
@@ -2462,7 +2474,15 @@ impl Viewer {
             self.editor.group_edit = None;
         }
         if let Some(next) = arranged {
-            selection::commit(tab, &next, None, &mut self.status);
+            if next.iter().any(|a| {
+                let b = a.bounds();
+                let p = tab.pages[a.page];
+                b[0] < 0. || b[1] < 0. || b[2] > p.width || b[3] > p.height
+            }) {
+                self.status=Some(("This arrangement would extend beyond the page. Move the objects inward or choose a smaller reference object.".into(),true));
+            } else {
+                selection::commit(tab, &next, None, &mut self.status);
+            }
         }
         if duplicate && let Some(s) = &mut tab.session {
             let copies: Vec<_> = mypdf_milestone0::object_tools::duplicate(&marks);

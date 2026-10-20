@@ -73,3 +73,5 @@ pub fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 pub mod rich_text;
+
+pub mod workflows;

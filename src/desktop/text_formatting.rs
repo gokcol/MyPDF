@@ -322,9 +322,12 @@ pub(super) fn layout(
     };
     job.justify = alignment == Alignment::Justified;
     job.sections[0].format.line_height = Some(font.size * 1.3);
+    let spans = rich_text::edited(source, text, spans);
+    // Deleting the last character must retain the empty row's chosen font and
+    // line height instead of leaving a sectionless, default-sized layout.
     if !spans.is_empty() {
         job.sections.clear();
-        for s in rich_text::edited(source, text, spans) {
+        for s in spans {
             let family = text_style::fonts()
                 .iter()
                 .find(|f| Some(&f.path) == s.font.as_ref())

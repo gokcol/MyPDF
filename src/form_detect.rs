@@ -239,6 +239,50 @@ fn overlaps(a: &Rect, b: &Rect, share: f64) -> bool {
     i.width() > 0. && i.height() > 0. && i.area() >= share * a.area().min(b.area())
 }
 
+/// Axis-aligned drawn edges, in displayed page coordinates; analysis only.
+#[derive(Clone, Debug, Default)]
+pub struct PageGuides {
+    pub xs: Vec<f32>,
+    pub ys: Vec<f32>,
+    pub baselines: Vec<f32>,
+}
+pub fn placement_guides(bytes: &[u8], page_index: usize) -> Result<PageGuides> {
+    let pdf = Pdf::new(bytes.to_vec()).map_err(|e| anyhow::anyhow!("Could not read PDF: {e:?}"))?;
+    let page = pdf
+        .pages()
+        .get(page_index)
+        .ok_or_else(|| anyhow::anyhow!("Page not found"))?;
+    let (w, h) = page.render_dimensions();
+    let cache = interpret::InterpreterCache::new();
+    let mut shapes = Shapes::default();
+    let mut context = interpret::Context::new(
+        page.initial_transform(true).to_kurbo(),
+        Rect::new(0., 0., w as f64, h as f64),
+        &cache,
+        page.xref(),
+        interpret::InterpreterSettings::default(),
+    );
+    interpret::interpret_page(page, &mut context, &mut shapes);
+    let mut guides = PageGuides::default();
+    for r in shapes.lines {
+        guides.ys.push(((r.y0 + r.y1) / 2.) as f32);
+    }
+    for r in shapes.verticals {
+        guides.xs.push(((r.x0 + r.x1) / 2.) as f32);
+    }
+    for r in shapes.boxes {
+        guides.xs.extend([r.x0 as f32, r.x1 as f32]);
+        guides.ys.extend([r.y0 as f32, r.y1 as f32]);
+    }
+    for values in [&mut guides.xs, &mut guides.ys] {
+        values.retain(|v| v.is_finite());
+        values.sort_by(f32::total_cmp);
+        values.dedup_by(|a, b| (*a - *b).abs() < 0.5);
+        values.truncate(4000);
+    }
+    Ok(guides)
+}
+
 /// Suggest fields for every page, skipping places that already have one.
 pub fn detect(bytes: &[u8]) -> Result<Vec<Suggestion>> {
     let pdf =
@@ -506,4 +550,32 @@ pub fn add_detected(bytes: &[u8], suggestions: &[Suggestion]) -> Result<(Vec<u8>
     }
     let (bytes, ids) = form_design::add_many(bytes, &fields)?;
     Ok((bytes, ids.len()))
+}
+
+#[cfg(test)]
+mod guide_tests {
+    #[test]
+    fn table_guides_follow_displayed_coordinates() -> anyhow::Result<()> {
+        let bytes = crate::convert::blank(300., 400.)?;
+        let mut doc = lopdf::Document::load_mem(&bytes)?;
+        let page = *doc.get_pages().values().next().unwrap();
+        let stream = doc.add_object(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            b"30 50 100 200 re S".to_vec(),
+        ));
+        doc.get_dictionary_mut(page)?.set("Contents", stream);
+        let bytes = crate::content::serialize(&mut doc)?;
+        let guides = super::placement_guides(&bytes, 0)?;
+        for x in [30., 130.] {
+            assert!(guides.xs.iter().any(|v| (*v - x).abs() < 0.1));
+        }
+        for y in [150., 350.] {
+            assert!(guides.ys.iter().any(|v| (*v - y).abs() < 0.1));
+        }
+        doc.get_dictionary_mut(page)?.set("Rotate", 90);
+        let rotated = super::placement_guides(&crate::content::serialize(&mut doc)?, 0)?;
+        assert!(!rotated.xs.is_empty() && !rotated.ys.is_empty());
+        assert!(super::placement_guides(&bytes, 1).is_err());
+        Ok(())
+    }
 }

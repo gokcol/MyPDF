@@ -71,6 +71,7 @@ impl InlineText {
 
 pub(super) struct Inspection {
     pub(super) key: Key,
+    guides: mypdf_milestone0::form_detect::PageGuides,
     text: Result<Vec<document::TextRun>, String>,
     images: Result<Vec<content::ImageObject>, String>,
     pub(super) fields: Result<Vec<forms::Field>, String>,
@@ -198,6 +199,8 @@ pub(super) struct ContentState {
     show_text_inspector: bool,
     focus_new_text: bool,
     new_rect: [f32; 4],
+    new_auto_height: bool,
+    pub(super) layout_guides: bool,
     new_initial_rect: Option<[f32; 4]>,
     new_drag: Option<[f32; 4]>,
     new_size: f32,
@@ -248,6 +251,42 @@ struct Erased {
     texture: Option<TextureHandle>,
 }
 impl ContentState {
+    pub(super) fn text_defaults(&self) -> mypdf_milestone0::workflows::TextDefaults {
+        mypdf_milestone0::workflows::TextDefaults {
+            font: text_style::fonts()
+                .get(self.new_font)
+                .map_or(String::new(), |f| f.ui_name()),
+            size: self.new_size,
+            color: self.new_color,
+        }
+    }
+    pub(super) fn apply_text_defaults(
+        &mut self,
+        style: &mypdf_milestone0::workflows::TextDefaults,
+    ) {
+        if style.size.is_finite() {
+            self.new_size = style.size.clamp(6., 144.);
+        }
+        if style
+            .color
+            .iter()
+            .all(|v| v.is_finite() && (0. ..=1.).contains(v))
+        {
+            self.new_color = style.color;
+        }
+        if let Some(i) = text_style::fonts()
+            .iter()
+            .position(|f| f.ui_name() == style.font)
+        {
+            self.new_font = i;
+        }
+    }
+
+    pub(super) fn set_layout_guides(&mut self, enabled: bool) {
+        self.layout_guides = enabled;
+        self.key = None;
+        self.inspection = None;
+    }
     /// Read the inline editor's selection without committing or changing it.
     pub(super) fn selected_translation_text(
         &self,
@@ -311,6 +350,7 @@ impl ContentState {
         self.new_spans.clear();
         self.new_selection = None;
         self.new_initial_rect = None;
+        self.new_auto_height = true;
     }
     fn sync_new_styles(&mut self) {
         let fallback = formatting::span(
@@ -325,6 +365,109 @@ impl ContentState {
             &mut self.new_spans,
             fallback,
         );
+    }
+    fn fit_new_text_height(&mut self, galley: &egui::Galley, scale: f32, page_height: f32) {
+        // Screen rows snap to pixels; PDF export uses unrounded line spacing.
+        // Accommodate both without reserving an extra line below the text.
+        let first_line = galley
+            .job
+            .sections
+            .first()
+            .map_or(self.new_size * scale * 1.3, |s| {
+                s.format.line_height.unwrap_or(s.format.font_id.size * 1.3)
+            });
+        let logical_height: f32 = galley
+            .rows
+            .iter()
+            .map(|row| {
+                row.glyphs
+                    .iter()
+                    .map(|glyph| glyph.line_height)
+                    .fold(first_line, f32::max)
+            })
+            .sum();
+        let required = (galley.size().y.max(logical_height) / scale * 64.).ceil() / 64.;
+        if self.new_auto_height || required > self.new_rect[3] {
+            self.new_rect[3] = required.min((page_height - self.new_rect[1]).max(0.));
+        }
+    }
+    fn match_surrounding(&mut self) -> bool {
+        let Some(info) = self
+            .inspection
+            .as_ref()
+            .filter(|i| self.add_target == Some((i.key.0, i.key.2)))
+        else {
+            return false;
+        };
+        let Ok(runs) = &info.text else {
+            return false;
+        };
+        let point = [self.new_rect[0], self.new_rect[1] + self.new_size / 2.];
+        let Some(run) = runs
+            .iter()
+            .filter(|r| !r.text.trim().is_empty() && (1. ..=500.).contains(&r.size))
+            .filter_map(|r| {
+                r.rect
+                    .filter(|b| b.iter().all(|v| v.is_finite()) && b[0] <= b[2] && b[1] <= b[3])
+                    .map(|b| {
+                        let dx = (point[0] - point[0].clamp(b[0], b[2])).abs();
+                        let dy = (point[1] - point[1].clamp(b[1], b[3])).abs();
+                        (r, dx.hypot(dy))
+                    })
+            })
+            .filter(|(_, d)| *d <= 120.)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(r, _)| r)
+        else {
+            return false;
+        };
+        let name = run
+            .base_font
+            .split('+')
+            .next_back()
+            .unwrap_or(&run.base_font)
+            .to_lowercase()
+            .replace([' ', '-'], "");
+        let bold = name.contains("bold");
+        let italic = name.contains("italic") || name.contains("oblique");
+        let family = if name.contains("helvetica") {
+            "arial"
+        } else if name.contains("times") {
+            "timesnewroman"
+        } else if name.contains("courier") {
+            "couriernew"
+        } else {
+            name.as_str()
+        };
+        if let Some(index) = text_style::fonts()
+            .iter()
+            .position(|f| {
+                family.contains(&f.family.to_lowercase().replace(' ', ""))
+                    && f.bold == bold
+                    && f.italic == italic
+            })
+            .or_else(|| {
+                text_style::fonts()
+                    .iter()
+                    .position(|f| f.bold == bold && f.italic == italic)
+            })
+        {
+            self.new_font = index;
+        }
+        self.new_size = run.size.clamp(6., 144.);
+        self.new_color = run.color;
+        self.new_spans = if self.new_text.is_empty() {
+            vec![]
+        } else {
+            vec![formatting::span(
+                self.new_font,
+                self.new_size,
+                self.new_color,
+                self.new_text.len(),
+            )]
+        };
+        self.new_styled_text = self.new_text.clone();
+        true
     }
     fn text_font(&self, size: f32) -> FontId {
         FontId::new(
@@ -341,7 +484,7 @@ impl ContentState {
         self.area_mode = false;
         self.place_text(id, page, [size.width / 2. - 120., size.height / 2.], size);
         let lines = text.lines().count().max(1) as f32;
-        self.new_rect[3] = (lines * self.new_size * 1.3 + self.new_size)
+        self.new_rect[3] = (lines * self.new_size * 1.3)
             .max(self.new_rect[3])
             .min(size.height - self.new_rect[1]);
         self.new_text = text;
@@ -352,7 +495,7 @@ impl ContentState {
         self.clear_new_text();
         let x = point[0].clamp(0., (size.width - 10.).max(0.));
         let w = 240_f32.min(size.width - x);
-        let h = (self.new_size * 2.6).min(size.height);
+        let h = (self.new_size * 1.3).min(size.height);
         // The I-beam click anchors the first line's center, not the top of its
         // line box. Keep the same page-space rectangle for editing and saving.
         let top = point[1] - self.new_size * 1.3 / 2.;
@@ -546,6 +689,8 @@ impl ContentState {
             show_text_inspector: false,
             focus_new_text: false,
             new_rect: [48., 48., 300., 120.],
+            new_auto_height: true,
+            layout_guides: false,
             new_initial_rect: None,
             new_drag: None,
             new_size: 18.,
@@ -724,6 +869,15 @@ impl Viewer {
             self.content.loading = false;
             if self.content.key == Some(inspection.key) {
                 self.content.loading = false;
+                if self.content.layout_guides
+                    && let Some(tab) = self.tabs.iter_mut().find(|t| t.id == inspection.key.0)
+                {
+                    tab.placement_guides = Some((
+                        inspection.key.1,
+                        inspection.key.2,
+                        inspection.guides.clone(),
+                    ));
+                }
                 self.content.inspection = Some(inspection);
             }
         }
@@ -1096,6 +1250,7 @@ impl Viewer {
         self.content.selected = None;
         self.content.inspection = None;
         self.content.loading = true;
+        let want_guides = self.content.layout_guides;
         let bytes = s.source.clone();
         let tx = self.content.inspect_tx.clone();
         let wake = ctx.clone();
@@ -1108,8 +1263,26 @@ impl Viewer {
                 let fields = forms::fields(&bytes).map_err(|e| format!("{e:#}"));
                 let designed =
                     mypdf_milestone0::form_design::describe(&bytes).map_err(|e| format!("{e:#}"));
+                let mut guides = if want_guides {
+                    mypdf_milestone0::form_detect::placement_guides(&bytes, key.2)
+                        .unwrap_or_default()
+                } else {
+                    Default::default()
+                };
+                if want_guides && let Ok(runs) = &text {
+                    for run in runs {
+                        if let Some(layout) = &run.layout
+                            && layout.direction[1].abs() < 0.02
+                            && layout.origin[1].is_finite()
+                            && guides.baselines.len() < 4000
+                        {
+                            guides.baselines.push(layout.origin[1]);
+                        }
+                    }
+                }
                 Inspection {
                     key,
+                    guides,
                     text,
                     images,
                     fields,
@@ -1119,6 +1292,7 @@ impl Viewer {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
                 .unwrap_or_else(|_| Inspection {
                     key,
+                    guides: Default::default(),
                     text: Err("Unsupported page content".into()),
                     images: Err("Unsupported images".into()),
                     fields: Err("Unsupported form structure".into()),
@@ -1454,12 +1628,20 @@ impl Viewer {
                 formatting::panel(ui, &self.content.new_text, &mut self.content.new_spans, &self.content.new_selection,
                     &mut self.content.new_font, &mut self.content.new_size, &mut self.content.new_color, &mut self.content.new_alignment);
                 ui.add_space(8.);
+                if self.content.new_placed && ui.button("Match surrounding text").on_hover_text("Use the nearest text's size, color and closest installed font; affects this new text block").clicked() && !self.content.match_surrounding() {
+                    self.status = Some(("No nearby editable text found on this page.".into(),false));
+                }
                 if self.content.new_placed {
                     egui::CollapsingHeader::new("Position & size").show(ui,|ui| {
                         if let Some(page) = self.tabs.get(self.active).and_then(|t| t.pages.get(t.page)) {
+                            ui.checkbox(&mut self.content.new_auto_height, "Fit height to text");
                             for (index, name) in ["Left", "Top", "Width", "Height"].into_iter().enumerate() {
+                                let before = self.content.new_rect[index];
                                 let max = match index { 0 => (page.width-self.content.new_rect[2]).max(0.), 1 => (page.height-self.content.new_rect[3]).max(0.), 2 => (page.width-self.content.new_rect[0]).max(10.), _ => (page.height-self.content.new_rect[1]).max(4.) };
                                 editing::property_slider(ui, name, &mut self.content.new_rect[index], (if index == 2 {10.} else if index == 3 {4.} else {0.})..=max, " pt");
+                                if index == 3 && before != self.content.new_rect[index] {
+                                    self.content.new_auto_height = false;
+                                }
                             }
                         }
                     });
@@ -2995,6 +3177,28 @@ pub(super) fn overlay(
                 state.next_text = None;
                 return;
             }
+            state.sync_new_styles();
+            let font = state.text_font(state.new_size * scale);
+            let rgb = state.new_color;
+            let color = Color32::from_rgb(
+                (rgb[0] * 255.) as u8,
+                (rgb[1] * 255.) as u8,
+                (rgb[2] * 255.) as u8,
+            );
+            // Measure before positioning the editor, including pasted text,
+            // wrapping and changes made in the font/size inspector.
+            let measured = formatting::layout(
+                ui,
+                &state.new_text,
+                &state.new_styled_text,
+                &state.new_spans,
+                font.clone(),
+                color,
+                state.new_rect[2] * scale,
+                scale,
+                state.new_alignment,
+            );
+            state.fit_new_text_height(&measured, scale, tab.pages[page].height);
             let [x, y, w, h] = state.new_rect;
             let r = Rect::from_min_size(page_rect.min + vec2(x, y) * scale, vec2(w, h) * scale);
             let painter = ui
@@ -3028,25 +3232,52 @@ pub(super) fn overlay(
                 state.new_rect[0] = (gesture.rect[0] + d.x).clamp(0., (p.width - w).max(0.));
                 state.new_rect[1] = (gesture.rect[1] + d.y).clamp(0., (p.height - h).max(0.));
             }
+            if state.layout_guides
+                && !ui.input(|i| i.modifiers.alt)
+                && (moving.dragged() || moving.drag_stopped())
+                && let Some(info) = &state.inspection
+                && info.key
+                    == (
+                        tab.id,
+                        tab.session.as_ref().map_or(0, |s| s.revision()),
+                        page,
+                    )
+            {
+                let nearest = |values: &[f32], anchors: &[f32]| {
+                    values
+                        .iter()
+                        .flat_map(|v| anchors.iter().map(move |a| (*v - *a, *v)))
+                        .filter(|(d, _)| d.abs() <= 6. / scale)
+                        .min_by(|a, b| a.0.abs().total_cmp(&b.0.abs()))
+                };
+                let [x, y, w, h] = state.new_rect;
+                let sx = nearest(&info.guides.xs, &[x, x + w]);
+                let sy = nearest(&info.guides.ys, &[y, y + h]);
+                let baseline = nearest(&info.guides.baselines, &[y + state.new_size]);
+                let sy = baseline
+                    .into_iter()
+                    .chain(sy)
+                    .min_by(|a, b| a.0.abs().total_cmp(&b.0.abs()));
+                if let Some((dx, _)) = sx {
+                    state.new_rect[0] = (x + dx).clamp(0., (p.width - w).max(0.));
+                }
+                if let Some((dy, _)) = sy {
+                    state.new_rect[1] = (y + dy).clamp(0., (p.height - h).max(0.));
+                }
+                manipulation::Guides {
+                    x: sx.map(|v| v.1),
+                    y: sy.map(|v| v.1),
+                }
+                .paint(&painter, page_rect, scale);
+            }
             if !ui.input(|input| input.pointer.primary_down()) {
                 ui.data_mut(|data| data.remove::<TextMoveGesture>(move_id));
             }
             let [x, y, w, h] = state.new_rect;
             let r = Rect::from_min_size(page_rect.min + vec2(x, y) * scale, vec2(w, h) * scale);
-            if !state.hide_guides {
-                ui::dashed_rect(&painter, r.expand(2.), theme::accent());
-            }
-            paint_text_move_handle(&painter, text_move_handle(r, page_rect));
-            let rgb = state.new_color;
-            let color = Color32::from_rgb(
-                (rgb[0] * 255.) as u8,
-                (rgb[1] * 255.) as u8,
-                (rgb[2] * 255.) as u8,
-            );
-            let font = state.text_font(state.new_size * scale);
-            state.sync_new_styles();
             let spans = state.new_spans.clone();
             let source_text = state.new_styled_text.clone();
+            let alignment = state.new_alignment;
             let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, width: f32| {
                 formatting::layout(
                     ui,
@@ -3057,11 +3288,15 @@ pub(super) fn overlay(
                     color,
                     width,
                     scale,
-                    state.new_alignment,
+                    alignment,
                 )
             };
             ui.scope_builder(egui::UiBuilder::new().max_rect(r), |ui| {
-                ui.set_clip_rect(r.intersect(page_rect).intersect(ui.clip_rect()));
+                ui.set_clip_rect(
+                    Rect::from_min_max(r.min, pos2(r.right(), page_rect.bottom()))
+                        .intersect(page_rect)
+                        .intersect(ui.clip_rect()),
+                );
                 let text_id = egui::Id::new((tab.id, page, "inline_new_text"));
                 let retained_selection = context::secondary_selection(ui.ctx(), text_id);
                 let mut edit = egui::TextEdit::multiline(&mut state.new_text)
@@ -3113,12 +3348,15 @@ pub(super) fn overlay(
                     edit.response.request_focus();
                     state.focus_new_text = false;
                 }
-                let required = edit.galley.size().y / scale;
-                if required > state.new_rect[3] {
-                    state.new_rect[3] =
-                        (required + state.new_size * 0.3).min((p.height - y).max(h));
-                }
+                state.fit_new_text_height(&edit.galley, scale, p.height);
             });
+            // Paint the bounds after TextEdit processes this frame's keystrokes,
+            // so the border follows new/deleted lines immediately.
+            let r = Rect::from_min_size(r.min, vec2(w, state.new_rect[3]) * scale);
+            if !state.hide_guides {
+                ui::dashed_rect(&painter, r.expand(2.), theme::accent());
+            }
+            paint_text_move_handle(&painter, text_move_handle(r, page_rect));
             for (edge, center, cursor) in [
                 (0, r.left_center(), egui::CursorIcon::ResizeHorizontal),
                 (1, r.right_center(), egui::CursorIcon::ResizeHorizontal),
@@ -3150,6 +3388,7 @@ pub(super) fn overlay(
                         state.new_rect[2] = (original[2] + d.x).clamp(10., (p.width - x).max(10.));
                     }
                     if edge == 2 {
+                        state.new_auto_height = false;
                         state.new_rect[3] = (original[3] + d.y)
                             .clamp(state.new_size, (p.height - y).max(state.new_size));
                     }
@@ -3223,6 +3462,48 @@ pub(super) fn overlay(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nearby_style_is_explicit_and_matches_only_the_new_block() {
+        let pdf = mypdf_milestone0::content::add_text(
+            &convert::blank(300., 400.).unwrap(),
+            1,
+            "Nearby",
+            [30., 40., 200., 60.],
+            12.,
+            [0.2, 0.4, 0.6],
+        )
+        .unwrap();
+        let runs = mypdf_milestone0::text_geometry::runs(&pdf, 1).unwrap();
+        let mut state = ContentState::new();
+        state.place_text(
+            9,
+            0,
+            [32., 80.],
+            PageSize {
+                width: 300.,
+                height: 400.,
+            },
+        );
+        state.new_text = "New words".into();
+        let original = state.new_size;
+        state.inspection = Some(Inspection {
+            key: (9, 0, 0),
+            guides: Default::default(),
+            text: Ok(runs),
+            images: Ok(vec![]),
+            fields: Ok(vec![]),
+            designed: Ok(vec![]),
+        });
+        assert_eq!(state.new_size, original);
+        assert!(state.match_surrounding());
+        assert_eq!(state.new_size, 12.);
+        assert_eq!(state.new_color, [0.2, 0.4, 0.6]);
+        assert_eq!(state.new_text, "New words");
+        assert_eq!(state.new_spans.len(), 1);
+        state.add_target = Some((10, 0));
+        assert!(!state.match_surrounding());
+    }
+
     use super::*;
     #[test]
     fn spacing_adjustment_preserves_indents_and_is_written_to_pdf() {
@@ -3813,6 +4094,60 @@ mod tests {
                     bounds[1] < 120. && bounds[3] > 120.,
                     "saved line must straddle the click: {bounds:?}"
                 );
+                let single_height = app.content.new_rect[3];
+                assert!((single_height - size * 1.3).abs() < 1., "{single_height}");
+                frame(&mut app, vec![egui::Event::Text("\nSecond line".into())]);
+                assert_eq!(app.content.new_text, "Hello\nSecond line");
+                let two_lines = app.content.new_rect[3];
+                assert!((two_lines - size * 2.6).abs() < 1., "{two_lines}");
+                content::add_text(
+                    &app.tabs[0].session.as_ref().unwrap().source,
+                    1,
+                    &app.content.new_text,
+                    app.content.new_rect,
+                    size,
+                    [0.; 3],
+                )
+                .expect("the fitted two-line box must also save");
+                app.content.new_rect[2] = 60.;
+                frame(&mut app, vec![]);
+                assert!(
+                    app.content.new_rect[3] > two_lines,
+                    "wrapping grows the box"
+                );
+                app.content.new_rect[2] = 240.;
+                frame(&mut app, vec![]);
+                assert!((app.content.new_rect[3] - two_lines).abs() < 0.1);
+                // Exercise real deletion: the empty placeholder returns to one row.
+                frame(
+                    &mut app,
+                    vec![egui::Event::Key {
+                        key: egui::Key::A,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::COMMAND,
+                    }],
+                );
+                frame(
+                    &mut app,
+                    vec![egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+                assert!(app.content.new_text.is_empty());
+                assert!(
+                    (app.content.new_rect[3] - single_height).abs() < 0.1,
+                    "empty {} vs typed {single_height}; size={size}, zoom={scale}",
+                    app.content.new_rect[3]
+                );
+                app.content.new_size *= 2.;
+                frame(&mut app, vec![]);
+                assert!((app.content.new_rect[3] - size * 2.6).abs() < 1.);
             }
         }
         app.content
@@ -5225,6 +5560,7 @@ mod tests {
         }
         app.content.add_target = Some((app.tabs[0].id, 0));
         app.content.new_rect = [40., 60., 200., 80.];
+        app.content.new_auto_height = false;
         app.content.new_placed = true;
         let run = |app: &mut Viewer, events| {
             let _ = ctx.run(

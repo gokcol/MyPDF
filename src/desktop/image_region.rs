@@ -362,6 +362,7 @@ mod tests {
         app.content.image_mode = true;
         app.content.key = Some(key);
         app.content.inspection = Some(Inspection {
+            guides: Default::default(),
             key,
             images: Ok(images),
             text: Ok(vec![]),

@@ -41,6 +41,17 @@ pub(super) fn snap(
             ys.extend([b[1], (b[1] + b[3]) / 2., b[3]]);
         }
     }
+    if let Some((revision, cached_page, guides)) = &tab.placement_guides
+        && *cached_page == page
+        && tab
+            .session
+            .as_ref()
+            .is_some_and(|s| s.revision() == *revision)
+    {
+        xs.extend(&guides.xs);
+        ys.extend(&guides.ys);
+        ys.extend(&guides.baselines);
+    }
     let nearest = |values: Vec<f32>, anchors: [f32; 3]| {
         values
             .into_iter()
