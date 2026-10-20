@@ -16,6 +16,7 @@ use manager::{Look, ManagerState, SavedSignature};
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Panel {
     Interface,
+    Styles,
     Signatures,
     Ink,
     Identities,
@@ -1385,21 +1386,30 @@ impl Viewer {
             if !docked {
                 if settings {
                     let remembered = egui::Id::new("settings_signature_tab");
-                    if self.digital.panel != Panel::Interface {
+                    if !matches!(self.digital.panel, Panel::Interface | Panel::Styles) {
                         ui.ctx()
                             .data_mut(|d| d.insert_temp(remembered, self.digital.panel));
                     }
-                    let section = usize::from(self.digital.panel == Panel::Interface);
-                    if let Some(i) = ui::segmented(ui, &["Signatures", "Appearance"], section) {
-                        self.digital.panel = if i == 1 {
-                            Panel::Interface
-                        } else {
-                            ui.ctx()
+                    let section = match self.digital.panel {
+                        Panel::Interface => 1,
+                        Panel::Styles => 2,
+                        _ => 0,
+                    };
+                    if let Some(i) = ui::segmented(
+                        ui,
+                        &["Signatures", "Appearance", "Reusable styles"],
+                        section,
+                    ) {
+                        self.digital.panel = match i {
+                            1 => Panel::Interface,
+                            2 => Panel::Styles,
+                            _ => ui
+                                .ctx()
                                 .data(|d| d.get_temp::<Panel>(remembered))
-                                .unwrap_or(Panel::Ink)
+                                .unwrap_or(Panel::Ink),
                         };
                     }
-                    if self.digital.panel != Panel::Interface {
+                    if !matches!(self.digital.panel, Panel::Interface | Panel::Styles) {
                         let panels = [
                             (Panel::Ink, "Ink signatures"),
                             (Panel::Signatures, "Digital signatures"),
@@ -1411,7 +1421,7 @@ impl Viewer {
                             .position(|(p, _)| *p == self.digital.panel)
                             .unwrap_or(0);
                         let labels: Vec<&str> = panels.iter().map(|(_, name)| *name).collect();
-                        if let Some(i) = ui::segmented(ui, &labels, current) {
+                        if let Some(i) = ui::sub_tabs(ui, &labels, current) {
                             self.digital.panel = panels[i].0;
                         }
                     }
@@ -1442,7 +1452,9 @@ impl Viewer {
                     (ctx.content_rect().height()
                         - 240.
                         - preview_height
-                        - if settings && self.digital.panel != Panel::Interface {
+                        - if settings
+                            && !matches!(self.digital.panel, Panel::Interface | Panel::Styles)
+                        {
                             40.
                         } else {
                             0.
@@ -1489,6 +1501,7 @@ impl Viewer {
                     }
                     ui.add_enabled_ui(!self.digital.busy, |ui| match self.digital.panel {
                     Panel::Interface => ui::appearance_settings(ui),
+                    Panel::Styles => styles::settings(ui),
                     Panel::Ink => {
                         self.sign_tools.placement_settings(ui, true);
                         ink_place = self.digital.ink_panel(ui, &mut self.editor, &assets, active.is_some_and(|t| t.session.as_ref().is_some_and(|s| s.editable)));
@@ -4476,6 +4489,25 @@ mod tests {
                 .iter()
                 .any(|(_, n)| n.label() == Some("Ink signatures"))
         );
+        click(&mut app, "Reusable styles");
+        assert!(app.digital.panel == Panel::Styles);
+        let output = frame(&mut app, vec![]);
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, n)| n.label() == Some("Review outline"))
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, n)| n.label() == Some("Document heading"))
+        );
+        assert!(
+            !nodes
+                .iter()
+                .any(|(_, n)| n.label() == Some("Ink signatures"))
+        );
         click(&mut app, "Signatures");
         assert!(app.digital.panel == Panel::Signatures);
         click(&mut app, "Ink signatures");
@@ -4671,20 +4703,63 @@ mod tests {
                 app.digital.default_signature.as_deref(),
                 Some(first.as_str())
             );
-            click(&mut app, "Soft tint", true);
+            click(&mut app, "Custom color", true);
             assert_eq!(
                 app.digital.signatures[0].background,
                 signing::Background::Tinted
+            );
+            click(&mut app, "Frame", false);
+            click(&mut app, "More colors…", false);
+            click(&mut app, "Hex color", false);
+            frame(
+                &mut app,
+                vec![
+                    egui::Event::Key {
+                        key: egui::Key::A,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::COMMAND,
+                    },
+                    egui::Event::Text("#D22846".into()),
+                ],
+            );
+            frame(&mut app, vec![]);
+            assert!(matches!(
+                app.digital.signatures[0].background,
+                signing::Background::Custom {
+                    frame: Some([210, 40, 70]),
+                    ..
+                }
+            ));
+            // Escape closes only the picker, keeping Settings open.
+            frame(
+                &mut app,
+                vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert!(app.digital.open);
+            let custom = signing::Background::Custom {
+                fill: [47, 110, 180],
+                frame: Some([210, 40, 70]),
+            };
+            app.digital.signatures[0].background = custom;
+            app.digital.commit_signatures();
+            assert_eq!(
+                DigitalState::at(temp.path().join("profile")).signatures[0].background,
+                custom
             );
             click(&mut app, "Date and time", true);
             assert!(!app.digital.signatures[0].show_date);
             click(&mut app, "Duplicate", false);
             assert_eq!(app.digital.signatures.len(), 2);
             assert_eq!(app.digital.signatures[1].name, "My signature copy");
-            assert_eq!(
-                app.digital.signatures[1].background,
-                signing::Background::Tinted
-            );
+            assert_eq!(app.digital.signatures[1].background, custom);
             click(&mut app, "Use for Quick Sign", true);
             let copy = app.digital.signatures[1].id.clone();
             assert_eq!(

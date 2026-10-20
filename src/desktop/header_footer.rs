@@ -752,7 +752,7 @@ fn options(ui: &mut egui::Ui, stamp: &mut Stamp) {
                 stamp.color = color;
             }
         }
-        ui::color_swatch(ui, &mut stamp.color, "Custom color");
+        ui::color_swatch_sized(ui, &mut stamp.color, "Custom color", vec2(26., 26.));
     });
 }
 

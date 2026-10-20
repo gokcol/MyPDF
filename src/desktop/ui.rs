@@ -1727,46 +1727,420 @@ fn segments(ui: &mut egui::Ui, options: &[&str], icons: &[Icon], selected: usize
     choice
 }
 
-/// A round color well that opens a picker. Returns true when the color changed.
-pub(super) fn color_swatch(ui: &mut egui::Ui, current: &mut [f32; 3], label: &str) -> bool {
-    let (rect, response) = ui.allocate_exact_size(vec2(32., 32.), egui::Sense::click());
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ColorButton, true, label));
-    let color = Color32::from_rgb(
-        (current[0] * 255.) as u8,
-        (current[1] * 255.) as u8,
-        (current[2] * 255.) as u8,
+/// Secondary navigation uses an underline rather than the primary tabs' filled track.
+pub(super) fn sub_tabs(ui: &mut egui::Ui, options: &[&str], selected: usize) -> Option<usize> {
+    let (track, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.), egui::Sense::hover());
+    ui.painter().hline(
+        track.x_range(),
+        track.bottom(),
+        Stroke::new(1., theme::line()),
     );
+    let width = track.width() / options.len().max(1) as f32;
+    let mut choice = None;
+    for (i, label) in options.iter().enumerate() {
+        let rect = Rect::from_min_size(track.min + vec2(i as f32 * width, 0.), vec2(width, 28.));
+        let response = ui.interact(
+            rect,
+            ui.id().with(("sub_tab", options, i)),
+            egui::Sense::click(),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Button,
+                ui.is_enabled(),
+                i == selected,
+                *label,
+            )
+        });
+        if response.hovered() {
+            ui.painter()
+                .rect_filled(rect.shrink2(vec2(3., 2.)), 4, theme::hover());
+        }
+        let ink = if i == selected {
+            theme::accent()
+        } else {
+            theme::muted()
+        };
+        let font = if i == selected {
+            strong(ui, 11.5)
+        } else {
+            FontId::proportional(11.5)
+        };
+        let galley = egui::WidgetText::from(RichText::new(*label).font(font).color(ink))
+            .into_galley(
+                ui,
+                Some(egui::TextWrapMode::Truncate),
+                (width - 12.).max(0.),
+                egui::TextStyle::Button,
+            );
+        let size = galley.size();
+        ui.painter()
+            .galley(rect.center() - size * 0.5 - vec2(0., 1.), galley, ink);
+        if i == selected {
+            let half = (size.x * 0.5 + 6.).min(width * 0.5 - 3.).max(0.);
+            ui.painter().line_segment(
+                [
+                    pos2(rect.center().x - half, rect.bottom() - 1.),
+                    pos2(rect.center().x + half, rect.bottom() - 1.),
+                ],
+                Stroke::new(2., theme::accent()),
+            );
+        }
+        if response
+            .on_hover_text(*label)
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            choice = Some(i);
+        }
+    }
+    choice
+}
+
+/// The multicolor rim distinguishes a custom picker from a preset swatch.
+pub(super) fn paint_color_picker(ui: &egui::Ui, rect: Rect, color: Color32) {
+    let radius = (rect.width().min(rect.height()) * 0.5 - 3.).min(11.);
+    ui.painter()
+        .circle_filled(rect.center(), radius - 3., color);
+    for i in 0..36 {
+        let angle = i as f32 * std::f32::consts::TAU / 36.;
+        let next = (i + 1) as f32 * std::f32::consts::TAU / 36.;
+        let tint = egui::ecolor::Hsva::new(i as f32 / 36., 0.75, 0.95, 1.);
+        ui.painter().line_segment(
+            [
+                rect.center() + vec2(angle.cos(), angle.sin()) * radius,
+                rect.center() + vec2(next.cos(), next.sin()) * radius,
+            ],
+            Stroke::new(2.5, Color32::from(tint)),
+        );
+    }
+}
+
+fn parse_hex_color(value: &str) -> Option<Color32> {
+    let value = value.trim().trim_start_matches('#');
+    if value.len() != 6 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let rgb = u32::from_str_radix(value, 16).ok()?;
+    Some(Color32::from_rgb(
+        (rgb >> 16) as u8,
+        (rgb >> 8) as u8,
+        rgb as u8,
+    ))
+}
+
+fn color_picker_button(
+    ui: &mut egui::Ui,
+    color: &mut Color32,
+    label: &str,
+    size: egui::Vec2,
+) -> bool {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::ColorButton, ui.is_enabled(), label)
+    });
     if response.hovered() {
         ui.painter().rect_filled(rect, 8, theme::hover());
     }
-    shadow(
-        ui.painter(),
-        Rect::from_center_size(rect.center(), vec2(20., 20.)),
-        10,
-        1,
-    );
-    ui.painter()
-        .circle_filled(rect.center(), 10., theme::raised());
-    ui.painter().circle_filled(rect.center(), 8., color);
+    paint_color_picker(ui, rect, *color);
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            5,
+            Stroke::new(1., theme::accent()),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let hex_id = response.id.with("hex");
+    if response.clicked() {
+        reset_color_picker(ui, hex_id);
+    }
     let mut changed = false;
     egui::Popup::from_toggle_button_response(&response)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
-            let mut picked = color;
-            if egui::color_picker::color_picker_color32(
-                ui,
-                &mut picked,
-                egui::color_picker::Alpha::Opaque,
-            ) && picked != color
-            {
-                *current = [picked.r(), picked.g(), picked.b()].map(|c| c as f32 / 255.);
-                changed = true;
-            }
+            changed = color_picker_contents(ui, color, label, hex_id);
         });
     response
-        .on_hover_text(label)
+        .on_hover_text(format!("{label} · choose any color"))
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     changed
+}
+
+/// A fixed grid makes color choices easy to hit without resizing the popup.
+const PICKER_COLORS: [(&str, [u8; 3]); 24] = [
+    ("Black", [0, 0, 0]),
+    ("Charcoal", [55, 65, 81]),
+    ("Gray", [107, 114, 128]),
+    ("Silver", [156, 163, 175]),
+    ("Light gray", [229, 231, 235]),
+    ("White", [255, 255, 255]),
+    ("Maroon", [128, 0, 32]),
+    ("Red", [220, 38, 38]),
+    ("Orange", [234, 88, 12]),
+    ("Gold", [217, 153, 6]),
+    ("Yellow", [250, 204, 21]),
+    ("Brown", [146, 64, 14]),
+    ("Forest", [22, 101, 52]),
+    ("Green", [22, 163, 74]),
+    ("Mint", [110, 231, 183]),
+    ("Teal", [13, 148, 136]),
+    ("Cyan", [6, 182, 212]),
+    ("Navy", [30, 58, 138]),
+    ("Blue", [37, 99, 235]),
+    ("Sky", [56, 189, 248]),
+    ("Violet", [124, 58, 237]),
+    ("Purple", [126, 34, 206]),
+    ("Magenta", [192, 38, 211]),
+    ("Pink", [244, 114, 182]),
+];
+
+pub(super) fn reset_color_picker(ui: &mut egui::Ui, id: egui::Id) {
+    ui.data_mut(|d| {
+        d.remove::<String>(id);
+        d.remove::<bool>(id.with("advanced"));
+    });
+}
+
+fn picker_row_label(ui: &mut egui::Ui, label: &str) {
+    ui.allocate_ui_with_layout(
+        vec2(36., 28.),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_size(vec2(36., 28.));
+            ui.label(label);
+        },
+    );
+}
+
+/// Standard colors first; exact RGB/hex editing is a second page of the same
+/// fixed-size popup. Color changes never alter its geometry or HSV round-trip.
+pub(super) fn color_picker_contents(
+    ui: &mut egui::Ui,
+    color: &mut Color32,
+    label: &str,
+    hex_id: egui::Id,
+) -> bool {
+    let before = *color;
+    ui.set_width(222.);
+    ui.spacing_mut().item_spacing = vec2(6., 6.);
+    ui.spacing_mut().interact_size.y = 26.;
+    ui.spacing_mut().button_padding = vec2(8., 4.);
+    let advanced_id = hex_id.with("advanced");
+    let mut advanced = ui
+        .data(|d| d.get_temp::<bool>(advanced_id))
+        .unwrap_or(false);
+    ui.style_mut().override_font_id = Some(FontId::proportional(12.));
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).font(strong(ui, 13.)));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (rect, response) = ui.allocate_exact_size(vec2(22., 22.), egui::Sense::hover());
+            ui.painter().rect(
+                rect.shrink(1.),
+                5,
+                *color,
+                Stroke::new(1., theme::muted()),
+                egui::StrokeKind::Inside,
+            );
+            let selected = format!(
+                "Selected #{:02X}{:02X}{:02X}",
+                color.r(),
+                color.g(),
+                color.b()
+            );
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::ColorButton, ui.is_enabled(), &selected)
+            });
+            response.on_hover_text(selected);
+        });
+    });
+    ui.allocate_ui_with_layout(
+        vec2(222., 124.),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_min_size(vec2(222., 124.));
+            ui.spacing_mut().item_spacing.y = 4.;
+            if advanced {
+                let mut rgb = [color.r(), color.g(), color.b()];
+                for ((channel, name), tint) in rgb.iter_mut().zip(["Red", "Green", "Blue"]).zip([
+                    Color32::from_rgb(224, 88, 82),
+                    Color32::from_rgb(54, 163, 110),
+                    Color32::from_rgb(66, 133, 224),
+                ]) {
+                    ui.push_id(name, |ui| {
+                        ui.horizontal(|ui| {
+                            picker_row_label(ui, name);
+                            ui.scope(|ui| {
+                                ui.spacing_mut().slider_width = 126.;
+                                ui.spacing_mut().interact_size.y = 16.;
+                                ui.spacing_mut().slider_rail_height = 4.;
+                                ui.visuals_mut().widgets.inactive.bg_fill =
+                                    theme::muted().gamma_multiply(0.35);
+                                ui.visuals_mut().selection.bg_fill = tint;
+                                ui.add(
+                                    egui::Slider::new(channel, 0..=255)
+                                        .show_value(false)
+                                        .trailing_fill(true),
+                                )
+                                .widget_info(|| {
+                                    egui::WidgetInfo::labeled(
+                                        egui::WidgetType::Slider,
+                                        ui.is_enabled(),
+                                        name,
+                                    )
+                                });
+                            });
+                            ui.add_sized(
+                                vec2(48., 26.),
+                                egui::DragValue::new(channel).range(0..=255),
+                            )
+                            .widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::DragValue,
+                                    ui.is_enabled(),
+                                    format!("{name} value"),
+                                )
+                            });
+                        });
+                    });
+                }
+                let picked = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                if picked != *color {
+                    *color = picked;
+                    ui.data_mut(|d| d.remove::<String>(hex_id));
+                }
+                let mut hex = ui
+                    .data(|d| d.get_temp::<String>(hex_id))
+                    .unwrap_or_else(|| {
+                        format!("#{:02X}{:02X}{:02X}", color.r(), color.g(), color.b())
+                    });
+                ui.horizontal(|ui| {
+                    picker_row_label(ui, "Hex");
+                    let entry = ui.add_sized(
+                        vec2(180., 26.),
+                        egui::TextEdit::singleline(&mut hex)
+                            .char_limit(7)
+                            .margin(vec2(8., 5.)),
+                    );
+                    entry.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::TextEdit,
+                            ui.is_enabled(),
+                            "Hex color",
+                        )
+                    });
+                    if entry.changed()
+                        && let Some(picked) = parse_hex_color(&hex)
+                    {
+                        *color = picked;
+                    }
+                    entry.on_hover_text("Six hexadecimal digits, for example #336699");
+                });
+                ui.data_mut(|d| d.insert_temp(hex_id, hex));
+            } else {
+                for row in PICKER_COLORS.chunks(6) {
+                    ui.horizontal(|ui| {
+                        for &(name, [r, g, b]) in row {
+                            let picked = Color32::from_rgb(r, g, b);
+                            let (rect, response) =
+                                ui.allocate_exact_size(vec2(32., 28.), egui::Sense::click());
+                            let selected = *color == picked;
+                            ui.painter().rect(
+                                rect.shrink(2.),
+                                4,
+                                picked,
+                                Stroke::new(1., theme::line()),
+                                egui::StrokeKind::Inside,
+                            );
+                            if response.hovered() || response.has_focus() || selected {
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    5,
+                                    Stroke::new(2., theme::accent()),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                            if selected {
+                                let light = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+                                draw_icon(
+                                    ui.painter(),
+                                    Rect::from_center_size(rect.center(), vec2(15., 15.)),
+                                    Icon::Check,
+                                    if light > 150. {
+                                        Color32::BLACK
+                                    } else {
+                                        Color32::WHITE
+                                    },
+                                );
+                            }
+                            response.widget_info(|| {
+                                egui::WidgetInfo::selected(
+                                    egui::WidgetType::Button,
+                                    ui.is_enabled(),
+                                    selected,
+                                    format!("{name} preset"),
+                                )
+                            });
+                            if response
+                                .on_hover_text(format!("{name} · #{r:02X}{g:02X}{b:02X}"))
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                *color = picked;
+                            }
+                        }
+                    });
+                }
+            }
+        },
+    );
+    if ui
+        .add_sized(
+            vec2(222., 26.),
+            egui::Button::new(if advanced {
+                "Standard colors"
+            } else {
+                "More colors…"
+            }),
+        )
+        .clicked()
+    {
+        advanced = !advanced;
+        ui.data_mut(|d| d.remove::<String>(hex_id));
+    }
+    ui.data_mut(|d| d.insert_temp(advanced_id, advanced));
+    *color != before
+}
+
+/// A custom color picker in the existing well's footprint.
+pub(super) fn color_swatch(ui: &mut egui::Ui, current: &mut [f32; 3], label: &str) -> bool {
+    color_swatch_sized(ui, current, label, vec2(32., 32.))
+}
+
+pub(super) fn color_swatch_sized(
+    ui: &mut egui::Ui,
+    current: &mut [f32; 3],
+    label: &str,
+    size: egui::Vec2,
+) -> bool {
+    let [r, g, b] = current.map(|c| (c * 255.).round() as u8);
+    let mut color = Color32::from_rgb(r, g, b);
+    if color_picker_button(ui, &mut color, label, size) {
+        *current = [color.r(), color.g(), color.b()].map(|c| c as f32 / 255.);
+        true
+    } else {
+        false
+    }
+}
+
+pub(super) fn color_swatch_srgb(ui: &mut egui::Ui, current: &mut [u8; 3], label: &str) -> bool {
+    let mut color = Color32::from_rgb(current[0], current[1], current[2]);
+    if color_picker_button(ui, &mut color, label, ui.spacing().interact_size) {
+        *current = [color.r(), color.g(), color.b()];
+        true
+    } else {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2316,6 +2690,204 @@ fn style_for(style: &mut egui::Style, p: &theme::Palette, dark: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn custom_picker_edits_exact_hex_without_idle_changes_or_more_space() {
+        let ctx = egui::Context::default();
+        install_theme(&ctx);
+        ctx.enable_accesskit();
+        let original = [0.12345, 0.45678, 0.78901];
+        let mut current = original;
+        let mut changes = 0;
+        let mut frame = |events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(700., 600.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let before = ui.cursor().top();
+                        changes += usize::from(editing::color_palette(ui, &mut current));
+                        assert!(ui.cursor().top() - before <= 32. + ui.spacing().item_spacing.y);
+                        let mut bytes = [18, 45, 210];
+                        assert!(!color_swatch_srgb(ui, &mut bytes, "Other color"));
+                        assert_eq!(bytes, [18, 45, 210]);
+                    });
+                },
+            )
+        };
+        let bounds = |out: egui::FullOutput, label: &str| {
+            let r = out
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .into_iter()
+                .find(|(_, n)| n.label() == Some(label))
+                .unwrap_or_else(|| panic!("missing {label}"))
+                .1
+                .bounds()
+                .unwrap();
+            Rect::from_min_max(
+                pos2(r.x0 as f32, r.y0 as f32),
+                pos2(r.x1 as f32, r.y1 as f32),
+            )
+        };
+        let mouse = |pos, pressed| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        for _ in 0..4 {
+            frame(vec![]);
+        }
+        let well = bounds(frame(vec![]), "Custom color");
+        assert_eq!(well.size(), vec2(24., 28.));
+        frame(mouse(well.center(), true));
+        frame(mouse(well.center(), false));
+        for _ in 0..4 {
+            frame(vec![]);
+        }
+        let first = bounds(frame(vec![]), "Black preset");
+        let last = bounds(frame(vec![]), "Pink preset");
+        for label in ["Green preset", "Gold preset", "Navy preset", "Navy preset"] {
+            let target = bounds(frame(vec![]), label);
+            frame(mouse(target.center(), true));
+            frame(mouse(target.center(), false));
+            for _ in 0..4 {
+                assert_eq!(bounds(frame(vec![]), "Black preset"), first);
+                assert_eq!(bounds(frame(vec![]), "Pink preset"), last);
+            }
+        }
+        let more = bounds(frame(vec![]), "More colors…");
+        frame(mouse(more.center(), true));
+        frame(mouse(more.center(), false));
+        for _ in 0..4 {
+            frame(vec![]);
+        }
+        assert_eq!(
+            bounds(frame(vec![]), "Standard colors"),
+            more,
+            "Switching to precise controls must not move or resize the popup"
+        );
+        let hex = bounds(frame(vec![]), "Hex color");
+        let red = bounds(frame(vec![]), "Red");
+        let red_value = bounds(frame(vec![]), "Red value");
+        assert!(
+            red.height() <= 18.,
+            "Small slider handles retain a visible track"
+        );
+        assert!(red_value.height() <= 28.);
+        for channel in ["Green", "Blue"] {
+            let slider = bounds(frame(vec![]), channel);
+            let value = bounds(frame(vec![]), &format!("{channel} value"));
+            assert_eq!(slider.x_range(), red.x_range(), "RGB tracks align");
+            assert_eq!(value.x_range(), red_value.x_range(), "RGB values align");
+            assert!((slider.center().y - value.center().y).abs() <= 1.);
+        }
+        assert_eq!(
+            hex.right(),
+            red_value.right(),
+            "Hex shares the values' right edge"
+        );
+        frame(mouse(hex.center(), true));
+        frame(mouse(hex.center(), false));
+        let select_all = || egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        frame(vec![select_all(), egui::Event::Text("#nothex".into())]);
+        frame(vec![select_all(), egui::Event::Text("#1A62C3".into())]);
+        for _ in 0..4 {
+            assert_eq!(bounds(frame(vec![]), "Hex color"), hex);
+        }
+        frame(vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        frame(mouse(well.center(), true));
+        frame(mouse(well.center(), false));
+        for _ in 0..4 {
+            frame(vec![]);
+        }
+        assert_eq!(
+            bounds(frame(vec![]), "Black preset"),
+            first,
+            "Reopening starts with standard colors while retaining the chosen color"
+        );
+        assert_eq!(current, [26., 98., 195.].map(|v| v / 255.));
+        assert_eq!(
+            changes, 4,
+            "Only three different presets and one valid hex edit create changes; repeated clicks and idle frames must not"
+        );
+        assert_eq!(parse_hex_color("#ffffff"), Some(Color32::WHITE));
+        assert_eq!(parse_hex_color("12345"), None);
+    }
+
+    #[test]
+    fn secondary_tabs_stay_on_one_short_row_in_narrow_panels() {
+        let ctx = egui::Context::default();
+        install_theme(&ctx);
+        ctx.enable_accesskit();
+        for width in [320., 420., 640.] {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(width, 240.))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        sub_tabs(
+                            ui,
+                            &[
+                                "Ink signatures",
+                                "Digital signatures",
+                                "Digital IDs",
+                                "Trusted",
+                            ],
+                            1,
+                        );
+                    });
+                },
+            );
+            let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+            let mut previous = None;
+            for label in [
+                "Ink signatures",
+                "Digital signatures",
+                "Digital IDs",
+                "Trusted",
+            ] {
+                let rect = nodes
+                    .iter()
+                    .find(|(_, n)| n.label() == Some(label))
+                    .unwrap()
+                    .1
+                    .bounds()
+                    .unwrap();
+                assert_eq!(rect.y1 - rect.y0, 28.);
+                assert!(rect.x0 >= 0. && rect.x1 <= width as f64);
+                if let Some((x, y)) = previous {
+                    assert!(rect.x0 >= x);
+                    assert_eq!(rect.y0, y);
+                }
+                previous = Some((rect.x1, rect.y0));
+            }
+        }
+    }
     #[test]
     fn visual_styles_preserve_controls_and_light_dark_preference() {
         let ctx = egui::Context::default();

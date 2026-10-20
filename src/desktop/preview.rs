@@ -234,6 +234,11 @@ const SCENES: &[&str] = &[
     "DocumentChooser",
     "WorkflowSettings",
     "Appearance",
+    "ReusableStyles",
+    "ReusableTextStyle",
+    "ReusableDrawingStyle",
+    "ReusableColorPicker",
+    "ReusableColorPickerMore",
     "Templates",
     "Batch",
     "SharingCopy",
@@ -597,6 +602,13 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
     if collection == "Appearance" {
         app.digital.open = true;
         app.digital.panel = digital::Panel::Interface;
+    }
+    if collection.starts_with("Reusable") {
+        app.digital.open = true;
+        app.digital.panel = digital::Panel::Styles;
+        if collection != "ReusableStyles" {
+            styles::preview_edit(&ctx, collection == "ReusableTextStyle");
+        }
     }
     if collection.starts_with("MySignatures") {
         use mypdf_milestone0::annotations::{Kind, Style};
@@ -1175,6 +1187,48 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
             preview.settle(&mut app, &ctx);
         }
     }
+    if collection.starts_with("ReusableColorPicker") {
+        ctx.enable_accesskit();
+        for label in if collection == "ReusableColorPickerMore" {
+            vec!["Custom color", "More colors…"]
+        } else {
+            vec!["Custom color"]
+        } {
+            preview.settle(&mut app, &ctx);
+            let output = preview.capture(&mut app, &ctx);
+            let rect = output
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .into_iter()
+                .find(|(_, n)| n.label() == Some(label))
+                .unwrap()
+                .1
+                .bounds()
+                .unwrap();
+            let pos = pos2(
+                ((rect.x0 + rect.x1) / 2.) as f32,
+                ((rect.y0 + rect.y1) / 2.) as f32,
+            );
+            for pressed in [true, false] {
+                preview.capture_with(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+        }
+        preview.settle(&mut app, &ctx);
+    }
     let output = preview.capture_with(&mut app, &ctx, events);
     assert_scene(collection, &app, &output);
     if let Some(root) = root {
@@ -1264,6 +1318,33 @@ fn assert_scene(scene: &str, app: &Viewer, output: &egui::FullOutput) {
     if scene == "Viewer" {
         assert!(app.editor.mode == editing::Mode::Read);
         assert!(app.close_intent.is_none() && !app.digital.open && !app.ocr_confirm);
+    }
+    if scene.starts_with("Reusable") {
+        assert!(app.digital.panel == digital::Panel::Styles && app.digital.open);
+        if scene == "ReusableStyles" {
+            for label in ["Review outline", "Document heading", "New style"] {
+                assert!(
+                    text.iter().any(|t| t == label),
+                    "Missing {label} in {scene}"
+                );
+            }
+        } else {
+            assert!(text.iter().any(|t| t == "Save style"));
+            assert!(text.iter().any(|t| t == "Cancel"));
+            assert!(text.iter().any(|t| t
+                == if scene == "ReusableTextStyle" {
+                    "Font size"
+                } else {
+                    "Line width"
+                }));
+        }
+        if scene == "ReusableColorPicker" {
+            assert!(text.iter().any(|t| t == "More colors…"));
+        }
+        if scene == "ReusableColorPickerMore" {
+            assert!(text.iter().any(|t| t == "Standard colors"));
+            assert!(text.iter().any(|t| t == "Hex"));
+        }
     }
 }
 

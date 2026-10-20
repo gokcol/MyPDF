@@ -154,7 +154,15 @@ impl Store {
             format!("{:x}", Sha256::digest(&bytes)) == metadata.sha256,
             "Recovery checksum failed; the copy was preserved"
         );
-        crate::content::editable(&bytes).context("Recovery PDF is not editable")?;
+        // An unlocked signed PDF is saved here as an incremental update. The
+        // editing permission is process-local, so it is not present after a
+        // restart. Reading a recovery copy must not require that permission or
+        // rewrite the signed bytes; the desktop restores its editing state.
+        let doc = lopdf::Document::load_mem(&bytes).context("Invalid recovery PDF")?;
+        ensure!(
+            !doc.is_encrypted(),
+            "Encrypted recovery PDFs cannot be restored; the copy was retained"
+        );
         Ok(bytes)
     }
     pub fn write(

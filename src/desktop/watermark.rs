@@ -167,7 +167,7 @@ impl Viewer {
                                         draft.color = color;
                                     }
                                 }
-                                ui::color_swatch(ui, &mut draft.color, "Another color");
+                                ui::color_swatch_sized(ui, &mut draft.color, "Custom color", vec2(22., 22.));
                             });
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut draft.fit, "Fit across the page");

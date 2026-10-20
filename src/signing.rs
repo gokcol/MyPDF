@@ -271,6 +271,11 @@ pub enum Background {
     Tinted,
     /// White with a thin frame.
     Framed,
+    /// A user-selected fill and optional frame, stored as exact sRGB bytes.
+    Custom {
+        fill: [u8; 3],
+        frame: Option<[u8; 3]>,
+    },
 }
 impl Background {
     pub const CHOICES: [Background; 4] = [
@@ -286,6 +291,7 @@ impl Background {
             Background::White => "White",
             Background::Tinted => "Soft tint",
             Background::Framed => "Framed",
+            Background::Custom { .. } => "Custom color",
         }
     }
     /// Fill and frame colors, if any.
@@ -295,6 +301,10 @@ impl Background {
             Background::White => Some(([1.0; 3], None)),
             Background::Tinted => Some(([0.925, 0.945, 0.99], None)),
             Background::Framed => Some(([1.0; 3], Some([0.11, 0.43, 0.35]))),
+            Background::Custom { fill, frame } => Some((
+                fill.map(|c| c as f32 / 255.),
+                frame.map(|rgb| rgb.map(|c| c as f32 / 255.)),
+            )),
         }
     }
 }
@@ -653,7 +663,10 @@ pub fn signature_appearance(request: &DesktopSigningRequest) -> Result<Signature
         } else {
             let mut all = backdrop.clone();
             for mark in &mut all {
-                let edge = if background == Background::Framed {
+                let edge = if background
+                    .colors()
+                    .is_some_and(|(_, frame)| frame.is_some())
+                {
                     0.5
                 } else {
                     0.

@@ -97,7 +97,7 @@ impl EmbeddedEffects {
         if self.options.border > 0 {
             ui.horizontal(|ui| {
                 ui.label("Border color");
-                ui.color_edit_button_srgb(&mut self.options.color);
+                ui::color_swatch_srgb(ui, &mut self.options.color, "Border color");
             });
         }
         if self.pending.is_none() && self.preview_options != Some(self.options) {

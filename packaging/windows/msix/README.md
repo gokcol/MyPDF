@@ -37,11 +37,10 @@ On GitHub, run **Actions → Microsoft Store MSIX → Run workflow**:
 - `ref`: the release tag or full commit SHA to package.
 - `mode`: `store` after configuring the three variables; `test` otherwise.
 - `package_version`: usually blank, which uses `version.txt` in this directory.
-  For MyPDF **1.6.0**, the internal MSIX version is **1.16.0.0**. The previous
-  release used **1.15.2.0**; using **1.6.0.0** would sort below
-  it and prevent an ordinary upgrade. Public app versions and MSIX package
-  versions are therefore maintained separately. Increase `version.txt` for
-  each Store release, even when the public version uses a different sequence.
+  For MyPDF **2.0.0**, the internal MSIX version is **2.0.0.0**, which
+  sorts above the previous release's **1.16.0.0** and preserves ordinary
+  upgrades. Public app versions and MSIX package versions are maintained
+  separately. Increase `version.txt` for each Store release.
   An explicit override must be at least the checked-in package version.
   The fourth field is reserved by Microsoft and must remain zero.
 
