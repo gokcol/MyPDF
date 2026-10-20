@@ -810,7 +810,10 @@ mod tests {
             Some("Memo {page}/{pages} · {file}")
         );
         until(&mut app, &|a| {
+            // The summary can finish before the refreshed document is editable.
+            // The real menu remains disabled until that reload completes.
             a.header_footer_summary(&ctx).is_some_and(|s| s.text == 1)
+                && a.tabs[0].session.as_ref().is_some_and(|s| s.editable)
         });
 
         app.remove_header_footer(&ctx, Kind::ALL.to_vec());
