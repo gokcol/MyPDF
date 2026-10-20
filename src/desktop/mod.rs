@@ -1293,6 +1293,15 @@ impl Viewer {
                                 .color(theme::ink()),
                         );
                     }
+                    #[cfg(not(target_os = "macos"))]
+                    ui.menu_button("Tools", |ui| {
+                        for (id, label) in menu::WORKFLOW_ITEMS {
+                            if ui.button(*label).clicked() {
+                                action = Some(*id);
+                                ui.close();
+                            }
+                        }
+                    });
                     if ui
                         .add(
                             ActionButton::new(Icon::Home, "Home")
@@ -2277,7 +2286,6 @@ impl eframe::App for Viewer {
         self.editor.text_editing = false;
         self.sync_status_context();
         self.toolbar(ctx);
-        self.productivity_bar(ctx);
         self.restore_reading_panels();
         if !self.home.visible
             && self.comparison.is_none()
