@@ -106,6 +106,7 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
                 Some(muda::AboutMetadata {
                     name: Some("MyPDF".into()),
                     version: Some(format!("{} · Native PDF editor", env!("CARGO_PKG_VERSION"))),
+                    credits: Some("Developed by Orhan Gökçöl".into()),
                     comments: Some(ABOUT.into()),
                     ..Default::default()
                 }),

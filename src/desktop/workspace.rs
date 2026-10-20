@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub(super) struct SavedTab {
     pub path: PathBuf,
     pub view: ReadingState,
+    #[serde(default)]
+    pub document_group: u64,
 }
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -17,6 +19,8 @@ struct Saved {
     sidebar: bool,
     inspector: bool,
     outline: bool,
+    groups: Vec<tabs::Group>,
+    active_group: u64,
 }
 impl Default for Saved {
     fn default() -> Self {
@@ -28,6 +32,8 @@ impl Default for Saved {
             sidebar: true,
             inspector: true,
             outline: false,
+            groups: tabs::State::default().groups,
+            active_group: 0,
         }
     }
 }
@@ -79,7 +85,27 @@ impl State {
     }
 }
 impl Viewer {
+    pub(super) fn restore_tab_groups(&mut self) {
+        self.tab_controls.groups = self.workspace.saved.groups.clone();
+        let mut ungrouped = self
+            .tab_controls
+            .groups
+            .iter()
+            .find(|g| g.id == 0)
+            .cloned()
+            .unwrap_or_else(|| tabs::State::default().groups.remove(0));
+        ungrouped.name = "Ungrouped".into();
+        // Retain a permanent fallback and ignore malformed/duplicate saved IDs.
+        self.tab_controls
+            .groups
+            .retain(|g| g.id != 0 && !g.name.trim().is_empty());
+        self.tab_controls.groups.truncate(31);
+        let mut ids = HashSet::new();
+        self.tab_controls.groups.retain(|g| ids.insert(g.id));
+        self.tab_controls.groups.insert(0, ungrouped);
+    }
     pub(super) fn restore_workspace(&mut self, ctx: &egui::Context) {
+        self.restore_tab_groups();
         if !self.workspace.saved.enabled {
             return;
         }
@@ -100,6 +126,22 @@ impl Viewer {
             self.active = i;
         }
         self.home.visible = saved.home || self.tabs.is_empty();
+        let group = if saved.groups.iter().any(|g| g.id == saved.active_group) {
+            saved.active_group
+        } else {
+            0
+        };
+        // Opening files during restore temporarily activates each one.
+        self.home.visible = true;
+        self.switch_group(group);
+        if let Some(i) = self
+            .tabs
+            .iter()
+            .position(|t| Some(&t.path) == saved.active.as_ref() && t.document_group == group)
+        {
+            self.active = i;
+        }
+        self.home.visible |= saved.home;
         self.sidebar = saved.sidebar;
         self.inspector = saved.inspector;
         self.outline = saved.outline;
@@ -113,6 +155,16 @@ impl Viewer {
     fn restore_tab(&mut self, entry: SavedTab, ctx: &egui::Context) {
         self.open(entry.path.clone(), ctx);
         if let Some(t) = self.tabs.iter_mut().find(|t| t.path == entry.path) {
+            t.document_group = if self
+                .tab_controls
+                .groups
+                .iter()
+                .any(|g| g.id == entry.document_group)
+            {
+                entry.document_group
+            } else {
+                0
+            };
             t.view_preferences = entry.view;
             t.page_layout = reading::PageLayout::from_code(t.view_preferences.layout);
             t.restore_view = true;
@@ -142,6 +194,7 @@ impl Viewer {
             return;
         }
         self.workspace.last = Some(std::time::Instant::now());
+        self.sync_tab_group();
         let next = Saved {
             enabled: self.workspace.saved.enabled,
             tabs: self
@@ -149,6 +202,7 @@ impl Viewer {
                 .iter()
                 .filter(|t| t.path.is_absolute() && t.path.is_file())
                 .map(|t| SavedTab {
+                    document_group: t.document_group,
                     path: t.path.clone(),
                     view: t.view_preferences.clone(),
                 })
@@ -158,6 +212,8 @@ impl Viewer {
             sidebar: self.sidebar,
             inspector: self.inspector,
             outline: self.outline,
+            groups: self.tab_controls.groups.clone(),
+            active_group: self.tab_controls.current_group,
         };
         if next != self.workspace.saved && self.workspace.error.is_none() {
             match preferences::save(&self.workspace.root, "workspace.json", &next) {
@@ -188,6 +244,59 @@ impl Viewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn grouped_workspace_round_trips_order_membership_and_active_documents() {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..4 {
+            let path = root.path().join(format!("group-document-{i}.pdf"));
+            std::fs::write(&path, mypdf_milestone0::convert::blank(500., 700.).unwrap()).unwrap();
+            app.open(path, &ctx);
+        }
+        app.tab_controls.groups.push(tabs::Group {
+            id: 1,
+            name: "Work".into(),
+            active: Some(app.tabs[1].path.clone()),
+        });
+        app.tabs[0].document_group = 1;
+        app.tabs[1].document_group = 1;
+        app.switch_group(1);
+        app.active = 1;
+        app.sync_tab_group();
+        let active_path = app.tabs[1].path.clone();
+        app.switch_group(0);
+        app.active = 2;
+        app.remember_workspace(&ctx);
+        let raw = std::fs::read_to_string(app.workspace.root.join("workspace.json")).unwrap();
+        let saved: Saved = serde_json::from_str(&raw).unwrap();
+        let expected: Vec<_> = app
+            .tabs
+            .iter()
+            .map(|t| (t.path.clone(), t.document_group))
+            .collect();
+        let mut restored = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        restored.workspace.saved = saved;
+        restored.restore_workspace(&ctx);
+        assert_eq!(
+            restored
+                .tabs
+                .iter()
+                .map(|t| (t.path.clone(), t.document_group))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(restored.tab_controls.current_group, 0);
+        assert_eq!(restored.active, 2);
+        restored.switch_group(1);
+        assert_eq!(restored.tabs[restored.active].path, active_path);
+        restored.close(restored.active);
+        restored.reopen_closed(&ctx);
+        assert_eq!(restored.tabs[restored.active].document_group, 1);
+        assert_eq!(restored.tabs[restored.active].path, active_path);
+        let legacy: Saved = serde_json::from_str(r#"{"enabled":true,"tabs":[]}"#).unwrap();
+        assert_eq!(legacy.groups[0].name, "Ungrouped");
+    }
     #[test]
     fn workspace_restores_order_active_tab_views_and_closed_tabs_without_capturing_content() {
         let ctx = egui::Context::default();
