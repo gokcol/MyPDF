@@ -336,8 +336,13 @@ pub fn images(bytes: &[u8], page: u32) -> Result<Vec<ImageObject>> {
     Ok(result)
 }
 
-/// Extract a page-level RGB or grayscale image, preserving its transparency.
+/// Extract only the selected image, preserving its transparency. PDF-specific
+/// color spaces, Decode arrays and masks are handled by the PDF renderer.
 pub fn image_png(bytes: &[u8], page: u32, index: usize) -> Result<Vec<u8>> {
+    image_png_direct(bytes, page, index).or_else(|_| render_image_png(bytes, page, index))
+}
+
+fn image_png_direct(bytes: &[u8], page: u32, index: usize) -> Result<Vec<u8>> {
     let selected = images(bytes, page)?
         .into_iter()
         .find(|i| i.index == index)
@@ -357,16 +362,16 @@ pub fn image_png(bytes: &[u8], page: u32, index: usize) -> Result<Vec<u8>> {
             w > 0 && h > 0 && w <= 4096 && h <= 4096,
             "Background removal supports images up to 4096 × 4096 pixels"
         );
+        ensure!(
+            !stream.dict.has(b"Decode"),
+            "Image requires PDF color decoding"
+        );
         if stream
             .filters()
             .is_ok_and(|f| f == vec![b"DCTDecode".as_slice()])
         {
             return decode_image(&stream.content);
         }
-        ensure!(
-            !stream.dict.has(b"Decode"),
-            "This image uses custom color mapping; export and reimport it as PNG first"
-        );
         ensure!(
             stream.dict.get(b"BitsPerComponent")?.as_i64()? == 8,
             "This image format cannot be processed directly"
@@ -412,6 +417,72 @@ pub fn image_png(bytes: &[u8], page: u32, index: usize) -> Result<Vec<u8>> {
     let mut output = std::io::Cursor::new(Vec::new());
     image.write_to(&mut output, image::ImageFormat::Png)?;
     Ok(output.into_inner())
+}
+
+/// Build a temporary one-image PDF. Never rasterize the original page: text,
+/// neighbouring artwork and annotations must not become part of the copy.
+fn render_image_png(bytes: &[u8], page: u32, index: usize) -> Result<Vec<u8>> {
+    let selected = images(bytes, page)?
+        .into_iter()
+        .find(|i| i.index == index)
+        .context("Image no longer exists")?;
+    let [width, height] = selected.pixels;
+    ensure!(
+        width > 0 && height > 0 && width <= 4096 && height <= 4096,
+        "Image extraction supports images up to 4096 × 4096 pixels"
+    );
+    let mut doc = Document::load_mem(bytes)?;
+    let source_page = *doc.get_pages().get(&page).context("Page not found")?;
+    let resources = resources(&doc, source_page)?;
+    let operations = vec![
+        Operation::new("q", vec![]),
+        Operation::new(
+            "cm",
+            vec![
+                width.into(),
+                0.into(),
+                0.into(),
+                height.into(),
+                0.into(),
+                0.into(),
+            ],
+        ),
+        Operation::new("Do", vec![Object::Name(selected.name.into_bytes())]),
+        Operation::new("Q", vec![]),
+    ];
+    let contents = doc.add_object(Stream::new(
+        dictionary! {},
+        Content { operations }.encode()?,
+    ));
+    let pages = doc.new_object_id();
+    let image_page = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages,
+        "MediaBox" => vec![0.into(), 0.into(), width.into(), height.into()],
+        "Resources" => resources, "Contents" => contents,
+    });
+    doc.objects.insert(
+        pages,
+        dictionary! {
+            "Type" => "Pages", "Kids" => vec![image_page.into()], "Count" => 1,
+        }
+        .into(),
+    );
+    let root = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+    doc.trailer.set("Root", root);
+    let pdf = hayro::hayro_syntax::Pdf::new(serialize(&mut doc)?)
+        .map_err(|e| anyhow::anyhow!("Could not decode selected PDF image: {e:?}"))?;
+    let raster = hayro::render(
+        &pdf.pages()[0],
+        &hayro::RenderCache::new(),
+        &hayro::hayro_interpret::InterpreterSettings::default(),
+        &hayro::RenderSettings::default(),
+        &hayro::PixmapSettings {
+            x_scale: 1.,
+            y_scale: 1.,
+            bg_color: hayro::vello_cpu::color::palette::css::TRANSPARENT,
+        },
+    );
+    Ok(raster.into_png()?)
 }
 
 /// Decode bounded PNG/JPEG artwork without external resources.

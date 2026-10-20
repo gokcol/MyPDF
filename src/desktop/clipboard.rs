@@ -320,7 +320,13 @@ impl Viewer {
             if n == 1 { "" } else { "s" },
             tab.name()
         );
-        let image = if marks.iter().any(|a| matches!(a.kind, Kind::Image { .. })) {
+        let image = if marks.iter().any(|a| {
+            a.asset_id.is_some()
+                || matches!(
+                    a.kind,
+                    Kind::Image { .. } | Kind::Ink { .. } | Kind::Svg { .. }
+                )
+        }) {
             let copied = image_for_clipboard(&marks).and_then(|pixels| {
                 write_image(&pixels)?;
                 Ok(ImageClip {
@@ -352,7 +358,10 @@ impl Viewer {
 
     /// Paste marks, or an image or text from another app, on the current page.
     pub(super) fn paste(&mut self, ctx: &egui::Context) {
-        let clip = read();
+        self.paste_clip(ctx, read());
+    }
+
+    pub(super) fn paste_clip(&mut self, ctx: &egui::Context, clip: Clip) {
         let ours = self
             .editor
             .marks_clip
@@ -565,6 +574,70 @@ mod tests {
             .unwrap();
         selection::set(&mut app.tabs[0], &mut app.editor, vec![mark.id.clone()]);
         (app, ctx, mark)
+    }
+
+    #[test]
+    fn ink_and_name_signatures_copy_as_images_and_keep_editable_internal_paste() {
+        let (mut app, ctx, mut signature) = image_fixture();
+        signature.asset_id = Some("saved-signature".into());
+        for kind in [
+            Kind::Ink {
+                strokes: vec![vec![[0.1, 0.8], [0.3, 0.1], [0.5, 0.7], [0.9, 0.2]]],
+            },
+            Kind::Svg {
+                source: "<svg xmlns='http://www.w3.org/2000/svg' width='200' height='100'><path d='M10 80 Q50 5 80 70 L180 20' fill='none' stroke='blue' stroke-width='3'/></svg>".into(),
+                tint: false,
+            },
+            Kind::Text { text: "Orhan".into() },
+        ] {
+            signature.kind = kind;
+            assert_eq!(app.copy_artwork(&ctx, vec![signature.clone()]), Some(1));
+            let clip = read();
+            let Clip::Image(bytes, _) = &clip else {
+                panic!("A copied signature must be available to image consumers");
+            };
+            let pixels = mypdf_milestone0::content::decode_image(bytes).unwrap();
+            assert!(pixels.pixels().any(|p| p[3] > 0));
+            assert!(pixels.pixels().any(|p| p[3] == 0));
+            set_for_test(clip);
+            app.paste(&ctx);
+            let pasted = &app.workbench.paste.as_ref().unwrap()[0];
+            assert_eq!(pasted.kind, signature.kind);
+            assert_ne!(pasted.id, signature.id);
+        }
+    }
+
+    #[test]
+    fn image_only_clipboard_pastes_with_key_event_without_text_paste_event() {
+        let (mut app, ctx, _) = image_fixture();
+        app.home.visible = false;
+        app.editor.mode = editing::Mode::Edit;
+        let bytes = png(200, 80, &[0, 0, 200, 255].repeat(200 * 80)).unwrap();
+        set_for_test(Clip::Image(bytes, [200, 80]));
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::V,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                }],
+                ..Default::default()
+            },
+            |ctx| app.shortcuts(ctx),
+        );
+        assert!(matches!(
+            app.workbench.paste.as_ref().unwrap()[0].kind,
+            Kind::Image { .. }
+        ));
+        app.place_pending_original();
+        let session = app.tabs[0].session.as_mut().unwrap();
+        assert_eq!(session.annotations.len(), 2);
+        session.undo();
+        assert_eq!(session.annotations.len(), 1);
+        session.redo();
+        assert_eq!(session.annotations.len(), 2);
     }
 
     #[test]

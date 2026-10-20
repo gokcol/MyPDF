@@ -610,3 +610,72 @@ fn removed_image_background_survives_pdf_save_and_undo_restores_original() {
     session.undo();
     assert_eq!(session.annotations, vec![mark]);
 }
+
+#[test]
+fn copy_embedded_indexed_signature_with_decode_and_mask_excludes_page_content() {
+    let blank = convert::blank(400., 300.).unwrap();
+    let source = content::add_text(
+        &blank,
+        1,
+        "SURROUNDING TEXT MUST NOT BE COPIED",
+        [10., 10., 380., 50.],
+        12.,
+        [1., 0., 0.],
+    )
+    .unwrap();
+    let mut png = vec![];
+    image::RgbaImage::from_pixel(16, 8, image::Rgba([0, 0, 255, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let source = content::add_image(&source, 1, [100., 100., 260., 180.], &png).unwrap();
+    let selected = content::images(&source, 1).unwrap().remove(0);
+    let mut doc = Document::load_mem(&source).unwrap();
+    let page = doc.get_pages()[&1];
+    let resources = content::resources(&doc, page).unwrap();
+    let objects = doc
+        .dereference(resources.get(b"XObject").unwrap())
+        .unwrap()
+        .1
+        .as_dict()
+        .unwrap();
+    let image_id = objects
+        .get(selected.name.as_bytes())
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let stream = doc
+        .get_object_mut(image_id)
+        .unwrap()
+        .as_stream_mut()
+        .unwrap();
+    // Common PDF signature encoding: palette + Decode + transparent color key.
+    stream.dict.remove(b"Filter");
+    stream.dict.remove(b"DecodeParms");
+    stream.dict.set("BitsPerComponent", 8);
+    stream.dict.set(
+        "ColorSpace",
+        vec![
+            Object::Name(b"Indexed".to_vec()),
+            Object::Name(b"DeviceRGB".to_vec()),
+            1.into(),
+            Object::String(
+                vec![255, 255, 255, 0, 0, 200],
+                lopdf::StringFormat::Hexadecimal,
+            ),
+        ],
+    );
+    stream.dict.set("Decode", vec![255.into(), 0.into()]);
+    stream.dict.set("Mask", vec![255.into(), 255.into()]);
+    stream.set_content((0..128).map(|p| if p % 16 < 8 { 0 } else { 255 }).collect());
+    let source = content::serialize(&mut doc).unwrap();
+    let index = content::images(&source, 1).unwrap()[0].index;
+    let pixels = content::decode_image(&content::image_png(&source, 1, index).unwrap()).unwrap();
+    assert_eq!(pixels.dimensions(), (16, 8));
+    assert_eq!(pixels.get_pixel(3, 4).0, [0, 0, 200, 255]);
+    assert_eq!(pixels.get_pixel(12, 4)[3], 0);
+    assert!(
+        pixels.pixels().all(|p| p[3] == 0 || p[0] == 0),
+        "Neighbouring red text leaked into copy"
+    );
+    assert!(content::image_png(&source, 1, index + 100).is_err());
+}

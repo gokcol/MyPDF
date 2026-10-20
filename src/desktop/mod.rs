@@ -677,6 +677,14 @@ impl Viewer {
             }
             return;
         }
+        if action == "paste" && self.live_text_has_focus(ctx) {
+            if let clip @ clipboard::Clip::Image(..) = clipboard::read() {
+                self.paste_image_over_text(ctx, clip);
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            }
+            return;
+        }
         if self.context_native_action(action, ctx) {
             return;
         }
@@ -1039,15 +1047,23 @@ impl Viewer {
             return;
         }
         if self.editor.signature_open {
-            if self.signature_image_paste_active(ctx)
-                && ctx.input_mut(|i| {
-                    let paste = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)));
-                    i.events.retain(|e| !matches!(e, egui::Event::Paste(_)));
-                    paste || i.consume_key(egui::Modifiers::COMMAND, egui::Key::V)
-                })
-            {
-                self.paste_signature_image();
+            if content::context::paste_requested(ctx) {
+                let clip = clipboard::read();
+                if matches!(clip, clipboard::Clip::Image(..))
+                    || self.signature_image_paste_active(ctx)
+                {
+                    content::context::consume_action(ctx, "paste");
+                    self.import_signature_clipboard(clip);
+                }
             }
+            return;
+        }
+        if self.live_text_has_focus(ctx)
+            && content::context::paste_requested(ctx)
+            && let clip @ clipboard::Clip::Image(..) = clipboard::read()
+        {
+            content::context::consume_action(ctx, "paste");
+            self.paste_image_over_text(ctx, clip);
             return;
         }
         if self.context_shortcuts(ctx) {
@@ -1079,11 +1095,13 @@ impl Viewer {
         {
             self.copy_page_text(ctx);
         } else if self.marks_keys(ctx) || self.paste_keys(ctx) {
-            let (copy, cut, paste) = ctx.input(|i| {
+            // Image-only clipboards may emit Command/Ctrl-V without a Paste
+            // event (the window backend can only provide pasted text).
+            let paste = self.paste_keys(ctx) && content::context::consume_action(ctx, "paste");
+            let (copy, cut) = ctx.input(|i| {
                 (
                     i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
                     i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
-                    i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))),
                 )
             });
             if (copy || cut) && self.marks_keys(ctx) {

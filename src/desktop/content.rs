@@ -176,6 +176,7 @@ pub(super) enum AfterText {
     Save(u64, super::save::Intent),
     Close(Option<u64>),
     Undo(u64, usize),
+    PasteImage(u64, clipboard::Clip),
 }
 pub(super) struct ContentState {
     pub(super) hide_guides: bool,
@@ -905,6 +906,7 @@ impl Viewer {
                 }
                 AfterText::Close(id) => self.request_close(id, ctx),
                 AfterText::Undo(id, page) => self.undo_finished_text(id, page, ctx),
+                AfterText::PasteImage(id, clip) => self.paste_after_text(ctx, id, clip),
             }
         }
     }
@@ -1908,6 +1910,81 @@ impl Viewer {
 }
 
 impl Viewer {
+    pub(super) fn live_text_has_focus(&self, ctx: &egui::Context) -> bool {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return false;
+        };
+        let focused = ctx.memory(|m| m.focused());
+        ["inline_new_text", "inline_existing_text"]
+            .iter()
+            .any(|name| focused == Some(egui::Id::new((tab.id, tab.page, *name))))
+    }
+
+    pub(super) fn paste_image_over_text(&mut self, ctx: &egui::Context, clip: clipboard::Clip) {
+        if self.content.busy || self.organizer.busy {
+            return;
+        }
+        let Some(id) = self
+            .tabs
+            .get(self.active)
+            .filter(|t| t.session.as_ref().is_some_and(|s| s.editable))
+            .map(|t| t.id)
+        else {
+            return;
+        };
+        if self.content.pending_text() == Some(id) {
+            self.content.after_text = Some(AfterText::PasteImage(id, clip));
+            self.content.new_commit = true;
+            self.finish_new_text(ctx);
+        } else {
+            // An untouched placeholder is not document content.
+            self.content.clear_new_text();
+            self.content.add_target = None;
+            self.content.new_placed = false;
+            self.paste_after_text(ctx, id, clip);
+        }
+    }
+
+    fn paste_after_text(&mut self, ctx: &egui::Context, id: u64, clip: clipboard::Clip) {
+        let Some(index) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        self.active = index;
+        self.content.add_target = None;
+        self.content.new_placed = false;
+        ctx.memory_mut(|m| {
+            if let Some(id) = m.focused() {
+                m.surrender_focus(id);
+            }
+        });
+        self.paste_clip(ctx, clip);
+    }
+
+    pub(super) fn delete_live_text(&mut self, ctx: &egui::Context) {
+        if self.content.busy
+            || !self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| t.session.as_ref().is_some_and(|s| s.editable))
+        {
+            return;
+        }
+        self.content.next_existing = None;
+        self.content.next_text = None;
+        self.content.after_text = None;
+        if let Some(draft) = &mut self.content.existing {
+            // Use the existing content/annotation transaction so Undo restores it.
+            draft.text.clear();
+            self.content.new_commit = true;
+            self.finish_new_text(ctx);
+        } else {
+            self.content.clear_new_text();
+            self.content.add_target = None;
+            self.content.new_placed = false;
+            self.content.new_commit = false;
+        }
+    }
+
     fn begin_add_after_existing(&mut self) {
         if let Some(target) = self.content.add_after_existing.take() {
             self.content.add_target = Some(target);
@@ -2056,6 +2133,7 @@ impl Viewer {
                 }
                 AfterText::Close(id) => self.request_close(id, ctx),
                 AfterText::Undo(id, page) => self.undo_finished_text(id, page, ctx),
+                AfterText::PasteImage(id, clip) => self.paste_after_text(ctx, id, clip),
             }
         }
     }
@@ -3084,7 +3162,7 @@ fn existing_overlay(
                 &mut draft.text,
                 &mut state.new_commit,
                 &mut state.show_text_inspector,
-                &mut state.context.cancel_text,
+                &mut state.context,
             );
             if let InlineTarget::Block(b) = &mut draft.target {
                 formatting::capture(&draft.text, &mut b.selected_chars, output.cursor_range);
@@ -3327,7 +3405,7 @@ pub(super) fn overlay(
                     &mut state.new_text,
                     &mut state.new_commit,
                     &mut state.show_text_inspector,
-                    &mut state.context.cancel_text,
+                    &mut state.context,
                 );
                 formatting::capture(&state.new_text, &mut state.new_selection, edit.cursor_range);
                 if edit.response.changed() {
