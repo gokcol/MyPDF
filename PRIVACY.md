@@ -1,10 +1,10 @@
 # Privacy Policy for MyPDF (OG)
 
-Effective date: 18 October 2026
+Effective date: 20 October 2026
 
 This policy covers MyPDF (OG), the Microsoft Store edition of MyPDF by
 Orhan Gökçöl, and the MyPDF desktop application distributed through the project's
-GitHub releases. It describes the behavior in version 1.3.1.
+GitHub releases. It describes the behavior in version 1.4.1.
 
 ## Information processed on your device
 
@@ -27,7 +27,7 @@ shortcuts, file paths, reading positions, custom stamps and signature artwork,
 saved signature appearances, public certificate information, trust preferences
 and references to signing identities. It also saves recovery copies of applied
 unsaved document changes, including document content and source-path metadata.
-Temporary local files may be used while processing or printing documents.
+Document templates contain local copies of the PDFs you save as templates. Batch-processing preferences are stored locally; generated documents are saved to the destination you choose. Temporary local files may be used while processing or printing documents.
 
 The default application-data locations are:
 

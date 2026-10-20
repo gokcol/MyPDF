@@ -257,9 +257,9 @@ pub(super) fn reveal_overlay(
 
 const COMMANDS: &[(&str, &str, &str)] = &[
     (
-        "Workflow settings / Quick access",
+        "Workflow settings",
         "workflow_settings",
-        "toolbar guides customize",
+        "placement snap table baseline guides",
     ),
     ("Document templates", "templates", "reusable form new copy"),
     (

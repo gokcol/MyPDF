@@ -189,12 +189,30 @@ impl Entry {
     fn purpose(&self) -> CertificatePurpose {
         CertificatePurpose::of(&self.der)
     }
+    fn short_certificate_id(&self) -> String {
+        self.info
+            .sha256
+            .chars()
+            .take(12)
+            .collect::<String>()
+            .to_ascii_uppercase()
+    }
+    fn selection_name(&self) -> String {
+        format!(
+            "{} · ID {}",
+            self.signer_name(),
+            self.short_certificate_id()
+        )
+    }
     fn label(&self) -> String {
         format!(
-            "{} • {} • {}",
+            "{}\n{} · {}\nIssuer: {}\nValid until: {}\nSHA-256: {}",
             self.info.subject,
             self.source_label(),
-            self.purpose().label()
+            self.purpose().label(),
+            self.info.issuer,
+            self.info.not_after,
+            self.info.sha256,
         )
     }
     fn source_label(&self) -> &str {
@@ -1950,13 +1968,13 @@ impl Viewer {
                                             .entries
                                             .iter()
                                             .find(|e| Some(&e.id) == self.digital.trust_id.as_ref())
-                                            .map_or("Choose public certificate".into(), Entry::label),
+                                            .map_or("Choose public certificate".into(), Entry::selection_name),
                                     )
                                     .width(ui.available_width())
                                     .show_ui(ui, |ui| {
                                         for entry in &self.digital.entries {
                                             if ui
-                                                .selectable_value(&mut self.digital.trust_id, Some(entry.id.clone()), entry.label())
+                                                .selectable_value(&mut self.digital.trust_id, Some(entry.id.clone()), entry.selection_name()).on_hover_text(entry.label())
                                                 .clicked()
                                             {
                                                 ui.close();
@@ -3159,7 +3177,7 @@ fn identity_row(
         _ => detail,
     };
     let subtitle = elide(
-        &detail,
+        &format!("ID {} · {detail}", entry.short_certificate_id()),
         FontId::proportional(11.5),
         match tone {
             ui::Tone::Danger => theme::danger(),

@@ -1,6 +1,14 @@
 use eframe::egui;
 use std::sync::mpsc;
 
+#[cfg(any(not(target_os = "macos"), not(test)))]
+pub(super) const WORKFLOW_ITEMS: &[(&str, &str)] = &[
+    ("templates", "Document Templates…"),
+    ("batch", "Batch Processing…"),
+    ("sharing_copy", "Prepare Copy for Sharing…"),
+    ("workflow_settings", "Workflow Settings…"),
+];
+
 #[cfg(target_os = "macos")]
 pub struct NativeMenu {
     menu: muda::Menu,
@@ -104,7 +112,6 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             ),
             &P::separator(),
             &item("settings", "Settings…", Code::Comma, Modifiers::empty()),
-            &MenuItem::with_id("workflow_settings", "Workflow Settings…", true, None),
             &P::separator(),
             &P::hide(None),
             &P::hide_others(None),
@@ -125,9 +132,6 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
                 Code::KeyT,
                 Modifiers::SHIFT,
             ),
-            &MenuItem::with_id("templates", "Document Templates…", true, None),
-            &MenuItem::with_id("batch", "Batch Processing…", true, None),
-            &MenuItem::with_id("sharing_copy", "Prepare Copy for Sharing…", true, None),
             &MenuItem::with_id("workspace", "Workspace…", true, None),
             &item("save", "Save…", Code::KeyS, Modifiers::empty()),
             &item("save_as", "Save As…", Code::KeyS, Modifiers::SHIFT),
@@ -301,6 +305,13 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             &MenuItem::with_id("page_text", "Accessible Page Text…", true, None),
         ],
     );
+    let tools = Submenu::new("Tools", true);
+    for (id, label) in WORKFLOW_ITEMS {
+        if let Err(e) = tools.append(&MenuItem::with_id(*id, *label, true, None)) {
+            eprintln!("Could not install Tools menu: {e}");
+            return (None, rx);
+        }
+    }
     let window = Submenu::with_items("Window", true, &[&P::minimize(None), &P::maximize(None)]);
     let sign = Submenu::with_items(
         "Sign",
@@ -332,7 +343,9 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
         return (None, rx);
     };
     let result = (|| -> muda::Result<()> {
-        menu.append_items(&[&app?, &file?, &edit, &edit_pdf?, &view?, &sign?, &window?])?;
+        menu.append_items(&[
+            &app?, &file?, &edit, &edit_pdf?, &tools, &view?, &sign?, &window?,
+        ])?;
         menu.init_for_nsapp();
         Ok(())
     })();

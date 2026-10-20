@@ -15,6 +15,12 @@ Reorder, insert, delete, extract, merge, split, rotate, and crop pages. Export m
 CONVERT AND KEEP WORK MOVING
 Convert images to PDF, export pages as PNG or JPEG, and work with plain text, Markdown, and DOCX conversions. Use undo, safe saving, and local recovery copies while you work.
 
+EVERYDAY WORKFLOWS
+Reuse local document templates, batch-compress PDFs or add page numbers and watermarks, and prepare separate sharing copies with selected comments, attachments and metadata removed. Match nearby text styling and align objects using optional table and baseline guides.
+
+TRANSLATE ON YOUR COMPUTER
+Translate selected text or pages locally using downloadable language packs, with no cloud fallback. Read the result in the side panel or attach it as a note. Model downloads require internet access; document text stays on your computer.
+
 LOCAL BY DESIGN
 MyPDF has no advertising, usage analytics, or automatic document uploads. Settings, custom stamps, signatures, and recovery data stay in local application storage. You choose where to save and share your files.
 

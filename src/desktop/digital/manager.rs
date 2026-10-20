@@ -322,6 +322,44 @@ pub(super) fn place(entry: &Entry) -> String {
     }
 }
 
+struct IdentityChoice {
+    reference: DefaultIdentity,
+    title: String,
+    detail: String,
+    tooltip: String,
+}
+impl IdentityChoice {
+    fn new(entry: &Entry) -> Self {
+        let validity = expiry(&entry.der).map_or_else(
+            || format!("Valid until {}", entry.info.not_after),
+            |(days, date)| {
+                format!(
+                    "{} {date}",
+                    if days < 0 { "Expired" } else { "Valid until" }
+                )
+            },
+        );
+        let purpose = if entry.purpose().other_purpose() {
+            format!(" · {}", entry.purpose().label())
+        } else {
+            String::new()
+        };
+        let source_detail = match &entry.source {
+            Source::File { path, .. } => format!("\nFile: {}", path.display()),
+            Source::Keychain {
+                path: Some(path), ..
+            } => format!("\nKeychain: {}", path.display()),
+            _ => String::new(),
+        };
+        Self {
+            reference: entry.reference(),
+            title: entry.selection_name(),
+            detail: format!("{} · {validity}{purpose}", place(entry)),
+            tooltip: format!("{}{source_detail}", entry.label()),
+        }
+    }
+}
+
 /// Days until the certificate expires, and the date it does.
 fn expiry(der: &[u8]) -> Option<(i64, String)> {
     let (_, certificate) = x509_parser::parse_x509_certificate(der).ok()?;
@@ -1512,24 +1550,7 @@ impl DigitalState {
         action: &mut Option<Action>,
     ) {
         ui::field(ui, "Signs with", |ui| {
-            let ids: Vec<(DefaultIdentity, String)> = self
-                .signing_entries()
-                .map(|e| {
-                    (
-                        e.reference(),
-                        format!(
-                            "{} · {}{}",
-                            e.signer_name(),
-                            place(e),
-                            if e.purpose().other_purpose() {
-                                format!(" · {}", e.purpose().label())
-                            } else {
-                                String::new()
-                            }
-                        ),
-                    )
-                })
-                .collect();
+            let ids: Vec<_> = self.signing_entries().map(IdentityChoice::new).collect();
             if ids.is_empty() {
                 ui::callout(
                     ui,
@@ -1560,9 +1581,10 @@ impl DigitalState {
             }
             let current = ids
                 .iter()
-                .find(|(r, _)| Some(r) == signature.identity.as_ref())
-                .map(|(_, label)| label.clone());
+                .find(|choice| Some(&choice.reference) == signature.identity.as_ref())
+                .map(|choice| choice.title.clone());
             let missing = signature.identity.is_some() && current.is_none();
+            let width = ui.available_width().min(460.);
             egui::ComboBox::from_id_salt(("signs_with", signature.id.as_str()))
                 .selected_text(current.unwrap_or_else(|| {
                     if missing {
@@ -1571,17 +1593,43 @@ impl DigitalState {
                         "Choose a digital ID".into()
                     }
                 }))
-                .width(ui.available_width().min(460.))
+                .width(width)
+                .wrap_mode(egui::TextWrapMode::Truncate)
                 .show_ui(ui, |ui| {
-                    for (reference, label) in ids {
+                    ui.set_width(width);
+                    for choice in ids {
+                        let mut text = egui::text::LayoutJob::default();
+                        text.append(
+                            &choice.title,
+                            0.,
+                            egui::TextFormat {
+                                font_id: ui::strong(ui, 13.),
+                                color: theme::ink(),
+                                ..Default::default()
+                            },
+                        );
+                        text.append(
+                            &format!("\n{}", choice.detail),
+                            0.,
+                            egui::TextFormat {
+                                font_id: FontId::proportional(11.5),
+                                color: theme::muted(),
+                                ..Default::default()
+                            },
+                        );
                         if ui
-                            .selectable_label(
-                                signature.identity.as_ref() == Some(&reference),
-                                label,
+                            .add_sized(
+                                vec2(width, 0.),
+                                egui::Button::new(text)
+                                    .selected(
+                                        signature.identity.as_ref() == Some(&choice.reference),
+                                    )
+                                    .wrap(),
                             )
+                            .on_hover_text(&choice.tooltip)
                             .clicked()
                         {
-                            signature.identity = Some(reference);
+                            signature.identity = Some(choice.reference);
                             ui.close();
                         }
                     }
@@ -1596,6 +1644,12 @@ impl DigitalState {
                 ui::callout(ui, ui::Tone::Warning, "Choose the digital ID that signs.");
             }
             if let Some(entry) = self.signer_of(signature) {
+                let choice = IdentityChoice::new(entry);
+                ui.add(
+                    egui::Label::new(RichText::new(choice.detail).small().color(theme::muted()))
+                        .wrap(),
+                )
+                .on_hover_text(choice.tooltip);
                 let (text, tone) = status(entry);
                 if !matches!(tone, ui::Tone::Success) {
                     ui::callout(ui, tone, &text);
@@ -2512,5 +2566,79 @@ mod preview_stability_tests {
             panic!("latest preview")
         };
         assert_ne!(latest.id(), first.id());
+    }
+}
+
+#[cfg(test)]
+mod identity_choice_tests {
+    use super::*;
+
+    fn same_name_identity(code_signing: bool) -> Entry {
+        use rcgen::{
+            CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
+        };
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "Same Person");
+        if code_signing {
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::CodeSigning];
+        }
+        let der = params.self_signed(&key).unwrap().der().to_vec();
+        let info = identity::info(&der).unwrap();
+        Entry {
+            id: info.sha256.clone(),
+            source: Source::Keychain {
+                path: None,
+                fingerprint: info.sha256.clone(),
+            },
+            info,
+            der,
+            eligible: true,
+            explanation: None,
+            token: false,
+        }
+    }
+
+    #[test]
+    fn same_name_and_expiry_choices_are_distinct_and_keep_the_selected_certificate() {
+        let first = same_name_identity(false);
+        let second = same_name_identity(false);
+        assert_eq!(first.signer_name(), second.signer_name());
+        assert_eq!(first.info.not_after, second.info.not_after);
+        let a = IdentityChoice::new(&first);
+        let b = IdentityChoice::new(&second);
+        assert_ne!(a.title, b.title);
+        assert!(a.title.contains(&first.short_certificate_id()));
+        assert!(a.detail.contains("Valid until"));
+        assert!(a.tooltip.contains(&first.info.sha256));
+        assert!(a.tooltip.contains(&first.info.issuer));
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = DigitalState::at(temp.path().into());
+        state.entries = vec![first, second.clone()];
+        let id = state.add_signature(Some(b.reference.clone()));
+        state.entries.reverse();
+        let signature = state.signature(&id).unwrap();
+        assert_eq!(
+            state.signer_of(signature).unwrap().info.sha256,
+            second.info.sha256
+        );
+        assert_eq!(signature.identity.as_ref(), Some(&b.reference));
+    }
+
+    #[test]
+    fn choices_keep_source_details_and_software_signing_warning() {
+        let mut entry = same_name_identity(true);
+        let choice = IdentityChoice::new(&entry);
+        assert!(choice.detail.contains("Code signing"));
+        entry.source = Source::File {
+            path: "/example/team.p12".into(),
+            alias: "Team ID".into(),
+        };
+        let choice = IdentityChoice::new(&entry);
+        assert!(choice.detail.contains("Team ID"));
+        assert!(choice.tooltip.contains("/example/team.p12"));
     }
 }

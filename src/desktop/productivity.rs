@@ -1,40 +1,13 @@
-//! Local copy workflows and optional personal tools. All long PDF work runs off the UI thread.
+//! Local copy workflows and placement settings. All long PDF work runs off the UI thread.
 use super::*;
 use mypdf_milestone0::workflows::{self, BatchOptions, ShareOptions, Template};
 use serde::{Deserialize, Serialize};
 
-const TOOLS: &[(&str, &str, Icon, &str)] = &[
-    ("save", "Save", Icon::Save, "⌘S / Ctrl+S"),
-    ("undo", "Undo", Icon::Undo, "⌘Z / Ctrl+Z"),
-    ("redo", "Redo", Icon::Redo, "⌘⇧Z / Ctrl+Shift+Z"),
-    ("edit_text", "Edit text", Icon::Text, ""),
-    ("add_image", "Add image", Icon::Import, ""),
-    ("translation", "Translate", Icon::Translate, ""),
-    ("sign_ink", "Sign in ink", Icon::Pen, ""),
-    ("ocr", "Recognize text", Icon::TextArea, ""),
-    ("templates", "Templates", Icon::Library, ""),
-    ("batch", "Batch processing", Icon::Group, ""),
-    ("sharing_copy", "Prepare copy for sharing", Icon::Export, ""),
-];
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Preferences {
-    visible: bool,
     guides: bool,
-    tools: Vec<String>,
     recipe: BatchOptions,
-}
-impl Default for Preferences {
-    fn default() -> Self {
-        Self {
-            visible: true,
-            guides: false,
-            tools: ["save", "undo", "templates", "batch", "sharing_copy"]
-                .map(str::to_owned)
-                .into(),
-            recipe: Default::default(),
-        }
-    }
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Panel {
@@ -245,61 +218,10 @@ impl State {
 }
 impl State {
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        let mut changed = ui
-            .checkbox(
-                &mut self.prefs.visible,
-                "Show personal quick-access toolbar",
-            )
-            .changed();
-        changed|=ui.checkbox(&mut self.prefs.guides,"Snap to detected table edges and text baselines").on_hover_text("Optional placement guides while dragging. Vector table edges only; scanned table lines are not detected.").changed();
-        ui.separator();
-        ui.label("Choose toolbar actions (up to eight). Use arrows to change their order.");
-        ui.columns(2, |columns| {
-            columns[0].vertical(|ui| {
-                for (id, label, _, _) in TOOLS {
-                    let mut selected = self.prefs.tools.iter().any(|v| v == id);
-                    if ui
-                        .add_enabled(
-                            selected || self.prefs.tools.len() < 8,
-                            egui::Checkbox::new(&mut selected, *label),
-                        )
-                        .changed()
-                    {
-                        if selected {
-                            self.prefs.tools.push((*id).into());
-                        } else {
-                            self.prefs.tools.retain(|v| v != id);
-                        }
-                        changed = true;
-                    }
-                }
-            });
-            columns[1].vertical(|ui| {
-                ui.strong("Toolbar order");
-                let items = self.prefs.tools.clone();
-                for (i, id) in items.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        let label = TOOLS
-                            .iter()
-                            .find(|t| t.0 == id)
-                            .map_or(id.as_str(), |t| t.1);
-                        ui.label(label);
-                        if ui.add_enabled(i > 0, egui::Button::new("↑")).clicked() {
-                            self.prefs.tools.swap(i, i - 1);
-                            changed = true;
-                        }
-                        if ui
-                            .add_enabled(i + 1 < items.len(), egui::Button::new("↓"))
-                            .clicked()
-                        {
-                            self.prefs.tools.swap(i, i + 1);
-                            changed = true;
-                        }
-                    });
-                }
-            });
-        });
-        if changed {
+        if ui.checkbox(&mut self.prefs.guides, "Snap to detected table edges and text baselines")
+            .on_hover_text("Optional placement guides while dragging. Vector table edges only; scanned table lines are not detected.")
+            .changed()
+        {
             self.save();
         }
     }
@@ -609,43 +531,6 @@ impl Viewer {
                 });
         }
         true
-    }
-    pub(super) fn productivity_bar(&mut self, ctx: &egui::Context) {
-        if self.zen.is_some() || self.comparison.is_some() {
-            return;
-        }
-        if !self.productivity.prefs.visible {
-            return;
-        }
-        let mut action = None;
-        egui::TopBottomPanel::top("personal_tools").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.weak("Quick access");
-                for id in &self.productivity.prefs.tools {
-                    if let Some((_, label, icon, shortcut)) = TOOLS.iter().find(|t| t.0 == id) {
-                        let available = matches!(id.as_str(), "templates" | "batch")
-                            || (!self.home.visible && self.active_document_ready());
-                        if ui
-                            .add_enabled(available, ActionButton::new(*icon, label).compact())
-                            .on_hover_text(format!("{label} {}", shortcut))
-                            .clicked()
-                        {
-                            action = Some(id.clone());
-                        }
-                    }
-                }
-                if ui
-                    .add(ActionButton::new(Icon::Settings, "Workflow settings").compact())
-                    .on_hover_text("Customize quick access and placement guides")
-                    .clicked()
-                {
-                    action = Some("workflow_settings".into());
-                }
-            });
-        });
-        if let Some(action) = action {
-            self.action(&action, ctx);
-        }
     }
     pub(super) fn productivity_windows(&mut self, ctx: &egui::Context) {
         let mut opened = None;
