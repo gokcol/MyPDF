@@ -3,7 +3,22 @@ use super::*;
 use mypdf_milestone0::pages::{self, Operation};
 use std::collections::BTreeSet;
 
-type Change = Result<(u64, u64, Vec<u8>), String>;
+type Change = Result<(u64, u64, Vec<u8>, Option<Vec<usize>>), String>;
+/// Weak source identities tie image remapping to the existing Undo/Redo history.
+pub(super) struct PageReorder {
+    before: std::sync::Weak<[u8]>,
+    after: std::sync::Weak<[u8]>,
+    /// New page index -> old page index.
+    order: Vec<usize>,
+}
+
+fn inverse_order(order: &[usize]) -> Vec<usize> {
+    let mut inverse = vec![0; order.len()];
+    for (new, &old) in order.iter().enumerate() {
+        inverse[old] = new;
+    }
+    inverse
+}
 /// Pages copied from one document, ready to paste into any open document.
 pub(super) struct PageClip {
     bytes: Vec<u8>,
@@ -61,20 +76,66 @@ impl Organizer {
     }
 }
 impl Tab {
+    /// Old page index -> new page index, only for a known pure reorder.
+    pub(super) fn reorder_mapping(&self, source: &Arc<[u8]>) -> Option<Vec<usize>> {
+        let current = self.bytes.as_ref()?;
+        self.page_reorders.iter().find_map(|change| {
+            let before = change.before.upgrade()?;
+            let after = change.after.upgrade()?;
+            if Arc::ptr_eq(current, &before) && Arc::ptr_eq(source, &after) {
+                Some(inverse_order(&change.order))
+            } else if Arc::ptr_eq(current, &after) && Arc::ptr_eq(source, &before) {
+                Some(change.order.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     /// Rebuild rendering/search only when an undo or page edit changes the PDF source.
-    pub(super) fn refresh_document(&mut self, ctx: &egui::Context) {
-        let Some(source) = self.session.as_ref().map(|s| s.source.clone()) else {
-            return;
-        };
+    pub(super) fn refresh_document(&mut self, ctx: &egui::Context) -> Option<Vec<usize>> {
+        // Release weak allocations promptly when history trimming removes a
+        // source, including frames where only annotations have changed.
+        self.page_reorders
+            .retain(|change| change.before.strong_count() > 0 && change.after.strong_count() > 0);
+        let source = self.session.as_ref().map(|s| s.source.clone())?;
         if self.bytes.as_ref().is_some_and(|b| Arc::ptr_eq(b, &source)) {
-            return;
+            return None;
         }
+        let mapping = self.reorder_mapping(&source);
         let wake = ctx.clone();
         self.worker = Worker::from_bytes(source.clone(), move || wake.request_repaint());
         self.bytes = Some(source);
         // After a content edit, each page keeps its sharpest old image until redrawn.
         self.stale.clear();
-        if std::mem::take(&mut self.keep_stale) {
+        let keep_stale = std::mem::take(&mut self.keep_stale);
+        if let Some(mapping) = &mapping {
+            // Page contents and dimensions are unchanged. Move the existing GPU
+            // textures with their pages, including thumbnails, without a blank frame.
+            self.rasters = self
+                .rasters
+                .drain()
+                .map(|(mut key, raster)| {
+                    key.page = mapping[key.page];
+                    (key, raster)
+                })
+                .collect();
+            let old_pages = self.pages.clone();
+            for (old, &new) in mapping.iter().enumerate() {
+                self.pages[new] = old_pages[old];
+            }
+            self.page = mapping[self.page];
+            self.page_input = (self.page + 1).to_string();
+            if let Some((page, _)) = &mut self.jump {
+                *page = mapping[*page];
+            }
+            for (page, _) in self.back.iter_mut().chain(&mut self.forward) {
+                if let Some(new) = mapping.get(*page) {
+                    *page = *new;
+                }
+            }
+            self.document_layout = None;
+        } else if keep_stale {
             for (key, raster) in self.rasters.drain() {
                 let sharper = self
                     .stale
@@ -85,7 +146,9 @@ impl Tab {
                 }
             }
         }
-        self.rasters.clear();
+        if mapping.is_none() {
+            self.rasters.clear();
+        }
         self.pending.clear();
         self.render_errors.clear();
         self.text.clear();
@@ -101,6 +164,7 @@ impl Tab {
         if let Some(session) = &mut self.session {
             session.editable = false;
         }
+        mapping
     }
 }
 impl Viewer {
@@ -108,7 +172,7 @@ impl Viewer {
         for result in self.organizer.rx.try_iter() {
             self.organizer.busy = false;
             match result {
-                Ok((id, revision, bytes)) => {
+                Ok((id, revision, bytes, order)) => {
                     let active = self.tabs.get(self.active).is_some_and(|t| t.id == id);
                     if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id)
                         && let Some(s) = &mut tab.session
@@ -117,13 +181,22 @@ impl Viewer {
                             self.status=Some(("The document changed while pages were processing. Please try again.".into(),true));
                             continue;
                         }
+                        let before = Arc::downgrade(&s.source);
                         match s.commit_document(bytes) {
                             Ok(()) => {
                                 s.name_last_change(self.organizer.change_name);
+                                let reordered = order.is_some();
+                                if let Some(order) = order {
+                                    tab.page_reorders.push(PageReorder {
+                                        before,
+                                        after: Arc::downgrade(&s.source),
+                                        order,
+                                    });
+                                }
                                 if active {
                                     self.editor.draft = None;
                                 }
-                                if self.organizer.tab == id {
+                                if self.organizer.tab == id && !reordered {
                                     self.organizer.selected.clear();
                                 }
                                 self.status = Some((
@@ -163,7 +236,23 @@ impl Viewer {
             });
         }
         for tab in &mut self.tabs {
-            tab.refresh_document(ctx);
+            if let Some(mapping) = tab.refresh_document(ctx)
+                && self.organizer.tab == tab.id
+            {
+                self.organizer.selected = self
+                    .organizer
+                    .selected
+                    .iter()
+                    .filter_map(|old| mapping.get(*old).copied())
+                    .collect();
+                self.organizer.range = self
+                    .organizer
+                    .selected
+                    .iter()
+                    .map(|page| (page + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+            }
         }
     }
     pub(super) fn page_change(&mut self, ctx: &egui::Context, operation: Operation) {
@@ -174,6 +263,11 @@ impl Viewer {
             return;
         };
         let Some(s) = &tab.session else { return };
+        if let Operation::Reorder(order) = &operation
+            && order.iter().copied().eq(0..tab.pages.len())
+        {
+            return;
+        }
         if !s.editable {
             self.status = Some(("This PDF is read-only for page changes.".into(), true));
             return;
@@ -205,7 +299,12 @@ impl Viewer {
                     } else {
                         mypdf_milestone0::annotations::export(&source, &annotations)?
                     };
-                    Ok((id, revision, pages::apply(&current, &operation)?))
+                    let bytes = pages::apply(&current, &operation)?;
+                    let order = match operation {
+                        Operation::Reorder(order) => Some(order),
+                        _ => None,
+                    };
+                    Ok((id, revision, bytes, order))
                 }))
                 .map_err(|_| {
                     "This PDF could not be processed. Your document is unchanged.".to_string()
@@ -535,7 +634,7 @@ impl Viewer {
                     current = pages::apply(&current, &Operation::InsertPdf { at, bytes })?;
                     at += lopdf::Document::load_mem(&current)?.get_pages().len() - before;
                 }
-                Ok((id, revision, current))
+                Ok((id, revision, current, None))
             })()
             .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
@@ -957,6 +1056,134 @@ mod tests {
     use super::*;
     use eframe::App;
     use mypdf_milestone0::annotations::{Annotation, Kind, Style};
+
+    #[test]
+    fn reordering_pages_keeps_rendered_images_selection_and_undo_redo_without_blank_frames() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Reorder.pdf");
+        let font = mypdf_milestone0::document::default_font().unwrap();
+        let bytes = mypdf_milestone0::document::fixture(&font).unwrap();
+        let bytes = pages::apply(
+            &bytes,
+            &Operation::InsertBlank {
+                at: 2,
+                width: 400.,
+                height: 300.,
+            },
+        )
+        .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(
+            &eframe::CreationContext::_new_kittest(ctx.clone()),
+            vec![path],
+        );
+        app.editor.mode = editing::Mode::Pages;
+        let frame = |app: &mut Viewer| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1200., 820.))),
+                    ..Default::default()
+                },
+                |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+            );
+        };
+        let until = |app: &mut Viewer, ready: &dyn Fn(&Viewer) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !ready(app) {
+                assert!(std::time::Instant::now() < deadline, "{:?}", app.status);
+                frame(app);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let ready = |a: &Viewer| a.tabs[0].session.as_ref().is_some_and(|s| s.editable);
+        until(&mut app, &|a| {
+            ready(a) && a.tabs[0].rasters.keys().filter(|k| k.thumbnail).count() == 3
+        });
+        let full = viewer::raster_key(0, app.tabs[0].pages[0], 1., false);
+        app.tabs[0].request(full);
+        until(&mut app, &|a| a.tabs[0].rasters.contains_key(&full));
+        let original: HashMap<_, _> = app.tabs[0]
+            .rasters
+            .iter()
+            .map(|(key, raster)| (*key, raster.texture.id()))
+            .collect();
+        let sizes = app.tabs[0].pages.clone();
+        let assert_images = |app: &Viewer, order: &[usize]| {
+            let mapping = inverse_order(order);
+            let tab = &app.tabs[0];
+            assert_eq!(tab.rasters.len(), original.len());
+            for (key, texture) in &original {
+                let moved = RasterKey {
+                    page: mapping[key.page],
+                    ..*key
+                };
+                assert_eq!(
+                    tab.rasters.get(&moved).map(|r| r.texture.id()),
+                    Some(*texture)
+                );
+            }
+            for (new, &old) in order.iter().enumerate() {
+                assert_eq!(tab.pages[new].width, sizes[old].width);
+                assert_eq!(tab.pages[new].height, sizes[old].height);
+            }
+        };
+
+        app.tabs[0].page = 0;
+        app.organizer.selected = BTreeSet::from([0, 1]);
+        // Dropping back in the same position must not rewrite the PDF.
+        let source = app.tabs[0].session.as_ref().unwrap().source.clone();
+        app.move_pages(&ctx, 0);
+        assert!(!app.organizer.busy);
+        assert!(Arc::ptr_eq(
+            &source,
+            &app.tabs[0].session.as_ref().unwrap().source
+        ));
+
+        app.move_pages(&ctx, 3);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while app.organizer.busy {
+            assert!(std::time::Instant::now() < deadline);
+            // Inspect the commit frame before the new worker can supply images.
+            app.page_events(&ctx);
+            if app.organizer.busy {
+                assert_images(&app, &[0, 1, 2]);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_images(&app, &[2, 0, 1]);
+        assert_eq!(app.organizer.selected, BTreeSet::from([1, 2]));
+        assert_eq!(app.tabs[0].page, 1);
+        until(&mut app, &ready);
+        assert_images(&app, &[2, 0, 1]);
+
+        app.editor_undo(false);
+        app.page_events(&ctx);
+        assert_images(&app, &[0, 1, 2]);
+        assert_eq!(app.organizer.selected, BTreeSet::from([0, 1]));
+        assert_eq!(app.tabs[0].page, 0);
+        until(&mut app, &ready);
+        app.editor_undo(true);
+        app.page_events(&ctx);
+        assert_images(&app, &[2, 0, 1]);
+        assert_eq!(app.organizer.selected, BTreeSet::from([1, 2]));
+        assert_eq!(app.tabs[0].page, 1);
+        until(&mut app, &ready);
+
+        // A real content/geometry change must still invalidate the old images.
+        let session = app.tabs[0].session.as_mut().unwrap();
+        let rotated = pages::apply(
+            &session.source,
+            &Operation::Rotate {
+                pages: vec![0],
+                clockwise: true,
+            },
+        )
+        .unwrap();
+        session.commit_document(rotated).unwrap();
+        app.page_events(&ctx);
+        assert!(app.tabs[0].rasters.is_empty());
+    }
 
     #[test]
     fn pages_copy_with_annotations_and_paste_into_another_open_pdf() {

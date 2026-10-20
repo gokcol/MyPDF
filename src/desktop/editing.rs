@@ -1990,7 +1990,10 @@ impl Viewer {
                     .find(|a| a.id == id && !a.object.hidden && matches!(a.kind, Kind::Note { .. }))
                     .cloned()
             });
-            if let Some((page, rect)) = focus {
+            let source = s.source.clone();
+            if let Some((page, rect)) = focus
+                && tab.reorder_mapping(&source).is_none()
+            {
                 let page = page.min(tab.pages.len().saturating_sub(1));
                 tab.jump(page);
                 self.workbench.reveal = Some((tab.id, page, rect, std::time::Instant::now()));
