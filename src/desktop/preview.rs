@@ -230,6 +230,8 @@ fn store_listing_preview() {
 }
 
 const SCENES: &[&str] = &[
+    "TabGroups",
+    "DocumentChooser",
     "WorkflowSettings",
     "Templates",
     "Batch",
@@ -1104,6 +1106,63 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
             );
         }
         preview.settle(&mut app, &ctx);
+    }
+    if matches!(collection, "TabGroups" | "DocumentChooser") {
+        ctx.enable_accesskit();
+        app.tab_controls.groups.push(tabs::Group {
+            id: 1,
+            name: "Work".into(),
+            active: None,
+        });
+        for name in [
+            "Annual report 2026",
+            "Audit checklist",
+            "Project proposal",
+            "Meeting notes",
+            "Supplier agreement",
+            "Budget review",
+        ] {
+            let path = fixture.path().join(format!("{name}.pdf"));
+            std::fs::copy(&pdf, &path).unwrap();
+            app.open(path, &ctx);
+        }
+        for tab in &mut app.tabs {
+            tab.document_group = 1;
+        }
+        app.active = 0;
+        app.home.visible = false;
+        preview.settle(&mut app, &ctx);
+        if collection == "DocumentChooser" {
+            let snapshot = preview.capture(&mut app, &ctx);
+            let nodes = snapshot.platform_output.accesskit_update.unwrap().nodes;
+            let bounds = nodes
+                .iter()
+                .find(|(_, n)| n.label() == Some("Open documents (7)"))
+                .unwrap()
+                .1
+                .bounds()
+                .unwrap();
+            let at = pos2(
+                (bounds.x0 + bounds.x1) as f32 / 2.,
+                (bounds.y0 + bounds.y1) as f32 / 2.,
+            );
+            for pressed in [true, false] {
+                preview.capture_with(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(at),
+                        egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            preview.settle(&mut app, &ctx);
+        }
     }
     let output = preview.capture_with(&mut app, &ctx, events);
     assert_scene(collection, &app, &output);

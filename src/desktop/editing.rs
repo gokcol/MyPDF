@@ -4064,7 +4064,10 @@ impl Viewer {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }
-                Some(2) => self.close_intent = None,
+                Some(2) => {
+                    self.close_intent = None;
+                    self.cancel_tab_closes();
+                }
                 _ => {}
             }
         }

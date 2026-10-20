@@ -178,7 +178,7 @@ mod tests {
                     |ctx| app.toolbar(ctx),
                 );
                 let nodes = output.platform_output.accesskit_update.unwrap().nodes;
-                for label in ["All open tabs", "Open PDF"] {
+                for label in ["Open documents (8)", "Open PDF"] {
                     let node = nodes
                         .iter()
                         .find(|(_, n)| {

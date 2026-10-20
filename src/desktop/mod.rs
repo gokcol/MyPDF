@@ -33,6 +33,7 @@ mod shrink;
 mod sign_tools;
 mod signatures;
 mod styles;
+mod tabs;
 mod text_selection;
 mod theme;
 mod translation;
@@ -67,6 +68,7 @@ struct Raster {
     used: u64,
 }
 struct Tab {
+    document_group: u64,
     placement_guides: Option<(u64, usize, mypdf_milestone0::form_detect::PageGuides)>,
     id: u64,
     path: PathBuf,
@@ -223,86 +225,6 @@ fn pill(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
         })
         .inner
 }
-enum TabClick {
-    Select,
-    Close,
-}
-/// A document tab chip: PDF glyph, name, unsaved dot and a close button on hover.
-fn document_tab(
-    ui: &mut egui::Ui,
-    tab: &Tab,
-    active: bool,
-    dirty: bool,
-    reveal: bool,
-) -> Option<TabClick> {
-    let full_name = tab.name();
-    let name = tab_caption(&full_name);
-    let font = FontId::proportional(13.);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(name.clone(), font, theme::ink());
-    let size = vec2(galley.size().x + 74., 30.);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Button, true, active, full_name.as_str())
-    });
-    if reveal {
-        response.scroll_to_me(Some(egui::Align::Center));
-    }
-    let close_rect =
-        Rect::from_center_size(pos2(rect.right() - 16., rect.center().y), vec2(20., 20.));
-    let close = ui.interact(
-        close_rect,
-        ui.id().with(("close_tab", tab.id)),
-        egui::Sense::click(),
-    );
-    close.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Close tab"));
-    let painter = ui.painter();
-    if active {
-        ui::shadow(painter, rect, 8, 1);
-        painter.rect_filled(rect, 8, theme::surface());
-    } else if response.hovered() || close.hovered() {
-        painter.rect_filled(rect, 8, theme::hover());
-    }
-    let glyph = Rect::from_center_size(pos2(rect.left() + 18., rect.center().y), vec2(16., 16.));
-    ui::draw_icon(
-        painter,
-        glyph,
-        Icon::Document,
-        if active {
-            theme::danger()
-        } else {
-            theme::muted()
-        },
-    );
-    painter.galley_with_override_text_color(
-        pos2(rect.left() + 32., rect.center().y - galley.size().y / 2.),
-        galley,
-        if active { theme::ink() } else { theme::muted() },
-    );
-    if close.hovered() {
-        painter.rect_filled(close_rect, 5, theme::pressed());
-    }
-    if active || response.hovered() || close.hovered() {
-        ui::draw_icon(painter, close_rect.shrink(5.), Icon::Close, theme::muted());
-    } else if dirty {
-        painter.circle_filled(close_rect.center(), 3.5, theme::accent());
-    }
-    if dirty && (active || response.hovered() || close.hovered()) {
-        painter.circle_filled(
-            pos2(close_rect.left() - 6., rect.center().y),
-            3.,
-            theme::accent(),
-        );
-    }
-    if close.on_hover_text("Close tab").clicked() {
-        return Some(TabClick::Close);
-    }
-    response
-        .on_hover_text(tab.path.display().to_string())
-        .clicked()
-        .then_some(TabClick::Select)
-}
 
 pub struct Viewer {
     productivity: productivity::State,
@@ -317,6 +239,7 @@ pub struct Viewer {
     active: usize,
     tab_revealed: Option<u64>,
     tab_strip_width: f32,
+    tab_controls: tabs::State,
     status_context: Option<StatusContext>,
     status_seen: Option<(String, bool)>,
     next_id: u64,
@@ -391,6 +314,7 @@ impl Viewer {
             active: 0,
             tab_revealed: None,
             tab_strip_width: 0.,
+            tab_controls: tabs::State::default(),
             status_context: None,
             status_seen: None,
             next_id: 0,
@@ -439,6 +363,7 @@ impl Viewer {
             navigation_editor: None,
             translation: translation::State::new(),
         };
+        app.restore_tab_groups();
         if paths.is_empty() {
             app.restore_workspace(&cc.egui_ctx);
         }
@@ -473,6 +398,7 @@ impl Viewer {
         let restore_view = saved_view.is_some();
         let view_preferences = saved_view.unwrap_or_default();
         self.tabs.push(Tab {
+            document_group: self.tab_controls.current_group,
             placement_guides: None,
             id: self.next_id,
             has_destination: true,
@@ -643,6 +569,7 @@ impl Viewer {
             .set_directory(tab.path.parent().unwrap_or(std::path::Path::new(".")));
         let Some(destination) = self.native_save(dialog) else {
             self.close_after_save = None;
+            self.cancel_tab_closes();
             self.save_intent = save::Intent::Automatic;
             return;
         };
@@ -684,6 +611,7 @@ impl Viewer {
             let t = &self.tabs[index];
             if t.path.is_absolute() && t.path.is_file() {
                 self.workspace.closed.push(workspace::SavedTab {
+                    document_group: t.document_group,
                     path: t.path.clone(),
                     view: t.view_preferences.clone(),
                 });
@@ -693,11 +621,17 @@ impl Viewer {
             }
             self.recovery.clear(self.tabs[index].id);
             self.clear_form_drafts(self.tabs[index].id);
+            let closed_group = self.tabs[index].document_group;
+            let was_active = self.active == index;
             self.tabs.remove(index);
             if self.active > index {
                 self.active -= 1;
             }
             self.active = self.active.min(self.tabs.len().saturating_sub(1));
+            if was_active {
+                self.home.visible = true;
+                self.switch_group(closed_group);
+            }
             if self.tabs.is_empty() {
                 self.home.visible = true;
             }
@@ -1066,6 +1000,7 @@ impl Viewer {
                 }
                 Err(e) => {
                     self.close_after_save = None;
+                    self.cancel_tab_closes();
                     (e, true)
                 }
             });
@@ -1248,8 +1183,7 @@ impl Viewer {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab))
             && !self.tabs.is_empty()
         {
-            self.active = (self.active + 1) % self.tabs.len();
-            self.home.visible = false;
+            self.cycle_group_tab(false);
         }
         if ctx.input_mut(|i| {
             i.consume_key(
@@ -1258,8 +1192,7 @@ impl Viewer {
             )
         }) && !self.tabs.is_empty()
         {
-            self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
-            self.home.visible = false;
+            self.cycle_group_tab(true);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.search = false;
@@ -1268,11 +1201,12 @@ impl Viewer {
     }
 
     fn toolbar(&mut self, ctx: &egui::Context) {
+        self.advance_tab_closes(ctx);
+        self.tab_group_dialog(ctx);
         if self.zen.is_some() {
             return;
         }
         let mut action = None;
-        let mut close = None;
         egui::TopBottomPanel::top("document_tabs")
             .frame(
                 egui::Frame::new()
@@ -1286,7 +1220,7 @@ impl Viewer {
                     ui.add_space(70.);
                     let (mark, _) = ui.allocate_exact_size(vec2(22., 22.), egui::Sense::hover());
                     ui::logo(ui.painter(), mark);
-                    if ui.available_width() > 620. {
+                    if ui.available_width() > 960. {
                         ui.label(
                             RichText::new("MyPDF")
                                 .font(ui::bold(ui, 14.))
@@ -1302,100 +1236,16 @@ impl Viewer {
                             }
                         }
                     });
-                    if ui
-                        .add(
-                            ActionButton::new(Icon::Home, "Home")
-                                .tab()
-                                .selected(self.home.visible),
-                        )
-                        .on_hover_text("Home · ⇧⌘H")
-                        .clicked()
-                    {
+                    let mut home = ActionButton::new(Icon::Home, "Home")
+                        .tab()
+                        .selected(self.home.visible);
+                    if ui.available_width() < 850. {
+                        home = home.compact();
+                    }
+                    if ui.add(home).on_hover_text("Home · ⇧⌘H").clicked() {
                         action = Some("home");
                     }
-                    let available = (ui.available_width() - 148.).max(40.);
-                    let selected = (!self.home.visible)
-                        .then(|| self.tabs.get(self.active).map(|t| t.id))
-                        .flatten();
-                    let reveal = selected != self.tab_revealed
-                        || (self.tab_strip_width - available).abs() > 1.;
-                    self.tab_revealed = selected;
-                    self.tab_strip_width = available;
-                    ui.allocate_ui_with_layout(
-                        vec2(available, 32.),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            egui::ScrollArea::horizontal()
-                                .id_salt("tab_strip")
-                                .auto_shrink([false, true])
-                                .scroll_bar_visibility(
-                                    egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
-                                )
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        for (i, tab) in self.tabs.iter().enumerate() {
-                                            let active = selected == Some(tab.id);
-                                            let dirty = tab.unsaved_on_load
-                                                || tab.session.as_ref().is_some_and(|s| s.dirty());
-                                            match document_tab(
-                                                ui,
-                                                tab,
-                                                active,
-                                                dirty,
-                                                active && reveal,
-                                            ) {
-                                                Some(TabClick::Select) => {
-                                                    self.active = i;
-                                                    self.home.visible = false;
-                                                }
-                                                Some(TabClick::Close) => close = Some(i),
-                                                None => {}
-                                            }
-                                        }
-                                        let drag = ui.allocate_response(
-                                            vec2(ui.available_width().max(1.), 30.),
-                                            egui::Sense::drag(),
-                                        );
-                                        if drag.drag_started() {
-                                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                                        }
-                                    });
-                                });
-                        },
-                    );
-                    let response =
-                        ui.add(ActionButton::new(Icon::Outline, "All open tabs").compact());
-                    egui::Popup::menu(&response).show(|ui| {
-                        ui.set_width(280.);
-                        egui::ScrollArea::vertical()
-                            .max_height(360.)
-                            .show(ui, |ui| {
-                                if self.tabs.is_empty() {
-                                    ui.weak("No open documents");
-                                }
-                                for (i, tab) in self.tabs.iter().enumerate() {
-                                    let name = if tab.session.as_ref().is_some_and(|s| s.dirty()) {
-                                        format!("● {}", tab.name())
-                                    } else {
-                                        tab.name()
-                                    };
-                                    if ui
-                                        .selectable_label(
-                                            i == self.active && !self.home.visible,
-                                            name,
-                                        )
-                                        .on_hover_text(tab.path.display().to_string())
-                                        .clicked()
-                                    {
-                                        self.active = i;
-                                        self.home.visible = false;
-                                        ui.close();
-                                    }
-                                }
-                            });
-                        ui.separator();
-                        ui.weak("Ctrl+Tab / Ctrl+Shift+Tab to switch");
-                    });
+                    self.document_tabs(ui, ctx);
                     if ui
                         .add(ActionButton::new(Icon::Plus, "Open PDF").compact())
                         .clicked()
@@ -1418,9 +1268,6 @@ impl Viewer {
                     }
                 });
             });
-        if let Some(index) = close.take() {
-            self.request_close(self.tabs.get(index).map(|t| t.id), ctx);
-        }
         if let Some(a) = action.take() {
             self.action(a, ctx);
         }
@@ -1733,9 +1580,6 @@ impl Viewer {
                     }
                 });
             });
-        if let Some(index) = close {
-            self.request_close(self.tabs.get(index).map(|t| t.id), ctx);
-        }
         if let Some(action) = action {
             self.action(action, ctx);
         }
