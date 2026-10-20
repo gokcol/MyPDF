@@ -1,4 +1,4 @@
-MyPDF (OG) 1.5.2 — Microsoft Store, English (United States)
+MyPDF (OG) 1.6.0 — Microsoft Store, English (United States)
 
 Description: paste description.txt as plain text.
 Screenshots: upload screenshots/01-read.png first, followed by the other three.

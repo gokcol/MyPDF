@@ -233,6 +233,7 @@ const SCENES: &[&str] = &[
     "TabGroups",
     "DocumentChooser",
     "WorkflowSettings",
+    "Appearance",
     "Templates",
     "Batch",
     "SharingCopy",
@@ -391,6 +392,12 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
         vec![pdf.clone()],
     );
     ctx.set_theme(theme);
+    if let Ok(style) = std::env::var("MYPDF_PREVIEW_STYLE") {
+        ui::set_visual_style(&ctx, theme::Style::from_key(&style)).unwrap();
+    }
+    if let Ok(style) = std::env::var("MYPDF_PREVIEW_ICONS") {
+        ui::set_icon_style(&ctx, theme::IconStyle::from_key(&style)).unwrap();
+    }
     app.editor.mode = editing::Mode::Annotate;
     app.tabs[0].zoom = Zoom::Page;
     let mut preview = Preview::default();
@@ -586,6 +593,10 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
     }
     if collection == "NewDigitalId" {
         app.digital.preview_new_id();
+    }
+    if collection == "Appearance" {
+        app.digital.open = true;
+        app.digital.panel = digital::Panel::Interface;
     }
     if collection.starts_with("MySignatures") {
         use mypdf_milestone0::annotations::{Kind, Style};

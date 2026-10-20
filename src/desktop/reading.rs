@@ -27,7 +27,7 @@ impl PageLayout {
         }
     }
 }
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(super) struct Layout {
     pub rects: Vec<Rect>,
     pub scale: f32,
@@ -622,5 +622,26 @@ impl Viewer {
         } else {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
+    }
+}
+
+#[cfg(test)]
+impl Tab {
+    /// PDF coordinate at the top-center of the viewport, independent of zoom
+    /// and changes in inspector width.
+    pub(super) fn canvas_anchor(&self) -> (usize, egui::Vec2) {
+        let (view, offset, _) = self.document_view.unwrap();
+        let layout = self.document_layout.as_ref().unwrap();
+        let at = offset + vec2(view.width() / 2., 0.);
+        let page = layout.page_at(at);
+        (page, (at - layout.rects[page].min.to_vec2()) / layout.scale)
+    }
+    pub(super) fn assert_canvas_anchor(&self, expected: (usize, egui::Vec2)) {
+        let actual = self.canvas_anchor();
+        assert_eq!(actual.0, expected.0, "The viewport changed pages");
+        assert!(
+            (actual.1.y - expected.1.y).abs() < 1.,
+            "Viewport jumped: {expected:?} -> {actual:?}"
+        );
     }
 }

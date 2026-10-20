@@ -1979,6 +1979,11 @@ impl Viewer {
                 })
                 .cloned();
             let focus = if redo { s.redo_focus() } else { s.undo_focus() };
+            let signature_change = if redo { s.redo_label() } else { s.undo_label() }.as_deref()
+                == Some("Remove digital signature");
+            if signature_change {
+                tab.keep_stale = true;
+            }
             if redo {
                 s.redo();
             } else {

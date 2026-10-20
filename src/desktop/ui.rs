@@ -359,13 +359,67 @@ pub(super) enum Icon {
     Zen,
 }
 
+/// Only control glyphs receive decorative color; artwork previews, warnings,
+/// disabled/primary actions and tools showing a document color keep their ink.
+fn control_icon_family(icon: Icon, mode_tab: bool) -> Option<theme::IconFamily> {
+    use theme::{IconFamily as F, IconStyle as S};
+    if theme::icon_style() == S::Selective {
+        return match icon {
+            Icon::Open => Some(F::Document),
+            Icon::Sign => Some(F::Signing),
+            Icon::Pen | Icon::Text if mode_tab => Some(F::Editing),
+            _ => None,
+        };
+    }
+    match icon {
+        Icon::Open | Icon::Blank | Icon::Library => Some(F::Document),
+        Icon::Save | Icon::Sign | Icon::Export | Icon::Stamp => Some(F::Signing),
+        Icon::Pen | Icon::Text | Icon::Shapes | Icon::Form | Icon::Translate | Icon::Note => {
+            Some(F::Editing)
+        }
+        _ => None,
+    }
+}
+
+fn control_icon_appearance(
+    icon: Icon,
+    mode_tab: bool,
+    decorative: bool,
+    fallback: Color32,
+) -> (Color32, bool) {
+    if decorative && let Some(family) = control_icon_family(icon, mode_tab) {
+        return (
+            theme::icon_color(family),
+            theme::icon_style() == theme::IconStyle::Duotone,
+        );
+    }
+    (fallback, false)
+}
+
 pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
+    draw_icon_impl(painter, rect, icon, color, false);
+}
+
+fn draw_icon_impl(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, duotone: bool) {
     let p = |x: f32, y: f32| rect.min + vec2(x, y) * rect.size();
     let width = (rect.width() * 0.082).clamp(1.3, 3.0);
     let stroke = Stroke::new(width, color);
     // Round caps and joins: a dot under every vertex hides mitred corners.
     let line = |points: &[[f32; 2]]| {
         let points: Vec<_> = points.iter().map(|v| p(v[0], v[1])).collect();
+        // These existing closed outlines are convex. Fill them without
+        // changing their vertices, stroke width, hit area or icon placement.
+        if duotone
+            && matches!(icon, Icon::Pen | Icon::Sign | Icon::Save | Icon::Blank)
+            && points.len() >= 4
+            && points.first() == points.last()
+        {
+            painter.add(egui::Shape::convex_polygon(
+                points[..points.len() - 1].to_vec(),
+                color.gamma_multiply(0.17),
+                Stroke::NONE,
+            ));
+        }
         for point in &points {
             painter.circle_filled(*point, width / 2., color);
         }
@@ -381,6 +435,13 @@ pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: 
             .collect()
     };
     let box_at = |a: [f32; 2], b: [f32; 2], radius: f32| {
+        if duotone {
+            painter.rect_filled(
+                Rect::from_min_max(p(a[0], a[1]), p(b[0], b[1])),
+                radius * rect.width(),
+                color.gamma_multiply(0.17),
+            );
+        }
         painter.rect_stroke(
             Rect::from_min_max(p(a[0], a[1]), p(b[0], b[1])),
             radius * rect.width(),
@@ -823,6 +884,13 @@ pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: 
         Icon::Shapes => {
             fill_box([0.08, 0.08], [0.56, 0.56], 0.06, soft);
             box_at([0.08, 0.08], [0.56, 0.56], 0.06);
+            if duotone {
+                painter.circle_filled(
+                    p(0.65, 0.65),
+                    rect.width() * 0.27,
+                    color.gamma_multiply(0.17),
+                );
+            }
             painter.circle_stroke(p(0.65, 0.65), rect.width() * 0.27, stroke);
         }
         Icon::Form => {
@@ -1335,11 +1403,14 @@ impl egui::Widget for MenuItem<'_> {
         if response.hovered() || response.has_focus() {
             ui.painter().rect_filled(rect, 5., visuals.weak_bg_fill);
         }
-        draw_icon(
+        let (icon_color, duotone) =
+            control_icon_appearance(self.icon, false, ui.is_enabled(), visuals.fg_stroke.color);
+        draw_icon_impl(
             ui.painter(),
             Rect::from_center_size(pos2(rect.left() + 15., rect.center().y), vec2(16., 16.)),
             self.icon,
-            visuals.fg_stroke.color,
+            icon_color,
+            duotone,
         );
         ui.painter().galley(
             pos2(rect.left() + 32., rect.center().y - galley.size().y / 2.),
@@ -1456,25 +1527,31 @@ impl egui::Widget for ActionButton<'_> {
             let hovered = enabled && response.hovered();
             let pressed = hovered && response.is_pointer_button_down_on();
             let filled = self.primary && enabled;
-            let radius = if self.tab { 7 } else { 8 };
+            let radius = theme::style().radius();
             if filled {
-                shadow(painter, rect, radius, 1);
-                gradient_rect(
-                    painter,
+                painter.rect_filled(
                     rect,
                     radius,
-                    Fill::Sheen,
                     if hovered {
                         theme::accent_hover()
                     } else {
                         theme::accent()
                     },
                 );
-            } else if self.selected && self.tab {
-                shadow(painter, rect, radius, 1);
-                painter.rect_filled(rect, radius, theme::raised());
             } else if self.selected {
+                if theme::style() == theme::Style::Glacier && self.tab {
+                    shadow(painter, rect, radius, 1);
+                }
                 painter.rect_filled(rect, radius, theme::accent_soft());
+                if theme::style() == theme::Style::Calico && self.tab {
+                    painter.line_segment(
+                        [
+                            pos2(rect.left() + 5., rect.bottom() - 1.),
+                            pos2(rect.right() - 5., rect.bottom() - 1.),
+                        ],
+                        Stroke::new(2., theme::accent()),
+                    );
+                }
             } else if hovered {
                 painter.rect_filled(
                     rect,
@@ -1489,7 +1566,7 @@ impl egui::Widget for ActionButton<'_> {
             let fg = if !enabled {
                 theme::muted().gamma_multiply(0.55)
             } else if filled {
-                Color32::WHITE
+                theme::on_accent()
             } else if self.selected {
                 theme::accent()
             } else {
@@ -1511,7 +1588,13 @@ impl egui::Widget for ActionButton<'_> {
             let lift = if self.tint.is_some() { 2.5 } else { 0. };
             let icon_rect =
                 Rect::from_center_size(pos2(icon_x, rect.center().y - lift), vec2(18., 18.));
-            draw_icon(painter, icon_rect, self.icon, fg);
+            let (icon_color, duotone) = control_icon_appearance(
+                self.icon,
+                self.tab,
+                enabled && !filled && self.tint.is_none(),
+                fg,
+            );
+            draw_icon_impl(painter, icon_rect, self.icon, icon_color, duotone);
             if let Some(tint) = self.tint {
                 let bar =
                     Rect::from_center_size(pos2(icon_x, icon_rect.bottom() + 3.5), vec2(15., 3.));
@@ -1560,8 +1643,12 @@ pub(super) fn segment_track<R>(
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     egui::Frame::new()
-        .fill(theme::track())
-        .corner_radius(10)
+        .fill(if theme::style() == theme::Style::Glacier {
+            theme::track()
+        } else {
+            Color32::TRANSPARENT
+        })
+        .corner_radius(theme::style().radius() + 3)
         .inner_margin(egui::Margin::same(3))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 2.;
@@ -1603,8 +1690,11 @@ fn segments(ui: &mut egui::Ui, options: &[&str], icons: &[Icon], selected: usize
             egui::WidgetInfo::selected(egui::WidgetType::Button, true, i == selected, *label)
         });
         if i == selected {
-            shadow(ui.painter(), r, 7, 1);
-            ui.painter().rect_filled(r, 7, theme::raised());
+            if theme::style() == theme::Style::Glacier {
+                shadow(ui.painter(), r, theme::style().radius(), 1);
+            }
+            ui.painter()
+                .rect_filled(r, theme::style().radius(), theme::raised());
         } else if response.hovered() {
             ui.painter().rect_filled(r, 7, theme::hover());
         }
@@ -1731,19 +1821,16 @@ pub(super) fn dialog_button(ui: &mut egui::Ui, label: &str, tone: DialogTone) ->
     let painter = ui.painter();
     let text = match tone {
         DialogTone::Primary => {
-            shadow(painter, rect, 9, 1);
-            gradient_rect(
-                painter,
+            painter.rect_filled(
                 rect,
-                9,
-                Fill::Sheen,
+                theme::style().radius(),
                 if hovered {
                     theme::accent_hover()
                 } else {
                     theme::accent()
                 },
             );
-            Color32::WHITE
+            theme::on_accent()
         }
         DialogTone::Secondary | DialogTone::Destructive => {
             painter.rect_filled(
@@ -2009,14 +2096,21 @@ pub(super) fn notice(ui: &mut egui::Ui, message: &str) -> bool {
 
 /// Install light and dark styles; egui picks one per the remembered preference.
 pub(super) fn install_theme(ctx: &egui::Context) {
+    let (preference, style) = theme::load_preferences();
+    theme::set_style(style);
+    theme::set_icon_style(theme::load_icon_style());
+    apply_style(ctx);
+    // Light when the platform does not report its appearance.
+    ctx.options_mut(|o| o.fallback_theme = egui::Theme::Light);
+    ctx.set_theme(preference);
+}
+fn apply_style(ctx: &egui::Context) {
     for (theme, dark) in [(egui::Theme::Light, false), (egui::Theme::Dark, true)] {
         let mut style = (*ctx.style_of(theme)).clone();
         style_for(&mut style, theme::palette_for(dark), dark);
         ctx.set_style_of(theme, style);
     }
-    // Light when the platform does not report its appearance.
-    ctx.options_mut(|o| o.fallback_theme = egui::Theme::Light);
-    ctx.set_theme(theme::load_preference());
+    ctx.request_repaint();
 }
 /// The tab-strip appearance button: Match System, Light or Dark.
 pub(super) fn theme_menu(ui: &mut egui::Ui) -> Option<&'static str> {
@@ -2052,6 +2146,89 @@ pub(super) fn set_theme_preference(ctx: &egui::Context, preference: egui::ThemeP
     ctx.set_theme(preference);
     let _ = theme::save_preference(preference);
 }
+/// Change visual treatment without touching geometry or the light/dark choice.
+pub(super) fn set_visual_style(ctx: &egui::Context, style: theme::Style) -> anyhow::Result<()> {
+    theme::save_style(style)?;
+    theme::set_style(style);
+    apply_style(ctx);
+    Ok(())
+}
+pub(super) fn set_icon_style(ctx: &egui::Context, style: theme::IconStyle) -> anyhow::Result<()> {
+    theme::save_icon_style(style)?;
+    theme::set_icon_style(style);
+    ctx.request_repaint();
+    Ok(())
+}
+
+pub(super) fn appearance_settings(ui: &mut egui::Ui) {
+    ui.label(RichText::new("Visual style").family(semibold()));
+    let mut selected = theme::style();
+    ui.horizontal_wrapped(|ui| {
+        for style in theme::Style::ALL {
+            ui.selectable_value(&mut selected, style, style.name());
+        }
+    });
+    let error_id = egui::Id::new("appearance_save_error");
+    if selected != theme::style() {
+        let error = set_visual_style(ui.ctx(), selected)
+            .err()
+            .map(|e| format!("Could not save appearance: {e}"));
+        ui.ctx().data_mut(|d| d.insert_temp(error_id, error));
+    }
+    ui.weak(match theme::style() {
+        theme::Style::Graphite => "Clean graphite surfaces with blue highlights.",
+        theme::Style::Glacier => "Cool surfaces, teal highlights and softly raised controls.",
+        theme::Style::Calico => "Warm neutrals, copper highlights and crisp edges.",
+    });
+    ui.add_space(8.);
+    ui.label(RichText::new("Icon colors").family(semibold()));
+    let mut icons = theme::icon_style();
+    ui.horizontal_wrapped(|ui| {
+        for style in theme::IconStyle::ALL {
+            ui.selectable_value(&mut icons, style, style.name());
+        }
+    });
+    if icons != theme::icon_style() {
+        let error = set_icon_style(ui.ctx(), icons)
+            .err()
+            .map(|e| format!("Could not save icon colors: {e}"));
+        ui.ctx().data_mut(|d| d.insert_temp(error_id, error));
+    }
+    ui.weak(match theme::icon_style() {
+        theme::IconStyle::Selective => "A few accents for Open, editing modes and signing.",
+        theme::IconStyle::Families => {
+            "Blue editing, teal signing and saving, amber document tools."
+        }
+        theme::IconStyle::Duotone => "The same color families with softly filled icon details.",
+    });
+    ui.add_space(8.);
+    ui.label(RichText::new("Appearance").family(semibold()));
+    let current = ui.ctx().options(|o| o.theme_preference);
+    let mut preference = current;
+    ui.horizontal_wrapped(|ui| {
+        for (value, label) in [
+            (egui::ThemePreference::System, "Match System"),
+            (egui::ThemePreference::Light, "Light"),
+            (egui::ThemePreference::Dark, "Dark"),
+        ] {
+            ui.selectable_value(&mut preference, value, label);
+        }
+    });
+    if preference != current {
+        let error = theme::save_preference(preference)
+            .err()
+            .map(|e| format!("Could not save appearance: {e}"));
+        if error.is_none() {
+            ui.ctx().set_theme(preference);
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(error_id, error));
+    }
+    ui.weak("Changes appear immediately. Each style supports light and dark appearance.");
+    if let Some(Some(error)) = ui.ctx().data(|d| d.get_temp::<Option<String>>(error_id)) {
+        ui.colored_label(theme::danger(), error);
+    }
+}
+
 fn style_for(style: &mut egui::Style, p: &theme::Palette, dark: bool) {
     style.visuals = if dark {
         egui::Visuals::dark()
@@ -2062,7 +2239,7 @@ fn style_for(style: &mut egui::Style, p: &theme::Palette, dark: bool) {
     v.override_text_color = None;
     v.panel_fill = p.paper;
     v.window_fill = p.surface;
-    v.window_corner_radius = 14.into();
+    v.window_corner_radius = (theme::style().radius() + 5).into();
     v.window_shadow = egui::epaint::Shadow {
         offset: [0, 14],
         blur: 40,
@@ -2076,16 +2253,12 @@ fn style_for(style: &mut egui::Style, p: &theme::Palette, dark: bool) {
         spread: 0,
         color: Color32::from_black_alpha(if dark { 100 } else { 34 }),
     };
-    v.menu_corner_radius = 10.into();
+    v.menu_corner_radius = (theme::style().radius() + 3).into();
     v.faint_bg_color = p.paper;
     v.extreme_bg_color = p.surface;
     v.code_bg_color = p.control;
     v.hyperlink_color = p.accent;
-    v.selection.bg_fill = if dark {
-        Color32::from_rgb(46, 72, 128)
-    } else {
-        Color32::from_rgb(205, 221, 255)
-    };
+    v.selection.bg_fill = p.accent_soft;
     v.selection.stroke = Stroke::new(1.0, p.accent);
     v.text_cursor.stroke = Stroke::new(2.0, p.accent);
     v.handle_shape = egui::style::HandleShape::Circle;
@@ -2097,7 +2270,7 @@ fn style_for(style: &mut egui::Style, p: &theme::Palette, dark: bool) {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        widget.corner_radius = 8.into();
+        widget.corner_radius = theme::style().radius().into();
         widget.fg_stroke = Stroke::new(1.0, p.ink);
         widget.expansion = 0.;
     }
@@ -2143,6 +2316,83 @@ fn style_for(style: &mut egui::Style, p: &theme::Palette, dark: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn visual_styles_preserve_controls_and_light_dark_preference() {
+        let ctx = egui::Context::default();
+        install_theme(&ctx);
+        let mut original = None;
+        for dark in [false, true] {
+            let preference = if dark {
+                egui::ThemePreference::Dark
+            } else {
+                egui::ThemePreference::Light
+            };
+            ctx.set_theme(preference);
+            for (style, icons) in theme::Style::ALL.into_iter().flat_map(|style| {
+                theme::IconStyle::ALL
+                    .into_iter()
+                    .map(move |icons| (style, icons))
+            }) {
+                set_icon_style(&ctx, icons).unwrap();
+                set_visual_style(&ctx, style).unwrap();
+                assert_eq!(ctx.options(|o| o.theme_preference), preference);
+                let mut geometry = Vec::new();
+                let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                    theme::sync(ctx.theme());
+                    let expected = theme::palette_for_style(style, dark);
+                    assert_eq!(ctx.style().visuals.panel_fill, expected.paper);
+                    assert_eq!(theme::accent(), expected.accent);
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        segment_track(ui, |ui| {
+                            for (icon, label) in [
+                                (Icon::Read, "Read"),
+                                (Icon::Text, "Edit"),
+                                (Icon::Sign, "Sign"),
+                            ] {
+                                geometry.push(
+                                    ui.add(ActionButton::new(icon, label).tab().selected(true))
+                                        .rect,
+                                );
+                            }
+                        });
+                        geometry.push(ui.add(ActionButton::new(Icon::Open, "Open").compact()).rect);
+                    });
+                });
+                if let Some(original) = &original {
+                    assert_eq!(&geometry, original, "{style:?} changed control positions");
+                } else {
+                    original = Some(geometry);
+                }
+            }
+        }
+        set_visual_style(&ctx, theme::Style::Graphite).unwrap();
+        theme::set_icon_style(theme::IconStyle::Selective);
+        theme::sync(egui::Theme::Light);
+    }
+    #[test]
+    fn icon_accents_preserve_semantic_and_disabled_colors() {
+        let fallback = Color32::from_rgb(172, 24, 42);
+        for style in theme::IconStyle::ALL {
+            theme::set_icon_style(style);
+            assert_eq!(
+                control_icon_appearance(Icon::Sign, false, false, fallback),
+                (fallback, false)
+            );
+            assert_eq!(
+                control_icon_appearance(Icon::Warning, false, true, fallback),
+                (fallback, false)
+            );
+        }
+        theme::set_icon_style(theme::IconStyle::Selective);
+        assert_eq!(
+            control_icon_appearance(Icon::Pen, false, true, fallback),
+            (fallback, false)
+        );
+        assert_ne!(
+            control_icon_appearance(Icon::Pen, true, true, fallback).0,
+            fallback
+        );
+    }
     #[test]
     fn confirmation_keyboard_chooses_safe_default_and_cancel() {
         for (key, expected) in [(egui::Key::Escape, 2), (egui::Key::Enter, 0)] {

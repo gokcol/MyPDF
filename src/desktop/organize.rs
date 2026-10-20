@@ -107,8 +107,10 @@ impl Tab {
         self.worker = Worker::from_bytes(source.clone(), move || wake.request_repaint());
         self.bytes = Some(source);
         // After a content edit, each page keeps its sharpest old image until redrawn.
-        self.stale.clear();
         let keep_stale = std::mem::take(&mut self.keep_stale);
+        if !keep_stale {
+            self.stale.clear();
+        }
         if let Some(mapping) = &mapping {
             // Page contents and dimensions are unchanged. Move the existing GPU
             // textures with their pages, including thumbnails, without a blank frame.

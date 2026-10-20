@@ -613,7 +613,7 @@ fn tab_chip(
     close.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Close tab"));
     let painter = ui.painter();
     if active {
-        painter.rect_filled(rect, 7, theme::surface());
+        painter.rect_filled(rect, theme::style().radius(), theme::raised());
         painter.line_segment(
             [
                 pos2(rect.left() + 10., rect.bottom()),
@@ -622,7 +622,7 @@ fn tab_chip(
             Stroke::new(2., theme::accent()),
         );
     } else if response.hovered() || close.hovered() {
-        painter.rect_filled(rect, 7, theme::hover());
+        painter.rect_filled(rect, theme::style().radius(), theme::hover());
     }
     if insertion_marker {
         let x = if after { rect.right() } else { rect.left() };
