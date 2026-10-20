@@ -5,6 +5,7 @@ pub(super) struct State {
     query: String,
     offset: f32,
     drag: Option<TabDrag>,
+    window_drag_requested: bool,
     close_queue: std::collections::VecDeque<u64>,
     waiting: Option<u64>,
     pub groups: Vec<Group>,
@@ -32,16 +33,27 @@ mod tests {
     }
 
     fn frame(app: &mut Viewer, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
-        ctx.run(
+        let width = ctx
+            .data(|d| d.get_temp::<f32>(egui::Id::new("test_width")))
+            .unwrap_or(1400.);
+        let output = ctx.run(
             egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1400., 800.))),
+                screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(width, 800.))),
                 events,
                 ..Default::default()
             },
             |ctx| {
                 eframe::App::update(app, ctx, &mut eframe::Frame::_new_kittest());
             },
-        )
+        );
+        assert!(
+            !output.viewport_output.values().any(|v| v
+                .commands
+                .iter()
+                .any(|c| matches!(c, egui::ViewportCommand::StartDrag))),
+            "A tab interaction started moving the OS window"
+        );
+        output
     }
 
     fn bounds(app: &mut Viewer, ctx: &egui::Context, name: &str) -> Rect {
@@ -120,6 +132,28 @@ mod tests {
             assert_eq!(app.tabs[2].id, first);
             assert_eq!(app.tabs[app.active].id, active_id);
             assert!(app.tabs.iter().all(dirty));
+        }
+    }
+
+    #[test]
+    fn windowed_tab_drags_never_request_native_window_movement() {
+        for width in [720., 900., 1200.] {
+            let (mut app, ctx) = fixture(8);
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("test_width"), width));
+            let source = app.tabs[7].id;
+            let from = bounds(&mut app, &ctx, "document-7.pdf").center();
+            let to = from - vec2(200., 0.);
+            pointer(&mut app, &ctx, from, egui::PointerButton::Primary, true);
+            for step in 1..=10 {
+                frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(from.lerp(to, step as f32 / 10.))],
+                );
+            }
+            pointer(&mut app, &ctx, to, egui::PointerButton::Primary, false);
+            assert!(app.tabs.iter().position(|t| t.id == source).unwrap() < 7);
+            assert_eq!(app.tabs[app.active].id, source);
         }
     }
 
@@ -379,6 +413,7 @@ impl Default for State {
             query: String::new(),
             offset: 0.,
             drag: None,
+            window_drag_requested: false,
             close_queue: Default::default(),
             waiting: None,
             groups: vec![Group {
@@ -408,6 +443,14 @@ struct TabContext<'a> {
 }
 
 impl State {
+    pub(super) fn request_window_drag(&mut self) {
+        self.window_drag_requested = true;
+    }
+
+    pub(super) fn take_window_drag(&mut self) -> bool {
+        std::mem::take(&mut self.window_drag_requested)
+    }
+
     fn tab_gesture(
         &mut self,
         events: &[egui::Event],
@@ -1291,8 +1334,20 @@ impl Viewer {
         ) {
             action = Some(command);
         }
-        if area.drag_started() && self.tab_controls.drag.is_none() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        // Decide ownership from the original press, never from the absence of
+        // a tab drag after its release. Close buttons and clipped tabs also
+        // belong to the tab strip and must never initiate window movement.
+        if area.drag_started()
+            && !egui::Popup::is_any_open(ctx)
+            && ctx.input(|i| {
+                i.pointer.primary_down()
+                    && i.pointer.press_origin().is_some_and(|origin| {
+                        strip_rect.contains(origin)
+                            && !targets.iter().any(|(_, rect)| rect.contains(origin))
+                    })
+            })
+        {
+            self.tab_controls.request_window_drag();
         }
         if self.tab_controls.drag.is_some_and(|d| d.moved) {
             ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
