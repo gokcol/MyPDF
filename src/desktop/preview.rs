@@ -230,6 +230,10 @@ fn store_listing_preview() {
 }
 
 const SCENES: &[&str] = &[
+    "WorkflowSettings",
+    "Templates",
+    "Batch",
+    "SharingCopy",
     "Home",
     "HomeEmpty",
     "Viewer",
@@ -1025,6 +1029,26 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
     } else {
         vec![]
     };
+    if let Some(action) = match collection {
+        "WorkflowSettings" => Some("workflow_settings"),
+        "Templates" => Some("templates"),
+        "Batch" => Some("batch"),
+        "SharingCopy" => Some("sharing_copy"),
+        _ => None,
+    } {
+        app.productivity_action(action, &ctx);
+        for _ in 0..4 {
+            preview.capture(&mut app, &ctx);
+        }
+        if collection == "SharingCopy" {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while app.productivity.is_busy() {
+                assert!(std::time::Instant::now() < deadline);
+                preview.capture(&mut app, &ctx);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
     if let Some(action) = match collection {
         "CropImage" => Some("crop_object"),
         "Objects" => Some("objects"),

@@ -2039,6 +2039,7 @@ mod tests {
             0,
         );
         app.content.inspection = Some(Inspection {
+            guides: Default::default(),
             key,
             text: Ok(runs),
             images: Ok(images.clone()),

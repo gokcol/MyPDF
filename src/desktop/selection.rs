@@ -373,6 +373,53 @@ pub(super) fn aligned(marks: &[Annotation], align: Align) -> Vec<Annotation> {
         })
         .collect()
 }
+/// Equal gaps preserve the two outer objects; size matching uses the first
+/// selected document-order object as reference and preserves each center.
+pub(super) fn distributed(marks: &[Annotation], axis: usize) -> Vec<Annotation> {
+    let mut out = marks.to_vec();
+    if out.len() < 3 {
+        return out;
+    }
+    let mut order: Vec<_> = (0..out.len()).collect();
+    order.sort_by(|&a, &b| out[a].bounds()[axis].total_cmp(&out[b].bounds()[axis]));
+    let first = out[order[0]].bounds()[axis];
+    let last = out[*order.last().unwrap()].bounds()[axis + 2];
+    let total: f32 = out
+        .iter()
+        .map(|a| a.bounds()[axis + 2] - a.bounds()[axis])
+        .sum();
+    let gap = (last - first - total) / (out.len() - 1) as f32;
+    let mut cursor = first;
+    for index in order {
+        let b = out[index].bounds();
+        let d = cursor - b[axis];
+        out[index].rect[axis] += d;
+        out[index].rect[axis + 2] += d;
+        cursor += b[axis + 2] - b[axis] + gap;
+    }
+    out
+}
+pub(super) fn matched_size(marks: &[Annotation], width: bool, height: bool) -> Vec<Annotation> {
+    let Some(first) = marks.first() else {
+        return vec![];
+    };
+    let w = first.rect[2] - first.rect[0];
+    let h = first.rect[3] - first.rect[1];
+    marks
+        .iter()
+        .map(|a| {
+            let mut next = a.clone();
+            for (axis, value, apply) in [(0, w, width), (1, h, height)] {
+                if apply {
+                    let center = (a.rect[axis] + a.rect[axis + 2]) / 2.;
+                    next.rect[axis] = center - value / 2.;
+                    next.rect[axis + 2] = center + value / 2.;
+                }
+            }
+            next
+        })
+        .collect()
+}
 /// Replace changed marks in one commit. `previous` coalesces a continuous edit.
 pub(super) fn commit(
     tab: &mut Tab,
@@ -1199,5 +1246,42 @@ mod tests {
             .unwrap();
         let pdf = lopdf::Document::load_mem(&bytes).unwrap();
         assert_eq!(ann::load(&pdf).len(), 3, "saved PDF retains all marks");
+    }
+    #[test]
+    fn equal_gaps_and_matching_size_save_and_undo_as_one_operation() {
+        let (_, mut app, marks) = setup();
+        let next = distributed(&marks, 0);
+        assert_eq!(next[0].rect, marks[0].rect);
+        assert_eq!(next[2].rect, marks[2].rect);
+        let gaps = [
+            next[1].bounds()[0] - next[0].bounds()[2],
+            next[2].bounds()[0] - next[1].bounds()[2],
+        ];
+        assert!((gaps[0] - gaps[1]).abs() < 0.001);
+        commit(&mut app.tabs[0], &next, None, &mut app.status).unwrap();
+        let session = app.tabs[0].session.as_mut().unwrap();
+        session.undo();
+        assert_eq!(session.annotations, marks);
+        session.redo();
+        assert_eq!(session.annotations, next);
+        let same = matched_size(&next, true, true);
+        for (before, after) in next.iter().zip(&same) {
+            assert_eq!(after.rect[2] - after.rect[0], 60.);
+            assert_eq!(after.rect[3] - after.rect[1], 60.);
+            assert_eq!(
+                before.rect[0] + before.rect[2],
+                after.rect[0] + after.rect[2]
+            );
+            assert_eq!(
+                before.rect[1] + before.rect[3],
+                after.rect[1] + after.rect[3]
+            );
+        }
+        commit(&mut app.tabs[0], &same, None, &mut app.status).unwrap();
+        let session = app.tabs[0].session.as_mut().unwrap();
+        let saved = session.snapshot_bytes().unwrap();
+        assert_eq!(ann::load(&lopdf::Document::load_mem(&saved).unwrap()), same);
+        session.undo();
+        assert_eq!(session.annotations, next);
     }
 }

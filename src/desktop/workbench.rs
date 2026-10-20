@@ -257,6 +257,22 @@ pub(super) fn reveal_overlay(
 
 const COMMANDS: &[(&str, &str, &str)] = &[
     (
+        "Workflow settings / Quick access",
+        "workflow_settings",
+        "toolbar guides customize",
+    ),
+    ("Document templates", "templates", "reusable form new copy"),
+    (
+        "Batch processing",
+        "batch",
+        "ocr compress watermark number files",
+    ),
+    (
+        "Prepare copy for sharing",
+        "sharing_copy",
+        "metadata comments attachments cleanup",
+    ),
+    (
         "Edit bookmarks and page labels",
         "edit_navigation",
         "outline numbering roman sections",
@@ -346,7 +362,8 @@ fn commands(query: &str) -> Vec<usize> {
 }
 impl Viewer {
     pub(super) fn workbench_owns_shortcuts(&self) -> bool {
-        self.workbench.palette
+        self.productivity.owns_input()
+            || self.workbench.palette
             || self.workbench.crop.is_some()
             || self.workbench.repeat.is_some()
             || self.workbench.paste.is_some()

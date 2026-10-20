@@ -2,9 +2,21 @@
 
 # MyPDF — native Rust desktop PDF editor
 
-Version **1.3.1** adds Fit box to content, outer padding and image–text gap controls with live signature previews, and aligns newly added text with the click. It builds on 1.3’s improvements to signing with a dedicated Sign ribbon, saved ink and digital signatures, name-based handwritten artwork, compact appearance controls and a live preview that stays visible while you adjust it. It also adds symbols and arrow styles, improves image copy/paste, and fixes signature-panel switching and divider flicker. Native Rust, local files, no WebViews. **Mac app for Apple Silicon** and **Windows x64 installer** downloads are available from [Releases](https://github.com/gokcol/MyPDF/releases).
+Version **1.4.0** adds nearby text-style matching, optional table/baseline guides, equal object spacing and sizes, a personal quick-access toolbar, document templates, local batch processing, and sharing-copy cleanup. New text boxes fit one line and grow or shrink with their contents. Native Rust, local files, no WebViews. Published **Mac app for Apple Silicon** and **Windows x64 installer** downloads are available from [Releases](https://github.com/gokcol/MyPDF/releases).
 
 > MyPDF was built with the help of Claude, Anthropic's AI assistant, to make everyday business paperwork easier. It is provided as is, without warranty of any kind: keep copies of important documents and use it at your own risk.
+
+## New in 1.4
+
+- **Add text → Match surrounding text** explicitly copies the nearest text's size, color and a matching installed font. Unavailable fonts use an installed substitute. It affects the new block, not surrounding page content. **Fit height to text** starts at one line, grows for wrapping/newlines and shrinks after deletion; resizing manually keeps your chosen minimum height.
+- **Workflow Settings → Snap to detected table edges and text baselines** enables page-content guides. Object movement also requires the ribbon's existing Snap toggle. Added text uses the setting directly; hold Option/Alt while moving it to bypass guides. Scanned table lines are not detected. Guides are local and never change the PDF.
+- **Select multiple objects → right inspector** offers equal horizontal/vertical gaps and Same width/height/size. Size matching uses the first selected object in document order, preserving centers. An arrangement that would exceed the page is rejected. Each action is one Undo step.
+- **Quick access** is an optional icon toolbar. Its gear opens Workflow Settings, where you can choose and reorder up to eight actions. Tooltips show available shortcuts. Workflow Settings is also in the Mac application menu and the Find Tool palette, even if the toolbar is hidden.
+- **Document Templates** (File menu, Quick access or Find Tool) saves a local reusable copy with pages, forms, placed artwork and the current Add text style. Templates can be renamed or deleted. **New copy** opens an unsaved document; the library template remains unchanged. Signed/encrypted documents must first be made into an editable unsigned copy.
+- **Batch Processing** combines on-device OCR (macOS), compression, bottom-center page numbering and text watermarks for up to 50 saved PDFs. Preview one of the selected files, then choose a different output folder. Inputs and existing outputs are never overwritten. Files are processed sequentially, with per-file results and cancellation between operations; OCR also supports cancellation during recognition. Windows has compression, numbering and watermarks, but no OCR.
+- **Prepare Copy for Sharing** reviews removal of notes/comment text, embedded attachments and document/annotation metadata. Visible drawings, highlights, page text and form values remain. Removing comments/metadata also removes MyPDF's private object-editing data so deleted comments cannot reappear. This is **not redaction**: page content, form values, bookmarks and hidden layers remain. Review the full output before sending it. The source and its Undo history stay unchanged.
+
+All three copy workflows work locally. Batch recipes, toolbar preferences and templates are saved in MyPDF's application data folder alongside, without replacing, existing settings and artwork.
 
 ## Screenshots
 

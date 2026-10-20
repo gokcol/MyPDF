@@ -20,6 +20,7 @@ mod preferences;
 #[cfg(test)]
 mod preview;
 mod print;
+mod productivity;
 mod protect;
 mod reading;
 mod recognize;
@@ -66,6 +67,7 @@ struct Raster {
     used: u64,
 }
 struct Tab {
+    placement_guides: Option<(u64, usize, mypdf_milestone0::form_detect::PageGuides)>,
     id: u64,
     path: PathBuf,
     /// False for new, imported, or recovered in-memory documents until first Save.
@@ -303,6 +305,7 @@ fn document_tab(
 }
 
 pub struct Viewer {
+    productivity: productivity::State,
     workbench: workbench::State,
     home: home::Home,
     content: content::ContentState,
@@ -376,6 +379,7 @@ impl Viewer {
         let (save_tx, save_events) = mpsc::channel();
         let (signature_tx, signature_rx) = mpsc::channel();
         let mut app = Self {
+            productivity: productivity::State::default(),
             workbench: workbench::State::default(),
             home: home::Home::new(&cc.egui_ctx),
             content: content::ContentState::new(),
@@ -469,6 +473,7 @@ impl Viewer {
         let restore_view = saved_view.is_some();
         let view_preferences = saved_view.unwrap_or_default();
         self.tabs.push(Tab {
+            placement_guides: None,
             id: self.next_id,
             has_destination: true,
             path,
@@ -699,6 +704,27 @@ impl Viewer {
         }
     }
     fn action(&mut self, action: &str, ctx: &egui::Context) {
+        if self.productivity.owns_input()
+            && !matches!(
+                action,
+                "workflow_settings" | "templates" | "batch" | "sharing_copy"
+            )
+        {
+            match action {
+                "copy" => ctx.send_viewport_cmd(egui::ViewportCommand::RequestCopy),
+                "cut" => ctx.send_viewport_cmd(egui::ViewportCommand::RequestCut),
+                "paste" => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+                "select_all" => Self::text_command(ctx, egui::Key::A, false),
+                "edit_undo" | "edit_redo" if ctx.wants_keyboard_input() => {
+                    Self::text_command(ctx, egui::Key::Z, action == "edit_redo")
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.productivity_action(action, ctx) {
+            return;
+        }
         if action == "settings" {
             self.digital.save_if_dirty();
             self.digital.open = true;
@@ -1067,6 +1093,9 @@ impl Viewer {
             && !self.editor.text_editing
     }
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        if self.productivity.owns_input() {
+            return;
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
             self.action("settings", ctx);
             return;
@@ -2068,7 +2097,7 @@ impl Viewer {
                         );
                         }
                         self.content.hide_guides = self.editor.hide_guides;
-                        self.content.paused = placing || self.redaction.active && self.editor.mode == editing::Mode::Edit;
+                        self.content.paused = self.productivity.owns_input() || placing || self.redaction.active && self.editor.mode == editing::Mode::Edit;
                         if self.editor.mode == editing::Mode::Forms {
                             let editable = !self.content.busy
                                 && !self.organizer.busy
@@ -2248,6 +2277,7 @@ impl eframe::App for Viewer {
         self.editor.text_editing = false;
         self.sync_status_context();
         self.toolbar(ctx);
+        self.productivity_bar(ctx);
         self.restore_reading_panels();
         if !self.home.visible
             && self.comparison.is_none()
@@ -2359,6 +2389,7 @@ impl eframe::App for Viewer {
         self.background_window(ctx);
         self.image_region_window(ctx);
         self.workbench_windows(ctx);
+        self.productivity_windows(ctx);
         self.header_footer_window(ctx);
         self.redaction_dialogs(ctx);
         self.signature_dialogs(ctx);
@@ -3365,7 +3396,7 @@ mod tests {
             .unwrap();
         let r = action.1.bounds().unwrap();
         assert!(
-            r.y0 >= 0. && r.y1 < 250. && r.x1 <= 1100.,
+            r.y0 >= 0. && r.y1 < 300. && r.x1 <= 1100.,
             "page action is visible at panel top: {r:?}"
         );
         assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
