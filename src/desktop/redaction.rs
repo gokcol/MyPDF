@@ -12,7 +12,7 @@ pub(super) struct Redaction {
     drag: Option<(u64, usize, egui::Pos2)>,
     query: String,
     flatten_pages: bool,
-    white: bool,
+    color: [f32; 3],
     confirm: Option<u64>,
     /// Tab and revision when redactions were applied, until the change lands.
     applied: Option<(u64, u64)>,
@@ -27,7 +27,7 @@ impl Redaction {
             drag: None,
             query: String::new(),
             flatten_pages: false,
-            white: false,
+            color: [0.; 3],
             confirm: None,
             applied: None,
             flatten: None,
@@ -290,11 +290,16 @@ impl Viewer {
                     }
                 });
                 ui::section(ui, "Box color", |ui| {
-                    let mut choice = self.redaction.white as usize;
-                    if let Some(c) = ui::segmented(ui, &["Black", "White"], choice) {
-                        choice = c;
-                    }
-                    self.redaction.white = choice == 1;
+                    ui.horizontal(|ui| {
+                        let choice = if self.redaction.color == [0.; 3] { 0 } else if self.redaction.color == [1.; 3] { 1 } else { 2 };
+                        let width = (ui.available_width() - 30. - ui.spacing().item_spacing.x).max(0.);
+                        ui.allocate_ui_with_layout(vec2(width, 30.), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            if let Some(c) = ui::segmented(ui, &["Black", "White"], choice) {
+                                self.redaction.color = [c as f32; 3];
+                            }
+                        });
+                        ui::color_swatch_sized(ui, &mut self.redaction.color, "Redaction color", vec2(30., 30.));
+                    });
                 });
                 ui::section(ui, "Method", |ui| {
                     ui.radio_value(&mut self.redaction.flatten_pages, false, "Remove the marked content");
@@ -458,11 +463,7 @@ impl Viewer {
             } else {
                 Method::Precise
             },
-            fill: if self.redaction.white {
-                [1.; 3]
-            } else {
-                [0.; 3]
-            },
+            fill: self.redaction.color,
         };
         self.active = index;
         self.redaction.applied = Some((id, revision));
@@ -605,6 +606,7 @@ mod tests {
         frame(&mut app, vec![button(inside, false)]);
         assert_eq!(app.redaction.count(id), 1, "a click unmarks");
 
+        app.redaction.color = [0.2, 0.4, 0.6];
         app.apply_redactions(&ctx, id);
         until(&mut app, &|a| editable(a) && a.redaction.applied.is_none());
         assert_eq!(app.redaction.count(id), 0, "marks clear once applied");

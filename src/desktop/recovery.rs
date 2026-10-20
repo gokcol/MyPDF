@@ -24,8 +24,28 @@ enum Command {
 enum Event {
     Scanned(Vec<Entry>, Vec<String>),
     Written(u64, u64, Result<(), String>),
-    Restored(Entry, Result<Vec<u8>, String>),
+    Restored(Entry, Result<RestoredPdf, String>),
     Error(String),
+}
+struct RestoredPdf {
+    bytes: Vec<u8>,
+    signed: bool,
+}
+impl RestoredPdf {
+    fn prepare(bytes: Vec<u8>) -> anyhow::Result<Self> {
+        let doc = lopdf::Document::load_mem(&bytes)?;
+        anyhow::ensure!(!doc.is_encrypted(), "Encrypted recovery PDF");
+        let caps = annotations::inspect(&doc);
+        let signed = caps.signed || caps.certified;
+        if signed {
+            // These local snapshots contain edits the user already enabled.
+            // Keep the complete recovered revision as the incremental-save
+            // baseline so neither earlier signatures nor unsaved edits are lost.
+            mypdf_milestone0::signature_edit::unlock(&bytes)?;
+        }
+        mypdf_milestone0::content::editable(&bytes)?;
+        Ok(Self { bytes, signed })
+    }
 }
 struct Tracking {
     revision: u64,
@@ -39,6 +59,7 @@ pub(super) struct Recovery {
     rx: mpsc::Receiver<Event>,
     tracking: HashMap<u64, Tracking>,
     origins: HashMap<u64, Entry>,
+    pending: HashMap<u64, Entry>,
     entries: Vec<Entry>,
     busy: bool,
     pub open: bool,
@@ -118,7 +139,7 @@ impl Recovery {
                     }
                     Command::Restore(e) => {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            store.read(&e)
+                            RestoredPdf::prepare(store.read(&e)?)
                         }))
                         .map_err(|_| {
                             "Could not process this recovery PDF; the copy was retained".to_owned()
@@ -135,6 +156,7 @@ impl Recovery {
             rx,
             tracking: HashMap::new(),
             origins: HashMap::new(),
+            pending: HashMap::new(),
             entries: vec![],
             busy: false,
             open: false,
@@ -143,10 +165,33 @@ impl Recovery {
         }
     }
     pub fn clear(&mut self, id: u64) {
+        if self.pending.remove(&id).is_some() {
+            self.busy = false;
+        }
         self.tracking.remove(&id);
         let _ = self.tx.send(Command::Clear(id));
         if let Some(entry) = self.origins.remove(&id) {
             let _ = self.tx.send(Command::Remove(entry));
+        }
+    }
+    pub(super) fn loaded(&mut self, id: u64) -> bool {
+        let Some(entry) = self.pending.remove(&id) else {
+            return false;
+        };
+        self.busy = false;
+        self.error = None;
+        self.entries.retain(|e| e.file != entry.file);
+        self.origins.insert(id, entry);
+        self.open = !self.entries.is_empty();
+        true
+    }
+    pub(super) fn failed(&mut self, id: u64, error: &str) {
+        if self.pending.remove(&id).is_some() {
+            self.busy = false;
+            self.error = Some(format!(
+                "Could not restore: {error}. The recovery copy was retained; you can retry."
+            ));
+            self.open = true;
         }
     }
     pub fn label(&self, id: u64, revision: u64) -> &'static str {
@@ -197,8 +242,11 @@ impl Viewer {
                 }
                 Event::Restored(entry, result) => {
                     self.recovery.busy = false;
+                    if !self.recovery.entries.iter().any(|e| e.file == entry.file) {
+                        self.recovery.entries.push(entry.clone());
+                    }
                     match result {
-                        Ok(bytes) if self.tabs.len() < 16 => {
+                        Ok(restored) if self.tabs.len() < 16 => {
                             let title = entry
                                 .metadata
                                 .original
@@ -209,23 +257,30 @@ impl Viewer {
                                 "{title} (Recovered {}).pdf",
                                 self.next_id + 1
                             ));
-                            self.open_memory(path, bytes, ctx);
+                            self.open_memory(path, restored.bytes, ctx);
                             if let Some(tab) = self.tabs.get_mut(self.active) {
                                 tab.page = entry.metadata.page;
-                                self.recovery.origins.insert(tab.id, entry.clone());
+                                tab.restore_view = false;
+                                if restored.signed {
+                                    tab.signed_original = tab.bytes.clone();
+                                }
+                                self.recovery.pending.insert(tab.id, entry);
+                                self.recovery.busy = true;
                             }
-                            self.recovery.entries.retain(|e| e.file != entry.file);
-                            self.status =
-                                Some(("Recovered your changes • Save when ready".into(), false));
+                            // Loading is asynchronous. Keep the recovery entry
+                            // until the renderer confirms that the tab opened.
+                            self.status = Some(("Opening recovery copy…".into(), false));
                         }
                         Ok(_) => {
                             self.recovery.error =
                                 Some("Close a tab before restoring another document.".into())
                         }
-                        Err(e) => self.recovery.error = Some(e),
-                    }
-                    if self.recovery.entries.is_empty() {
-                        self.recovery.open = false;
+                        Err(e) => {
+                            self.recovery.error = Some(format!(
+                                "Could not restore: {e}. The recovery copy was retained; you can retry."
+                            ));
+                            self.recovery.open = true;
+                        }
                     }
                 }
             }
@@ -402,6 +457,7 @@ impl Viewer {
             });
         self.recovery.open = open;
         if let Some(e) = restore {
+            self.recovery.error = None;
             self.recovery.busy = self.recovery.tx.send(Command::Restore(e)).is_ok();
         }
         if let Some(entry) = self.recovery.discard.clone() {
@@ -439,6 +495,134 @@ impl Viewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn restore_fixture(
+        bytes: &[u8],
+    ) -> (
+        tempfile::TempDir,
+        Viewer,
+        egui::Context,
+        mpsc::Sender<Event>,
+        Entry,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::new(root.path()).unwrap();
+        store.write(1, "Original.pdf".into(), 1, 0, bytes).unwrap();
+        drop(store);
+        let mut store = Store::new(root.path()).unwrap();
+        let entry = store.scan().unwrap().0.remove(0);
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        let (tx, rx) = mpsc::channel();
+        app.recovery.rx = rx;
+        app.recovery.entries.push(entry.clone());
+        app.recovery.open = true;
+        (root, app, ctx, tx, entry)
+    }
+
+    #[test]
+    fn signed_recovery_restores_editing_and_incremental_save_baseline() {
+        let signed = super::super::signatures::signed_fixture(
+            &mypdf_milestone0::convert::blank(595., 842.).unwrap(),
+            "Recovery Desktop Signer",
+        );
+        assert!(mypdf_milestone0::content::editable(&signed).is_err());
+        let (_root, mut app, ctx, tx, entry) = restore_fixture(&signed);
+        app.recovery.error = Some("Previous failure".into());
+        tx.send(Event::Restored(
+            entry.clone(),
+            Ok(RestoredPdf::prepare(signed.clone()).unwrap()),
+        ))
+        .unwrap();
+        app.recovery_tick(&ctx);
+        assert_eq!(
+            app.recovery.entries.len(),
+            1,
+            "keep copy listed until loading succeeds"
+        );
+        assert!(app.recovery.busy);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let tab = &mut app.tabs[0];
+        let session = tab.session.as_mut().unwrap();
+        assert!(session.dirty() && session.editable && tab.signed);
+        assert!(!tab.has_destination);
+        assert_eq!(tab.signed_original.as_deref().unwrap(), signed);
+        assert!(!app.recovery.open && !app.recovery.busy && app.recovery.error.is_none());
+        assert!(app.recovery.entries.is_empty());
+        assert!(
+            entry.file.exists(),
+            "only explicit save or discard removes recovery data"
+        );
+        let mut marks = session.annotations.clone();
+        marks.push(annotations::Annotation::new(
+            0,
+            [10., 10., 80., 80.],
+            annotations::Kind::Rectangle,
+            Default::default(),
+        ));
+        session.commit(marks).unwrap();
+        let edited = annotations::export(&session.source, &session.annotations).unwrap();
+        let saved = mypdf_milestone0::signature_edit::incremental_update(
+            tab.signed_original.as_ref().unwrap(),
+            &edited,
+        )
+        .unwrap();
+        assert!(saved.starts_with(&signed));
+        let proof = mypdf_milestone0::signing::verify(&saved, None).unwrap();
+        assert!(proof[0].crypto_valid && proof[0].digest_matches);
+        assert_eq!(
+            annotations::load(&lopdf::Document::load_mem(&saved).unwrap()).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_restore_keeps_the_copy_visible_and_retryable() {
+        let mut bytes = vec![];
+        lopdf::Document::new().save_to(&mut bytes).unwrap();
+        let (_root, mut app, ctx, tx, entry) = restore_fixture(&bytes);
+        app.recovery.entries.clear();
+        tx.send(Event::Restored(
+            entry.clone(),
+            Err("Simulated read failure".into()),
+        ))
+        .unwrap();
+        app.recovery_tick(&ctx);
+        assert!(app.recovery.open && !app.recovery.busy);
+        assert_eq!(app.recovery.entries.len(), 1);
+        assert!(entry.file.exists());
+        // A PDF can pass storage checks but fail asynchronous renderer loading.
+        tx.send(Event::Restored(
+            entry.clone(),
+            Ok(RestoredPdf::prepare(bytes).unwrap()),
+        ))
+        .unwrap();
+        app.recovery_tick(&ctx);
+        assert_eq!(app.recovery.entries.len(), 1);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while app.tabs[0].error.is_none() {
+            app.events(&ctx);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.recovery.open && !app.recovery.busy);
+        assert_eq!(app.recovery.entries.len(), 1);
+        assert!(app.recovery.pending.is_empty() && app.recovery.origins.is_empty());
+        assert!(
+            app.recovery
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("you can retry")
+        );
+        assert!(entry.file.exists());
+    }
+
     #[test]
     fn autosave_tracks_revision_and_does_not_mark_document_saved() {
         let ctx = egui::Context::default();

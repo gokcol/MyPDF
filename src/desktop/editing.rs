@@ -659,7 +659,7 @@ pub(super) fn color_palette(ui: &mut egui::Ui, current: &mut [f32; 3]) -> bool {
         }
         // The picker converts RGB through HSV even without user input. Only accept
         // an actual edit, avoiding floating-point drift and phantom undo revisions.
-        changed |= ui::color_swatch(ui, current, "Custom color");
+        changed |= ui::color_swatch_sized(ui, current, "Custom color", vec2(24., 28.));
     });
     changed
 }

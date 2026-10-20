@@ -942,6 +942,10 @@ impl Viewer {
                         tab.capabilities = Some(capabilities);
                         tab.editing_warning = editing_warning;
                         tab.signed = signed;
+                        if self.recovery.loaded(tab.id) {
+                            self.status =
+                                Some(("Recovered your changes • Save when ready".into(), false));
+                        }
                     }
                     Event::Indexed { page, text } => {
                         tab.text[page] = Some(Arc::new(text));
@@ -982,6 +986,7 @@ impl Viewer {
                     }
                     Event::Failed(error) => {
                         tab.pending.clear();
+                        self.recovery.failed(tab.id, &error);
                         tab.error = Some(error);
                     }
                 }

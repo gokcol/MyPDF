@@ -648,10 +648,16 @@ fn new_card(ui: &mut egui::Ui, size: egui::Vec2, label: &str) -> egui::Response 
 }
 
 /// A background choice drawn as a small swatch.
-fn background_tile(ui: &mut egui::Ui, background: Background, selected: bool) -> bool {
+fn background_tile(ui: &mut egui::Ui, background: Background, selected: bool) -> egui::Response {
+    let custom = matches!(background, Background::Tinted | Background::Custom { .. });
+    let label = if custom {
+        "Custom color"
+    } else {
+        background.label()
+    };
     let (rect, response) = ui.allocate_exact_size(vec2(92., 70.), egui::Sense::click());
     response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, background.label())
+        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, label)
     });
     ui.painter().rect(
         rect,
@@ -717,10 +723,17 @@ fn background_tile(ui: &mut egui::Ui, background: Background, selected: bool) ->
         .collect();
     ui.painter()
         .add(egui::Shape::line(points, Stroke::new(1.4, ink)));
+    if custom {
+        ui::paint_color_picker(
+            ui,
+            Rect::from_center_size(pos2(rect.right() - 13., rect.top() + 13.), vec2(22., 22.)),
+            rgb(background.colors().unwrap().0),
+        );
+    }
     ui.painter().text(
         pos2(rect.center().x, rect.bottom() - 13.),
         egui::Align2::CENTER_CENTER,
-        background.label(),
+        label,
         FontId::proportional(11.5),
         if selected {
             theme::accent()
@@ -728,9 +741,85 @@ fn background_tile(ui: &mut egui::Ui, background: Background, selected: bool) ->
             theme::ink()
         },
     );
-    response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .clicked()
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn background_choices(ui: &mut egui::Ui, current: &mut Background) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(8., 8.);
+        for preset in Background::CHOICES {
+            let background =
+                if preset == Background::Tinted && matches!(current, Background::Custom { .. }) {
+                    *current
+                } else {
+                    preset
+                };
+            let response = background_tile(ui, background, *current == background);
+            if response.clicked() {
+                *current = background;
+                ui::reset_color_picker(ui, response.id.with("fill_hex"));
+                ui::reset_color_picker(ui, response.id.with("frame_hex"));
+            }
+            if preset == Background::Tinted {
+                egui::Popup::from_toggle_button_response(&response)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| {
+                        let (fill, frame) = current.colors().unwrap_or(([1.; 3], None));
+                        let bytes = |rgb: [f32; 3]| rgb.map(|c| (c * 255.).round() as u8);
+                        let channel = response.id.with("frame_channel");
+                        let mut edit_frame =
+                            ui.data(|d| d.get_temp::<bool>(channel)).unwrap_or(false);
+                        let mut framed = frame.is_some();
+                        let mut changed = false;
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut edit_frame, false, "Fill");
+                            if ui
+                                .selectable_value(&mut edit_frame, true, "Frame")
+                                .clicked()
+                                && !framed
+                            {
+                                framed = true;
+                                changed = true;
+                            }
+                        });
+                        let mut fill = bytes(fill);
+                        let mut frame_color = bytes(frame.unwrap_or([0.11, 0.43, 0.35]));
+                        let [r, g, b] = if edit_frame { frame_color } else { fill };
+                        let mut color = Color32::from_rgb(r, g, b);
+                        if ui::color_picker_contents(
+                            ui,
+                            &mut color,
+                            if edit_frame {
+                                "Frame color"
+                            } else {
+                                "Background color"
+                            },
+                            response
+                                .id
+                                .with(if edit_frame { "frame_hex" } else { "fill_hex" }),
+                        ) {
+                            let bytes = [color.r(), color.g(), color.b()];
+                            if edit_frame {
+                                frame_color = bytes;
+                            } else {
+                                fill = bytes;
+                            }
+                            changed = true;
+                        }
+                        if ui.checkbox(&mut framed, "Show frame").changed() {
+                            changed = true;
+                        }
+                        ui.data_mut(|d| d.insert_temp(channel, edit_frame));
+                        if changed {
+                            *current = Background::Custom {
+                                fill,
+                                frame: framed.then_some(frame_color),
+                            };
+                        }
+                    });
+            }
+        }
+    });
 }
 
 /// The "no image" choice beside the library images.
@@ -1450,14 +1539,7 @@ impl DigitalState {
                     });
                 });
                 ui::field(ui, "Background", |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = vec2(8., 8.);
-                        for background in Background::CHOICES {
-                            if background_tile(ui, background, signature.background == background) {
-                                signature.background = background;
-                            }
-                        }
-                    });
+                    background_choices(ui, &mut signature.background);
                 });
             },
         );

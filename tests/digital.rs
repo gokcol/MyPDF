@@ -609,6 +609,24 @@ fn signature_backgrounds_paint_what_their_names_say() {
         frame[1] > frame[0] && frame[0] < 200,
         "a green frame: {frame:?}"
     );
+    let custom = Background::Custom {
+        fill: [47, 110, 180],
+        frame: Some([210, 40, 70]),
+    };
+    let (frame, inside) = sample(custom);
+    for (actual, expected) in inside.into_iter().zip([47_u8, 110, 180, 255]) {
+        assert!(actual.abs_diff(expected) <= 1, "custom fill: {inside:?}");
+    }
+    assert!(
+        frame[0] > inside[0] + 50 && frame[1] < inside[1] && frame[2] < inside[2],
+        "custom red frame blends over the blue fill: {frame:?}"
+    );
+    let json = serde_json::to_string(&custom).unwrap();
+    assert_eq!(serde_json::from_str::<Background>(&json).unwrap(), custom);
+    assert_eq!(
+        serde_json::from_str::<Background>("\"Tinted\"").unwrap(),
+        Background::Tinted
+    );
 }
 
 #[test]
@@ -962,7 +980,19 @@ fn signature_fit_trims_the_box_without_scaling_ink_and_keeps_the_background() {
             "Ink must not shift or stretch"
         );
     }
-    for background in [Background::Tinted, Background::White, Background::Framed] {
+    for background in [
+        Background::Tinted,
+        Background::White,
+        Background::Framed,
+        Background::Custom {
+            fill: [47, 110, 180],
+            frame: None,
+        },
+        Background::Custom {
+            fill: [47, 110, 180],
+            frame: Some([210, 40, 70]),
+        },
+    ] {
         request.background = background;
         let filled = signing::signature_appearance(&request).unwrap();
         assert_eq!(

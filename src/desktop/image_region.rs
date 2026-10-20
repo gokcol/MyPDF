@@ -197,7 +197,7 @@ impl Viewer {
                 ui.add_space(8.);
                 ui.checkbox(&mut draft.cover, "Cover the original area when adding here");
                 if draft.cover {
-                    ui.horizontal(|ui| { ui.label("Cover color"); ui.color_edit_button_srgb(&mut draft.color); });
+                    ui.horizontal(|ui| { ui.label("Cover color"); ui::color_swatch_srgb(ui, &mut draft.color, "Cover color"); });
                     ui.weak("Adds a separate rectangle behind the copy. The cover stays in place when you move the image; delete it to reveal the original.");
                     ui.weak("This is a visual cover, not redaction. Underlying content remains in the PDF.");
                 } else {

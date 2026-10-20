@@ -112,6 +112,50 @@ fn recovery_child() {
     };
     let root = PathBuf::from(root);
     let store = Store::new(&root.join("copies")).unwrap();
+    if std::env::var_os("MYPDF_RECOVERY_SIGNED").is_some() {
+        use mypdf_milestone0::{content, identity, signature_edit, signing};
+        let created = identity::create_personal(
+            &identity::PersonalId {
+                name: "Recovery Test Signer".into(),
+                organization: "Synthetic tests".into(),
+                email: "recovery@example.invalid".into(),
+                validity_days: 1,
+                ecdsa: true,
+            },
+            "test-only-password",
+        )
+        .unwrap();
+        let signer =
+            identity::FileSigner::load(&created.pkcs12, "test-only-password", None).unwrap();
+        let signed = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(signing::sign_custom(
+                &convert::blank(595., 842.).unwrap(),
+                &signer,
+                &signing::DesktopSigningRequest {
+                    field: "RecoveryApproval".into(),
+                    name: "Recovery Test Signer".into(),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        let original = root.join("Original signed.pdf");
+        fs::write(&original, &signed).unwrap();
+        signature_edit::unlock(&signed).unwrap();
+        let edited = content::add_text(
+            &signed,
+            1,
+            "Unsaved recovery text",
+            [20., 20., 300., 60.],
+            14.,
+            [0.; 3],
+        )
+        .unwrap();
+        let snapshot = signature_edit::incremental_update(&signed, &edited).unwrap();
+        store.write(7, original, 9, 0, &snapshot).unwrap();
+        return;
+    }
     store
         .write(
             7,
@@ -125,6 +169,83 @@ fn recovery_child() {
     loop {
         std::thread::park();
     }
+}
+
+#[test]
+fn signed_edits_survive_a_process_restart_without_rewriting_signed_bytes() {
+    use mypdf_milestone0::{content, signature_edit, signing};
+    let temp = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "recovery_child"])
+        .env("MYPDF_RECOVERY_CHILD", temp.path())
+        .env("MYPDF_RECOVERY_SIGNED", "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let original = fs::read(temp.path().join("Original signed.pdf")).unwrap();
+    assert!(
+        content::editable(&original).is_err(),
+        "unlock state does not survive restart"
+    );
+    let mut reader = Store::new(&temp.path().join("copies")).unwrap();
+    let entry = reader.scan().unwrap().0.remove(0);
+    let recovered = reader.read(&entry).unwrap();
+    assert!(recovered.starts_with(&original));
+    assert!(
+        content::editable(&recovered).is_err(),
+        "reading does not grant editing permission"
+    );
+    let proof = signing::verify(&recovered, None).unwrap();
+    assert!(proof[0].crypto_valid && proof[0].digest_matches && !proof[0].covers_current_file);
+    signature_edit::unlock(&recovered).unwrap();
+    let edited = content::add_text(
+        &recovered,
+        1,
+        "Edited after recovery",
+        [20., 100., 300., 140.],
+        14.,
+        [0.; 3],
+    )
+    .unwrap();
+    let saved = signature_edit::incremental_update(&recovered, &edited).unwrap();
+    assert!(saved.starts_with(&recovered));
+    let proof = signing::verify(&saved, None).unwrap();
+    assert!(proof[0].crypto_valid && proof[0].digest_matches);
+    let text = lopdf::Document::load_mem(&saved)
+        .unwrap()
+        .extract_text(&[1])
+        .unwrap();
+    assert!(text.contains("Unsaved recovery text") && text.contains("Edited after recovery"));
+    assert!(
+        entry.file.exists(),
+        "reading never consumes a recovery copy"
+    );
+    assert_eq!(fs::read(entry.metadata.original).unwrap(), original);
+}
+
+#[test]
+fn encrypted_recovery_is_rejected_and_retained() {
+    let temp = tempfile::tempdir().unwrap();
+    let protected = mypdf_milestone0::security::protect(
+        &convert::blank(200., 300.).unwrap(),
+        "test-only-password",
+    )
+    .unwrap();
+    let store = Store::new(temp.path()).unwrap();
+    store
+        .write(1, "Protected.pdf".into(), 1, 0, &protected)
+        .unwrap();
+    drop(store);
+    let mut reader = Store::new(temp.path()).unwrap();
+    let entry = reader.scan().unwrap().0.remove(0);
+    assert!(
+        reader
+            .read(&entry)
+            .unwrap_err()
+            .to_string()
+            .contains("Encrypted")
+    );
+    assert!(entry.file.exists());
 }
 
 #[test]
