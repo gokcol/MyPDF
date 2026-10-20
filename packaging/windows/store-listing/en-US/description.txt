@@ -3,6 +3,9 @@ MyPDF (OG) is a native desktop PDF reader and editor for everyday document work.
 READ COMFORTABLY
 Open documents in compact tabs, drag to reorder them, and organize them into named groups such as Work or Personal. Find open files in the searchable tab list and use right-click actions to manage tabs and groups. Navigate with thumbnails and outlines, search text, and choose the zoom and reading layout that suits your screen. Start a blank PDF whenever you need a fresh page.
 
+MAKE IT YOUR WORKSPACE
+Choose Graphite, Glacier or Calico styling and Selective accents, Color families or Soft duotone icons. Appearance choices keep the controls in their familiar positions. Signature settings are grouped together for easy management.
+
 EDIT AND ANNOTATE
 Add text directly on the page and edit supported existing text and images. Highlight passages, add notes, draw shapes and arrows, and use standard stamps or your own SVG and image artwork. Move, resize, recolor, rotate, and flip supported objects.
 

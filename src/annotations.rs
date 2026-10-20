@@ -804,6 +804,11 @@ impl Session {
     pub fn set_change_focus(&mut self, page: usize, rect: Option<Box2>) {
         self.focus = Some((page, rect));
     }
+    /// Some document edits (such as clearing a signature) keep the current
+    /// viewport through Undo/Redo rather than navigating to a default page.
+    pub fn clear_change_focus(&mut self) {
+        self.focus = None;
+    }
     pub fn undo_focus(&self) -> Option<(usize, Option<Box2>)> {
         self.past.last().and(self.focus)
     }

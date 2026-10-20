@@ -216,6 +216,37 @@ impl Inputs {
     }
 }
 
+impl Tab {
+    /// Signing creates a separate file, but it is the same page geometry and
+    /// reading position. Share the old textures only until the new PDF renders.
+    pub(super) fn continue_signed_view(&mut self, source: &Tab) {
+        self.document_group = source.document_group;
+        self.pages = source.pages.clone();
+        self.page = source.page;
+        self.page_input = source.page_input.clone();
+        self.zoom = source.zoom;
+        self.scale = source.scale;
+        self.page_layout = source.page_layout;
+        self.view_preferences = source.view_preferences.clone();
+        self.document_view = source.document_view;
+        self.document_layout = source.document_layout.clone();
+        self.restore_view = false;
+        self.restore_scroll = source.document_view.is_some();
+        self.jump = source.jump;
+        self.stale = source.stale.clone();
+        for (key, raster) in &source.rasters {
+            if !key.thumbnail
+                && self
+                    .stale
+                    .get(&key.page)
+                    .is_none_or(|old| old.texture.size()[0] < raster.texture.size()[0])
+            {
+                self.stale.insert(key.page, raster.clone());
+            }
+        }
+    }
+}
+
 impl Viewer {
     pub(super) fn signature_events(&mut self, ctx: &egui::Context) {
         for job in self.signature_rx.try_iter().collect::<Vec<_>>() {
@@ -233,13 +264,16 @@ impl Viewer {
                         }
                         signature_edit::unlock(&original).map_err(|e| format!("{e:#}"))?;
                         session.editable = true;
-                        session.commit_document(bytes).map_err(|e| format!("{e:#}"))
+                        session.commit_document(bytes).map_err(|e| format!("{e:#}"))?;
+                        session.name_last_change("Remove digital signature");
+                        session.clear_change_focus();
+                        Ok(())
                     }) {
                         Ok(()) => {
                             tab.signed_original = Some(original);
                             tab.signatures.selected = None;
                             tab.signatures.key = None;
-                            tab.bytes = None;
+                            tab.keep_stale = true;
                             let _ = tab.refresh_document(ctx);
                             self.status = Some((
                                 "Signature removed • Save to keep the change; your original file is unchanged".into(),
@@ -816,6 +850,7 @@ impl Viewer {
                 }
                 // Re-render without the managed annotations, which are now editable.
                 tab.bytes = None;
+                tab.keep_stale = true;
                 let _ = tab.refresh_document(ctx);
                 self.status = Some((
                     "Editing enabled • Save appends your changes as a new revision".into(),
@@ -1044,13 +1079,36 @@ mod tests {
         app.close(1);
         app.active = 0;
 
-        // Removing the signature keeps the edits; Undo brings it back.
+        // Removing the signature keeps both the edits and the scrolled view.
+        app.tabs[0].zoom = Zoom::Scale(1.5);
+        app.tabs[0].jump = Some((1, Some(120.)));
+        for _ in 0..3 {
+            frame(&mut app, vec![]);
+        }
+        until(&mut app, &|a| {
+            a.tabs[0]
+                .rasters
+                .keys()
+                .any(|k| k.page == 1 && !k.thumbnail)
+        });
+        let anchor = app.tabs[0].canvas_anchor();
         app.remove_signature(tab_id, "Approval".into(), &ctx);
         until(&mut app, &|a| {
             !a.signature_busy
                 && a.tabs[0].signatures.job.is_none()
                 && matches!(&a.tabs[0].signatures.views, Some(Ok(v)) if v.iter().all(|v| !v.field.signed))
         });
+        for _ in 0..10 {
+            frame(&mut app, vec![]);
+            app.tabs[0].assert_canvas_anchor(anchor);
+            assert!(
+                app.tabs[0].stale.contains_key(&1)
+                    || app.tabs[0]
+                        .rasters
+                        .keys()
+                        .any(|k| k.page == 1 && !k.thumbnail)
+            );
+        }
         let saved = Inputs::of(&app.tabs[0]).unwrap().effective().unwrap();
         assert!(saved.starts_with(&signed));
         assert!(signing::verify(&saved, None).unwrap().is_empty());
@@ -1072,6 +1130,10 @@ mod tests {
         app.editor_undo(false);
         until(&mut app, &|a| first(a) == Some((true, true, false)));
         assert!(!app.tabs[0].signatures.no_active_signatures());
+        app.tabs[0].assert_canvas_anchor(anchor);
+        app.editor_undo(true);
+        until(&mut app, &|a| a.tabs[0].signatures.no_active_signatures());
+        app.tabs[0].assert_canvas_anchor(anchor);
     }
 
     #[test]

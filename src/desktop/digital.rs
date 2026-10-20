@@ -15,6 +15,7 @@ use manager::{Look, ManagerState, SavedSignature};
 
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Panel {
+    Interface,
     Signatures,
     Ink,
     Identities,
@@ -1162,7 +1163,15 @@ impl Viewer {
                     {
                         s.mark_saved(revision);
                     }
+                    let previous_id = self.next_id;
                     self.open(path.clone(), ctx);
+                    if self.next_id != previous_id {
+                        let destination = self.tabs.len() - 1;
+                        let (sources, copies) = self.tabs.split_at_mut(destination);
+                        if let Some(source) = sources.iter().find(|t| t.id == tab) {
+                            copies[0].continue_signed_view(source);
+                        }
+                    }
                     self.digital.open = false;
                     self.digital.quick = false;
                     self.digital.quick_prompt = false;
@@ -1372,24 +1381,50 @@ impl Viewer {
         let docked = self.digital_docked();
         let mut body = |ui: &mut egui::Ui| {
             ui.spacing_mut().item_spacing.y = 6.;
-            let panels: &[(Panel, &str)] = if settings {
-                &[
-                    (Panel::Ink, "Ink signatures"),
-                    (Panel::Signatures, "Digital signatures"),
-                    (Panel::Identities, "Digital IDs"),
-                    (Panel::Trusted, "Trusted"),
-                ]
-            } else {
-                &[(Panel::Sign, "Sign"), (Panel::Validate, "Validate")]
-            };
-            let current = panels
-                .iter()
-                .position(|(p, _)| *p == self.digital.panel)
-                .unwrap_or(0);
-            let labels: Vec<&str> = panels.iter().map(|(_, name)| *name).collect();
-            if !docked && let Some(i) = ui::segmented(ui, &labels, current) {
+            let previous_panel = self.digital.panel;
+            if !docked {
+                if settings {
+                    let remembered = egui::Id::new("settings_signature_tab");
+                    if self.digital.panel != Panel::Interface {
+                        ui.ctx()
+                            .data_mut(|d| d.insert_temp(remembered, self.digital.panel));
+                    }
+                    let section = usize::from(self.digital.panel == Panel::Interface);
+                    if let Some(i) = ui::segmented(ui, &["Signatures", "Appearance"], section) {
+                        self.digital.panel = if i == 1 {
+                            Panel::Interface
+                        } else {
+                            ui.ctx()
+                                .data(|d| d.get_temp::<Panel>(remembered))
+                                .unwrap_or(Panel::Ink)
+                        };
+                    }
+                    if self.digital.panel != Panel::Interface {
+                        let panels = [
+                            (Panel::Ink, "Ink signatures"),
+                            (Panel::Signatures, "Digital signatures"),
+                            (Panel::Identities, "Digital IDs"),
+                            (Panel::Trusted, "Trusted"),
+                        ];
+                        let current = panels
+                            .iter()
+                            .position(|(p, _)| *p == self.digital.panel)
+                            .unwrap_or(0);
+                        let labels: Vec<&str> = panels.iter().map(|(_, name)| *name).collect();
+                        if let Some(i) = ui::segmented(ui, &labels, current) {
+                            self.digital.panel = panels[i].0;
+                        }
+                    }
+                } else if let Some(i) = ui::segmented(
+                    ui,
+                    &["Sign", "Validate"],
+                    usize::from(self.digital.panel == Panel::Validate),
+                ) {
+                    self.digital.panel = if i == 0 { Panel::Sign } else { Panel::Validate };
+                }
+            }
+            if self.digital.panel != previous_panel {
                 self.digital.save_if_dirty();
-                self.digital.panel = panels[i].0;
                 self.digital.error = None;
                 self.digital.message.clear();
             }
@@ -1404,7 +1439,15 @@ impl Viewer {
                 if docked {
                     (ui.available_height() - 105.).max(80.)
                 } else {
-                    (ctx.content_rect().height() - 240. - preview_height).clamp(80., 560.)
+                    (ctx.content_rect().height()
+                        - 240.
+                        - preview_height
+                        - if settings && self.digital.panel != Panel::Interface {
+                            40.
+                        } else {
+                            0.
+                        })
+                    .clamp(80., 560.)
                 },
                 |ui| {
                     #[cfg(test)]
@@ -1445,6 +1488,7 @@ impl Viewer {
                         ui::callout(ui, ui::Tone::Danger, error);
                     }
                     ui.add_enabled_ui(!self.digital.busy, |ui| match self.digital.panel {
+                    Panel::Interface => ui::appearance_settings(ui),
                     Panel::Ink => {
                         self.sign_tools.placement_settings(ui, true);
                         ink_place = self.digital.ink_panel(ui, &mut self.editor, &assets, active.is_some_and(|t| t.session.as_ref().is_some_and(|s| s.editable)));
@@ -3713,11 +3757,14 @@ mod tests {
         assert!(app.editor.tool != editing::Tool::SignArea, "Esc cancels");
 
         app.sign_in_area();
+        app.tabs[0].zoom = Zoom::Scale(1.5);
+        app.tabs[0].jump = Some((1, Some(120.)));
         for _ in 0..3 {
             frame(&mut app, vec![]);
         }
+        let anchor = app.tabs[0].canvas_anchor();
         let page = ctx
-            .read_response(egui::Id::new((app.tabs[0].id, 0_usize, "page_actions")))
+            .read_response(egui::Id::new((app.tabs[0].id, 1_usize, "page_actions")))
             .unwrap()
             .rect;
         let at = page.min + vec2(300., 300.) * app.tabs[0].scale;
@@ -3737,6 +3784,10 @@ mod tests {
         }
         assert!(app.digital.open && app.digital.panel == Panel::Sign);
         assert!(!app.digital.quick && app.digital.visible);
+        for _ in 0..8 {
+            frame(&mut app, vec![]);
+            app.tabs[0].assert_canvas_anchor(anchor);
+        }
         let r = app.digital.request.rect.expect("the area is filled in");
         assert!(((r[0] + r[2]) / 2. - 300.).abs() < 0.5 && ((r[1] + r[3]) / 2. - 300.).abs() < 0.5);
     }
@@ -3827,11 +3878,20 @@ mod tests {
             assert!(app.digital.quick && !app.digital.open);
             assert!(app.editor.pending_sign_rect.is_none());
             assert!(app.editor.tool == editing::Tool::SignArea);
+            app.tabs[0].zoom = Zoom::Scale(1.5);
+            app.tabs[0].jump = Some((1, Some(120.)));
             for _ in 0..3 {
                 frame(&mut app, vec![]);
             }
+            until(&mut app, &|a| {
+                a.tabs[0]
+                    .rasters
+                    .keys()
+                    .any(|k| k.page == 1 && !k.thumbnail)
+            });
+            let anchor = app.tabs[0].canvas_anchor();
             let page = ctx
-                .read_response(egui::Id::new((app.tabs[0].id, 0_usize, "page_actions")))
+                .read_response(egui::Id::new((app.tabs[0].id, 1_usize, "page_actions")))
                 .unwrap()
                 .rect;
             let start = if drag_region {
@@ -3880,6 +3940,20 @@ mod tests {
             until(&mut app, &|a| a.tabs.len() == 2 && !a.digital.busy);
             assert!(!app.digital.open && !app.digital.quick_prompt && !app.digital.quick);
             assert!(app.editor.pending_sign_rect.is_none());
+            assert_eq!(app.digital.request.page, 1);
+            // The new signed file shares the source view and keeps its page
+            // image visible before and after the background reload finishes.
+            for _ in 0..20 {
+                frame(&mut app, vec![]);
+                let tab = &app.tabs[app.active];
+                tab.assert_canvas_anchor(anchor);
+                assert!(tab.zoom == Zoom::Scale(1.5));
+                assert!(
+                    tab.stale.contains_key(&1)
+                        || tab.rasters.keys().any(|k| k.page == 1 && !k.thumbnail)
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
 
             let signed = temp.path().join("Contract-signed 2.pdf");
             assert!(signed.is_file(), "{:?}", app.digital.error);
@@ -4334,6 +4408,78 @@ mod tests {
             state.signature_request(&gone, &assets).layout,
             AppearanceLayout::DetailsOnly
         );
+    }
+    #[test]
+    fn settings_groups_signatures_and_restores_subtab_after_appearance() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.digital = DigitalState::at(temp.path().join("profile"));
+        app.digital.open = true;
+        app.digital.panel = Panel::Ink;
+        let frame = |app: &mut Viewer, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1100., 900.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.digital_window(ctx),
+            )
+        };
+        let click = |app: &mut Viewer, label: &str| {
+            for _ in 0..6 {
+                frame(app, vec![]);
+            }
+            let output = frame(app, vec![]);
+            let r = output
+                .platform_output
+                .accesskit_update
+                .unwrap()
+                .nodes
+                .into_iter()
+                .find(|(_, n)| n.label() == Some(label))
+                .unwrap_or_else(|| panic!("missing {label}"))
+                .1
+                .bounds()
+                .unwrap();
+            let pos = pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32);
+            for pressed in [true, false] {
+                frame(
+                    app,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+        };
+        click(&mut app, "Digital signatures");
+        assert!(app.digital.panel == Panel::Signatures);
+        click(&mut app, "Appearance");
+        assert!(app.digital.panel == Panel::Interface);
+        let output = frame(&mut app, vec![]);
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(
+            nodes
+                .iter()
+                .any(|(_, n)| n.label() == Some("Selective accents"))
+        );
+        assert!(
+            !nodes
+                .iter()
+                .any(|(_, n)| n.label() == Some("Ink signatures"))
+        );
+        click(&mut app, "Signatures");
+        assert!(app.digital.panel == Panel::Signatures);
+        click(&mut app, "Ink signatures");
+        assert!(app.digital.panel == Panel::Ink);
     }
     #[test]
     fn signature_preview_stays_pinned_when_settings_scroll() {

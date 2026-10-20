@@ -63,6 +63,7 @@ enum Zoom {
     Page,
     Scale(f32),
 }
+#[derive(Clone)]
 struct Raster {
     texture: TextureHandle,
     bytes: usize,
@@ -102,6 +103,8 @@ struct Tab {
     page_layout: reading::PageLayout,
     view_preferences: mypdf_milestone0::home::ReadingState,
     restore_view: bool,
+    /// A related PDF copy starts with the source tab’s canvas offset.
+    restore_scroll: bool,
     back: Vec<(usize, f32)>,
     forward: Vec<(usize, f32)>,
     text: Vec<Option<Arc<PageText>>>,
@@ -428,6 +431,7 @@ impl Viewer {
             last_pinch: None,
             page_layout: reading::PageLayout::from_code(view_preferences.layout),
             restore_view,
+            restore_scroll: false,
             view_preferences,
             back: vec![],
             forward: vec![],
@@ -897,6 +901,8 @@ impl Viewer {
                         if std::mem::take(&mut tab.remember_open) && !tab.unsaved_on_load {
                             self.home.remember(&tab.path);
                         }
+                        let continuing_view =
+                            tab.document_layout.is_some() && tab.pages.len() == pages.len();
                         tab.text.resize_with(pages.len(), || None);
                         tab.pages = pages;
                         if tab.session.is_none() {
@@ -925,7 +931,7 @@ impl Viewer {
                                 tab.page,
                                 Some(v.top.max(0.).min(tab.pages[tab.page].height)),
                             ));
-                        } else {
+                        } else if !continuing_view {
                             tab.jump(tab.page.min(tab.pages.len().saturating_sub(1)));
                         }
                         tab.bytes = Some(bytes);
@@ -1720,7 +1726,7 @@ impl Viewer {
                             ui.painter().rect_stroke(image.expand(4.0), 6, Stroke::new(2.0, theme::accent_line()), egui::StrokeKind::Middle);
                         }
                         ui.painter().rect_filled(image, 2.0, Color32::WHITE);
-                        if let Some(raster) = tab.rasters.get_mut(&key) { raster.used = tick; ui.painter().image(raster.texture.id(), image, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE); }
+                        if let Some(raster) = tab.rasters.get_mut(&key).or_else(|| tab.stale.get_mut(&page)) { raster.used = tick; ui.painter().image(raster.texture.id(), image, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE); }
                         if let Some(session) = &tab.session && session.editable {
                             for a in session.annotations.iter().filter(|a| a.page == page) {
                                 editing::paint_annotation(&mut self.editor, ctx, ui.painter(), image, factor, a);
@@ -1730,7 +1736,7 @@ impl Viewer {
                         if current {
                             ui.painter().rect_filled(Rect::from_center_size(number, vec2(26. + 6. * (page + 1).to_string().len() as f32, 18.)), 9, theme::accent());
                         }
-                        ui.painter().text(number, egui::Align2::CENTER_CENTER, (page + 1).to_string(), ui::strong(ui, 11.5), if current { Color32::WHITE } else { theme::muted() });
+                        ui.painter().text(number, egui::Align2::CENTER_CENTER, (page + 1).to_string(), ui::strong(ui, 11.5), if current { theme::on_accent() } else { theme::muted() });
                         if response.on_hover_text(format!("Go to page {}", page + 1)).clicked() { tab.jump(page); }
                     }
                 });
@@ -1830,12 +1836,13 @@ impl Viewer {
                 if anchor_offset.is_none() && tab.jump.is_none()
                     && let Some((view, offset, _)) = tab.document_view
                     && let Some(old) = &tab.document_layout
-                    && old.rects.len() == layout.rects.len() && *old != layout
+                    && old.rects.len() == layout.rects.len() && (*old != layout || tab.restore_scroll)
                 {
                     let mut next = old.anchored_offset(&layout, offset, vec2(view.width() / 2., 0.));
                     next.x = (next.x + (view.width() - available.x) / 2.).max(0.);
                     anchor_offset = Some(next);
                 }
+                tab.restore_scroll = false;
                 let max_width = layout.size.x;
                 let mut scroll = egui::ScrollArea::both()
                     .scroll_source(egui::scroll_area::ScrollSource {
