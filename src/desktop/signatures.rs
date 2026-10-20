@@ -240,7 +240,7 @@ impl Viewer {
                             tab.signatures.selected = None;
                             tab.signatures.key = None;
                             tab.bytes = None;
-                            tab.refresh_document(ctx);
+                            let _ = tab.refresh_document(ctx);
                             self.status = Some((
                                 "Signature removed • Save to keep the change; your original file is unchanged".into(),
                                 false,
@@ -816,7 +816,7 @@ impl Viewer {
                 }
                 // Re-render without the managed annotations, which are now editable.
                 tab.bytes = None;
-                tab.refresh_document(ctx);
+                let _ = tab.refresh_document(ctx);
                 self.status = Some((
                     "Editing enabled • Save appends your changes as a new revision".into(),
                     false,

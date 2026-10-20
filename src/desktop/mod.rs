@@ -118,6 +118,7 @@ struct Tab {
     search_limited: bool,
     search_dirty: bool,
     rasters: HashMap<RasterKey, Raster>,
+    page_reorders: Vec<organize::PageReorder>,
     /// The previous version's page images, shown until the edited pages are drawn.
     stale: HashMap<usize, Raster>,
     /// The outline and links, read in the background.
@@ -447,6 +448,7 @@ impl Viewer {
             search_limited: false,
             search_dirty: false,
             rasters: HashMap::new(),
+            page_reorders: vec![],
             stale: HashMap::new(),
             nav: None,
             locked: None,

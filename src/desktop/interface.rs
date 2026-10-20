@@ -37,7 +37,7 @@ impl Viewer {
             // Restart rendering from the current source, never reopen the old
             // disk file over unsaved edits or remove its recovery checkpoint.
             tab.bytes = None;
-            tab.refresh_document(ctx);
+            let _ = tab.refresh_document(ctx);
         } else {
             let wake = ctx.clone();
             tab.worker = Worker::open(tab.path.clone(), move || wake.request_repaint());
