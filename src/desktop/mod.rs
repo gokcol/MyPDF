@@ -31,6 +31,7 @@ mod redaction;
 mod review;
 mod save;
 mod selection;
+mod shell_menu;
 mod shrink;
 mod sign_tools;
 mod signatures;
@@ -283,6 +284,7 @@ pub struct Viewer {
     exit_approved: bool,
     _native_menu: Option<menu::NativeMenu>,
     menu_events: mpsc::Receiver<String>,
+    shell_menu: shell_menu::State,
     signature_prompt: Option<signatures::Prompt>,
     signature_busy: bool,
     signature_tx: mpsc::Sender<signatures::SignatureJob>,
@@ -356,6 +358,7 @@ impl Viewer {
             exit_approved: false,
             _native_menu: native_menu,
             menu_events,
+            shell_menu: shell_menu::State::new(),
             signature_prompt: None,
             signature_busy: false,
             signature_tx,
@@ -2270,6 +2273,9 @@ impl eframe::App for Viewer {
         for path in arrivals.paths {
             self.open(path, ctx);
         }
+        for action in arrivals.actions {
+            self.shell_action(action, ctx);
+        }
         self.content_events(ctx);
         self.page_events(ctx);
         self.events(ctx);
@@ -2454,6 +2460,7 @@ impl eframe::App for Viewer {
         }
         self.remember_reading(ctx, self.exit_approved);
         self.remember_workspace(ctx);
+        self.publish_shell_menu();
         self.workspace_window(ctx);
         self.review_window(ctx);
         self.navigation_editor_window(ctx);

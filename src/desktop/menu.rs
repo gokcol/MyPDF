@@ -353,6 +353,15 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
         return (None, rx);
     }
     muda::MenuEvent::set_event_handler(Some(move |event: muda::MenuEvent| {
+        if let Some(encoded) = event.id.0.strip_prefix("shell:")
+            && let Some(action) = super::shell_menu::Action::decode(encoded)
+        {
+            super::open_with::queue_launch_actions(&super::open_with::Request {
+                paths: vec![],
+                actions: vec![action],
+            });
+            return;
+        }
         let _ = tx.send(event.id.0);
         ctx.request_repaint();
     }));

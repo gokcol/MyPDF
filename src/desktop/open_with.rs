@@ -4,15 +4,61 @@
 //! macOS sends them to the MyPDF that is already open. On Windows, Open With
 //! starts another MyPDF with the file; it hands the file to the one already
 //! open and quits, so documents open as tabs in one window.
+use super::shell_menu::Action;
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::Mutex;
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Request {
+    pub paths: Vec<PathBuf>,
+    pub(super) actions: Vec<Action>,
+}
+
+/// Shell links pass an encoded action; ordinary Open With arguments stay paths.
+pub fn launch_request(args: Vec<std::ffi::OsString>) -> Result<Request, String> {
+    if args
+        .first()
+        .is_some_and(|arg| arg == super::shell_menu::ARGUMENT)
+    {
+        if args.len() != 2 {
+            return Err("Invalid MyPDF shortcut".into());
+        }
+        let action = args[1]
+            .to_str()
+            .and_then(Action::decode)
+            .ok_or("Invalid MyPDF shortcut")?;
+        Ok(Request {
+            paths: vec![],
+            actions: vec![action],
+        })
+    } else {
+        let skip = usize::from(args.first().is_some_and(|arg| arg == "--"));
+        Ok(Request {
+            paths: args.into_iter().skip(skip).map(PathBuf::from).collect(),
+            actions: vec![],
+        })
+    }
+}
+
+pub fn queue_launch_actions(request: &Request) {
+    if !request.actions.is_empty() {
+        deliver_request(
+            Request {
+                paths: vec![],
+                actions: request.actions.clone(),
+            },
+            true,
+        );
+    }
+}
 
 /// Files to open, and whether the window should come to the front.
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct Arrivals {
     pub paths: Vec<PathBuf>,
     pub focus: bool,
+    pub actions: Vec<Action>,
 }
 impl Arrivals {
     pub fn activate(&self, ctx: &egui::Context) {
@@ -26,16 +72,29 @@ impl Arrivals {
 static WAITING: Mutex<Arrivals> = Mutex::new(Arrivals {
     paths: Vec::new(),
     focus: false,
+    actions: Vec::new(),
 });
 static WAKE: Mutex<Option<egui::Context>> = Mutex::new(None);
 
+#[cfg(any(target_os = "macos", test))]
 fn deliver(paths: Vec<PathBuf>, focus: bool) {
-    if paths.is_empty() && !focus {
+    deliver_request(
+        Request {
+            paths,
+            actions: vec![],
+        },
+        focus,
+    );
+}
+
+fn deliver_request(request: Request, focus: bool) {
+    if request.paths.is_empty() && request.actions.is_empty() && !focus {
         return;
     }
     {
         let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
-        waiting.paths.extend(paths);
+        waiting.paths.extend(request.paths);
+        waiting.actions.extend(request.actions);
         waiting.focus |= focus || !waiting.paths.is_empty();
     }
     if let Some(ctx) = WAKE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
@@ -54,11 +113,11 @@ pub(super) fn take(ctx: &egui::Context) -> Arrivals {
 /// When another MyPDF is already open, give it these files (or just bring it
 /// to the front) and return true: this one should then quit.
 #[cfg(not(target_os = "macos"))]
-pub fn hand_over(paths: &[PathBuf]) -> bool {
-    mailbox::hand_over(&mypdf_milestone0::assets::data_directory(), paths)
+pub fn hand_over(request: &Request) -> bool {
+    mailbox::hand_over(&mypdf_milestone0::assets::data_directory(), request)
 }
 #[cfg(target_os = "macos")]
-pub fn hand_over(_: &[PathBuf]) -> bool {
+pub fn hand_over(_: &Request) -> bool {
     false
 }
 
@@ -105,15 +164,10 @@ mod mailbox {
         }
     }
 
-    pub(super) fn send(root: &Path, paths: &[PathBuf]) -> std::io::Result<()> {
-        let mut names = vec![];
-        for path in paths {
-            let path = std::path::absolute(path)?;
-            names.push(
-                path.to_str()
-                    .ok_or_else(|| std::io::Error::other("unusual file name"))?
-                    .to_owned(),
-            );
+    pub(super) fn send(root: &Path, request: &super::Request) -> std::io::Result<()> {
+        let mut request = request.clone();
+        for path in &mut request.paths {
+            *path = std::path::absolute(&*path)?;
         }
         let inbox = root.join("open");
         std::fs::create_dir_all(&inbox)?;
@@ -123,13 +177,13 @@ mod mailbox {
             .as_nanos();
         let name = format!("{time:024}-{}", std::process::id());
         let part = inbox.join(format!("{name}.part"));
-        std::fs::write(&part, serde_json::to_vec(&names)?)?;
+        std::fs::write(&part, serde_json::to_vec(&request)?)?;
         std::fs::rename(&part, inbox.join(format!("{name}.request")))
     }
 
     /// The files of every waiting request, oldest first, or None when there
     /// is no request. Each request is taken once.
-    pub(super) fn receive(root: &Path) -> Option<Vec<PathBuf>> {
+    pub(super) fn receive(root: &Path) -> Option<super::Request> {
         let mut requests: Vec<PathBuf> = std::fs::read_dir(root.join("open"))
             .ok()?
             .flatten()
@@ -137,7 +191,7 @@ mod mailbox {
             .filter(|path| path.extension().is_some_and(|e| e == "request"))
             .collect();
         requests.sort();
-        let mut paths = vec![];
+        let mut combined = super::Request::default();
         let mut any = false;
         for request in requests {
             let fresh = std::fs::metadata(&request)
@@ -149,17 +203,28 @@ mod mailbox {
             let _ = std::fs::remove_file(&request);
             if fresh
                 && let Ok(bytes) = bytes
-                && let Ok(names) = serde_json::from_slice::<Vec<String>>(&bytes)
+                && bytes.len() <= 1024 * 1024
+                && let Some(request) = serde_json::from_slice::<super::Request>(&bytes)
+                    .ok()
+                    .or_else(|| {
+                        serde_json::from_slice::<Vec<PathBuf>>(&bytes)
+                            .ok()
+                            .map(|paths| super::Request {
+                                paths,
+                                actions: vec![],
+                            })
+                    })
             {
                 any = true;
-                paths.extend(names.into_iter().map(PathBuf::from));
+                combined.paths.extend(request.paths);
+                combined.actions.extend(request.actions);
             }
         }
-        any.then_some(paths)
+        any.then_some(combined)
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub(super) fn hand_over(root: &Path, paths: &[PathBuf]) -> bool {
+    pub(super) fn hand_over(root: &Path, request: &super::Request) -> bool {
         match claim(root) {
             Claim::Mine(lock) => {
                 let root = root.to_path_buf();
@@ -167,8 +232,8 @@ mod mailbox {
                     let _lock = lock;
                     loop {
                         std::thread::sleep(Duration::from_millis(250));
-                        if let Some(paths) = receive(&root) {
-                            super::deliver(paths, true);
+                        if let Some(request) = receive(&root) {
+                            super::deliver_request(request, true);
                         }
                     }
                 });
@@ -183,7 +248,7 @@ mod mailbox {
                         windows_sys::Win32::UI::WindowsAndMessaging::ASFW_ANY,
                     );
                 }
-                send(root, paths).is_ok()
+                send(root, request).is_ok()
             }
         }
     }
@@ -316,6 +381,7 @@ mod tests {
             Arrivals {
                 paths: vec![PathBuf::from("/tmp/a.pdf"), PathBuf::from("/tmp/b.pdf")],
                 focus: true,
+                actions: vec![],
             }
         );
         assert_eq!(take(&ctx), Arrivals::default(), "each file is opened once");
@@ -333,6 +399,7 @@ mod tests {
             Arrivals {
                 paths: vec![],
                 focus: true,
+                actions: vec![],
             }
             .activate(ctx);
         });
@@ -363,12 +430,32 @@ mod tests {
         assert!(matches!(mailbox::claim(root.path()), mailbox::Claim::Taken));
         assert_eq!(mailbox::receive(root.path()), None);
         let pdf = root.path().join("Ünïcode name.pdf");
-        mailbox::send(root.path(), std::slice::from_ref(&pdf)).unwrap();
-        mailbox::send(root.path(), &[]).unwrap();
-        assert_eq!(mailbox::receive(root.path()), Some(vec![pdf]));
+        mailbox::send(
+            root.path(),
+            &Request {
+                paths: vec![pdf.clone()],
+                actions: vec![Action::New],
+            },
+        )
+        .unwrap();
+        mailbox::send(root.path(), &Request::default()).unwrap();
+        assert_eq!(
+            mailbox::receive(root.path()),
+            Some(Request {
+                paths: vec![pdf],
+                actions: vec![Action::New]
+            })
+        );
         assert_eq!(mailbox::receive(root.path()), None, "taken once");
         // A request left from a MyPDF that quit long ago is dropped.
-        mailbox::send(root.path(), &[PathBuf::from("/old.pdf")]).unwrap();
+        mailbox::send(
+            root.path(),
+            &Request {
+                paths: vec![PathBuf::from("/old.pdf")],
+                actions: vec![],
+            },
+        )
+        .unwrap();
         let request = std::fs::read_dir(root.path().join("open"))
             .unwrap()
             .flatten()

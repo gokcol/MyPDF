@@ -94,6 +94,18 @@ impl Home {
         self.previews
             .remove(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
     }
+    pub(super) fn recent_paths(&self) -> Vec<PathBuf> {
+        self.history
+            .as_ref()
+            .map(|h| {
+                h.entries
+                    .iter()
+                    .filter(|e| e.opened > 0)
+                    .map(|e| e.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
     fn change(&mut self, action: impl FnOnce(&mut History) -> anyhow::Result<()>) {
         if let Some(history) = &mut self.history {
             self.error = action(history).err().map(|e| format!("{e:#}"));
