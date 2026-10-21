@@ -4,7 +4,7 @@ Version 0.4.0, verified on macOS on 13 October 2026. The app remains native Rust
 
 ## Delivered
 
-- PDF Expert’s installed macOS application was inspected read-only: annotation ribbon, shapes panel, stamps panel, and page-management overview. MyPDF now uses dark document tabs, compact grouped controls, a light annotation ribbon, fixed right-hand asset panels, and a page overview. The Mac titlebar integrates with the tab strip while retaining native window controls.
+- MyPDF uses dark document tabs, compact grouped controls, a light annotation ribbon, fixed right-hand asset panels, and a page overview. The Mac titlebar integrates with the tab strip while retaining native window controls.
 - 33 rebuilt vector assets: 15 arrows/chevrons, 14 symbols, and 4 stamps. Panels support searching, artwork import, saved signatures, and repeated placement. Filled vector artwork exports as a compound path so external readers do not show internal triangulation seams. Imported/personal assets remain untouched.
 - Reorder pages by dragging or a numeric destination; multi-select with ⌘/Ctrl/Shift or explicit ranges.
 - Insert a blank page matching the displayed current page size, or insert pages from one or more PDFs at a chosen position. Merge appends PDFs in file-picker order.
