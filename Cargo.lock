@@ -3550,7 +3550,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "mypdf-milestone0"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3592,6 +3592,7 @@ dependencies = [
  "underskrift",
  "unicode-bidi",
  "wgpu",
+ "windows 0.61.3",
  "windows-sys 0.61.2",
  "winresource",
  "x509-parser",

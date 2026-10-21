@@ -1,6 +1,6 @@
 [package]
 name = "mypdf-milestone0"
-version = "2.0.2"
+version = "2.0.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 default-run = "mypdf"
@@ -71,6 +71,7 @@ objc2 = "0.6"
 raw-window-handle = "0.6"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem", "Win32_Storage_EnhancedStorage"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_UI_WindowsAndMessaging", "Win32_System_DataExchange"] }
 
 [target."cfg(windows)".build-dependencies]

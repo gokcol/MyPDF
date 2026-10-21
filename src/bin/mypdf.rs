@@ -4,14 +4,19 @@
 mod desktop;
 
 fn main() -> eframe::Result {
-    let paths = std::env::args_os()
-        .skip(1)
-        .map(std::path::PathBuf::from)
-        .collect::<Vec<_>>();
-    if desktop::open_with::hand_over(&paths) {
+    let request = match desktop::open_with::launch_request(std::env::args_os().skip(1).collect()) {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("{error}");
+            return Ok(());
+        }
+    };
+    if desktop::open_with::hand_over(&request) {
         return Ok(());
     }
     desktop::open_with::install();
+    desktop::open_with::queue_launch_actions(&request);
+    let paths = request.paths;
     let viewport = eframe::egui::ViewportBuilder::default();
     #[cfg(target_os = "macos")]
     let viewport = viewport
