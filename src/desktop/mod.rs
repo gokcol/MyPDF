@@ -1450,7 +1450,7 @@ impl Viewer {
                 };
                 let full = ui.available_width();
                 // Reserve space for file actions and the search, translation and panel controls.
-                let compact = full < track_width(ui, false) + 390.;
+                let compact = full < track_width(ui, false) + 354.;
                 ui.horizontal(|ui| {
                     for (icon, label, key) in [
                         (Icon::Blank, "New blank PDF", "new"),
@@ -1473,10 +1473,9 @@ impl Viewer {
                             },
                             "save_as",
                         ),
-                        (Icon::Print, "Print… (⌘P)", "print"),
                         (Icon::Compare, "Compare Documents…", "compare"),
                     ] {
-                        let enabled = !matches!(key, "save" | "save_as" | "print")
+                        let enabled = !matches!(key, "save" | "save_as")
                             || (!self.saving
                                 && self
                                     .tabs
@@ -3424,6 +3423,7 @@ mod tests {
         for width in [720., 1200.] {
             let ctx = egui::Context::default();
             ctx.enable_accesskit();
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("preview_portable_menu"), true));
             let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
             app.home.visible = false;
             let output = ctx.run(
@@ -3434,13 +3434,21 @@ mod tests {
                 |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
             );
             let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+            let ribbon_y = nodes
+                .iter()
+                .find(|(_, n)| n.label() == Some("Read"))
+                .and_then(|(_, n)| n.bounds())
+                .unwrap()
+                .y0;
             let mut previous = 0.;
             for label in [
                 "Read", "Annotate", "Edit", "Draw", "Forms", "Sign", "Pages", "Export",
             ] {
                 let node = &nodes
                     .iter()
-                    .find(|(_, n)| n.label() == Some(label))
+                    .find(|(_, n)| {
+                        n.label() == Some(label) && n.bounds().is_some_and(|r| r.y0 == ribbon_y)
+                    })
                     .unwrap()
                     .1;
                 let r = node.bounds().unwrap();
