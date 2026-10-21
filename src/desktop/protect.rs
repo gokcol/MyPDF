@@ -51,7 +51,7 @@ impl Viewer {
                     let wake = ctx.clone();
                     tab.worker = Worker::from_bytes(bytes.into(), move || wake.request_repaint());
                     self.status = Some((
-                        "Opened with its password • Copies you save keep the password".into(),
+                        "Opened with its password • Saving keeps the password".into(),
                         false,
                     ));
                     return;
@@ -177,7 +177,7 @@ impl Viewer {
                 "Save a copy without the password?",
                 "The copy opens without a password. The file you opened keeps its password.",
                 &[
-                    ("Save a Copy…", ui::DialogTone::Primary),
+                    ("Save As…", ui::DialogTone::Primary),
                     ("Cancel", ui::DialogTone::Secondary),
                 ],
                 1,
@@ -249,7 +249,7 @@ impl Viewer {
                         cancel = ui::dialog_button(ui, "Cancel", ui::DialogTone::Secondary).clicked();
                     });
                     ui.allocate_ui(vec2(half, 32.), |ui| {
-                        save = ui::dialog_button(ui, "Save a Copy…", ui::DialogTone::Primary).clicked();
+                        save = ui::dialog_button(ui, "Save As…", ui::DialogTone::Primary).clicked();
                     });
                 });
             });

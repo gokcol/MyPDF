@@ -5,6 +5,7 @@ pub mod compress;
 pub mod content;
 pub mod convert;
 pub mod document;
+pub mod file_save;
 pub mod form_data;
 pub mod form_design;
 pub mod form_detect;
