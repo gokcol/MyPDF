@@ -4,6 +4,7 @@ use mypdf_milestone0::{
     annotations::{Annotation, Kind},
     object_tools,
 };
+use std::collections::BTreeSet;
 
 #[derive(Default)]
 pub(super) struct State {
@@ -35,6 +36,74 @@ struct Repeat {
     key: (u64, u64),
     marks: Vec<Annotation>,
     range: String,
+    selected: BTreeSet<usize>,
+    error: Option<String>,
+}
+impl Repeat {
+    fn new(key: (u64, u64), marks: Vec<Annotation>, page_count: usize) -> Self {
+        let mut draft = Self {
+            key,
+            marks,
+            range: String::new(),
+            selected: BTreeSet::new(),
+            error: None,
+        };
+        draft.select_all(page_count);
+        draft
+    }
+    fn source_page(&self, page: usize) -> bool {
+        self.marks.iter().all(|a| a.page == page)
+    }
+    fn select_all(&mut self, page_count: usize) {
+        self.selected = (0..page_count).filter(|&p| !self.source_page(p)).collect();
+        self.sync_range();
+    }
+    fn read_range(&mut self, page_count: usize) {
+        if self.range.trim().is_empty() {
+            self.selected.clear();
+            self.error = None;
+            return;
+        }
+        match mypdf_milestone0::pages::parse_range(&self.range, page_count) {
+            Ok(pages) => {
+                self.selected = pages
+                    .into_iter()
+                    .filter(|&p| !self.source_page(p))
+                    .collect();
+                self.error = None;
+            }
+            Err(e) => {
+                self.selected.clear();
+                self.error = Some(e.to_string());
+            }
+        }
+    }
+    fn toggle(&mut self, page: usize) {
+        if self.source_page(page) {
+            return;
+        }
+        if !self.selected.remove(&page) {
+            self.selected.insert(page);
+        }
+        self.sync_range();
+    }
+    fn sync_range(&mut self) {
+        let mut ranges = Vec::new();
+        let mut pages = self.selected.iter().copied().peekable();
+        while let Some(first) = pages.next() {
+            let mut last = first;
+            while pages.peek() == Some(&(last + 1)) {
+                last = pages.next().unwrap();
+            }
+            ranges.push(if first == last {
+                (first + 1).to_string()
+            } else {
+                format!("{}-{}", first + 1, last + 1)
+            });
+        }
+        self.range = ranges.join(", ");
+        self.error = None;
+    }
 }
 pub(super) fn positioned(
     marks: &[Annotation],
@@ -553,11 +622,8 @@ impl Viewer {
                     .cloned()
                     .collect();
                 if s.editable && !marks.is_empty() {
-                    self.workbench.repeat = Some(Repeat {
-                        key: (t.id, s.revision()),
-                        marks,
-                        range: format!("1-{}", t.pages.len()),
-                    });
+                    self.workbench.repeat =
+                        Some(Repeat::new((t.id, s.revision()), marks, t.pages.len()));
                 } else {
                     self.status = Some(("Select artwork on the page first".into(), false));
                 }
@@ -915,7 +981,7 @@ impl Viewer {
         let Some(d) = &mut self.workbench.repeat else {
             return;
         };
-        let Some(t) = self.tabs.get(self.active) else {
+        let Some(t) = self.tabs.get_mut(self.active) else {
             self.workbench.repeat = None;
             return;
         };
@@ -925,54 +991,279 @@ impl Viewer {
             .is_some_and(|s| (t.id, s.revision()) == d.key && s.editable);
         let mut done = false;
         let mut cancel = false;
-        let pages = mypdf_milestone0::pages::parse_range(&d.range, t.pages.len());
-        let count = pages
-            .as_ref()
-            .map(|p| {
-                p.iter()
-                    .filter(|&&page| !d.marks.iter().all(|a| a.page == page))
-                    .count()
-                    * d.marks.len()
-            })
-            .unwrap_or(0);
-        let fits = count + t.session.as_ref().map(|s| s.annotations.len()).unwrap_or(0) <= 5000;
-        let copies = pages
-            .as_ref()
-            .ok()
-            .filter(|_| fits)
-            .map(|p| {
-                object_tools::repeat(
-                    &d.marks,
-                    &p.iter()
-                        .map(|&i| (i, [t.pages[i].width, t.pages[i].height]))
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .unwrap_or_default();
-        let modal=egui::Modal::new(egui::Id::new("repeat_objects")).frame(ui::modal_frame()).show(ctx,|ui|{
-            ui.set_width(480.);ui.heading("Repeat on pages");ui.weak("Copies the selected artwork. The source page is skipped.");
-            ui.horizontal(|ui|{ui.label("Pages");ui.text_edit_singleline(&mut d.range);});
-            ui.weak("Examples: 1-4, 7, 10 · One Undo removes all copies.");
-            if let Err(e)=&pages {ui.colored_label(theme::danger(),e.to_string());}
-            egui::ScrollArea::vertical().max_height(300.).show(ui,|ui|{
-                if let Ok(pages)=&pages {ui.horizontal_wrapped(|ui|{for &page in pages.iter().filter(|&&p|!d.marks.iter().all(|a|a.page==p)).take(12) {
-                    ui.vertical(|ui|{let size=t.pages[page];let scale=(100./size.width).min(130./size.height);let (r,_)=ui.allocate_exact_size(vec2(size.width,size.height)*scale,egui::Sense::hover());ui.painter().rect_filled(r,2.,Color32::WHITE);
-                        if let Some(raster)=t.rasters.iter().find(|(k,_)|k.page==page).map(|(_,r)|r){ui.painter().image(raster.texture.id(),r,Rect::from_min_max(pos2(0.,0.),pos2(1.,1.)),Color32::WHITE);}
-                        if let Some(s)=&t.session { for a in s.annotations.iter().filter(|a|a.page==page) { editing::paint_annotation(&mut self.editor,ctx,ui.painter(),r,scale,a); } }
-                        for a in copies.iter().filter(|a|a.page==page){editing::paint_annotation(&mut self.editor,ctx,ui.painter(),r,scale,a);}
-                        ui.label(format!("Page {}",page+1));});
-                }});}
+        let screen = ctx.content_rect().size();
+        let width = (screen.x - 80.).clamp(240., 760.);
+        let height = (screen.y - 80.).max(260.);
+        let modal = egui::Modal::new(egui::Id::new("repeat_objects"))
+            .frame(ui::modal_frame().inner_margin(18))
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                let top = ui.cursor().top();
+                ui.heading("Repeat on pages");
+                ui.label("Select destination pages. The source page is skipped.");
+                ui.horizontal(|ui| {
+                    if ui.button("Select all").clicked() {
+                        d.select_all(t.pages.len());
+                    }
+                    if ui.button("Clear").clicked() {
+                        d.selected.clear();
+                        d.sync_range();
+                    }
+                    ui.label(format!(
+                        "{} of {} pages selected",
+                        d.selected.len(),
+                        t.pages.len()
+                    ));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Pages");
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut d.range)
+                            .hint_text("e.g. 1-4, 7, 10")
+                            .desired_width(ui.available_width()),
+                    );
+                    if response.changed() {
+                        d.read_range(t.pages.len());
+                    }
+                });
+                if let Some(error) = &d.error {
+                    ui.colored_label(theme::danger(), error);
+                }
+                ui.add_space(4.);
+                // Fixed-size cards in explicit rows cannot expand the modal horizontally.
+                // Virtual rows also keep rendering work bounded for long documents.
+                let grid_height = (height - (ui.cursor().top() - top) - 100.).clamp(90., 390.);
+
+                let gap = 10.;
+                let grid_width = (width - 18.).max(1.);
+                let columns = ((grid_width + gap) / (128. + gap)).floor().max(1.) as usize;
+                let cell_width = (grid_width - (columns - 1) as f32 * gap) / columns as f32;
+                egui::ScrollArea::vertical()
+                    .id_salt(("repeat_pages", t.id))
+                    .max_height(grid_height)
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .show_rows(ui, 188., t.pages.len().div_ceil(columns), |ui, rows| {
+                        for row in rows {
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = gap;
+                                for page in row * columns..((row + 1) * columns).min(t.pages.len())
+                                {
+                                    let (card, _) = ui.allocate_exact_size(
+                                        vec2(cell_width, 188.),
+                                        egui::Sense::hover(),
+                                    );
+                                    let source = d.source_page(page);
+                                    let response = ui.interact(
+                                        card,
+                                        egui::Id::new(("repeat_page", t.id, page)),
+                                        egui::Sense::click(),
+                                    );
+                                    response.widget_info(|| {
+                                        egui::WidgetInfo::selected(
+                                            egui::WidgetType::Checkbox,
+                                            valid && !source,
+                                            d.selected.contains(&page),
+                                            if source {
+                                                format!("Page {} (source)", page + 1)
+                                            } else {
+                                                format!("Repeat on page {}", page + 1)
+                                            },
+                                        )
+                                    });
+                                    if response.clicked() && valid && !source {
+                                        d.toggle(page);
+                                    }
+                                    let selected = d.selected.contains(&page);
+                                    ui.painter().rect_filled(
+                                        card,
+                                        7.,
+                                        if selected {
+                                            theme::accent_soft()
+                                        } else {
+                                            theme::track()
+                                        },
+                                    );
+                                    ui.painter().rect_stroke(
+                                        card,
+                                        7.,
+                                        Stroke::new(
+                                            1.,
+                                            if selected {
+                                                theme::accent()
+                                            } else if response.hovered() && !source {
+                                                theme::accent_line()
+                                            } else {
+                                                theme::line()
+                                            },
+                                        ),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    let size = t.pages[page];
+                                    let scale =
+                                        ((cell_width - 20.) / size.width).min(150. / size.height);
+                                    let rect = Rect::from_center_size(
+                                        pos2(card.center().x, card.top() + 83.),
+                                        vec2(size.width, size.height) * scale,
+                                    );
+                                    let painter =
+                                        ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                                    painter.rect_filled(rect, 1., Color32::WHITE);
+                                    if ui.is_rect_visible(card) {
+                                        let key = viewer::raster_key(
+                                            page,
+                                            size,
+                                            scale * ctx.pixels_per_point(),
+                                            true,
+                                        );
+                                        t.request(key);
+                                        if let Some(raster) = t.rasters.get_mut(&key) {
+                                            raster.used = self.tick;
+                                            painter.image(
+                                                raster.texture.id(),
+                                                rect,
+                                                Rect::from_min_max(pos2(0., 0.), pos2(1., 1.)),
+                                                Color32::WHITE,
+                                            );
+                                        } else {
+                                            painter.text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                if t.render_errors.contains_key(&page) {
+                                                    "Preview unavailable"
+                                                } else {
+                                                    "Loading…"
+                                                },
+                                                FontId::proportional(10.),
+                                                Color32::GRAY,
+                                            );
+                                        }
+                                        if let Some(s) = &t.session {
+                                            for mark in
+                                                s.annotations.iter().filter(|a| a.page == page)
+                                            {
+                                                editing::paint_annotation(
+                                                    &mut self.editor,
+                                                    ctx,
+                                                    &painter,
+                                                    rect,
+                                                    scale,
+                                                    mark,
+                                                );
+                                            }
+                                        }
+                                        if selected {
+                                            // Preview only visible destinations; create the full set once on Apply.
+                                            for mark in object_tools::repeat(
+                                                &d.marks,
+                                                &[(page, [size.width, size.height])],
+                                            ) {
+                                                editing::paint_annotation(
+                                                    &mut self.editor,
+                                                    ctx,
+                                                    &painter,
+                                                    rect,
+                                                    scale,
+                                                    &mark,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    let label_y = card.bottom() - 15.;
+                                    if !source {
+                                        let check = Rect::from_center_size(
+                                            pos2(card.left() + 17., label_y),
+                                            vec2(15., 15.),
+                                        );
+                                        ui.painter().rect_filled(
+                                            check,
+                                            3.,
+                                            if selected {
+                                                theme::accent()
+                                            } else {
+                                                theme::surface()
+                                            },
+                                        );
+                                        if selected {
+                                            ui::draw_icon(
+                                                ui.painter(),
+                                                check.shrink(2.),
+                                                Icon::Check,
+                                                theme::on_accent(),
+                                            );
+                                        } else {
+                                            ui.painter().rect_stroke(
+                                                check,
+                                                3.,
+                                                Stroke::new(1., theme::muted()),
+                                                egui::StrokeKind::Inside,
+                                            );
+                                        }
+                                    }
+                                    ui.painter().text(
+                                        pos2(
+                                            card.center().x + if source { 0. } else { 8. },
+                                            label_y,
+                                        ),
+                                        egui::Align2::CENTER_CENTER,
+                                        if source {
+                                            format!("{} · Source", page + 1)
+                                        } else {
+                                            format!("Page {}", page + 1)
+                                        },
+                                        ui::strong(ui, 11.5),
+                                        if source { theme::muted() } else { theme::ink() },
+                                    );
+                                    if !source {
+                                        response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                                    }
+                                }
+                            });
+                        }
+                    });
+                ui.add_space(4.);
+                ui.small(
+                    "Smaller pages fit the artwork proportionally. One Undo removes all copies.",
+                );
+                let count = d.selected.len() * d.marks.len();
+                let fits = count + t.session.as_ref().map_or(0, |s| s.annotations.len()) <= 5000;
+                if !fits {
+                    ui.colored_label(
+                        theme::danger(),
+                        "Choose fewer pages: the document limit is 5,000 objects.",
+                    );
+                }
+                if !valid {
+                    ui.colored_label(theme::danger(), "The document changed. Reopen this dialog.");
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        done = ui
+                            .add_enabled(
+                                valid && fits && d.error.is_none() && count > 0,
+                                ActionButton::new(
+                                    Icon::Copy,
+                                    &format!(
+                                        "Add {count} {}",
+                                        if count == 1 { "copy" } else { "copies" }
+                                    ),
+                                )
+                                .primary(),
+                            )
+                            .clicked();
+                        cancel = ui.button("Cancel").clicked();
+                    });
+                });
             });
-            ui.weak("Preview shows the first 12 destination pages. Smaller pages fit the artwork proportionally.");
-            if !fits { ui.colored_label(theme::danger(), "Choose fewer pages: the document limit is 5,000 objects."); }
-            if !valid{ui.weak("The document changed. Reopen this dialog.");}
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                done=ui.add_enabled(valid&&!copies.is_empty(),ActionButton::new(Icon::Copy,&format!("Add {} {}",copies.len(),if copies.len()==1 { "copy" } else { "copies" })).primary()).clicked();
-                cancel=ui.button("Cancel").clicked();
-            });
-        });
         if done {
-            let s = self.tabs[self.active].session.as_mut().unwrap();
+            let destinations: Vec<_> = d
+                .selected
+                .iter()
+                .map(|&page| (page, [t.pages[page].width, t.pages[page].height]))
+                .collect();
+            let copies = object_tools::repeat(&d.marks, &destinations);
+            let s = t.session.as_mut().unwrap();
             let mut entries = s.annotations.clone();
             entries.extend(copies);
             match s.commit(entries) {
@@ -1360,6 +1651,215 @@ mod tests {
         app.home.visible = false;
         app.editor.mode = editing::Mode::Draw;
         (app, ctx)
+    }
+    fn repeat_fixture() -> (Viewer, egui::Context) {
+        let (mut app, ctx) = fixture();
+        let bytes = mypdf_milestone0::convert::text_to_pdf("# Review document\n\nFull-page thumbnail preview.\n\nSelect pages to repeat your artwork.", true).unwrap();
+        let mut doc = lopdf::Document::load_mem(&bytes).unwrap();
+        let page_id = *doc.get_pages().values().next().unwrap();
+        let original = doc.get_dictionary(page_id).unwrap().clone();
+        let parent = original.get(b"Parent").unwrap().as_reference().unwrap();
+        let mut kids = Vec::new();
+        for page in 0..52 {
+            let mut dictionary = original.clone();
+            if page % 3 == 1 {
+                dictionary.set("MediaBox", vec![0.into(), 0.into(), 842.into(), 595.into()]);
+            }
+            kids.push(lopdf::Object::Reference(doc.add_object(dictionary)));
+        }
+        let pages = doc.get_dictionary_mut(parent).unwrap();
+        pages.set("Kids", kids);
+        pages.set("Count", 52);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        app.tabs.clear();
+        app.open_memory(PathBuf::from("Repeat artwork trial.pdf"), bytes, &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mark = Annotation::new(
+            13,
+            [40., 40., 120., 90.],
+            Kind::Rectangle,
+            Default::default(),
+        );
+        app.tabs[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .commit(vec![mark.clone()])
+            .unwrap();
+        selection::set(&mut app.tabs[0], &mut app.editor, vec![mark.id]);
+        app.workbench_action("repeat_objects", &ctx);
+        ctx.enable_accesskit();
+        (app, ctx)
+    }
+    fn repeat_frame(
+        app: &mut Viewer,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        app.events(ctx);
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0., 0.), size)),
+                max_texture_side: Some(8192),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.repeat_window(ctx),
+        )
+    }
+    fn repeat_control(
+        app: &mut Viewer,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        label: &str,
+    ) -> Rect {
+        for _ in 0..3 {
+            repeat_frame(app, ctx, size, vec![]);
+        }
+        let out = repeat_frame(app, ctx, size, vec![]);
+        let nodes = out.platform_output.accesskit_update.unwrap().nodes;
+        let node = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some(label) && n.bounds().is_some())
+            .unwrap_or_else(|| {
+                panic!(
+                    "Missing {label}: {:?}",
+                    nodes
+                        .iter()
+                        .filter_map(|(_, n)| n.label())
+                        .collect::<Vec<_>>()
+                )
+            });
+        let r = node.1.bounds().unwrap();
+        Rect::from_min_max(
+            pos2(r.x0 as f32, r.y0 as f32),
+            pos2(r.x1 as f32, r.y1 as f32),
+        )
+    }
+    fn repeat_click(app: &mut Viewer, ctx: &egui::Context, size: egui::Vec2, label: &str) {
+        let pos = repeat_control(app, ctx, size, label).center();
+        for pressed in [true, false] {
+            repeat_frame(
+                app,
+                ctx,
+                size,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+    }
+    #[test]
+    fn repeat_dialog_stays_inside_small_windows_and_loads_visible_full_pages() {
+        let (mut app, ctx) = repeat_fixture();
+        for size in [vec2(1200., 820.), vec2(800., 600.), vec2(480., 420.)] {
+            let screen = Rect::from_min_size(pos2(0., 0.), size);
+            for label in [
+                "Select all",
+                "Clear",
+                "Repeat on page 1",
+                "Cancel",
+                "Add 51 copies",
+            ] {
+                let r = repeat_control(&mut app, &ctx, size, label);
+                assert!(screen.contains_rect(r), "{label}: {r:?} outside {size:?}");
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !app.tabs[0]
+            .rasters
+            .keys()
+            .any(|k| k.page == 0 && k.thumbnail)
+        {
+            repeat_frame(&mut app, &ctx, vec2(480., 420.), vec![]);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Off-screen pages are not all queued up just to open the dialog.
+        assert!(app.tabs[0].rasters.len() + app.tabs[0].pending.len() < 52);
+    }
+    #[test]
+    fn repeat_dialog_selects_last_page_and_commits_only_chosen_destinations_with_one_undo() {
+        let (mut app, ctx) = repeat_fixture();
+        let size = vec2(800., 600.);
+        repeat_click(&mut app, &ctx, size, "Clear");
+        assert!(app.workbench.repeat.as_ref().unwrap().selected.is_empty());
+        repeat_click(&mut app, &ctx, size, "Repeat on page 1");
+        repeat_click(&mut app, &ctx, size, "Repeat on page 2");
+        let pos = repeat_control(&mut app, &ctx, size, "Repeat on page 2").center();
+        repeat_frame(
+            &mut app,
+            &ctx,
+            size,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0., -10000.),
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        // Let smooth scrolling reach the bottom.
+        for _ in 0..40 {
+            repeat_frame(&mut app, &ctx, size, vec![]);
+        }
+        repeat_click(&mut app, &ctx, size, "Repeat on page 52");
+        let draft = app.workbench.repeat.as_ref().unwrap();
+        assert_eq!(draft.selected, BTreeSet::from([0, 1, 51]));
+        assert_eq!(draft.range, "1-2, 52");
+        repeat_click(&mut app, &ctx, size, "Add 3 copies");
+        assert!(app.workbench.repeat.is_none());
+        let session = app.tabs[0].session.as_mut().unwrap();
+        assert_eq!(
+            session
+                .annotations
+                .iter()
+                .map(|a| a.page)
+                .collect::<Vec<_>>(),
+            vec![13, 0, 1, 51]
+        );
+        assert_eq!(
+            session.undo_label().as_deref(),
+            Some("Repeat artwork on pages")
+        );
+        session.undo();
+        assert_eq!(session.annotations.len(), 1);
+        assert_eq!(session.annotations[0].page, 13);
+    }
+    #[test]
+    fn repeat_page_ranges_sync_with_selection_and_skip_source() {
+        let mark = Annotation::new(13, [0., 0., 20., 20.], Kind::Rectangle, Default::default());
+        let mut d = Repeat::new((1, 1), vec![mark], 52);
+        assert_eq!(d.selected.len(), 51);
+        assert_eq!(d.range, "1-13, 15-52");
+        d.toggle(13);
+        assert!(!d.selected.contains(&13));
+        d.range = "2, 14, 48-52".into();
+        d.read_range(52);
+        assert_eq!(d.selected, BTreeSet::from([1, 47, 48, 49, 50, 51]));
+        d.range = "53".into();
+        d.read_range(52);
+        assert!(d.error.is_some() && d.selected.is_empty());
+        d.toggle(51);
+        assert!(d.error.is_none());
+        assert_eq!(d.range, "52");
+        d.range.clear();
+        d.read_range(52);
+        assert!(d.selected.is_empty() && d.error.is_none());
     }
     #[test]
     fn translation_attachment_preserves_pending_image_crop_without_mutation() {
