@@ -41,11 +41,10 @@ impl Publisher {
                 if let Err(error) = update(&snapshot, &mut removed) {
                     eprintln!("Could not update the MyPDF Jump List: {error}");
                 }
-                if removed != before {
-                    if let Err(error) = preferences::save(&root, "jump-list-removed.json", &removed)
-                    {
-                        eprintln!("Could not remember removed Jump List items: {error}");
-                    }
+                if removed != before
+                    && let Err(error) = preferences::save(&root, "jump-list-removed.json", &removed)
+                {
+                    eprintln!("Could not remember removed Jump List items: {error}");
                 }
             }
             unsafe {
