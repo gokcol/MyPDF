@@ -7,6 +7,7 @@ use eframe::App;
 struct Preview {
     textures: HashMap<egui::TextureId, egui::ColorImage>,
     time: f64,
+    size: Option<egui::Vec2>,
 }
 impl Preview {
     fn capture(&mut self, app: &mut Viewer, ctx: &egui::Context) -> egui::FullOutput {
@@ -21,7 +22,10 @@ impl Preview {
         self.time += 1. / 60.;
         let output = ctx.run(
             egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 820.0))),
+                screen_rect: Some(Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    self.size.unwrap_or(vec2(1200.0, 820.0)),
+                )),
                 max_texture_side: Some(8192),
                 time: Some(self.time),
                 events,
@@ -59,7 +63,8 @@ impl Preview {
     }
     fn save(&self, ctx: &egui::Context, output: egui::FullOutput, path: &std::path::Path) {
         let scale = output.pixels_per_point;
-        let (w, h) = ((1200.0 * scale) as u32, (820.0 * scale) as u32);
+        let size = self.size.unwrap_or(vec2(1200.0, 820.0));
+        let (w, h) = ((size.x * scale) as u32, (size.y * scale) as u32);
         let mut canvas = image::RgbaImage::from_pixel(w, h, image::Rgba([232, 237, 245, 255]));
         let cross = |a: egui::Vec2, b: egui::Vec2| a.x * b.y - a.y * b.x;
         for primitive in ctx.tessellate(output.shapes, scale) {
@@ -386,6 +391,26 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
             .unwrap();
     let source = if matches!(collection, "AddText" | "EditBlank") {
         mypdf_milestone0::convert::blank(595., 842.).unwrap()
+    } else if collection == "RepeatArtwork" {
+        let source = mypdf_milestone0::convert::text_to_pdf(PREVIEW_AGREEMENT, true).unwrap();
+        let mut doc = lopdf::Document::load_mem(&source).unwrap();
+        let page_id = *doc.get_pages().values().next().unwrap();
+        let original = doc.get_dictionary(page_id).unwrap().clone();
+        let parent = original.get(b"Parent").unwrap().as_reference().unwrap();
+        let mut kids = Vec::new();
+        for page in 0..52 {
+            let mut dictionary = original.clone();
+            if page % 3 == 1 {
+                dictionary.set("MediaBox", vec![0.into(), 0.into(), 842.into(), 595.into()]);
+            }
+            kids.push(lopdf::Object::Reference(doc.add_object(dictionary)));
+        }
+        let pages = doc.get_dictionary_mut(parent).unwrap();
+        pages.set("Kids", kids);
+        pages.set("Count", 52);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
     } else {
         source
     };
@@ -406,6 +431,10 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
     app.editor.mode = editing::Mode::Annotate;
     app.tabs[0].zoom = Zoom::Page;
     let mut preview = Preview::default();
+    if let Ok(size) = std::env::var("MYPDF_PREVIEW_SIZE") {
+        let (w, h) = size.split_once('x').expect("Use WIDTHxHEIGHT");
+        preview.size = Some(vec2(w.parse().unwrap(), h.parse().unwrap()));
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while !app.tabs[0].index_done || !app.tabs[0].rasters.keys().any(|key| !key.thumbnail) {
         assert!(std::time::Instant::now() < deadline);
@@ -1228,6 +1257,15 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
             }
         }
         preview.settle(&mut app, &ctx);
+    }
+    if collection == "RepeatArtwork" {
+        preview.settle(&mut app, &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !app.tabs[0].pending.is_empty() {
+            assert!(std::time::Instant::now() < deadline);
+            preview.capture(&mut app, &ctx);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
     let output = preview.capture_with(&mut app, &ctx, events);
     assert_scene(collection, &app, &output);
