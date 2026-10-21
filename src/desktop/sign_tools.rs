@@ -164,14 +164,21 @@ mod tests {
         for _ in 0..3 {
             frame(app, ctx, vec![]);
         }
-        let mut results: Vec<_> = frame(app, ctx, vec![])
+        let nodes = frame(app, ctx, vec![])
             .platform_output
             .accesskit_update
             .unwrap()
-            .nodes
+            .nodes;
+        let ribbon_y = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Read"))
+            .and_then(|(_, n)| n.bounds())
+            .map(|r| r.y0);
+        let mut results: Vec<_> = nodes
             .into_iter()
             .filter(|(_, n)| n.label() == Some(label))
             .filter_map(|(_, n)| n.bounds())
+            .filter(|r| label != "Sign" || Some(r.y0) == ribbon_y)
             .map(|r| pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32))
             .collect();
         results.sort_by(|a, b| a.x.total_cmp(&b.x));
@@ -189,6 +196,7 @@ mod tests {
             .unwrap();
             let ctx = egui::Context::default();
             ctx.enable_accesskit();
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("preview_portable_menu"), true));
             ctx.set_theme(theme);
             let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
             app.sign_tools = State::at(profile.path().into());
