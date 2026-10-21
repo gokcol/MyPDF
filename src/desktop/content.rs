@@ -1446,6 +1446,7 @@ impl Viewer {
             tab.bytes = Some(source.clone());
             tab.unsaved_on_load = true;
             tab.has_destination = false;
+            tab.disk_fingerprint = None;
             tab.remember_open = false;
             let wake = ctx.clone();
             tab.worker = Worker::from_bytes(source, move || wake.request_repaint());

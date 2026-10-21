@@ -4042,7 +4042,7 @@ impl Viewer {
                     "Your changes will be lost if you don’t save them. Saving creates a new PDF copy."
                 },
                 &[
-                    ("Save PDF…", ui::DialogTone::Primary),
+                    ("Save", ui::DialogTone::Primary),
                     ("Don’t Save", ui::DialogTone::Secondary),
                     ("Cancel", ui::DialogTone::Secondary),
                 ],

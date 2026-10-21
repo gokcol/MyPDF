@@ -16,6 +16,8 @@ mod navigation_editor;
 mod nup;
 pub mod open_with;
 mod organize;
+#[cfg(any(not(target_os = "macos"), test))]
+mod portable_menu;
 mod preferences;
 #[cfg(test)]
 mod preview;
@@ -76,6 +78,7 @@ struct Tab {
     path: PathBuf,
     /// False for new, imported, or recovered in-memory documents until first Save.
     has_destination: bool,
+    disk_fingerprint: Option<mypdf_milestone0::file_save::Fingerprint>,
     worker: Worker,
     bytes: Option<Arc<[u8]>>,
     pages: Vec<PageSize>,
@@ -259,10 +262,10 @@ pub struct Viewer {
     focus_search: bool,
     status: Option<(String, bool)>,
     saving: bool,
+    about_open: bool,
     /// The file name the next Save suggests.
     save_name: Option<String>,
     save_intent: save::Intent,
-    saving_adopts: bool,
     /// A web or mail link waiting for the user to agree to open it.
     link_confirm: Option<String>,
     protect: Option<protect::ProtectDraft>,
@@ -273,8 +276,8 @@ pub struct Viewer {
     nup: Option<nup::Draft>,
     ocr_confirm: bool,
     ocr_progress: Option<Arc<recognize::Progress>>,
-    save_events: mpsc::Receiver<Result<(PathBuf, u64, u64), String>>,
-    save_tx: mpsc::Sender<Result<(PathBuf, u64, u64), String>>,
+    save_events: mpsc::Receiver<Result<save::Completed, String>>,
+    save_tx: mpsc::Sender<Result<save::Completed, String>>,
     close_intent: Option<Option<u64>>,
     close_after_save: Option<Option<u64>>,
     exit_approved: bool,
@@ -334,7 +337,6 @@ impl Viewer {
             outline: false,
             save_name: None,
             save_intent: save::Intent::Automatic,
-            saving_adopts: false,
             link_confirm: None,
             protect: None,
             unprotect: false,
@@ -346,6 +348,7 @@ impl Viewer {
             focus_search: false,
             status: None,
             saving: false,
+            about_open: false,
             save_events,
             save_tx,
             close_intent: None,
@@ -409,6 +412,7 @@ impl Viewer {
             placement_guides: None,
             id: self.next_id,
             has_destination: true,
+            disk_fingerprint: None,
             path,
             worker,
             bytes: None,
@@ -558,34 +562,49 @@ impl Viewer {
             .unwrap_or_default();
         let signed_original = tab.signed_original.clone();
         let password = tab.password.clone();
-        let stem = tab.path.file_stem().unwrap_or_default().to_string_lossy();
-        let adopts = self.save_intent.adopts();
-        let name = self.save_name.take().unwrap_or_else(|| {
-            if !tab.has_destination {
-                tab.name()
-            } else {
-                format!("{stem}-copy.pdf")
-            }
-        });
-        let dialog = rfd::FileDialog::new()
-            .set_title(if adopts {
-                "Save PDF • choose a new filename"
-            } else {
-                "Save a Copy • source stays open"
-            })
-            .add_filter("PDF document", &["pdf"])
-            .set_file_name(name)
-            .set_directory(tab.path.parent().unwrap_or(std::path::Path::new(".")));
-        let Some(destination) = self.native_save(dialog) else {
-            self.close_after_save = None;
-            self.cancel_tab_closes();
-            self.save_intent = save::Intent::Automatic;
-            return;
+        let current_path = tab.path.clone();
+        let baseline = tab.disk_fingerprint;
+        let direct = self.save_intent.destination(tab);
+        let name = self.save_name.take();
+        let destination = if let Some(path) = direct.filter(|_| name.is_none()) {
+            path
+        } else {
+            let dialog = rfd::FileDialog::new()
+                .set_title("Save As")
+                .add_filter("PDF document", &["pdf"])
+                .set_file_name(name.unwrap_or_else(|| tab.name()))
+                .set_directory(tab.path.parent().unwrap_or(std::path::Path::new(".")));
+            let Some(path) = self.native_save(dialog) else {
+                self.close_after_save = None;
+                self.cancel_tab_closes();
+                self.save_intent = save::Intent::Automatic;
+                return;
+            };
+            path
         };
-        self.saving_adopts = adopts;
         self.save_intent = save::Intent::Automatic;
+        // Replacing the current path always checks against the opened/last-saved
+        // version. Save As may replace another file after the OS confirms it.
+        let same_file = destination
+            .canonicalize()
+            .unwrap_or_else(|_| destination.clone())
+            == current_path;
+        let expected = if same_file && baseline.is_some() {
+            Ok(baseline)
+        } else {
+            mypdf_milestone0::file_save::existing(&destination)
+        };
+        let expected = match expected {
+            Ok(value) => value,
+            Err(e) => {
+                self.status = Some((format!("Could not save: {e:#}"), true));
+                self.close_after_save = None;
+                self.cancel_tab_closes();
+                return;
+            }
+        };
         self.saving = true;
-        self.status = Some(("Saving a complete copy…".into(), false));
+        self.status = Some(("Saving PDF…".into(), false));
         let tx = self.save_tx.clone();
         let wake = ctx.clone();
         std::thread::spawn(move || {
@@ -602,13 +621,19 @@ impl Viewer {
                     }
                     None => bytes,
                 };
-                // A protected document's copies keep its password.
+                // Saving a protected document keeps its password.
                 let bytes = match &password {
                     Some(password) => mypdf_milestone0::security::protect(&bytes, password)?,
                     None => bytes,
                 };
-                viewer::save_copy(&destination, &bytes)?;
-                Ok((destination, tab_id, revision))
+                let fingerprint =
+                    mypdf_milestone0::file_save::write(&destination, &bytes, expected)?;
+                Ok(save::Completed {
+                    path: destination,
+                    id: tab_id,
+                    revision,
+                    fingerprint,
+                })
             })()
             .map_err(|e| format!("Could not save: {e:#}. Existing files are preserved."));
             let _ = tx.send(result);
@@ -691,6 +716,27 @@ impl Viewer {
             }
             return;
         }
+        if ctx.wants_keyboard_input() {
+            match action {
+                "copy" => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestCopy);
+                    return;
+                }
+                "cut" => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestCut);
+                    return;
+                }
+                "paste" => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                    return;
+                }
+                "select_all" => {
+                    Self::text_command(ctx, egui::Key::A, false);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if self.context_native_action(action, ctx) {
             return;
         }
@@ -702,7 +748,6 @@ impl Viewer {
                 action,
                 "save"
                     | "save_as"
-                    | "save_copy"
                     | "print"
                     | "protect"
                     | "unprotect"
@@ -731,6 +776,32 @@ impl Viewer {
             return;
         }
         match action {
+            "about" => self.about_open = true,
+            "window_minimize" => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+            "window_maximize" => ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(
+                !ctx.input(|i| i.viewport().maximized.unwrap_or(false)),
+            )),
+            "annotate_highlight" | "annotate_underline" | "annotate_strikeout"
+            | "annotate_note" | "annotate_text" | "annotate_pen" | "annotate_rectangle"
+            | "annotate_ellipse" | "annotate_arrow" => {
+                if !self.home.visible && self.apply_pending_annotation() {
+                    self.editor.mode = editing::Mode::Annotate;
+                    self.editor.select_tool(match action {
+                        "annotate_highlight" => editing::Tool::Highlight,
+                        "annotate_underline" => editing::Tool::Underline,
+                        "annotate_strikeout" => editing::Tool::Strikeout,
+                        "annotate_note" => editing::Tool::Note,
+                        "annotate_text" => editing::Tool::Text,
+                        "annotate_pen" => editing::Tool::Pen,
+                        "annotate_rectangle" => editing::Tool::Rectangle,
+                        "annotate_ellipse" => editing::Tool::Ellipse,
+                        _ => editing::Tool::Arrow,
+                    });
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        tab.signatures.panel = false;
+                    }
+                }
+            }
             "translation" => self.open_translation_panel(),
             "translate_selection" => self.translate_selection(ctx),
             "translate_page" => self.translate_page(ctx),
@@ -738,7 +809,7 @@ impl Viewer {
             "home" => self.show_home(),
             "new" => self.new_blank(ctx),
             "open" => self.open_dialog(ctx),
-            "save" | "save_as" | "save_copy" => {
+            "save" | "save_as" => {
                 if self.content.busy || self.organizer.busy {
                     self.status = Some((
                         "Wait for the current operation before saving.".into(),
@@ -747,7 +818,6 @@ impl Viewer {
                 } else if !self.saving {
                     self.save_intent = match action {
                         "save_as" => save::Intent::As,
-                        "save_copy" => save::Intent::Copy,
                         _ => save::Intent::Automatic,
                     };
                     self.save_dialog(ctx);
@@ -898,6 +968,10 @@ impl Viewer {
                         capabilities,
                         editing_warning,
                     } => {
+                        if tab.has_destination && tab.disk_fingerprint.is_none() {
+                            tab.disk_fingerprint =
+                                Some(mypdf_milestone0::file_save::fingerprint(&bytes));
+                        }
                         if std::mem::take(&mut tab.remember_open) && !tab.unsaved_on_load {
                             self.home.remember(&tab.path);
                         }
@@ -982,6 +1056,10 @@ impl Viewer {
                         tab.render_errors.insert(key.page, error);
                     }
                     Event::PasswordNeeded(encrypted) => {
+                        if tab.has_destination && tab.disk_fingerprint.is_none() {
+                            tab.disk_fingerprint =
+                                Some(mypdf_milestone0::file_save::fingerprint(&encrypted));
+                        }
                         tab.locked = Some(protect::Locked::new(encrypted));
                     }
                     Event::Failed(error) => {
@@ -1004,23 +1082,13 @@ impl Viewer {
         for saved in saved {
             self.saving = false;
             self.status = Some(match saved {
-                Ok((path, id, revision)) => {
-                    self.finish_save(&path, id, revision, self.saving_adopts);
+                Ok(saved) => {
+                    let path = saved.path.clone();
+                    self.finish_save(saved);
                     if let Some(intent) = self.close_after_save.take() {
                         self.request_close(intent, ctx);
                     }
-                    (
-                        format!(
-                            "{} {} • original file preserved",
-                            if self.saving_adopts {
-                                "Saved"
-                            } else {
-                                "Exported a copy to"
-                            },
-                            path.display()
-                        ),
-                        false,
-                    )
+                    (format!("Saved {}", path.display()), false)
                 }
                 Err(e) => {
                     self.close_after_save = None;
@@ -1241,6 +1309,45 @@ impl Viewer {
             return;
         }
         let mut action = None;
+        if self.about_open {
+            egui::Window::new("About MyPDF")
+                .open(&mut self.about_open)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.heading(concat!("MyPDF ", env!("CARGO_PKG_VERSION")));
+                    ui.label("Developed by Orhan Gökçöl");
+                    ui.label("Native PDF editor");
+                    ui.add_space(8.);
+                    ui.set_max_width(380.);
+                    ui.label(menu::ABOUT);
+                });
+        }
+        #[cfg(any(not(target_os = "macos"), test))]
+        if !cfg!(target_os = "macos")
+            || ctx.data(|d| {
+                d.get_temp::<bool>(egui::Id::new("preview_portable_menu"))
+                    .unwrap_or(false)
+            })
+        {
+            egui::TopBottomPanel::top("application_menus")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::chrome())
+                        .inner_margin(egui::Margin::symmetric(8, 2)),
+                )
+                .show(ctx, |ui| {
+                    action = portable_menu::bar(
+                        ui,
+                        !self.home.visible
+                            && self
+                                .tabs
+                                .get(self.active)
+                                .is_some_and(|t| t.bytes.is_some()),
+                        self.saving,
+                    );
+                });
+        }
         egui::TopBottomPanel::top("document_tabs")
             .frame(
                 egui::Frame::new()
@@ -1271,15 +1378,6 @@ impl Viewer {
                             self.tab_controls.request_window_drag();
                         }
                     }
-                    #[cfg(not(target_os = "macos"))]
-                    ui.menu_button("Tools", |ui| {
-                        for (id, label) in menu::WORKFLOW_ITEMS {
-                            if ui.button(*label).clicked() {
-                                action = Some(*id);
-                                ui.close();
-                            }
-                        }
-                    });
                     let mut home = ActionButton::new(Icon::Home, "Home")
                         .tab()
                         .selected(self.home.visible);
@@ -1352,16 +1450,33 @@ impl Viewer {
                 };
                 let full = ui.available_width();
                 // Reserve space for file actions and the search, translation and panel controls.
-                let compact = full < track_width(ui, false) + 356.;
+                let compact = full < track_width(ui, false) + 390.;
                 ui.horizontal(|ui| {
                     for (icon, label, key) in [
                         (Icon::Blank, "New blank PDF", "new"),
                         (Icon::Open, "Open…", "open"),
-                        (Icon::Save, "Save PDF…", "save"),
+                        (
+                            Icon::Save,
+                            if cfg!(target_os = "macos") {
+                                "Save · ⌘S"
+                            } else {
+                                "Save · Ctrl+S"
+                            },
+                            "save",
+                        ),
+                        (
+                            Icon::SaveAs,
+                            if cfg!(target_os = "macos") {
+                                "Save As… · ⇧⌘S"
+                            } else {
+                                "Save As… · Ctrl+Shift+S"
+                            },
+                            "save_as",
+                        ),
                         (Icon::Print, "Print… (⌘P)", "print"),
                         (Icon::Compare, "Compare Documents…", "compare"),
                     ] {
-                        let enabled = !matches!(key, "save" | "print")
+                        let enabled = !matches!(key, "save" | "save_as" | "print")
                             || (!self.saving
                                 && self
                                     .tabs
@@ -1580,7 +1695,7 @@ impl Viewer {
                                 theme::warning()
                             },
                         );
-                        ui.label(RichText::new(label).size(11.5).color(theme::muted())).on_hover_text(if s.dirty() { "Your PDF has unsaved changes. Save writes a new PDF and switches to it; Save a Copy exports without changing this document." } else { "No unsaved document changes." });
+                        ui.label(RichText::new(label).size(11.5).color(theme::muted())).on_hover_text(if s.dirty() { "Your PDF has unsaved changes. Save updates this file; Save As lets you choose another name." } else { "No unsaved document changes." });
                     }
                     if let Some(tab) = self.tabs.get_mut(self.active) {
                         if tab.signed_original.is_some() && !tab.signatures.no_active_signatures() {

@@ -1013,7 +1013,14 @@ mod tests {
         let id = app.tabs[0].id;
         let saved = root.join("Saved Copy.pdf");
         std::fs::write(&saved, &bytes).unwrap();
-        app.save_tx.send(Ok((saved.clone(), id, 0))).unwrap();
+        app.save_tx
+            .send(Ok(save::Completed {
+                path: saved.clone(),
+                id,
+                revision: 0,
+                fingerprint: [0; 32],
+            }))
+            .unwrap();
         frame(&mut app, &ctx, 1200., vec![]);
         assert_eq!(app.home.entries(false).len(), 2);
         app.home_action(HomeAction::Favorite(saved.clone(), true), &ctx);
@@ -1032,7 +1039,7 @@ mod tests {
         assert!(app.home.visible);
         assert_eq!(app.tabs[0].id, id);
         assert_eq!(app.tabs.len(), 1);
-        app.home_action(HomeAction::Recent(path), &ctx);
+        app.home_action(HomeAction::Recent(saved), &ctx);
         assert!(!app.home.visible);
         assert_eq!(
             app.tabs.len(),

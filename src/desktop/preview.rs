@@ -315,6 +315,7 @@ const SCENES: &[&str] = &[
     "CompareChoose",
     "Compare",
     "Signatures",
+    "WindowsMenus",
 ];
 
 #[test]
@@ -427,6 +428,9 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
     }
     if let Ok(style) = std::env::var("MYPDF_PREVIEW_ICONS") {
         ui::set_icon_style(&ctx, theme::IconStyle::from_key(&style)).unwrap();
+    }
+    if collection == "WindowsMenus" {
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("preview_portable_menu"), true));
     }
     app.editor.mode = editing::Mode::Annotate;
     app.tabs[0].zoom = Zoom::Page;
@@ -1267,6 +1271,24 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
+    if collection == "WindowsMenus" {
+        for pressed in [true, false] {
+            preview.capture_with(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(pos2(24., 13.)),
+                    egui::Event::PointerButton {
+                        pos: pos2(24., 13.),
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        preview.settle(&mut app, &ctx);
+    }
     let output = preview.capture_with(&mut app, &ctx, events);
     assert_scene(collection, &app, &output);
     if let Some(root) = root {
@@ -1302,6 +1324,29 @@ fn assert_scene(scene: &str, app: &Viewer, output: &egui::FullOutput) {
         "{scene}: Home visibility"
     );
     let text = rendered_text(output);
+    if scene == "WindowsMenus" {
+        for label in [
+            "File",
+            "Edit",
+            "View",
+            "Annotate",
+            "Edit PDF",
+            "Scan & OCR",
+            "Sign",
+            "Tools",
+            "Window",
+            "Help",
+            "Save",
+            "Save As…",
+        ] {
+            assert!(
+                text.iter().any(|t| t == label),
+                "Missing menu command {label}: {text:?}"
+            );
+        }
+        assert!(!text.iter().any(|t| t == "Save a Copy…"));
+    }
+
     for (owner, title) in [
         ("TransparentImage", "Remove background"),
         ("Prompt", "SVG Studio"),

@@ -1,7 +1,7 @@
 use eframe::egui;
 use std::sync::mpsc;
 
-#[cfg(any(not(target_os = "macos"), not(test)))]
+#[cfg(all(target_os = "macos", not(test)))]
 pub(super) const WORKFLOW_ITEMS: &[(&str, &str)] = &[
     ("templates", "Document Templates…"),
     ("batch", "Batch Processing…"),
@@ -78,8 +78,7 @@ impl NativeMenu {
 }
 
 /// What MyPDF is, in the About window and the README.
-#[cfg(all(target_os = "macos", not(test)))]
-const ABOUT: &str = "MyPDF was built with the help of Claude, Anthropic's AI assistant, to make everyday business paperwork easier. It is provided as is, without warranty of any kind: keep copies of important documents and use it at your own risk.";
+pub(super) const ABOUT: &str = "MyPDF was built with the help of Claude, Anthropic's AI assistant, to make everyday business paperwork easier. It is provided as is, without warranty of any kind: keep copies of important documents and use it at your own risk.";
 
 #[cfg(all(target_os = "macos", not(test)))]
 pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String>) {
@@ -134,9 +133,8 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
                 Modifiers::SHIFT,
             ),
             &MenuItem::with_id("workspace", "Workspace…", true, None),
-            &item("save", "Save…", Code::KeyS, Modifiers::empty()),
+            &item("save", "Save", Code::KeyS, Modifiers::empty()),
             &item("save_as", "Save As…", Code::KeyS, Modifiers::SHIFT),
-            &MenuItem::with_id("save_copy", "Save a Copy…", true, None),
             &P::separator(),
             &item("print", "Print…", Code::KeyP, Modifiers::empty()),
             &MenuItem::with_id("nup", "Multiple Pages per Sheet…", true, None),

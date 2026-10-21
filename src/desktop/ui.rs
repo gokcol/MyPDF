@@ -262,6 +262,7 @@ pub(super) enum Icon {
     Document,
     Open,
     Save,
+    SaveAs,
     Search,
     Sidebar,
     Inspector,
@@ -373,7 +374,7 @@ fn control_icon_family(icon: Icon, mode_tab: bool) -> Option<theme::IconFamily> 
     }
     match icon {
         Icon::Open | Icon::Blank | Icon::Library => Some(F::Document),
-        Icon::Save | Icon::Sign | Icon::Export | Icon::Stamp => Some(F::Signing),
+        Icon::Save | Icon::SaveAs | Icon::Sign | Icon::Export | Icon::Stamp => Some(F::Signing),
         Icon::Pen | Icon::Text | Icon::Shapes | Icon::Form | Icon::Translate | Icon::Note => {
             Some(F::Editing)
         }
@@ -861,6 +862,26 @@ fn draw_icon_impl(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             line(&[[0.32, 0.12], [0.32, 0.34], [0.64, 0.34], [0.64, 0.12]]);
             fill_box([0.3, 0.56], [0.72, 0.88], 0.04, soft);
             box_at([0.3, 0.56], [0.72, 0.88], 0.04);
+        }
+        Icon::SaveAs => {
+            line(&[
+                [0.12, 0.88],
+                [0.12, 0.12],
+                [0.7, 0.12],
+                [0.87, 0.29],
+                [0.87, 0.42],
+            ]);
+            line(&[[0.3, 0.12], [0.3, 0.34], [0.62, 0.34], [0.62, 0.12]]);
+            line(&[[0.3, 0.83], [0.3, 0.55], [0.5, 0.55]]);
+            line(&[
+                [0.48, 0.92],
+                [0.52, 0.73],
+                [0.85, 0.4],
+                [0.98, 0.53],
+                [0.65, 0.86],
+                [0.48, 0.92],
+            ]);
+            line(&[[0.78, 0.47], [0.91, 0.6]]);
         }
         Icon::Search => {
             painter.circle_stroke(p(0.43, 0.43), rect.width() * 0.29, stroke);
@@ -2971,7 +2992,7 @@ mod tests {
             let ctx = egui::Context::default();
             let mut decision = None;
             let buttons = [
-                ("Save a Copy…", DialogTone::Primary),
+                ("Save", DialogTone::Primary),
                 ("Don’t Save", DialogTone::Secondary),
                 ("Cancel", DialogTone::Secondary),
             ];
