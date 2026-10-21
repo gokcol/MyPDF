@@ -3,11 +3,12 @@
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+  xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
   xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
   xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"
   xmlns:virtualization="http://schemas.microsoft.com/appx/manifest/virtualization/windows10"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap uap3 uap10 desktop6 virtualization rescap">
+  IgnorableNamespaces="uap uap3 uap5 uap10 desktop6 virtualization rescap">
   <!-- The packaging script replaces these values; this template is not a Store identity. -->
   <Identity Name="MyPDF.Placeholder" Publisher="CN=Placeholder" Version="1.1.0.0" ProcessorArchitecture="x64" />
   <Properties>
@@ -36,6 +37,12 @@
         Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png"
         BackgroundColor="transparent" />
       <Extensions>
+        <!-- Stable launch target for Jump List items across Store updates. -->
+        <uap5:Extension Category="windows.appExecutionAlias" Executable="MyPDF.exe">
+          <uap5:AppExecutionAlias uap10:Subsystem="windows">
+            <uap5:ExecutionAlias Alias="mypdf-og.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
         <uap3:Extension Category="windows.fileTypeAssociation">
           <uap3:FileTypeAssociation Name="mypdf.pdf" Parameters="&quot;%1&quot;" MultiSelectModel="Document">
             <uap:DisplayName>PDF document</uap:DisplayName>

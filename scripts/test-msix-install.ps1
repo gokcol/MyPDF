@@ -47,6 +47,9 @@ try {
     $installed = Get-AppxPackage -Name $identity
     if (-not $installed -or $installed.Version -ne $info.version) { throw 'Installed package/version not found.' }
     $manifest = Get-AppxPackageManifest -Package $installed.PackageFullName
+    $alias = $manifest.SelectSingleNode("//*[local-name()='ExecutionAlias' and @Alias='mypdf-og.exe']")
+    if (-not $alias) { throw 'Missing stable Jump List execution alias.' }
+    if (-not (Test-Path (Join-Path $env:LOCALAPPDATA 'Microsoft/WindowsApps/mypdf-og.exe'))) { throw 'Jump List execution alias was not registered.' }
     if ($manifest.Package.Applications.Application.Id -ne 'MyPDF') { throw 'Missing desktop application registration.' }
     if (-not (Test-Path (Join-Path $installed.InstallLocation 'MyPDF.exe'))) { throw 'Packaged executable missing.' }
     # Exercise WindowsApps code with the installed app's package identity;
