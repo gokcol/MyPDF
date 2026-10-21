@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "macos")]
 mod mac;
-#[cfg(all(target_os = "windows", not(test)))]
+#[cfg(target_os = "windows")]
 mod windows;
 
 const RECENT_LIMIT: usize = 8;
