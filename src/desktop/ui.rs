@@ -350,6 +350,7 @@ pub(super) enum Icon {
     FieldDate,
     TabOrder,
     Flatten,
+    #[cfg(any(not(target_os = "macos"), test))]
     Print,
     Watermark,
     Ocr,
@@ -679,6 +680,7 @@ fn draw_icon_impl(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             line(&arc([0.5, 0.32], 0.17, 0., 360.));
             line(&arc([0.5, 0.94], 0.34, 180., 360.));
         }
+        #[cfg(any(not(target_os = "macos"), test))]
         Icon::Print => {
             line(&[[0.28, 0.36], [0.28, 0.1], [0.72, 0.1], [0.72, 0.36]]);
             box_at([0.1, 0.36], [0.9, 0.72], 0.08);
