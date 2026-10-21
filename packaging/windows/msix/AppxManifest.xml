@@ -38,7 +38,7 @@
         BackgroundColor="transparent" />
       <Extensions>
         <!-- Stable launch target for Jump List items across Store updates. -->
-        <uap5:Extension Category="windows.appExecutionAlias" Executable="MyPDF.exe">
+        <uap5:Extension Category="windows.appExecutionAlias" Executable="MyPDF.exe" EntryPoint="Windows.FullTrust">
           <uap5:AppExecutionAlias uap10:Subsystem="windows">
             <uap5:ExecutionAlias Alias="mypdf-og.exe" />
           </uap5:AppExecutionAlias>
