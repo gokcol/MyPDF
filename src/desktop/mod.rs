@@ -36,6 +36,7 @@ mod shrink;
 mod sign_tools;
 mod signatures;
 mod styles;
+mod table_tools;
 mod tabs;
 mod text_selection;
 mod theme;
@@ -292,6 +293,7 @@ pub struct Viewer {
     header_footer: header_footer::HeaderFooterState,
     redaction: redaction::Redaction,
     forms: form_tools::FormState,
+    table: table_tools::State,
     /// Compare Documents: choosing the versions, then the side-by-side view.
     compare_chooser: Option<comparison::Chooser>,
     comparison: Option<comparison::Comparison>,
@@ -366,6 +368,7 @@ impl Viewer {
             header_footer: header_footer::HeaderFooterState::new(),
             redaction: redaction::Redaction::new(),
             forms: form_tools::FormState::new(),
+            table: table_tools::State::new(),
             compare_chooser: None,
             comparison: None,
             zen: None,
@@ -508,6 +511,9 @@ impl Viewer {
         }
     }
     fn save_dialog(&mut self, ctx: &egui::Context) {
+        if self.table_save(ctx) {
+            return;
+        }
         if let Some(id) = self.tabs.get(self.active).map(|t| t.id)
             && self.pending_form_edits(id)
         {
@@ -842,10 +848,12 @@ impl Viewer {
             }
             "sign_ink" | "sign_digital" | "sign_quick" => self.signing_ribbon_action(action),
             "quick_sign" => self.quick_sign(),
+            "edit_table" => {
+                self.automatic_edit();
+                self.table.chooser = true;
+            }
             "edit_text" | "edit_images" => {
-                self.editor.mode = editing::Mode::Edit;
-                self.content.image_mode = action == "edit_images";
-                self.inspector = true;
+                self.automatic_edit();
             }
             "hf_page_numbers" => {
                 self.open_header_footer(mypdf_milestone0::header_footer::Kind::PageNumber)
@@ -1506,7 +1514,16 @@ impl Viewer {
                                 .clicked()
                                 && self.apply_pending_annotation()
                             {
+                                if mode != editing::Mode::Edit
+                                    && self.content.pending_text().is_some()
+                                {
+                                    self.content.new_commit = true;
+                                    self.content.exit_text_tool = true;
+                                }
                                 self.editor.mode = mode;
+                                if mode == editing::Mode::Edit {
+                                    self.automatic_edit();
+                                }
                                 self.editor.library_open = false;
                                 if let Some(tab) = self.tabs.get_mut(self.active) {
                                     tab.signatures.panel = false;
@@ -2096,11 +2113,18 @@ impl Viewer {
                                 }
                             }
                         }
-                        if self.workbench.paste.is_none() && self.workbench.crop.is_none() && !self.organizer.busy && !self.redaction.active {
+                        if matches!(self.editor.mode, editing::Mode::Edit|editing::Mode::Annotate) && self.table.owns_page(tab.id, page) && let Some(session) = &tab.session {
+                            for a in session.annotations.iter().filter(|a| a.page == page && !a.object.hidden && Some(a.id.as_str()) != self.table.editing_layer()) {
+                                editing::paint_annotation(&mut self.editor,ctx,ui.painter(),page_rect,scale,a);
+                            }
+                        }
+                        let table_owns = (self.editor.mode == editing::Mode::Edit || self.editor.mode == editing::Mode::Annotate && (self.editor.tool == editing::Tool::Select || self.table.owns_page(tab.id,page))) && !self.redaction.active && ((self.content.pending_text().is_none() && self.content.add_target.is_none() && !self.content.area_mode) || self.table.owns_page(tab.id,page)) && table_tools::overlay(&mut self.table,tab,ui,page,page_rect,scale);
+                        if std::mem::take(&mut self.table.show_panel) { self.inspector=true; }
+                        if !table_owns && !self.table.deferring_input() && self.workbench.paste.is_none() && self.workbench.crop.is_none() && !self.organizer.busy && !self.redaction.active {
                             content::smart_select(&mut self.content,&mut self.editor,tab,ui,page,page_rect,scale,&mut self.inspector);
                         }
-                        let placing = workbench::crop_overlay(&mut self.workbench, &mut self.editor, tab, ui, page, page_rect, scale) || workbench::paste_overlay(&mut self.workbench, &mut self.editor, tab, ui, page, page_rect, scale, &mut self.status);
-                        if !placing {
+                        let placing = !self.table.deferring_input() && (workbench::crop_overlay(&mut self.workbench, &mut self.editor, tab, ui, page, page_rect, scale) || workbench::paste_overlay(&mut self.workbench, &mut self.editor, tab, ui, page, page_rect, scale, &mut self.status));
+                        if !placing && !table_owns && !self.table.deferring_input() {
                         editing::page_interaction(
                             &mut self.editor,
                             tab,
@@ -2112,7 +2136,7 @@ impl Viewer {
                         );
                         }
                         self.content.hide_guides = self.editor.hide_guides;
-                        self.content.paused = self.productivity.owns_input() || placing || self.redaction.active && self.editor.mode == editing::Mode::Edit;
+                        self.content.paused = table_owns || self.table.deferring_input() || self.productivity.owns_input() || placing || self.redaction.active && self.editor.mode == editing::Mode::Edit;
                         if self.editor.mode == editing::Mode::Forms {
                             let editable = !self.content.busy
                                 && !self.organizer.busy
@@ -2160,6 +2184,13 @@ impl Viewer {
                     Some(navigation::Target::Page(page)) => tab.jump(page),
                     Some(navigation::Target::Uri(uri)) => self.link_confirm = Some(uri),
                     None => {}
+                }
+                if self.editor.mode == editing::Mode::Edit
+                    && let Some(page) = self.content.interaction_page(tab.id)
+                    && let Some(rect) = tab.document_layout.as_ref().and_then(|l| l.rects.get(page))
+                    && rect.translate(output.inner_rect.min.to_vec2() - output.state.offset).intersects(output.inner_rect)
+                {
+                    visible_page = page;
                 }
                 if visible_page != tab.page {
                     tab.page = visible_page;
@@ -2277,6 +2308,7 @@ impl eframe::App for Viewer {
             self.shell_action(action, ctx);
         }
         self.content_events(ctx);
+        self.table_tick(ctx);
         self.page_events(ctx);
         self.events(ctx);
         self.translation_tick(ctx);
@@ -2313,6 +2345,7 @@ impl eframe::App for Viewer {
             self.signature_bar(ctx);
             self.workbench_bar(ctx);
         }
+        self.table_handoff(ctx);
         self.sync_signature_panel();
         self.sync_status_context();
         if let Some((status, true)) = &self.status {
@@ -2369,7 +2402,12 @@ impl eframe::App for Viewer {
                 && !translation_visible
                 && !digital_docked
             {
-                if self.editor.mode == editing::Mode::Edit && self.redaction.active {
+                if matches!(
+                    self.editor.mode,
+                    editing::Mode::Edit | editing::Mode::Annotate
+                ) && self.table_panel(ctx)
+                {
+                } else if self.editor.mode == editing::Mode::Edit && self.redaction.active {
                     self.redaction_panel(ctx);
                 } else if self.editor.mode == editing::Mode::Forms {
                     self.form_panel(ctx);
@@ -2393,6 +2431,12 @@ impl eframe::App for Viewer {
         }
         self.form_events(ctx);
         self.form_dialogs(ctx);
+        self.table_window(ctx);
+        if let Some(next) =
+            ctx.data_mut(|d| d.remove_temp::<usize>(egui::Id::new("table_next_cell")))
+        {
+            self.table_commit(ctx, Some(next), false, None);
+        }
         self.password_prompt(ctx);
         self.protect_dialogs(ctx);
         self.shrink_dialog(ctx);
@@ -2880,7 +2924,7 @@ mod tests {
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;
         let r = nodes
             .iter()
-            .find(|(_, n)| n.label() == Some("Add text"))
+            .find(|(_, n)| n.label() == Some("Text"))
             .unwrap()
             .1
             .bounds()

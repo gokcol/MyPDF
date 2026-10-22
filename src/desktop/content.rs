@@ -102,6 +102,23 @@ pub(super) enum Edit {
         original: String,
         replacement: String,
     },
+    DetachTable {
+        page: u32,
+        table: mypdf_milestone0::tables::Table,
+    },
+    TableWrite {
+        page: u32,
+        table: mypdf_milestone0::tables::Table,
+    },
+    TableDelete {
+        page: u32,
+        table: mypdf_milestone0::tables::Table,
+    },
+    TableCells {
+        page: u32,
+        table: mypdf_milestone0::tables::Table,
+        base: mypdf_milestone0::tables::Table,
+    },
     Block {
         page: u32,
         block: text_block::Replacement,
@@ -177,10 +194,11 @@ pub(super) enum AfterText {
     Close(Option<u64>),
     Undo(u64, usize),
     PasteImage(u64, clipboard::Clip),
+    SelectAt(u64, usize, [f32; 2]),
 }
 pub(super) struct ContentState {
     pub(super) hide_guides: bool,
-    context: context::State,
+    pub(super) context: context::State,
     change_page: usize,
     change_name: &'static str,
     pub(super) after_text: Option<AfterText>,
@@ -190,8 +208,9 @@ pub(super) struct ContentState {
     add_after_existing: Option<(u64, usize)>,
     pub(super) area_mode: bool,
     marquee: Option<(Key, egui::Pos2)>,
+    pub(super) table_selection: Option<(Key, [f32; 4])>,
     selection_hint: Option<String>,
-    key: Option<Key>,
+    pub(super) key: Option<Key>,
     pub add_target: Option<(u64, usize)>,
     new_text: String,
     new_styled_text: String,
@@ -211,7 +230,7 @@ pub(super) struct ContentState {
     new_placed: bool,
     pub(super) new_commit: bool,
     inserting_text: bool,
-    exit_text_tool: bool,
+    pub(super) exit_text_tool: bool,
     next_text: Option<(u64, usize, [f32; 2])>,
     pub(super) loading: bool,
     pub(super) inspection: Option<Inspection>,
@@ -589,6 +608,49 @@ impl ContentState {
             self.new_commit = true;
         }
     }
+    pub(super) fn interaction_page(&self, tab: u64) -> Option<usize> {
+        self.existing
+            .as_ref()
+            .filter(|e| e.key.0 == tab)
+            .map(|e| e.key.2)
+            .or_else(|| {
+                self.context
+                    .area_after_table
+                    .filter(|v| v.0 == tab)
+                    .map(|v| v.1)
+            })
+            .or_else(|| {
+                self.context
+                    .select_after_text
+                    .filter(|v| v.0 == tab)
+                    .map(|v| v.1)
+            })
+    }
+    pub(super) fn region_active(&self) -> bool {
+        self.region.active
+    }
+    pub(super) fn cancel_table_handoff_tools(&mut self) {
+        self.add_target = None;
+        self.area_mode = false;
+        self.marquee = None;
+        self.region.active = false;
+        self.region.drag = None;
+        self.image_mode = false;
+    }
+    #[cfg(test)]
+    pub(super) fn existing_text(&self) -> Option<&str> {
+        self.existing.as_ref().map(|draft| draft.text.as_str())
+    }
+    pub(super) fn release_table_selection(&mut self) -> Option<(Key, [f32; 4])> {
+        if self.existing.as_ref().is_some_and(|e| e.changed()) {
+            return None;
+        }
+        let area = self.table_selection.take()?;
+        self.existing = None;
+        self.next_existing = None;
+        self.new_commit = false;
+        Some(area)
+    }
     pub(super) fn pending_text(&self) -> Option<u64> {
         if let Some(text) = &self.existing {
             return Some(text.key.0);
@@ -680,6 +742,7 @@ impl ContentState {
             add_after_existing: None,
             area_mode: false,
             marquee: None,
+            table_selection: None,
             selection_hint: None,
             key: None,
             add_target: None,
@@ -907,10 +970,31 @@ impl Viewer {
                 AfterText::Close(id) => self.request_close(id, ctx),
                 AfterText::Undo(id, page) => self.undo_finished_text(id, page, ctx),
                 AfterText::PasteImage(id, clip) => self.paste_after_text(ctx, id, clip),
+                AfterText::SelectAt(id, page, point) => {
+                    self.content.context.select_after_text = Some((id, page, point));
+                }
             }
         }
     }
     pub(super) fn content_change(&mut self, ctx: &egui::Context, edit: Edit) {
+        let active = self.tabs.get(self.active).map(|tab| tab.id);
+        if !matches!(
+            &edit,
+            Edit::DetachTable { .. }
+                | Edit::TableWrite { .. }
+                | Edit::TableDelete { .. }
+                | Edit::TableCells { .. }
+        ) && active.is_some()
+            && self.pending_table(active)
+        {
+            self.inspector = true;
+            self.status = Some((
+                "Finish the table edit with Done or Cancel before changing other PDF content."
+                    .into(),
+                false,
+            ));
+            return;
+        }
         if self.content.busy || self.organizer.busy || !self.apply_pending_annotation() {
             return;
         }
@@ -933,6 +1017,10 @@ impl Viewer {
         self.content.change_name = match &edit {
             Edit::AddText { .. } => "Add text",
             Edit::Text { .. } | Edit::Block { .. } => "Edit text",
+            Edit::DetachTable { .. } => "Detach table as layer",
+            Edit::TableWrite { .. } => "Edit table",
+            Edit::TableDelete { .. } => "Delete table",
+            Edit::TableCells { .. } => "Edit table cell",
             Edit::Image { .. } => "Edit image",
             Edit::AddImage { .. } => "Add image",
             Edit::HeaderFooter(_) => "Add header or footer",
@@ -1167,10 +1255,14 @@ impl Viewer {
                             note = Some(parts.join(" • "));
                             bytes
                         }
+                        Edit::DetachTable { page, table } => mypdf_milestone0::tables::detach(&bytes,page,&table)?,
+                        Edit::TableWrite { page, table } => mypdf_milestone0::tables::write(&bytes, page, &table)?,
+                        Edit::TableDelete {page,table} => mypdf_milestone0::tables::delete(&bytes,page,&table)?,
+                        Edit::TableCells { page, table, base } => mypdf_milestone0::tables::edit_detected(&bytes,page,&table,&base)?,
                         Edit::Block { page, block } => text_block::replace(&bytes, page, &block)?,
                         Edit::AddImage { page, rect, image } => {
                             note = Some(
-                                "Image added to the page • Edit → Images moves, resizes or replaces it"
+                                "Image added to the page • Click it to move, resize or replace it"
                                     .into(),
                             );
                             content::add_image(&bytes, page, rect, &image)?
@@ -1305,6 +1397,9 @@ impl Viewer {
         });
     }
     pub(super) fn content_panel(&mut self, ctx: &egui::Context) {
+        if self.editor.mode == editing::Mode::Edit && self.table_panel(ctx) {
+            return;
+        }
         let mode = self.editor.mode;
         if mode == editing::Mode::Convert {
             self.conversion_panel(ctx);
@@ -1356,7 +1451,7 @@ impl Viewer {
 
         egui::SidePanel::right("content_inspector").default_width(310.).width_range(280.0..=380.0).resizable(true).frame(egui::Frame::new().fill(theme::paper()).inner_margin(18.)).show(ctx,|ui|{
             egui::ScrollArea::vertical().id_salt("content_image_scroll").show(ui,|ui|{
-            ui.heading("Edit PDF");ui.label(RichText::new(format!("Page {}",page+1)).small().color(theme::muted()));ui.add_space(12.);
+            ui.heading("Image");ui.label(RichText::new(format!("Page {}",page+1)).small().color(theme::muted()));ui.add_space(12.);
             if ui.add_enabled(editable && !self.content.busy, ActionButton::new(Icon::Crop, "Copy region").selected(self.content.region.active)).on_hover_text("Draw a rectangle around any artwork, logo or scanned content to copy it into an editable image layer").clicked() {
                 self.content.region.active = !self.content.region.active;
                 self.content.region.drag = None;
@@ -1369,7 +1464,6 @@ impl Viewer {
             let Some(info)=&self.content.inspection else{ui.label("Open a PDF to begin.");return};
             if !editable{ui.label(RichText::new(if self.content.busy{"Applying changes…"}else{"This document is read-only."}).color(theme::muted()));}
             {
-                ui.horizontal(|ui|{if ui.selectable_value(&mut self.content.image_mode,false,"Text").changed()|ui.selectable_value(&mut self.content.image_mode,true,"Images").changed(){self.content.selected=None;}});ui.add_space(8.);
                 if self.content.image_mode{
                     match &info.images{Err(e)=>{ui.label(e);},Ok(images)=>{
                         ui.label(RichText::new("Select an image here or on the page.").small().color(theme::muted()));
@@ -1452,6 +1546,25 @@ impl Viewer {
             tab.worker = Worker::from_bytes(source, move || wake.request_repaint());
         }
     }
+    pub(super) fn automatic_edit(&mut self) {
+        self.editor.mode = editing::Mode::Edit;
+        self.redaction.active = false;
+        self.content.area_mode = false;
+        self.content.marquee = None;
+        self.content.region.active = false;
+        self.content.region.drag = None;
+        self.content.image_mode = false;
+        self.content.selected = None;
+        if self.content.pending_text().is_some() {
+            self.content.new_commit = true;
+            self.content.exit_text_tool = true;
+        } else {
+            self.content.add_target = None;
+            self.content.new_placed = false;
+        }
+        self.inspector = true;
+    }
+
     pub(super) fn content_tools(&mut self, ctx: &egui::Context) {
         if self.editor.mode != editing::Mode::Edit {
             return;
@@ -1474,11 +1587,11 @@ impl Viewer {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add_space(((ui.available_width() - 820.) / 2.).max(0.));
+                    ui.add_space(((ui.available_width() - 630.) / 2.).max(0.));
                     if ui
                         .add_enabled(
                             editable,
-                            ActionButton::new(Icon::Text, "Add text")
+                            ActionButton::new(Icon::Text, "Text")
                                 .selected(self.content.add_target.is_some()),
                         )
                         .clicked()
@@ -1500,75 +1613,18 @@ impl Viewer {
                     }
                     ui.separator();
                     if ui
-                        .add(ActionButton::new(Icon::Select, "Edit text").selected(
-                            !self.content.image_mode
-                                && !self.content.area_mode
-                                && self.content.add_target.is_none()
-                                && !self.redaction.active,
-                        ))
-                        .clicked()
-                    {
-                        self.redaction.active = false;
-                        self.content.area_mode = false;
-                        self.content.marquee = None;
-                        if self.content.pending_text().is_some() {
-                            self.content.new_commit = true;
-                            self.content.exit_text_tool = true;
-                        } else {
-                            self.content.add_target = None;
-                        }
-                        self.content.image_mode = false;
-                        self.inspector = true;
-                    }
-                    if ui
                         .add_enabled(
                             editable,
-                            ActionButton::new(Icon::TextArea, "Select area").selected(
-                                self.content.area_mode
-                                    && self.content.add_target.is_none()
-                                    && !self.redaction.active,
-                            ),
+                            ActionButton::new(Icon::Table, "Table")
+                                .selected(self.table.chooser || self.table.placing),
                         )
-                        .on_hover_text(
-                            "Drag a rectangle around several lines to edit them as one block",
-                        )
+                        .on_hover_text("Place a table or edit bordered tables on this page")
                         .clicked()
                     {
-                        self.redaction.active = false;
-                        if self.content.pending_text().is_some() {
-                            self.content.new_commit = true;
-                            self.content.exit_text_tool = true;
-                        } else {
-                            self.content.add_target = None;
-                        }
-                        self.content.image_mode = false;
-                        self.content.area_mode = true;
-                        self.content.marquee = None;
-                        self.content.selection_hint = None;
-                        self.inspector = true;
+                        self.table.chooser = !self.table.chooser;
                     }
                     if ui
-                        .add(ActionButton::new(Icon::Import, "Images").selected(
-                            self.content.image_mode
-                                && self.content.add_target.is_none()
-                                && !self.redaction.active,
-                        ))
-                        .clicked()
-                    {
-                        self.redaction.active = false;
-                        self.content.area_mode = false;
-                        self.content.marquee = None;
-                        if self.content.pending_text().is_some() {
-                            self.content.new_commit = true;
-                            self.content.exit_text_tool = true;
-                        } else {
-                            self.content.add_target = None;
-                        }
-                        self.content.image_mode = true;
-                        self.inspector = true;
-                    }
-                    if ui
-                        .add_enabled(editable, ActionButton::new(Icon::Plus, "Add image…"))
+                        .add_enabled(editable, ActionButton::new(Icon::FieldImage, "Image"))
                         .on_hover_text("Place a PNG or JPEG on this page (or paste one with ⌘V)")
                         .clicked()
                     {
@@ -2135,6 +2191,9 @@ impl Viewer {
                 AfterText::Close(id) => self.request_close(id, ctx),
                 AfterText::Undo(id, page) => self.undo_finished_text(id, page, ctx),
                 AfterText::PasteImage(id, clip) => self.paste_after_text(ctx, id, clip),
+                AfterText::SelectAt(id, page, point) => {
+                    self.content.context.select_after_text = Some((id, page, point));
+                }
             }
         }
     }
@@ -2158,7 +2217,7 @@ impl Viewer {
             .frame(egui::Frame::new().fill(theme::paper()).inner_margin(18.))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Text").size(18.).family(ui::semibold()));
+                    ui.label(RichText::new(if self.content.existing.is_some() { "Text" } else { "Edit PDF" }).size(18.).family(ui::semibold()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(ActionButton::new(Icon::Close, "Hide text panel").compact()).clicked() { self.inspector = false; }
                     });
@@ -2166,6 +2225,8 @@ impl Viewer {
                 egui::ScrollArea::vertical().id_salt("text_inspector_scroll").show(ui, |ui| {
                     ui.spacing_mut().item_spacing = vec2(8., 10.);
                     ui.add_space(12.);
+                    if self.content.table_selection.is_some_and(|(key,_)|current==Some((key.0,key.2))) && ui.add_enabled(!self.content.busy,ActionButton::new(Icon::Table,"Detect table in selection")).clicked(){self.content.context.detect_table_area=true;}
+
                     if let Some(draft) = &mut self.content.existing && current == Some((draft.key.0, draft.key.2)) {
                         ui.label(RichText::new(format!("{} words · {} characters", draft.text.split_whitespace().count(), draft.text.chars().count())).small().color(theme::muted()));
                         if let InlineTarget::Block(block) = &mut draft.target {
@@ -2239,12 +2300,12 @@ impl Viewer {
                         let empty = self.content.inspection.as_ref().is_some_and(|info| info.text.as_ref().is_ok_and(|runs| runs.is_empty()));
                         if empty {
                             ui.label(RichText::new("No editable text on this page.").size(15.).color(theme::ink()));
-                            ui.label(RichText::new("Start a new text block anywhere on the page.").color(theme::muted()));
-                            add_text = ui.add_enabled(editable, ActionButton::new(Icon::Text, "Add text").primary()).clicked();
+                            ui.label(RichText::new("Click an image to edit it, or add a text block.").color(theme::muted()));
+                            add_text = ui.add_enabled(editable, ActionButton::new(Icon::Text, "Text").primary()).clicked();
                         } else {
-                            ui.label(RichText::new(if self.content.area_mode { "Drag a rectangle around the text you want to edit together." } else { "Click text on the page to edit it." }).size(15.).color(theme::ink()));
+                            ui.label(RichText::new(if self.content.area_mode { "Drag a rectangle around the text you want to edit together." } else { "Click text or an image on the page to edit it." }).size(15.).color(theme::ink()));
                             ui.add_space(12.);
-                            ui.label(RichText::new("Select area edits several lines together. Add text starts a new block.").color(theme::muted()));
+                            ui.label(RichText::new("Drag around text to edit several lines. Right-click for Select area.").color(theme::muted()));
                         }
                         if let Some(hint) = &self.content.selection_hint { ui.add_space(12.); ui.label(RichText::new(hint).color(theme::muted())); }
                         if self.content.loading { ui.add_space(12.); ui.spinner(); }
@@ -2754,11 +2815,24 @@ fn existing_overlay(
         egui::Id::new((tab.id, page, "text_page_background")),
         egui::Sense::click_and_drag(),
     );
-    if background.drag_started()
-        && !state.busy
+    if !state.busy
         && !state.loading
         && state.marquee.is_none()
-        && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+        && let Some(origin) = text_move_start(ui, &background)
+        && (background.drag_started()
+            || ui.input(|i| {
+                i.pointer
+                    .interact_pos()
+                    .is_some_and(|pos| pos.distance(origin) >= 4.)
+            }))
+        && (state.area_mode
+            || state.existing.as_ref().is_none_or(|draft| {
+                draft.key != key
+                    || (!screen(draft.rect).expand(8.).contains(origin)
+                        && !text_move_handle(screen(draft.rect), page_rect)
+                            .expand(6.)
+                            .contains(origin))
+            }))
     {
         if state
             .existing
@@ -2784,6 +2858,7 @@ fn existing_overlay(
         }
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             state.marquee = None;
+            state.area_mode = false;
             return;
         }
         if let Some((start_key, start)) = state.marquee
@@ -2809,9 +2884,10 @@ fn existing_overlay(
                     theme::accent().gamma_multiply(0.17),
                 );
             }
-            if background.drag_stopped() {
+            if background.drag_stopped() || ui.input(|i| i.pointer.primary_released()) {
                 let a = (r.min - page_rect.min) / scale;
                 let b = (r.max - page_rect.min) / scale;
+                state.table_selection = Some((key, [a.x, a.y, b.x, b.y]));
                 if selected.len() > 2000
                     || selected.iter().map(|d| d.text.len() + 1).sum::<usize>() > 32_768
                 {
@@ -2826,11 +2902,23 @@ fn existing_overlay(
                     }
                 }
                 state.marquee = None;
+                state.area_mode = false;
                 ui.ctx().request_repaint();
             }
         }
         // Render the new text area on the next frame, after releasing the drag.
         return;
+    }
+    if state.existing.is_none()
+        && let Some((selected_key, area)) = state.table_selection
+        && selected_key == key
+    {
+        painter.rect_stroke(
+            screen(area),
+            2.,
+            Stroke::new(1., theme::accent()),
+            egui::StrokeKind::Inside,
+        );
     }
     let mut clicked = None;
     for (i, draft) in candidates.iter().cloned().enumerate() {
@@ -3228,6 +3316,14 @@ pub(super) fn overlay(
     }
     if state.add_target.is_some() && !state.busy && tab.session.as_ref().is_some_and(|s| s.editable)
     {
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            state.clear_new_text();
+            state.new_placed = false;
+            state.next_text = None;
+            state.add_target = None;
+            state.image_mode = false;
+            return;
+        }
         let response = ui
             .interact(
                 page_rect,
@@ -3249,12 +3345,6 @@ pub(super) fn overlay(
         if state.new_placed && state.add_target == Some((tab.id, page)) {
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)) {
                 state.new_commit = true;
-            }
-            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-                state.clear_new_text();
-                state.new_placed = false;
-                state.next_text = None;
-                return;
             }
             state.sync_new_styles();
             let font = state.text_font(state.new_size * scale);
@@ -3510,6 +3600,7 @@ pub(super) fn overlay(
     );
     if background.clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         state.selected = None;
+        state.image_mode = false;
     }
     for (i, r, selected) in boxes {
         let r = Rect::from_min_max(

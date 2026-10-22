@@ -111,9 +111,9 @@ const MENUS: &[(&str, &[Entry])] = &[
     (
         "Edit PDF",
         &[
-            C("edit_text", "Text"),
-            C("edit_images", "Image"),
-            C("add_image", "Add Image…"),
+            C("edit_text", "Edit Text and Images"),
+            C("add_image", "Image…"),
+            C("edit_table", "Table…"),
             C("redact", "Redact"),
             M(
                 "Header and Footer",

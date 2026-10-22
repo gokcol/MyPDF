@@ -253,9 +253,9 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
         "Edit PDF",
         true,
         &[
-            &MenuItem::with_id("edit_text", "Text", true, None),
-            &MenuItem::with_id("edit_images", "Image", true, None),
-            &MenuItem::with_id("add_image", "Add Image…", true, None),
+            &MenuItem::with_id("edit_text", "Edit Text and Images", true, None),
+            &MenuItem::with_id("add_image", "Image…", true, None),
+            &MenuItem::with_id("edit_table", "Table…", true, None),
             &MenuItem::with_id("redact", "Redact", true, None),
             &header_footer,
             &MenuItem::with_id("watermark", "Watermark…", true, None),

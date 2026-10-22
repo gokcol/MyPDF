@@ -10,7 +10,10 @@ pub(in crate::desktop) struct State {
     command: Option<(&'static str, Menu)>,
     pub cancel_text: bool,
     pub delete_text: bool,
+    pub detect_table_area: bool,
     image_paste: Option<clipboard::Clip>,
+    pub(in crate::desktop) select_after_text: Option<(u64, usize, [f32; 2])>,
+    pub(in crate::desktop) area_after_table: Option<(u64, usize, [f32; 4])>,
 }
 
 #[derive(Clone)]
@@ -131,7 +134,7 @@ pub(in crate::desktop) fn paste_requested(ctx: &egui::Context) -> bool {
 }
 
 fn items(target: &Target, editable: bool) -> Vec<Item> {
-    match target {
+    let mut entries = match target {
         Target::PendingText => vec![
             item("Delete", "delete_text_box", editable),
             item("Finish text edit", "finish_text", true),
@@ -147,9 +150,11 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
         ],
         Target::Text(_) => vec![
             item("Edit text…", "edit_text_here", editable),
+            item("Edit table…", "edit_table_here", editable),
+            item("Detect table in selection", "table_area", editable),
             item("Copy text", "copy_text", true),
             item("Translate text…", "translate_text", true),
-            item("Select text area…", "text_area", editable),
+            item("Select area…", "text_area", editable),
         ],
         Target::Image(_) => vec![
             item("Image properties…", "image_properties", true),
@@ -227,6 +232,9 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
             v
         }
         Target::Page => vec![
+            item("Edit table…", "edit_table_here", editable),
+            item("Detect table in selection", "table_area", editable),
+            item("Select area…", "text_area", editable),
             item("Paste Here", "paste_here", editable),
             item("Paste in Original Position", "paste_original", editable),
             item("Add text here", "add_text_here", editable),
@@ -234,7 +242,11 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
             item("Copy region…", "copy_region", editable),
             item("Select all page text", "all_text", true),
         ],
+    };
+    if !matches!(target, Target::PendingText) && !entries.iter().any(|i| i.action == "text_area") {
+        entries.push(item("Select area…", "text_area", editable));
     }
+    entries
 }
 
 fn action_icon(action: &str, label: &str) -> Icon {
@@ -248,6 +260,7 @@ fn action_icon(action: &str, label: &str) -> Icon {
         "underline" => Icon::Underline,
         "strikeout" => Icon::Strikeout,
         "all" | "all_text" | "text_area" => Icon::TextArea,
+        "edit_table_here" | "table_area" => Icon::Table,
         "translate_selection" | "translate_text" => Icon::Translate,
         "done" | "finish_text" => Icon::Check,
         "cancel" | "cancel_text" => Icon::Close,
@@ -418,7 +431,6 @@ pub(in crate::desktop) fn smart_select(
     inspector: &mut bool,
 ) {
     if state.busy
-        || state.pending_text().is_some()
         || state.add_target.is_some()
         || state.region.active
         || state.area_mode
@@ -428,7 +440,7 @@ pub(in crate::desktop) fn smart_select(
             editor.mode,
             editing::Mode::Edit | editing::Mode::Draw | editing::Mode::Annotate
         )
-        || editor.tool != editing::Tool::Select
+        || (editor.mode != editing::Mode::Edit && editor.tool != editing::Tool::Select)
         || egui::Popup::is_any_open(ui.ctx())
     {
         return;
@@ -448,6 +460,35 @@ pub(in crate::desktop) fn smart_select(
     let point = [p.x, p.y];
     let Some(session) = &tab.session else { return };
     let key = (tab.id, session.revision(), page);
+    if let Some(draft) = &state.existing {
+        let active = Rect::from_min_max(
+            rect.min + vec2(draft.rect[0], draft.rect[1]) * scale,
+            rect.min + vec2(draft.rect[2], draft.rect[3]) * scale,
+        );
+        // Typing and its move/resize handles keep their input. A click on
+        // another object commits the draft first, then resolves that point
+        // against the new revision so old image/text indices cannot leak.
+        if clicked
+            && draft.key.0 == tab.id
+            && !(draft.key.2 == page
+                && (active.expand(6.).contains(pos)
+                    || text_move_handle(active, rect).expand(6.).contains(pos)))
+            && !candidates(state, tab, page)
+                .iter()
+                .any(|text| contains(text.rect, point))
+            && (editing::hit_annotation(tab, page, point, scale).is_some()
+                || state.inspection.as_ref().is_some_and(|info| {
+                    info.key == key
+                        && info.images.as_ref().is_ok_and(|images| {
+                            images.iter().any(|image| contains(image.rect, point))
+                        })
+                }))
+        {
+            state.after_text = Some(AfterText::SelectAt(tab.id, page, point));
+            state.new_commit = true;
+        }
+        return;
+    }
     if let Some(a) = editing::hit_annotation(tab, page, point, scale) {
         // A note is a comment, not an empty drawing or underlying PDF text.
         // Keep the pointer press for page gestures, and open its body on click.
@@ -455,9 +496,6 @@ pub(in crate::desktop) fn smart_select(
             if clicked {
                 selection::set(tab, editor, vec![a.id.clone()]);
                 editor.note_requested = Some((tab.id, a.id));
-                if editor.mode == editing::Mode::Edit {
-                    editor.mode = editing::Mode::Annotate;
-                }
             }
             return;
         }
@@ -467,9 +505,17 @@ pub(in crate::desktop) fn smart_select(
             && editor.mode == editing::Mode::Edit
             && !state.image_mode
         {
+            if clicked {
+                *inspector = true;
+            }
             return;
         }
-        if clicked && matches!(a.kind, Kind::Text { .. }) && !a.object.locked && session.editable {
+        if clicked
+            && editor.mode == editing::Mode::Edit
+            && matches!(a.kind, Kind::Text { .. })
+            && !a.object.locked
+            && session.editable
+        {
             state.context.command = Some((
                 "edit_text_here",
                 Menu {
@@ -482,9 +528,11 @@ pub(in crate::desktop) fn smart_select(
             if !ui.input(|i| i.modifiers.shift) && !selection::selected_ids(tab).contains(&a.id) {
                 selection::set(tab, editor, vec![a.id]);
             }
-            editor.mode = editing::Mode::Draw;
             *inspector = true;
         }
+        return;
+    }
+    if editor.mode != editing::Mode::Edit {
         return;
     }
     // Active move/resize handles are outside the artwork's painted area.
@@ -493,8 +541,8 @@ pub(in crate::desktop) fn smart_select(
     }
     if let Some(info) = state.inspection.as_ref().filter(|i| i.key == key) {
         let texts = candidates(state, tab, page);
-        if clicked && let Some(d) = texts.iter().rev().find(|d| contains(d.rect, point)) {
-            if session.editable {
+        if let Some(d) = texts.iter().rev().find(|d| contains(d.rect, point)) {
+            if clicked && session.editable {
                 let draft = line_at(d.clone(), &texts, tab.pages[page]);
                 state.context.command = Some((
                     "edit_text_here",
@@ -604,7 +652,12 @@ pub(in crate::desktop) fn page_menu(
         .open_memory(open)
         .at_pointer_fixed()
         .show(|ui| {
-            let entries = items(&menu.target, editable);
+            let mut entries = items(&menu.target, editable);
+            if editor.mode != editing::Mode::Edit
+                || state.table_selection.is_none_or(|(k, _)| k != key)
+            {
+                entries.retain(|e| e.action != "table_area");
+            }
             let mut labels = entries
                 .iter()
                 .filter_map(|entry| match (state.context.group, submenu(entry.action)) {
@@ -753,6 +806,7 @@ pub(super) fn text_menu(
                 ("Delete text box", "delete_text_box", true),
                 ("Select all text", "all", !text.is_empty()),
                 ("Text properties…", "properties", true),
+                ("Detect table in selection", "table_area", true),
                 ("Finish text edit", "done", true),
                 ("Cancel text edit", "cancel", true),
             ];
@@ -787,6 +841,7 @@ pub(super) fn text_menu(
     output.response.request_focus();
     output.cursor_range = Some(range);
     match action {
+        "table_area" => context.detect_table_area = true,
         "done" => *done = true,
         "cancel" => context.cancel_text = true,
         "delete_text_box" => context.delete_text = true,
@@ -1034,6 +1089,94 @@ impl Viewer {
     }
 
     pub(in crate::desktop) fn context_commands(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.content.context.detect_table_area) {
+            self.table_from_selection();
+        }
+
+        if let Some((id, page, area)) = self.content.context.area_after_table {
+            let active = self
+                .tabs
+                .get(self.active)
+                .and_then(|t| t.session.as_ref().map(|s| (t.id, s.revision(), t.page)));
+            if self.editor.mode != editing::Mode::Edit
+                || active.is_none_or(|k| k.0 != id || k.2 != page)
+            {
+                self.content.context.area_after_table = None;
+            } else if !self.content.busy
+                && self
+                    .content
+                    .inspection
+                    .as_ref()
+                    .is_some_and(|i| Some(i.key) == active)
+            {
+                self.content.context.area_after_table = None;
+                let tab = &self.tabs[self.active];
+                let rect = Rect::from_min_max(pos2(area[0], area[1]), pos2(area[2], area[3]));
+                let selected: Vec<_> = candidates(&self.content, tab, page)
+                    .into_iter()
+                    .filter(|d| {
+                        rect.contains(pos2(
+                            (d.rect[0] + d.rect[2]) / 2.,
+                            (d.rect[1] + d.rect[3]) / 2.,
+                        ))
+                    })
+                    .collect();
+                if selected.len() > 2000
+                    || selected.iter().map(|d| d.text.len() + 1).sum::<usize>() > 32_768
+                {
+                    self.content.selection_hint = Some(
+                        "Select a smaller block (up to 2,000 objects or 32 KB of text).".into(),
+                    );
+                } else {
+                    self.content.existing = selected_block(selected, area, tab.pages[page]);
+                }
+                self.content.table_selection = Some((active.unwrap(), area));
+                self.content.area_mode = false;
+                self.inspector = true;
+            }
+        }
+        if let Some((id, page, point)) = self.content.context.select_after_text {
+            let current = self.tabs.get(self.active).and_then(|tab| {
+                tab.session
+                    .as_ref()
+                    .map(|session| (tab.id, session.revision(), tab.page))
+            });
+            if current.is_none_or(|key| key.0 != id || key.2 != page) {
+                self.content.context.select_after_text = None;
+            } else if !self.content.busy
+                && self
+                    .content
+                    .inspection
+                    .as_ref()
+                    .is_some_and(|info| Some(info.key) == current)
+            {
+                self.content.context.select_after_text = None;
+                let target = target_at(
+                    &self.content,
+                    &mut self.editor,
+                    &mut self.tabs[self.active],
+                    page,
+                    point,
+                    1.,
+                );
+                let action = match &target {
+                    Target::Text(_) => Some("edit_text_here"),
+                    Target::Image(_) => Some("image_properties"),
+                    Target::Artwork(_) => Some("object_properties"),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    self.content.context.command = Some((
+                        action,
+                        Menu {
+                            key: current.unwrap(),
+                            point,
+                            target,
+                        },
+                    ));
+                }
+            }
+        }
         if let Some(clip) = self.content.context.image_paste.take() {
             self.paste_image_over_text(ctx, clip);
         }
@@ -1118,6 +1261,11 @@ impl Viewer {
             );
         }
         match action {
+            "table_area" => self.table_from_selection(),
+            "edit_table_here" => {
+                self.editor.mode = editing::Mode::Edit;
+                self.open_table_at(menu.point);
+            }
             "translate_selection" => {
                 if let Target::SelectedText(selection) = menu.target {
                     self.editor.text_selection = Some(selection);
@@ -1282,9 +1430,11 @@ impl Viewer {
                 if let Some(draft) = draft {
                     self.content.existing = Some(draft);
                     self.content.image_mode = false;
+                    self.content.selected = None;
                     self.content.area_mode = false;
                     self.content.add_target = None;
                     self.editor.mode = editing::Mode::Edit;
+                    self.content.show_text_inspector = true;
                     self.inspector = true;
                 }
             }
@@ -1388,6 +1538,7 @@ impl Viewer {
                 if let Target::Image(image) = menu.target {
                     self.editor.mode = editing::Mode::Edit;
                     self.content.image_mode = true;
+                    self.content.area_mode = false;
                     self.inspector = true;
                     self.content.selected = self
                         .content
@@ -2474,8 +2625,296 @@ mod tests {
         };
         assert_eq!(quads, &vec![[0., 0., 1., 1.]]);
     }
+    fn auto_edit_fixture(image_rect: [f32; 4]) -> (Viewer, egui::Context, egui::Pos2) {
+        let (mut app, ctx) = fixture();
+        let source = content::add_text(
+            &app.tabs[0].session.as_ref().unwrap().source,
+            1,
+            "Original words",
+            [30., 40., 300., 80.],
+            16.,
+            [0.; 3],
+        )
+        .unwrap();
+        let png = clipboard::png(2, 2, &[0, 90, 240, 255].repeat(4)).unwrap();
+        let source = content::add_image(&source, 1, image_rect, &png).unwrap();
+        let runs = mypdf_milestone0::text_geometry::runs(&source, 1).unwrap();
+        let r = runs[0].rect.unwrap();
+        let images = content::images(&source, 1).unwrap();
+        app.tabs[0].session = Some(mypdf_milestone0::annotations::Session::new(
+            source.into(),
+            vec![],
+            true,
+        ));
+        let key = (app.tabs[0].id, 0, 0);
+        app.content.key = Some(key);
+        app.content.inspection = Some(Inspection {
+            key,
+            guides: Default::default(),
+            text: Ok(runs),
+            images: Ok(images),
+            fields: Ok(vec![]),
+            designed: Ok(vec![]),
+        });
+        (
+            app,
+            ctx,
+            pos2(20. + (r[0] + r[2]) / 2., 20. + (r[1] + r[3]) / 2.),
+        )
+    }
+
+    fn auto_edit_frame(app: &mut Viewer, ctx: &egui::Context, events: Vec<egui::Event>) {
+        app.content_events(ctx);
+        app.inspect_content(ctx);
+        app.context_commands(ctx);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(700., 700.))),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let rect = Rect::from_min_size(pos2(20., 20.), vec2(500., 500.));
+                    smart_select(
+                        &mut app.content,
+                        &mut app.editor,
+                        &mut app.tabs[0],
+                        ui,
+                        0,
+                        rect,
+                        1.,
+                        &mut app.inspector,
+                    );
+                    overlay(
+                        &mut app.content,
+                        app.editor.mode,
+                        &app.tabs[0],
+                        ui,
+                        0,
+                        rect,
+                        1.,
+                    );
+                });
+            },
+        );
+        app.context_commands(ctx);
+        app.finish_new_text(ctx);
+    }
+
+    fn auto_edit_click(app: &mut Viewer, ctx: &egui::Context, pos: egui::Pos2) {
+        for pressed in [true, false] {
+            auto_edit_frame(
+                app,
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+        auto_edit_frame(app, ctx, vec![]);
+    }
+
     #[test]
-    fn smart_selection_opens_artwork_inspector_in_edit_without_changing_read_selection() {
+    fn automatic_edit_switches_text_and_images_and_keeps_committed_typing() {
+        let (mut app, ctx, text_point) = auto_edit_fixture([100., 200., 200., 300.]);
+        // A tool remembered from Draw must not prevent selection in Edit.
+        app.editor.tool = editing::Tool::Arrow;
+        for _ in 0..2 {
+            auto_edit_frame(&mut app, &ctx, vec![]);
+        }
+        auto_edit_click(&mut app, &ctx, pos2(170., 270.));
+        assert!(app.content.image_mode);
+        assert_eq!(app.content.selected, Some(0));
+        auto_edit_click(&mut app, &ctx, text_point);
+        assert!(!app.content.image_mode);
+        assert!(app.content.existing.is_some());
+        app.content.existing.as_mut().unwrap().text = "Edited words".into();
+        auto_edit_click(&mut app, &ctx, pos2(170., 270.));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !app.content.image_mode || app.content.selected != Some(0) {
+            assert!(std::time::Instant::now() < deadline, "{:?}", app.status);
+            auto_edit_frame(&mut app, &ctx, vec![]);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.content.existing.is_none());
+        let session = app.tabs[0].session.as_mut().unwrap();
+        assert_eq!(session.revision(), 1);
+        assert!(
+            mypdf_milestone0::text_geometry::runs(&session.source, 1)
+                .unwrap()
+                .iter()
+                .any(|r| r.text == "Edited words")
+        );
+        session.undo();
+        assert!(
+            mypdf_milestone0::text_geometry::runs(&session.source, 1)
+                .unwrap()
+                .iter()
+                .any(|r| r.text == "Original words")
+        );
+    }
+
+    #[test]
+    fn escape_leaves_explicit_edit_tools_ready_for_automatic_selection() {
+        let (mut app, ctx, _) = auto_edit_fixture([100., 200., 200., 300.]);
+        for _ in 0..2 {
+            auto_edit_frame(&mut app, &ctx, vec![]);
+        }
+        for add in [true, false] {
+            app.content.image_mode = false;
+            app.content.area_mode = !add;
+            app.content.add_target = add.then_some((app.tabs[0].id, 0));
+            auto_edit_frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+            );
+            assert!(app.content.add_target.is_none());
+            assert!(!app.content.area_mode);
+            auto_edit_click(&mut app, &ctx, pos2(170., 270.));
+            assert!(app.content.image_mode);
+            assert_eq!(app.content.selected, Some(0));
+        }
+    }
+
+    #[test]
+    fn automatic_edit_prioritizes_text_over_background_images_and_retains_failed_drafts() {
+        let (mut app, ctx, text_point) = auto_edit_fixture([0., 0., 500., 500.]);
+        for _ in 0..2 {
+            auto_edit_frame(&mut app, &ctx, vec![]);
+        }
+        auto_edit_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(text_point),
+                egui::Event::PointerButton {
+                    pos: text_point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert!(
+            !app.content.image_mode,
+            "pressing text must not flash the background image inspector"
+        );
+        auto_edit_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerButton {
+                pos: text_point,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+        let draft = app.content.existing.as_mut().unwrap();
+        draft.text = "Keep these unsaved words".into();
+        draft.key.1 += 1; // Simulate a revision conflict during an edit.
+        auto_edit_click(&mut app, &ctx, pos2(170., 270.));
+        assert!(!app.content.image_mode);
+        assert_eq!(
+            app.content.existing.as_ref().unwrap().text,
+            "Keep these unsaved words"
+        );
+        assert!(app.content.after_text.is_none());
+        assert!(app.content.context.select_after_text.is_none());
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
+    }
+
+    #[test]
+    fn a_coalesced_area_drag_keeps_its_bounds_for_table_detection() {
+        let (mut app, ctx, _) = auto_edit_fixture([100., 200., 200., 300.]);
+        app.content.area_mode = true;
+        for _ in 0..3 {
+            auto_edit_frame(&mut app, &ctx, vec![]);
+        }
+        let (start, end) = (pos2(30., 30.), pos2(350., 120.));
+        auto_edit_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerMoved(end),
+                egui::Event::PointerButton {
+                    pos: end,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert_eq!(
+            app.content.table_selection,
+            Some(((app.tabs[0].id, 0, 0), [10., 10., 330., 100.]))
+        );
+        assert!(!app.content.area_mode);
+        assert!(app.content.existing.is_some());
+        app.content.existing = None;
+        app.content.table_selection = None;
+        auto_edit_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        assert!(
+            app.content.table_selection.is_none(),
+            "A plain click must not create an empty area selection"
+        );
+    }
+
+    #[test]
+    fn annotate_clicks_do_not_enter_pdf_text_or_image_editing() {
+        let (mut app, ctx, text_point) = auto_edit_fixture([100., 200., 200., 300.]);
+        app.editor.mode = editing::Mode::Annotate;
+        auto_edit_frame(&mut app, &ctx, vec![]);
+        auto_edit_frame(&mut app, &ctx, vec![]);
+        for point in [text_point, pos2(170., 270.)] {
+            auto_edit_click(&mut app, &ctx, point);
+            assert!(app.editor.mode == editing::Mode::Annotate);
+            assert!(app.content.existing.is_none());
+            assert!(!app.content.image_mode);
+            assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
+        }
+    }
+
+    #[test]
+    fn smart_selection_opens_artwork_inspector_without_changing_modes() {
         let (mut app, ctx) = fixture();
         let shape = Annotation::new(
             0,
@@ -2528,7 +2967,7 @@ mod tests {
                 },
             ],
         );
-        assert!(app.editor.mode == editing::Mode::Draw);
+        assert!(app.editor.mode == editing::Mode::Edit);
         assert_eq!(app.tabs[0].selected_annotation, Some(id));
         assert!(app.inspector);
         draw(

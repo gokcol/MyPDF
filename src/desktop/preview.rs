@@ -316,6 +316,8 @@ const SCENES: &[&str] = &[
     "Compare",
     "Signatures",
     "WindowsMenus",
+    "Table",
+    "DetectedTable",
 ];
 
 #[test]
@@ -392,6 +394,56 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
             .unwrap();
     let source = if matches!(collection, "AddText" | "EditBlank") {
         mypdf_milestone0::convert::blank(595., 842.).unwrap()
+    } else if matches!(collection, "Table" | "DetectedTable") {
+        let source = mypdf_milestone0::content::add_text(
+            &mypdf_milestone0::convert::blank(595., 842.).unwrap(),
+            1,
+            "Quarterly review",
+            [50., 55., 540., 90.],
+            22.,
+            [0.1, 0.15, 0.2],
+        )
+        .unwrap();
+        let mut table = mypdf_milestone0::tables::Table::new(4, 3, [50., 130., 545., 350.]);
+        table.apply_template(1);
+        table.cells = vec![
+            "Item",
+            "Owner",
+            "Status",
+            "Annual review",
+            "Deniz",
+            "In progress",
+            "Supplier audit",
+            "Orhan",
+            "Approved",
+            "Follow-up",
+            "Selin",
+            "",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let bytes = mypdf_milestone0::tables::write(&source, 1, &table).unwrap();
+        if collection == "DetectedTable" {
+            let mut doc = lopdf::Document::load_mem(&bytes).unwrap();
+            let id = doc.get_pages()[&1];
+            let mut ops = doc.get_and_decode_page_content(id).unwrap();
+            for op in &mut ops.operations {
+                if op.operator == "BDC"
+                    && let Some(d) = op.operands.get_mut(1).and_then(|o| o.as_dict_mut().ok())
+                {
+                    d.remove(b"MyPDFTable");
+                }
+            }
+            let stream = doc.add_object(lopdf::Stream::new(
+                lopdf::Dictionary::new(),
+                ops.encode().unwrap(),
+            ));
+            doc.get_dictionary_mut(id).unwrap().set("Contents", stream);
+            mypdf_milestone0::content::serialize(&mut doc).unwrap()
+        } else {
+            bytes
+        }
     } else if collection == "RepeatArtwork" {
         let source = mypdf_milestone0::convert::text_to_pdf(PREVIEW_AGREEMENT, true).unwrap();
         let mut doc = lopdf::Document::load_mem(&source).unwrap();
@@ -477,10 +529,13 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
     };
     if matches!(
         collection,
-        "Edit" | "EditBlank" | "Images" | "InlineText" | "BlockText"
+        "Edit" | "EditBlank" | "Images" | "InlineText" | "BlockText" | "Table" | "DetectedTable"
     ) {
         app.editor.mode = editing::Mode::Edit;
         app.content.image_mode = collection == "Images";
+    }
+    if matches!(collection, "Table" | "DetectedTable") {
+        super::table_tools::preview(&mut app, &ctx, collection == "DetectedTable");
     }
     if collection == "Viewer" {
         app.editor.mode = editing::Mode::Read;
@@ -1394,7 +1449,7 @@ fn assert_scene(scene: &str, app: &Viewer, output: &egui::FullOutput) {
             "blank Edit must offer its own empty state"
         );
         assert!(
-            text.iter().any(|t| t == "Add text"),
+            text.iter().any(|t| t == "Text"),
             "blank Edit must offer text insertion"
         );
     }

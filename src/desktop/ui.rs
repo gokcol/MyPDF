@@ -347,6 +347,7 @@ pub(super) enum Icon {
     FieldList,
     FieldButton,
     FieldImage,
+    Table,
     FieldDate,
     TabOrder,
     Flatten,
@@ -568,6 +569,16 @@ fn draw_icon_impl(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             fill_box([0.08, 0.28], [0.92, 0.72], 0.14, soft);
             box_at([0.08, 0.28], [0.92, 0.72], 0.14);
             line(&[[0.34, 0.5], [0.66, 0.5]]);
+        }
+        Icon::Table => {
+            box_at([0.08, 0.12], [0.92, 0.88], 0.04);
+            fill_box([0.08, 0.12], [0.92, 0.37], 0.02, soft);
+            for x in [0.36, 0.64] {
+                line(&[[x, 0.12], [x, 0.88]]);
+            }
+            for y in [0.37, 0.63] {
+                line(&[[0.08, y], [0.92, y]]);
+            }
         }
         Icon::FieldImage => {
             box_at([0.1, 0.16], [0.9, 0.84], 0.08);

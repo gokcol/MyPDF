@@ -246,6 +246,9 @@ impl Default for Style {
 /// Editable object metadata travels with the artwork, including through the clipboard.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ObjectProperties {
+    /// Structured table data accompanying its movable vector appearance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table: Option<crate::tables::Table>,
     #[serde(default)]
     pub review: crate::review::Review,
     /// A persistent, page-local group. Copies receive independent group IDs.
@@ -356,6 +359,13 @@ impl Annotation {
                 "Only images can be cropped"
             );
             crate::object_tools::validate_crop(crop)?;
+        }
+        if let Some(table) = &self.object.table {
+            ensure!(
+                matches!(self.kind, Kind::Svg { .. }),
+                "A table layer must use vector artwork"
+            );
+            table.validate()?;
         }
         self.kind.validate()?;
         if let Kind::Image { png } = &self.kind {

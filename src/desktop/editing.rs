@@ -1961,6 +1961,9 @@ impl Viewer {
         if self.content.busy || self.organizer.busy {
             return;
         }
+        if self.pending_table(None) {
+            return;
+        }
         if let Some(tab) = self.tabs.get(self.active)
             && self.content.queue_text_undo(tab.id, redo)
         {
@@ -2226,6 +2229,7 @@ impl Viewer {
                                         }
                                     }
                                 }
+                                if self.editor.mode == Mode::Annotate && ui.add_enabled(self.tabs.get(self.active).is_some_and(|t|t.session.as_ref().is_some_and(|s|s.editable)) && !self.content.busy,ActionButton::new(Icon::Table,"Table").compact()).on_hover_text("Place a movable table layer").clicked(){self.choose_table();}
                                 ui.separator();
                                 let libraries: &[(&str, Icon)] = if self.editor.mode == Mode::Draw {
                                     &[
@@ -3901,6 +3905,9 @@ impl Viewer {
         }
     }
     pub(super) fn unfinished_edit(&mut self, target: Option<u64>) -> bool {
+        if self.pending_table(target) {
+            return true;
+        }
         if let Some(id) = self
             .content
             .pending_text()

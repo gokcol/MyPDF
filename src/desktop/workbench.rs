@@ -361,9 +361,17 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ("Group objects", "group_objects", "together join selection"),
     ("Ungroup objects", "ungroup_objects", "separate selection"),
     ("Open PDF", "open", "file"),
-    ("Edit text", "edit_text", "font paragraph words"),
-    ("Edit images", "edit_images", "picture logo"),
-    ("Add image", "add_image", "picture photo import"),
+    (
+        "Edit text and images",
+        "edit_text",
+        "font paragraph words picture logo",
+    ),
+    ("Image", "add_image", "add picture photo import"),
+    (
+        "Table",
+        "edit_table",
+        "add rows columns cells bordered grid",
+    ),
     ("Crop selected image", "crop_object", "trim margins restore"),
     (
         "Remove image background",

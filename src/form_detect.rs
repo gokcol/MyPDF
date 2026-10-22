@@ -246,6 +246,40 @@ pub struct PageGuides {
     pub ys: Vec<f32>,
     pub baselines: Vec<f32>,
 }
+/// Visible axis-aligned border segments in displayed page coordinates.
+pub(crate) fn border_segments(bytes: &[u8], page_index: usize) -> Result<Vec<[f32; 4]>> {
+    let pdf = Pdf::new(bytes.to_vec()).map_err(|e| anyhow::anyhow!("Could not read PDF: {e:?}"))?;
+    let page = pdf
+        .pages()
+        .get(page_index)
+        .ok_or_else(|| anyhow::anyhow!("Page not found"))?;
+    let (w, h) = page.render_dimensions();
+    let cache = interpret::InterpreterCache::new();
+    let mut shapes = Shapes::default();
+    let mut context = interpret::Context::new(
+        page.initial_transform(true).to_kurbo(),
+        Rect::new(0., 0., w as f64, h as f64),
+        &cache,
+        page.xref(),
+        interpret::InterpreterSettings::default(),
+    );
+    interpret::interpret_page(page, &mut context, &mut shapes);
+    let mut result = Vec::new();
+    for r in shapes.lines {
+        let y = ((r.y0 + r.y1) / 2.) as f32;
+        result.push([r.x0 as f32, y, r.x1 as f32, y]);
+    }
+    for r in shapes.verticals {
+        let x = ((r.x0 + r.x1) / 2.) as f32;
+        result.push([x, r.y0 as f32, x, r.y1 as f32]);
+    }
+    for r in shapes.boxes {
+        let [l, t, r, b] = [r.x0 as f32, r.y0 as f32, r.x1 as f32, r.y1 as f32];
+        result.extend([[l, t, r, t], [l, b, r, b], [l, t, l, b], [r, t, r, b]]);
+    }
+    result.truncate(4000);
+    Ok(result)
+}
 pub fn placement_guides(bytes: &[u8], page_index: usize) -> Result<PageGuides> {
     let pdf = Pdf::new(bytes.to_vec()).map_err(|e| anyhow::anyhow!("Could not read PDF: {e:?}"))?;
     let page = pdf

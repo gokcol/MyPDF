@@ -37,6 +37,7 @@ pub mod signature_edit;
 pub mod signing;
 pub mod stroke;
 pub mod svg;
+pub mod tables;
 pub mod text_block;
 pub mod text_geometry;
 pub mod text_style;

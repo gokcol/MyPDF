@@ -94,13 +94,10 @@ impl Viewer {
             Mode::Edit if self.content.add_target.is_some() => {
                 "Click a page and type · ⌘Return finishes · Esc cancels"
             }
-            Mode::Edit if self.content.image_mode => {
-                "Select an image to edit, or capture artwork with Copy region"
-            }
             Mode::Edit if self.content.area_mode => {
                 "Drag around text to edit several lines together"
             }
-            Mode::Edit => "Click text to edit it · Add text starts a new block",
+            Mode::Edit => "Click text or an image to edit · Esc returns to selection",
             Mode::Annotate | Mode::Draw => match self.editor.tool {
                 Tool::Select | Tool::Lasso => {
                     "Click an object to select · Click outside to deselect · Arrow keys nudge"
