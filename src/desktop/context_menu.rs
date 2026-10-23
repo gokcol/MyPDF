@@ -6,12 +6,14 @@ use mypdf_milestone0::annotations::{Annotation, Kind, Markup};
 #[derive(Default)]
 pub(in crate::desktop) struct State {
     menu: Option<Menu>,
-    group: Option<&'static str>,
     command: Option<(&'static str, Menu)>,
+    pub(in crate::desktop) clear_selection: Option<u64>,
     pub cancel_text: bool,
     pub delete_text: bool,
     pub detect_table_area: bool,
     image_paste: Option<clipboard::Clip>,
+    highlight_color: Option<[f32; 3]>,
+    pub(in crate::desktop) bookmark: Option<navigation_editor::SelectionBookmark>,
     pub(in crate::desktop) select_after_text: Option<(u64, usize, [f32; 2])>,
     pub(in crate::desktop) area_after_table: Option<(u64, usize, [f32; 4])>,
 }
@@ -66,6 +68,7 @@ fn shortcut(action: &str) -> Option<egui::KeyboardShortcut> {
         "paste_format" => (M::COMMAND | M::ALT, Key::V),
         "highlight" => (markup, Key::H),
         "underline" => (markup, Key::U),
+        "squiggly" => (markup, Key::W),
         "strikeout" => (markup, Key::S),
         "delete" | "object_delete" | "delete_image" => (
             M::NONE,
@@ -76,7 +79,6 @@ fn shortcut(action: &str) -> Option<egui::KeyboardShortcut> {
             },
         ),
         "done" | "finish_text" => (M::COMMAND, Key::Enter),
-        "cancel" | "cancel_text" => (M::NONE, Key::Escape),
         _ => return None,
     };
     Some(KeyboardShortcut::new(modifiers, key))
@@ -134,7 +136,7 @@ pub(in crate::desktop) fn paste_requested(ctx: &egui::Context) -> bool {
 }
 
 fn items(target: &Target, editable: bool) -> Vec<Item> {
-    let mut entries = match target {
+    match target {
         Target::PendingText => vec![
             item("Delete", "delete_text_box", editable),
             item("Finish text edit", "finish_text", true),
@@ -143,9 +145,12 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
         Target::SelectedText(_) => vec![
             item("Copy selected text", "copy_text", true),
             item("Translate selected text…", "translate_selection", true),
+            item("Note on selection…", "selection_note", editable),
             item("Highlight", "highlight", editable),
             item("Underline", "underline", editable),
+            item("Squiggly underline", "squiggly", editable),
             item("Strikethrough", "strikeout", editable),
+            item("Bookmark selection…", "selection_bookmark", editable),
             item("Select all page text", "all_text", true),
         ],
         Target::Text(_) => vec![
@@ -154,7 +159,6 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
             item("Detect table in selection", "table_area", editable),
             item("Copy text", "copy_text", true),
             item("Translate text…", "translate_text", true),
-            item("Select area…", "text_area", editable),
         ],
         Target::Image(_) => vec![
             item("Image properties…", "image_properties", true),
@@ -171,6 +175,8 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
             let mut v = vec![];
             if single.is_some_and(|a| matches!(a.kind, Kind::Text { .. })) {
                 v.push(item("Edit text…", "edit_text_here", change));
+            }
+            if single.is_some_and(|a| matches!(a.kind, Kind::Text { .. } | Kind::Callout { .. })) {
                 v.push(item("Copy text", "copy_artwork_text", true));
                 v.push(item("Translate text…", "translate_text", true));
             }
@@ -178,6 +184,7 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
                 match single.map(|a| &a.kind) {
                     Some(Kind::Image { .. }) => "Image properties…",
                     Some(Kind::Text { .. }) => "Text properties…",
+                    Some(Kind::Callout { .. }) => "Callout properties…",
                     Some(Kind::Note { .. }) => "Edit note…",
                     Some(Kind::Svg { .. } | Kind::Stamp { .. }) => "Stamp properties…",
                     Some(_) => "Drawing properties…",
@@ -234,7 +241,6 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
         Target::Page => vec![
             item("Edit table…", "edit_table_here", editable),
             item("Detect table in selection", "table_area", editable),
-            item("Select area…", "text_area", editable),
             item("Paste Here", "paste_here", editable),
             item("Paste in Original Position", "paste_original", editable),
             item("Add text here", "add_text_here", editable),
@@ -242,11 +248,7 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
             item("Copy region…", "copy_region", editable),
             item("Select all page text", "all_text", true),
         ],
-    };
-    if !matches!(target, Target::PendingText) && !entries.iter().any(|i| i.action == "text_area") {
-        entries.push(item("Select area…", "text_area", editable));
     }
-    entries
 }
 
 fn action_icon(action: &str, label: &str) -> Icon {
@@ -258,6 +260,9 @@ fn action_icon(action: &str, label: &str) -> Icon {
         "delete" | "delete_image" | "object_delete" | "delete_text_box" => Icon::Trash,
         "highlight" => Icon::Highlight,
         "underline" => Icon::Underline,
+        "squiggly" => Icon::Squiggly,
+        "selection_note" => Icon::Note,
+        "selection_bookmark" => Icon::Outline,
         "strikeout" => Icon::Strikeout,
         "all" | "all_text" | "text_area" => Icon::TextArea,
         "edit_table_here" | "table_area" => Icon::Table,
@@ -311,6 +316,174 @@ fn action_row(ui: &mut egui::Ui, i: &Item, width: f32) -> bool {
     )
     .clicked()
 }
+const HIGHLIGHT_COLORS: [(&str, [f32; 3]); 5] = [
+    ("Yellow", [1., 0.85, 0.2]),
+    ("Pink", [1., 0.38, 0.63]),
+    ("Orange", [1., 0.57, 0.2]),
+    ("Green", [0.35, 0.85, 0.4]),
+    ("Blue", [0.35, 0.68, 1.]),
+];
+
+/// Apply a preset in one click; the existing picker stays inside this menu's
+/// footprint and requires Apply, so RGB/hex adjustments never close it midway.
+fn highlight_row(ui: &mut egui::Ui, item: &Item, width: f32, menu: &Menu, state: &mut State) {
+    ui.add_enabled_ui(item.enabled, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.;
+            if action_row(ui, item, (width - 156.).max(116.)) {
+                state.command = Some(("highlight", menu.clone()));
+                ui.close();
+            }
+            for (name, color) in HIGHLIGHT_COLORS {
+                let label = format!("{name} highlight");
+                let (rect, response) = ui.allocate_exact_size(vec2(24., 24.), egui::Sense::click());
+                let [r, g, b] = color.map(|c| (c * 255.).round() as u8);
+                ui.painter()
+                    .circle_filled(rect.center(), 7., Color32::from_rgb(r, g, b));
+                if response.hovered() || response.has_focus() {
+                    ui.painter().rect_stroke(
+                        rect.shrink(1.),
+                        4,
+                        Stroke::new(1., theme::accent()),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &label)
+                });
+                if response
+                    .on_hover_text(&label)
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    state.highlight_color = Some(color);
+                    state.command = Some(("highlight", menu.clone()));
+                    ui.close();
+                }
+            }
+            let (rect, response) = ui.allocate_exact_size(vec2(24., 24.), egui::Sense::click());
+            let [r, g, b] = state
+                .highlight_color
+                .unwrap_or([1., 0.85, 0.2])
+                .map(|c| (c * 255.).round() as u8);
+            ui::paint_color_picker(ui, rect, Color32::from_rgb(r, g, b));
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    "Custom highlight color…",
+                )
+            });
+            let response = response
+                .on_hover_text("Custom highlight color…")
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if response.clicked() {
+                ui::reset_color_picker(ui, highlight_hex_id(menu));
+            }
+            show_cascade(ui, &response, |ui| {
+                let [r, g, b] = state
+                    .highlight_color
+                    .unwrap_or([1., 0.85, 0.2])
+                    .map(|c| (c * 255.).round() as u8);
+                let mut picked = Color32::from_rgb(r, g, b);
+                ui::color_picker_contents(
+                    ui,
+                    &mut picked,
+                    "Highlight color",
+                    highlight_hex_id(menu),
+                );
+                state.highlight_color =
+                    Some([picked.r(), picked.g(), picked.b()].map(|c| c as f32 / 255.));
+                if ui
+                    .add(ActionButton::new(Icon::Highlight, "Apply highlight").primary())
+                    .clicked()
+                {
+                    state.command = Some(("highlight", menu.clone()));
+                    ui.close();
+                }
+            });
+        });
+    });
+}
+
+fn highlight_hex_id(menu: &Menu) -> egui::Id {
+    egui::Id::new((menu.key.0, menu.key.2, "contextual_page_menu")).with("highlight_hex")
+}
+
+/// A submenu never replaces its parent's contents. egui keeps this popup
+/// beside the original response and propagates a chosen action's close upward.
+fn cascading_menu(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    width: f32,
+    content: impl FnOnce(&mut egui::Ui),
+) {
+    let response = ui.add(ui::MenuItem::new(icon, label).width(width));
+    ui::draw_icon(
+        ui.painter(),
+        Rect::from_center_size(
+            pos2(response.rect.right() - 12., response.rect.center().y),
+            vec2(12., 12.),
+        ),
+        Icon::Right,
+        ui.visuals().text_color(),
+    );
+    show_cascade(ui, &response, content);
+}
+
+fn show_cascade<R>(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<egui::InnerResponse<R>> {
+    let id = egui::containers::menu::SubMenu::id_from_widget_id(response.id);
+    let needs_measurement =
+        egui::AreaState::load(ui.ctx(), id).is_none_or(|state| state.size.is_none());
+    let popup = egui::containers::menu::SubMenu::new()
+        .config(
+            egui::containers::menu::MenuConfig::new()
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+        )
+        .show(ui, response, content);
+    if needs_measurement && popup.is_some() {
+        // An unmeasured Area starts at egui's broad default size, which can
+        // temporarily overlap the parent and misinterpret the next click as
+        // outside. Measure and align again before this frame is displayed.
+        ui.ctx()
+            .request_discard("Measure the cascading menu before displaying it");
+    }
+    popup
+}
+
+fn selection_note(
+    selection: &text_selection::TextSelection,
+    tab: &Tab,
+    style: &mypdf_milestone0::annotations::Style,
+) -> Option<Annotation> {
+    let quote = selection.text(tab)?;
+    let first = *selection.rects(tab).first()?;
+    let page = *tab.pages.get(selection.page)?;
+    let size = 18_f32.min(page.width).min(page.height);
+    let x = (first[0] - size - 3.).clamp(0., (page.width - size).max(0.));
+    let y = first[1].clamp(0., (page.height - size).max(0.));
+    let mut text = quote.trim().chars().take(1800).collect::<String>();
+    if quote.trim().chars().count() > 1800 {
+        text.push('…');
+    }
+    let mut style = style.clone();
+    style.fill = Some([1., 0.82, 0.23]);
+    style.opacity = 1.;
+    Some(Annotation::new(
+        selection.page,
+        [x, y, x + size, y + size],
+        Kind::Note {
+            text: format!("“{text}”\n\n"),
+        },
+        style,
+    ))
+}
+
 fn contains(r: [f32; 4], p: [f32; 2]) -> bool {
     p[0] >= r[0] - 2. && p[0] <= r[2] + 2. && p[1] >= r[1] - 2. && p[1] <= r[3] + 2.
 }
@@ -372,6 +545,17 @@ fn target_at(
         || (state.new_placed && state.add_target == Some((tab.id, page)))
     {
         return Target::PendingText;
+    }
+    // The explicitly selected passage wins over a highlight or drawing beneath
+    // it. Secondary click must not replace those words with the old artwork.
+    if let Some(selected) = editor.text_selection.filter(|s| {
+        s.tab == tab.id
+            && s.page == page
+            && s.contains(tab, p)
+            && matches!(editor.mode, editing::Mode::Read | editing::Mode::Annotate)
+    }) {
+        selection::set(tab, editor, vec![]);
+        return Target::SelectedText(selected);
     }
     if let Some(a) = editing::hit_annotation(tab, page, p, scale) {
         if !selection::selected_ids(tab).contains(&a.id) {
@@ -555,22 +739,27 @@ pub(in crate::desktop) fn smart_select(
             }
             return;
         }
-        if pressed
-            && let Ok(images) = &info.images
+        if let Ok(images) = &info.images
             && let Some((i, image)) = images
                 .iter()
                 .enumerate()
                 .rev()
                 .find(|(_, im)| contains(im.rect, point))
         {
-            let r = image.rect;
-            state.image_mode = true;
-            state.selected = Some(i);
-            state.rect = [r[0], r[1], r[2] - r[0], r[3] - r[1]];
-            selection::set(tab, editor, vec![]);
-            editor.mode = editing::Mode::Edit;
-            *inspector = true;
+            if pressed {
+                let r = image.rect;
+                state.image_mode = true;
+                state.selected = Some(i);
+                state.rect = [r[0], r[1], r[2] - r[0], r[3] - r[1]];
+                selection::set(tab, editor, vec![]);
+                editor.mode = editing::Mode::Edit;
+                *inspector = true;
+            }
+            return;
         }
+    }
+    if clicked {
+        state.click_outside(tab.id);
     }
 }
 
@@ -629,7 +818,6 @@ pub(in crate::desktop) fn page_menu(
                 point: [p.x, p.y],
                 target,
             });
-            state.context.group = None;
             open = Some(egui::SetOpenCommand::Bool(true));
         }
     }
@@ -658,66 +846,49 @@ pub(in crate::desktop) fn page_menu(
             {
                 entries.retain(|e| e.action != "table_area");
             }
-            let mut labels = entries
-                .iter()
-                .filter_map(|entry| match (state.context.group, submenu(entry.action)) {
-                    (Some(group), Some((name, _))) if group == name => {
-                        Some((entry.label, shortcut(entry.action)))
-                    }
-                    (None, Some((name, _))) => Some((name, None)),
-                    (None, None) => Some((entry.label, shortcut(entry.action))),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            if state.context.group.is_some() {
-                labels.push(("Back to actions", None));
-            }
-            let width = ui::menu_width(ui, labels);
+            let labels = entries.iter().map(|entry| match submenu(entry.action) {
+                Some((name, _)) => (name, None),
+                None => (entry.label, shortcut(entry.action)),
+            });
+            let width =
+                ui::menu_width(ui, labels).max(if matches!(menu.target, Target::SelectedText(_)) {
+                    300.
+                } else {
+                    0.
+                });
             menu_layout(ui, width);
             egui::ScrollArea::vertical()
                 .id_salt("context_actions_scroll")
                 .max_height((ctx.content_rect().height() - 40.).max(80.))
                 .show(ui, |ui| {
-                    if let Some(group) = state.context.group {
-                        if ui
-                            .add(ui::MenuItem::new(Icon::Left, "Back to actions").width(width))
-                            .clicked()
-                        {
-                            state.context.group = None;
-                        }
-                        ui.separator();
-                        ui.weak(group);
-                        for entry in entries
-                            .iter()
-                            .filter(|e| submenu(e.action).is_some_and(|g| g.0 == group))
-                        {
-                            if action_row(ui, entry, width) {
-                                state.context.command = Some((entry.action, menu.clone()));
-                                state.context.group = None;
-                                ui.close();
-                            }
-                        }
-                        return;
-                    }
                     let mut shown_groups = std::collections::HashSet::new();
                     for i in &entries {
+                        if i.action == "highlight" {
+                            highlight_row(ui, i, width, &menu, &mut state.context);
+                            continue;
+                        }
                         if let Some((label, icon)) = submenu(i.action) {
                             if !shown_groups.insert(label) {
                                 continue;
                             }
-                            let response = ui.add(ui::MenuItem::new(icon, label).width(width));
-                            ui::draw_icon(
-                                ui.painter(),
-                                Rect::from_center_size(
-                                    pos2(response.rect.right() - 12., response.rect.center().y),
-                                    vec2(12., 12.),
-                                ),
-                                Icon::Right,
-                                ui.visuals().text_color(),
-                            );
-                            if response.clicked() {
-                                state.context.group = Some(label);
-                            }
+                            cascading_menu(ui, icon, label, width, |ui| {
+                                let children = entries.iter().filter(|entry| {
+                                    submenu(entry.action).is_some_and(|group| group.0 == label)
+                                });
+                                let child_width = ui::menu_width(
+                                    ui,
+                                    children
+                                        .clone()
+                                        .map(|entry| (entry.label, shortcut(entry.action))),
+                                );
+                                menu_layout(ui, child_width);
+                                for entry in children {
+                                    if action_row(ui, entry, child_width) {
+                                        state.context.command = Some((entry.action, menu.clone()));
+                                        ui.close();
+                                    }
+                                }
+                            });
                             continue;
                         }
                         if matches!(
@@ -936,6 +1107,7 @@ impl Viewer {
             || self.accessible_text
             || self.review.open
             || self.navigation_editor.is_some()
+            || self.content.context.bookmark.is_some()
             || self.workspace.options
             || self.workbench_owns_shortcuts()
             || ctx.memory(|m| m.top_modal_layer().is_some())
@@ -1089,6 +1261,19 @@ impl Viewer {
     }
 
     pub(in crate::desktop) fn context_commands(&mut self, ctx: &egui::Context) {
+        self.selection_bookmark_window(ctx);
+        if let Some(id) = self.content.context.clear_selection
+            && !self.content.busy
+        {
+            self.content.context.clear_selection = None;
+            if self.editor.mode == editing::Mode::Edit
+                && self.tabs.get(self.active).is_some_and(|t| t.id == id)
+                && self.apply_pending_annotation()
+            {
+                selection::set(&mut self.tabs[self.active], &mut self.editor, vec![]);
+                self.editor.text_selection = None;
+            }
+        }
         if std::mem::take(&mut self.content.context.detect_table_area) {
             self.table_from_selection();
         }
@@ -1262,6 +1447,32 @@ impl Viewer {
         }
         match action {
             "table_area" => self.table_from_selection(),
+            "selection_bookmark" => {
+                if let Target::SelectedText(selection) = &menu.target
+                    && let Some(text) = selection.text(&self.tabs[index])
+                {
+                    self.open_selection_bookmark(text, menu.key);
+                }
+            }
+            "selection_note" => {
+                if let Target::SelectedText(selection) = &menu.target
+                    && let Some(mark) =
+                        selection_note(selection, &self.tabs[index], &self.editor.style)
+                {
+                    let tab = &mut self.tabs[index];
+                    let session = tab.session.as_mut().unwrap();
+                    let mut entries = session.annotations.clone();
+                    entries.push(mark.clone());
+                    match session.commit(entries) {
+                        Ok(()) => {
+                            session.name_last_change("Add note on selected text");
+                            selection::set(tab, &mut self.editor, vec![mark.id.clone()]);
+                            self.editor.note_requested = Some((tab.id, mark.id));
+                        }
+                        Err(e) => self.status = Some((e.to_string(), true)),
+                    }
+                }
+            }
             "edit_table_here" => {
                 self.editor.mode = editing::Mode::Edit;
                 self.open_table_at(menu.point);
@@ -1351,9 +1562,8 @@ impl Viewer {
             "all_text" => {
                 self.editor.text_selection =
                     text_selection::TextSelection::all(&self.tabs[index], menu.key.2);
-                self.editor.mode = editing::Mode::Read;
             }
-            "highlight" | "underline" | "strikeout" => {
+            "highlight" | "underline" | "squiggly" | "strikeout" => {
                 if let Target::SelectedText(s) = &menu.target {
                     let quads = s.rects(&self.tabs[index]);
                     if !quads.is_empty() {
@@ -1386,7 +1596,11 @@ impl Viewer {
                             .collect();
                         let mut style = self.editor.style.clone();
                         if action == "highlight" {
-                            style.color = [1., 0.85, 0.2];
+                            style.color = self
+                                .content
+                                .context
+                                .highlight_color
+                                .unwrap_or([1., 0.85, 0.2]);
                             style.opacity = 0.35;
                         }
                         let mark = Annotation::new(
@@ -1396,6 +1610,7 @@ impl Viewer {
                                 kind: match action {
                                     "highlight" => Markup::Highlight,
                                     "underline" => Markup::Underline,
+                                    "squiggly" => Markup::Squiggly,
                                     _ => Markup::Strikeout,
                                 },
                                 quads,
@@ -1701,6 +1916,7 @@ mod tests {
         for (action, expected) in [
             ("highlight", Markup::Highlight),
             ("underline", Markup::Underline),
+            ("squiggly", Markup::Squiggly),
             ("strikeout", Markup::Strikeout),
         ] {
             app.editor.text_selection =
@@ -1727,7 +1943,7 @@ mod tests {
         selection::set(&mut app.tabs[0], &mut app.editor, vec![id]);
         assert!(app.editor.text_selection.is_none());
         press_shortcut(&mut app, &ctx, "object_duplicate", false);
-        assert_eq!(app.tabs[0].session.as_ref().unwrap().annotations.len(), 4);
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().annotations.len(), 5);
     }
 
     #[test]
@@ -2107,6 +2323,236 @@ mod tests {
         }
     }
 
+    fn visible_bounds(output: &egui::FullOutput) -> HashMap<String, Rect> {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| {
+                let (label, b) = (node.label()?, node.bounds()?);
+                Some((
+                    label.to_owned(),
+                    Rect::from_min_max(
+                        pos2(b.x0 as f32, b.y0 as f32),
+                        pos2(b.x1 as f32, b.y1 as f32),
+                    ),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cascading_groups_keep_the_parent_visible_and_anchor_stable_and_use_the_captured_target() {
+        for (group, command) in [
+            ("Style", "Copy style"),
+            ("Transform", "Rotate 90° clockwise"),
+            ("Arrange", "Lock"),
+        ] {
+            let (mut app, ctx) = fixture();
+            let mut first = Annotation::new(
+                0,
+                [100., 100., 180., 180.],
+                Kind::Rectangle,
+                Default::default(),
+            );
+            first.style.color = [0.8, 0.2, 0.3];
+            let second = Annotation::new(
+                0,
+                [250., 100., 330., 180.],
+                Kind::Ellipse,
+                Default::default(),
+            );
+            app.tabs[0]
+                .session
+                .as_mut()
+                .unwrap()
+                .commit(vec![first.clone(), second.clone()])
+                .unwrap();
+            frame(&mut app, &ctx, vec![]);
+            click(
+                &mut app,
+                &ctx,
+                pos2(120., 150.),
+                egui::PointerButton::Secondary,
+            );
+            let before = visible_bounds(&frame(&mut app, &ctx, vec![]));
+            let id = egui::Id::new((app.tabs[0].id, 0usize, "contextual_page_menu"));
+            let anchor = egui::Popup::position_of_id(&ctx, id).unwrap();
+            let parent = before["Drawing properties…"];
+            // Hover opens a separate submenu without replacing any parent row.
+            frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::PointerMoved(before[group].center())],
+            );
+            let open = visible_bounds(&frame(&mut app, &ctx, vec![]));
+            assert!(open.contains_key(command), "missing child {command}");
+            for label in [
+                "Drawing properties…",
+                "Copy",
+                "Cut",
+                "Duplicate",
+                "Transform",
+                "Style",
+                "Arrange",
+                "Delete",
+            ] {
+                assert_eq!(
+                    open[label], before[label],
+                    "parent row moved or disappeared: {label}"
+                );
+            }
+            assert!(
+                open[command].left() > parent.right(),
+                "child must open beside parent"
+            );
+            assert!(!open.contains_key("Back to actions"));
+            assert_eq!(egui::Popup::position_of_id(&ctx, id), Some(anchor));
+            // Clicking an already hovered submenu must keep both menus alive.
+            menu_click(&mut app, &ctx, group);
+            for _ in 0..4 {
+                let current = visible_bounds(&frame(&mut app, &ctx, vec![]));
+                assert_eq!(current["Drawing properties…"], parent);
+                assert!(current.contains_key(command));
+            }
+            selection::set(&mut app.tabs[0], &mut app.editor, vec![second.id.clone()]);
+            menu_click(&mut app, &ctx, command);
+            assert!(!egui::Popup::is_any_open(&ctx));
+            let session = app.tabs[0].session.as_ref().unwrap();
+            let actual = session
+                .annotations
+                .iter()
+                .find(|a| a.id == first.id)
+                .unwrap();
+            match group {
+                "Style" => assert!(
+                    matches!(styles::pasted(&ctx, &styles::Preset::Drawing(second.style.clone())), Some(styles::Preset::Drawing(style)) if style == first.style)
+                ),
+                "Transform" => assert_eq!(actual.rotation, 90.),
+                _ => assert!(actual.object.locked),
+            }
+            assert_eq!(
+                session
+                    .annotations
+                    .iter()
+                    .find(|a| a.id == second.id)
+                    .unwrap(),
+                &second
+            );
+        }
+    }
+
+    #[test]
+    fn select_area_is_absent_from_every_page_and_inline_text_menu() {
+        let (mut app, ctx) = fixture();
+        let selected = passage(&mut app);
+        let key = (
+            app.tabs[0].id,
+            app.tabs[0].session.as_ref().unwrap().revision(),
+            0,
+        );
+        let targets = [
+            Target::Page,
+            Target::PendingText,
+            Target::SelectedText(selected),
+            Target::Text(Box::new(InlineText {
+                key,
+                target: InlineTarget::Run(0),
+                geometry: None,
+                original: "Text".into(),
+                text: "Text".into(),
+                rect: [70., 100., 130., 112.],
+                size: 12.,
+                color: [0.; 3],
+                font: "Helvetica".into(),
+                focus: false,
+            })),
+            Target::Image(content::ImageObject {
+                index: 0,
+                name: "Im1".into(),
+                pixels: [1, 1],
+                rect: [10., 10., 60., 60.],
+                matrix: [1., 0., 0., 1., 0., 0.],
+            }),
+            Target::Artwork(vec![Annotation::new(
+                0,
+                [50., 50., 100., 100.],
+                Kind::Rectangle,
+                Default::default(),
+            )]),
+            Target::Artwork(vec![Annotation::new(
+                0,
+                [50., 50., 100., 100.],
+                Kind::callout("Note"),
+                Default::default(),
+            )]),
+        ];
+        for target in targets {
+            for editable in [false, true] {
+                assert!(items(&target, editable).iter().all(
+                    |entry| entry.action != "text_area" && !entry.label.contains("Select area")
+                ));
+            }
+        }
+        app.editor.text_selection = None;
+        app.content
+            .place_text(app.tabs[0].id, 0, [50., 60.], app.tabs[0].pages[0]);
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        click(
+            &mut app,
+            &ctx,
+            pos2(100., 85.),
+            egui::PointerButton::Secondary,
+        );
+        let labels = visible_bounds(&frame(&mut app, &ctx, vec![]));
+        assert!(labels.contains_key("Delete text box"));
+        assert!(labels.keys().all(|label| !label.contains("Select area")));
+    }
+
+    #[test]
+    fn callout_menu_copies_text_and_opens_its_properties_without_pdf_text_editing() {
+        let (mut app, ctx) = fixture();
+        app.editor.mode = editing::Mode::Annotate;
+        let callout = Annotation::new(
+            0,
+            [70., 100., 230., 180.],
+            Kind::callout("Review İstanbul"),
+            Default::default(),
+        );
+        app.tabs[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .commit(vec![callout.clone()])
+            .unwrap();
+        let entries = items(&Target::Artwork(vec![callout.clone()]), true);
+        assert!(entries.iter().any(|e| e.label == "Callout properties…"));
+        assert!(entries.iter().any(|e| e.action == "copy_artwork_text"));
+        assert!(entries.iter().any(|e| e.action == "translate_text"));
+        assert!(!entries.iter().any(|e| e.action == "edit_text_here"));
+        run_command(
+            &mut app,
+            &ctx,
+            Target::Artwork(vec![callout.clone()]),
+            "copy_artwork_text",
+        );
+        let out = frame(&mut app, &ctx, vec![]);
+        assert!(out.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::CopyText(text) if text == "Review İstanbul")));
+        run_command(
+            &mut app,
+            &ctx,
+            Target::Artwork(vec![callout.clone()]),
+            "object_properties",
+        );
+        assert!(app.inspector);
+        assert_eq!(app.editor.draft.as_ref().unwrap().id, callout.id);
+        assert!(app.content.pending_text().is_none());
+    }
+
     #[test]
     fn drawing_menu_stays_compact_and_transform_submenu_remains_actionable() {
         for dark in [false, true] {
@@ -2432,6 +2878,185 @@ mod tests {
         s.undo();
         assert_eq!(content::images(&s.source, 1).unwrap().len(), 1);
     }
+    fn passage(app: &mut Viewer) -> text_selection::TextSelection {
+        use mypdf_milestone0::viewer::{GlyphBox, PageText};
+        let text = "First line\nSecond line";
+        app.tabs[0].text[0] = Some(Arc::new(PageText {
+            text: text.into(),
+            limited: false,
+            glyphs: text
+                .char_indices()
+                .filter(|(_, c)| *c != '\n')
+                .map(|(i, c)| {
+                    let row = usize::from(i > 10);
+                    let x = 70. + (if row == 0 { i } else { i - 11 }) as f32 * 6.;
+                    GlyphBox {
+                        range: i..i + c.len_utf8(),
+                        rect: [x, 100. + row as f32 * 20., x + 6., 112. + row as f32 * 20.],
+                    }
+                })
+                .collect(),
+        }));
+        text_selection::TextSelection::all(&app.tabs[0], 0).unwrap()
+    }
+
+    #[test]
+    fn selected_passage_markup_and_note_keep_annotate_mode_and_undo() {
+        let (mut app, ctx) = fixture();
+        app.editor.mode = editing::Mode::Annotate;
+        let selected = passage(&mut app);
+        let custom = [0.2, 0.6, 0.7];
+        app.content.context.highlight_color = Some(custom);
+        for (action, kind) in [
+            ("highlight", Markup::Highlight),
+            ("squiggly", Markup::Squiggly),
+        ] {
+            run_command(&mut app, &ctx, Target::SelectedText(selected), action);
+            assert_eq!(app.editor.mode, editing::Mode::Annotate);
+            let session = app.tabs[0].session.as_mut().unwrap();
+            let mark = session.annotations.last().unwrap();
+            assert_eq!(mark.rect, [70., 100., 136., 132.]);
+            let Kind::Markup {
+                kind: actual,
+                quads,
+            } = &mark.kind
+            else {
+                panic!("not markup")
+            };
+            assert_eq!(*actual, kind);
+            assert_eq!(quads.len(), 2);
+            assert_eq!(quads[0], [0., 0., 60. / 66., 12. / 32.]);
+            assert_eq!(quads[1], [0., 20. / 32., 1., 1.]);
+            if action == "highlight" {
+                assert_eq!(mark.style.color, custom);
+                assert_eq!(mark.style.opacity, 0.35);
+            }
+            session.undo();
+            assert!(session.annotations.is_empty());
+        }
+        run_command(
+            &mut app,
+            &ctx,
+            Target::SelectedText(selected),
+            "selection_note",
+        );
+        let session = app.tabs[0].session.as_mut().unwrap();
+        let note = &session.annotations[0];
+        assert_eq!(note.rect, [49., 100., 67., 118.]);
+        assert!(
+            matches!(&note.kind, Kind::Note { text } if text == "“First line\nSecond line”\n\n")
+        );
+        assert_eq!(
+            session.undo_label().as_deref(),
+            Some("Add note on selected text")
+        );
+        assert!(app.editor.note_requested.is_some());
+        assert_eq!(app.editor.mode, editing::Mode::Annotate);
+        session.undo();
+        assert!(session.annotations.is_empty());
+    }
+
+    #[test]
+    fn selected_text_menu_presets_apply_and_custom_picker_waits_for_apply() {
+        let (mut app, ctx) = fixture();
+        app.editor.mode = editing::Mode::Annotate;
+        passage(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        click(
+            &mut app,
+            &ctx,
+            pos2(98., 126.),
+            egui::PointerButton::Secondary,
+        );
+        menu_click(&mut app, &ctx, "Pink highlight");
+        let mark = &app.tabs[0].session.as_ref().unwrap().annotations[0];
+        assert_eq!(mark.style.color, HIGHLIGHT_COLORS[1].1);
+        assert_eq!(app.editor.mode, editing::Mode::Annotate);
+        app.tabs[0].session.as_mut().unwrap().undo();
+        selection::set(&mut app.tabs[0], &mut app.editor, vec![]);
+        passage(&mut app);
+        click(
+            &mut app,
+            &ctx,
+            pos2(98., 126.),
+            egui::PointerButton::Secondary,
+        );
+        menu_click(&mut app, &ctx, "Custom highlight color…");
+        assert!(egui::Popup::is_any_open(&ctx));
+        menu_click(&mut app, &ctx, "Blue preset");
+        assert!(
+            app.tabs[0].session.as_ref().unwrap().annotations.is_empty(),
+            "color adjustments must not commit midway"
+        );
+        assert!(egui::Popup::is_any_open(&ctx));
+        menu_click(&mut app, &ctx, "Apply highlight");
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().annotations.len(), 1);
+        assert!(!egui::Popup::is_any_open(&ctx));
+    }
+
+    #[test]
+    fn selected_passage_wins_over_existing_highlight_without_changing_mode() {
+        let (mut app, _) = fixture();
+        app.editor.mode = editing::Mode::Annotate;
+        let selected = passage(&mut app);
+        app.tabs[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .commit(vec![Annotation::new(
+                0,
+                [70., 100., 136., 132.],
+                Kind::Markup {
+                    kind: Markup::Highlight,
+                    quads: vec![[0., 0., 1., 1.]],
+                },
+                Style::default(),
+            )])
+            .unwrap();
+        app.editor.text_selection = Some(selected);
+        let target = target_at(
+            &app.content,
+            &mut app.editor,
+            &mut app.tabs[0],
+            0,
+            [78., 106.],
+            1.,
+        );
+        assert!(matches!(target, Target::SelectedText(s) if s == selected));
+        assert_eq!(app.editor.text_selection, Some(selected));
+        assert!(app.tabs[0].selected_annotation.is_none());
+        assert_eq!(app.editor.mode, editing::Mode::Annotate);
+    }
+
+    #[test]
+    fn selection_commands_respect_readonly_and_select_all_preserves_mode() {
+        let (mut app, ctx) = fixture();
+        app.editor.mode = editing::Mode::Annotate;
+        let selection = passage(&mut app);
+        app.tabs[0].session.as_mut().unwrap().editable = false;
+        for action in [
+            "highlight",
+            "squiggly",
+            "selection_note",
+            "selection_bookmark",
+        ] {
+            run_command(&mut app, &ctx, Target::SelectedText(selection), action);
+        }
+        assert!(app.tabs[0].session.as_ref().unwrap().annotations.is_empty());
+        assert!(app.content.context.bookmark.is_none());
+        run_command(&mut app, &ctx, Target::SelectedText(selection), "all_text");
+        assert_eq!(app.editor.mode, editing::Mode::Annotate);
+        assert_eq!(
+            app.editor
+                .text_selection
+                .unwrap()
+                .text(&app.tabs[0])
+                .as_deref(),
+            Some("First line\nSecond line")
+        );
+        assert!(!commands(&Target::SelectedText(selection), true).contains(&"edit_text_here"));
+    }
+
     #[test]
     fn context_translation_stays_with_text_and_omits_page_and_zoom_actions() {
         use mypdf_milestone0::viewer::{GlyphBox, PageText};
@@ -2719,6 +3344,113 @@ mod tests {
             );
         }
         auto_edit_frame(app, ctx, vec![]);
+    }
+
+    fn selected_artwork_fixture() -> (Viewer, egui::Context, Annotation) {
+        let (mut app, ctx, _) = auto_edit_fixture([100., 200., 200., 300.]);
+        let mark = Annotation::new(
+            0,
+            [300., 200., 400., 300.],
+            Kind::Rectangle,
+            mypdf_milestone0::annotations::Style {
+                fill: Some([0.9, 0.95, 1.]),
+                ..Default::default()
+            },
+        );
+        let source = app.tabs[0].session.as_ref().unwrap().source.clone();
+        app.tabs[0].session = Some(mypdf_milestone0::annotations::Session::new(
+            source,
+            vec![mark.clone()],
+            true,
+        ));
+        selection::set(&mut app.tabs[0], &mut app.editor, vec![mark.id.clone()]);
+        for _ in 0..2 {
+            auto_edit_frame(&mut app, &ctx, vec![]);
+        }
+        (app, ctx, mark)
+    }
+
+    #[test]
+    fn edit_blank_click_clears_artwork_selection_and_preserves_pending_properties() {
+        let (mut app, ctx, mark) = selected_artwork_fixture();
+        let source = app.tabs[0].session.as_ref().unwrap().source.clone();
+        let draft = app.editor.draft.as_mut().unwrap();
+        draft.style.color = [0.8, 0.2, 0.1];
+        draft.style.width = 5.;
+
+        auto_edit_click(&mut app, &ctx, pos2(470., 450.));
+
+        assert!(app.tabs[0].selected_annotation.is_none());
+        assert!(app.editor.draft.is_none());
+        assert!(app.editor.mode == editing::Mode::Edit);
+        assert!(app.content.context.clear_selection.is_none());
+        let session = app.tabs[0].session.as_mut().unwrap();
+        assert_eq!(session.revision(), 1);
+        assert_eq!(session.annotations[0].style.color, [0.8, 0.2, 0.1]);
+        assert_eq!(session.annotations[0].style.width, 5.);
+        assert_eq!(session.source, source);
+        session.undo();
+        assert_eq!(session.annotations, vec![mark]);
+    }
+
+    #[test]
+    fn edit_inside_artwork_click_keeps_selection_and_pending_properties() {
+        let (mut app, ctx, mark) = selected_artwork_fixture();
+        app.editor.draft.as_mut().unwrap().style.width = 5.;
+
+        auto_edit_click(&mut app, &ctx, pos2(370., 270.));
+
+        assert_eq!(
+            app.tabs[0].selected_annotation.as_deref(),
+            Some(mark.id.as_str())
+        );
+        assert_eq!(app.editor.draft.as_ref().unwrap().style.width, 5.);
+        assert!(app.content.context.clear_selection.is_none());
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
+        assert!(app.editor.mode == editing::Mode::Edit);
+    }
+
+    #[test]
+    fn annotate_blank_click_does_not_use_edit_selection_clearing() {
+        let (mut app, ctx, mark) = selected_artwork_fixture();
+        app.editor.mode = editing::Mode::Annotate;
+        app.editor.select_tool(editing::Tool::Select);
+        app.editor.draft.as_mut().unwrap().style.width = 5.;
+
+        auto_edit_click(&mut app, &ctx, pos2(470., 450.));
+
+        assert_eq!(
+            app.tabs[0].selected_annotation.as_deref(),
+            Some(mark.id.as_str())
+        );
+        assert_eq!(app.editor.draft.as_ref().unwrap().style.width, 5.);
+        assert!(app.content.context.clear_selection.is_none());
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
+        assert!(app.editor.mode == editing::Mode::Annotate);
+    }
+
+    #[test]
+    fn edit_image_click_keeps_selection_until_blank_page_click() {
+        let (mut app, ctx, _) = auto_edit_fixture([100., 200., 200., 300.]);
+        let source = app.tabs[0].session.as_ref().unwrap().source.clone();
+        for _ in 0..2 {
+            auto_edit_frame(&mut app, &ctx, vec![]);
+        }
+        for _ in 0..2 {
+            auto_edit_click(&mut app, &ctx, pos2(170., 270.));
+            assert_eq!(app.content.selected, Some(0));
+            assert!(app.content.image_mode);
+            assert!(app.content.context.clear_selection.is_none());
+        }
+
+        auto_edit_click(&mut app, &ctx, pos2(470., 450.));
+
+        assert!(app.content.selected.is_none());
+        assert!(!app.content.image_mode);
+        assert!(app.content.context.clear_selection.is_none());
+        let session = app.tabs[0].session.as_ref().unwrap();
+        assert_eq!(session.revision(), 0);
+        assert_eq!(session.source, source);
     }
 
     #[test]

@@ -284,6 +284,7 @@ pub(super) enum Icon {
     Select,
     Highlight,
     Underline,
+    Squiggly,
     Strikeout,
     Text,
     TextArea,
@@ -295,10 +296,33 @@ pub(super) enum Icon {
     AlignJustify,
     Note,
     Rectangle,
+    Square,
+    Diamond,
+    Triangle,
+    Pentagon,
+    Hexagon,
+    Ellipse,
     Circle,
+    Semicircle,
     Line,
+    DashedLine,
+    DottedLine,
+    DashDotLine,
+    WavyLine,
+    DoubleLine,
+    ElbowLine,
+    SteppedLine,
+    CurvedLine,
     Arrow,
     DoubleArrow,
+    ElbowArrow,
+    SteppedArrow,
+    CurvedArrow,
+    DoubleElbowArrow,
+    DoubleSteppedArrow,
+    DoubleCurvedArrow,
+    Eraser,
+    Callout,
     Polyline,
     Polygon,
     Stamp,
@@ -797,6 +821,53 @@ fn draw_icon_impl(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             line(&[[0.14, 0.5], [0.14, 0.86], [0.5, 0.86]]);
             line(&[[0.5, 0.14], [0.86, 0.14], [0.86, 0.5]]);
         }
+        Icon::ElbowArrow | Icon::DoubleElbowArrow => {
+            line(&[[0.12, 0.82], [0.82, 0.82], [0.82, 0.18]]);
+            line(&[[0.66, 0.36], [0.82, 0.18], [0.98, 0.36]]);
+            if matches!(icon, Icon::DoubleElbowArrow) {
+                line(&[[0.3, 0.66], [0.12, 0.82], [0.3, 0.98]]);
+            }
+        }
+        Icon::SteppedArrow | Icon::DoubleSteppedArrow => {
+            line(&[[0.12, 0.82], [0.5, 0.82], [0.5, 0.2], [0.86, 0.2]]);
+            line(&[[0.66, 0.05], [0.86, 0.2], [0.66, 0.36]]);
+            if matches!(icon, Icon::DoubleSteppedArrow) {
+                line(&[[0.3, 0.66], [0.12, 0.82], [0.3, 0.98]]);
+            }
+        }
+        Icon::CurvedArrow | Icon::DoubleCurvedArrow => {
+            let points: Vec<_> = (0..=20)
+                .map(|i| {
+                    let t = i as f32 / 20.;
+                    [0.12 + 0.76 * t, 0.82 - 0.65 * (2. * t - t * t)]
+                })
+                .collect();
+            line(&points);
+            line(&[[0.67, 0.04], [0.88, 0.17], [0.71, 0.36]]);
+            if matches!(icon, Icon::DoubleCurvedArrow) {
+                line(&[[0.1, 0.6], [0.12, 0.82], [0.33, 0.72]]);
+            }
+        }
+        Icon::Eraser => {
+            line(&[
+                [0.14, 0.62],
+                [0.6, 0.12],
+                [0.9, 0.4],
+                [0.47, 0.86],
+                [0.31, 0.86],
+                [0.14, 0.7],
+                [0.14, 0.62],
+            ]);
+            line(&[[0.39, 0.34], [0.69, 0.62]]);
+            line(&[[0.57, 0.88], [0.92, 0.88]]);
+        }
+        Icon::Callout => {
+            box_at([0.3, 0.1], [0.92, 0.62], 0.04);
+            line(&[[0.61, 0.62], [0.61, 0.83], [0.08, 0.83]]);
+            line(&[[0.26, 0.69], [0.08, 0.83], [0.26, 0.97]]);
+            line(&[[0.42, 0.28], [0.81, 0.28]]);
+            line(&[[0.42, 0.44], [0.7, 0.44]]);
+        }
         Icon::Crop => {
             line(&[[0.26, 0.06], [0.26, 0.74], [0.94, 0.74]]);
             line(&[[0.06, 0.26], [0.74, 0.26], [0.74, 0.94]]);
@@ -1085,6 +1156,28 @@ fn draw_icon_impl(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             ]);
             line(&[[0.16, 0.9], [0.84, 0.9]]);
         }
+        Icon::Squiggly => {
+            line(&[
+                [0.26, 0.1],
+                [0.26, 0.45],
+                [0.34, 0.59],
+                [0.5, 0.64],
+                [0.66, 0.59],
+                [0.74, 0.45],
+                [0.74, 0.1],
+            ]);
+            line(&[
+                [0.12, 0.89],
+                [0.21, 0.81],
+                [0.30, 0.89],
+                [0.39, 0.81],
+                [0.48, 0.89],
+                [0.57, 0.81],
+                [0.66, 0.89],
+                [0.75, 0.81],
+                [0.84, 0.89],
+            ]);
+        }
         Icon::Strikeout => {
             line(&[
                 [0.76, 0.22],
@@ -1127,10 +1220,90 @@ fn draw_icon_impl(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             line(&[[0.3, 0.5], [0.58, 0.5]]);
         }
         Icon::Rectangle => box_at([0.1, 0.2], [0.9, 0.8], 0.08),
+        Icon::Square => box_at([0.17, 0.17], [0.83, 0.83], 0.03),
+        Icon::Diamond => line(&[
+            [0.5, 0.08],
+            [0.9, 0.5],
+            [0.5, 0.92],
+            [0.1, 0.5],
+            [0.5, 0.08],
+        ]),
+        Icon::Triangle => line(&[[0.5, 0.1], [0.91, 0.87], [0.09, 0.87], [0.5, 0.1]]),
+        Icon::Pentagon | Icon::Hexagon => {
+            let sides = if matches!(icon, Icon::Pentagon) { 5 } else { 6 };
+            let points: Vec<_> = (0..=sides)
+                .map(|i| {
+                    let angle = i as f32 * std::f32::consts::TAU / sides as f32
+                        - std::f32::consts::FRAC_PI_2;
+                    [0.5 + angle.cos() * 0.42, 0.5 + angle.sin() * 0.42]
+                })
+                .collect();
+            line(&points);
+        }
+        Icon::Semicircle => {
+            let points: Vec<_> = (0..=20)
+                .map(|i| {
+                    let angle = i as f32 / 20. * std::f32::consts::PI;
+                    [0.5 - angle.cos() * 0.42, 0.7 - angle.sin() * 0.42]
+                })
+                .chain(std::iter::once([0.08, 0.7]))
+                .collect();
+            line(&points);
+        }
+        Icon::Ellipse => {
+            let points: Vec<_> = (0..=32)
+                .map(|i| {
+                    let angle = i as f32 / 32. * std::f32::consts::TAU;
+                    [0.5 + angle.cos() * 0.43, 0.5 + angle.sin() * 0.3]
+                })
+                .collect();
+            line(&points);
+        }
         Icon::Circle => {
             painter.circle_stroke(rect.center(), rect.width() * 0.37, stroke);
         }
         Icon::Line => line(&[[0.14, 0.86], [0.86, 0.14]]),
+        Icon::DashedLine => {
+            line(&[[0.14, 0.86], [0.3, 0.7]]);
+            line(&[[0.42, 0.58], [0.58, 0.42]]);
+            line(&[[0.7, 0.3], [0.86, 0.14]]);
+        }
+        Icon::DottedLine => {
+            for i in 0..5 {
+                let t = i as f32 / 4.;
+                painter.circle_filled(p(0.14 + 0.72 * t, 0.86 - 0.72 * t), width * 0.8, color);
+            }
+        }
+        Icon::DashDotLine => {
+            line(&[[0.14, 0.86], [0.34, 0.66]]);
+            painter.circle_filled(p(0.5, 0.5), width * 0.8, color);
+            line(&[[0.66, 0.34], [0.86, 0.14]]);
+        }
+        Icon::WavyLine => {
+            let points: Vec<_> = (0..=28)
+                .map(|i| {
+                    let t = i as f32 / 28.;
+                    let wave = (t * 4. * std::f32::consts::PI).sin() * 0.07;
+                    [0.14 + 0.72 * t + wave, 0.86 - 0.72 * t + wave]
+                })
+                .collect();
+            line(&points);
+        }
+        Icon::DoubleLine => {
+            line(&[[0.1, 0.76], [0.76, 0.1]]);
+            line(&[[0.24, 0.9], [0.9, 0.24]]);
+        }
+        Icon::ElbowLine => line(&[[0.12, 0.82], [0.82, 0.82], [0.82, 0.18]]),
+        Icon::SteppedLine => line(&[[0.12, 0.82], [0.5, 0.82], [0.5, 0.2], [0.86, 0.2]]),
+        Icon::CurvedLine => {
+            let points: Vec<_> = (0..=20)
+                .map(|i| {
+                    let t = i as f32 / 20.;
+                    [0.12 + 0.76 * t, 0.82 - 0.65 * (2. * t - t * t)]
+                })
+                .collect();
+            line(&points);
+        }
         Icon::Arrow => {
             line(&[[0.14, 0.86], [0.84, 0.16]]);
             line(&[[0.44, 0.16], [0.84, 0.16], [0.84, 0.56]]);

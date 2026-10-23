@@ -433,11 +433,14 @@ fn signing_time_label() -> String {
     format!("{} {:02}:{:02} UTC", now.date(), now.hour(), now.minute())
 }
 
-/// Appearance pixels and their bounds relative to the originally drawn box.
+/// Preview pixels and their bounds relative to the originally drawn box.
 #[derive(Clone, Debug)]
 pub struct SignatureAppearance {
     pub png: Vec<u8>,
     pub bounds: [f32; 4],
+    // Keep the same composition as PDF objects for the signed appearance. The
+    // preview bitmap must never become the final signature's resolution limit.
+    pdf: Vec<u8>,
 }
 impl SignatureAppearance {
     pub fn page_rect(&self, rect: [f32; 4]) -> [f32; 4] {
@@ -613,18 +616,17 @@ pub fn signature_appearance(request: &DesktopSigningRequest) -> Result<Signature
         if !request.transform.fit_to_content {
             let mut all = backdrop.clone();
             all.extend(marks);
+            let pdf = crate::annotations::export(&base, &all)?;
             return Ok(SignatureAppearance {
-                png: render_pdf(crate::annotations::export(&base, &all)?, transparent)?,
+                png: render_pdf(pdf.clone(), transparent)?,
                 bounds: [0., 0., 1., 1.],
+                pdf,
             });
         }
         // Measure only the artwork, never the fill/frame. Keep its page position and
         // scale unchanged when trimming, and use the same bounds in preview and signing.
-        let ink = crate::assets::decode_png(&render_pdf(
-            crate::annotations::export(&base, &marks)?,
-            true,
-        )?)?
-        .into_rgba8();
+        let ink_pdf = crate::annotations::export(&base, &marks)?;
+        let ink = crate::assets::decode_png(&render_pdf(ink_pdf.clone(), true)?)?.into_rgba8();
         let (pw, ph) = ink.dimensions();
         let mut bounds = [pw, ph, 0, 0];
         for (x, y, pixel) in ink.enumerate_pixels() {
@@ -658,8 +660,8 @@ pub fn signature_appearance(request: &DesktopSigningRequest) -> Result<Signature
             bounds[2] as f32 / pw as f32,
             bounds[3] as f32 / ph as f32,
         ];
-        let image = if backdrop.is_empty() {
-            ink
+        let (image, pdf) = if backdrop.is_empty() {
+            (ink, ink_pdf)
         } else {
             let mut all = backdrop.clone();
             for mark in &mut all {
@@ -679,11 +681,10 @@ pub fn signature_appearance(request: &DesktopSigningRequest) -> Result<Signature
                 ];
             }
             all.extend(marks);
-            crate::assets::decode_png(&render_pdf(
-                crate::annotations::export(&base, &all)?,
-                transparent,
-            )?)?
-            .into_rgba8()
+            let pdf = crate::annotations::export(&base, &all)?;
+            let image =
+                crate::assets::decode_png(&render_pdf(pdf.clone(), transparent)?)?.into_rgba8();
+            (image, pdf)
         };
         let cropped = image::imageops::crop_imm(
             &image,
@@ -698,6 +699,7 @@ pub fn signature_appearance(request: &DesktopSigningRequest) -> Result<Signature
         Ok(SignatureAppearance {
             png: png.into_inner(),
             bounds: normalized,
+            pdf,
         })
     };
     let padding = request.transform.outer_padding.map(|p| p * k);
@@ -871,6 +873,68 @@ pub fn signature_appearance(request: &DesktopSigningRequest) -> Result<Signature
     render(annotations, transparent)
 }
 
+/// Paint the composition's annotation appearances into a PDF page, retaining
+/// vector lettering/ink and original image samples. Normalize fitted bounds
+/// and compensate for the destination page's rotation in vector coordinates.
+fn signature_pdf_page(
+    appearance: &SignatureAppearance,
+    rotation: hayro::hayro_syntax::page::Rotation,
+) -> Result<Vec<u8>> {
+    use hayro::{hayro_syntax::page::Rotation, kurbo::Affine};
+    use lopdf::{Document, Object, Stream, dictionary};
+    let mut doc = Document::load_mem(&appearance.pdf)?;
+    let page = doc.get_pages()[&1];
+    let media = doc.get_dictionary(page)?.get(b"MediaBox")?.as_array()?;
+    let (w, h) = (media[2].as_float()?, media[3].as_float()?);
+    let [left, top, right, bottom] = appearance.bounds;
+    let (cw, ch) = ((right - left) * w, (bottom - top) * h);
+    let crop = Affine::translate((-(left * w) as f64, -((1. - bottom) * h) as f64));
+    let (turn, width, height) = match rotation {
+        Rotation::None => (Affine::IDENTITY, cw, ch),
+        Rotation::Horizontal => (Affine::new([0., 1., -1., 0., ch as f64, 0.]), ch, cw),
+        Rotation::Flipped => (
+            Affine::new([-1., 0., 0., -1., cw as f64, ch as f64]),
+            cw,
+            ch,
+        ),
+        Rotation::FlippedHorizontal => (Affine::new([0., -1., 1., 0., 0., cw as f64]), ch, cw),
+    };
+    crate::nup::flatten_appearances(&mut doc, page)?;
+    // Let PDF viewers smoothly resample photographs/scans when scaled or
+    // rotated, while retaining the source RGB and alpha samples exactly.
+    for object in doc.objects.values_mut() {
+        if let Ok(stream) = object.as_stream_mut()
+            && stream
+                .dict
+                .get(b"Subtype")
+                .and_then(Object::as_name)
+                .is_ok_and(|n| n == b"Image")
+        {
+            stream.dict.set("Interpolate", true);
+        }
+    }
+    let [a, b, c, d, e, f] = (turn * crop).as_coeffs();
+    let mut content = format!("q {a} {b} {c} {d} {e} {f} cm\n").into_bytes();
+    content.extend(doc.get_page_content(page));
+    content.extend(b"\nQ\n");
+    let contents = doc.add_object(Stream::new(dictionary! {}, content));
+    let page = doc.get_dictionary_mut(page)?;
+    page.set("Contents", contents);
+    page.set(
+        "MediaBox",
+        vec![
+            0.into(),
+            0.into(),
+            Object::Real(width),
+            Object::Real(height),
+        ],
+    );
+    doc.prune_objects();
+    let mut bytes = vec![];
+    doc.save_to(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// Shrink a text or stamp mark until it fits its box; other marks are kept as they are.
 fn fit_text(
     base: &[u8],
@@ -898,7 +962,6 @@ pub async fn sign_custom(
     request: &DesktopSigningRequest,
 ) -> Result<Vec<u8>> {
     use hayro::hayro_interpret::TransformExt;
-    use underskrift::visual::{ImageConfig, ImageFormat, ImageScale};
     let before = checked_input(bytes, signer, &request.field)?;
     ensure!(
         request.name.len() <= 200 && request.reason.len() <= 1000 && request.location.len() <= 300,
@@ -922,16 +985,7 @@ pub async fn sign_custom(
         );
         let appearance = signature_appearance(request)?;
         let rect = appearance.page_rect(rect);
-        let image = crate::assets::decode_png(&appearance.png)?.into_rgba8();
-        use hayro::hayro_syntax::page::Rotation;
-        let image = match page.rotation() {
-            Rotation::None => image,
-            Rotation::Horizontal => image::imageops::rotate270(&image),
-            Rotation::Flipped => image::imageops::rotate180(&image),
-            Rotation::FlippedHorizontal => image::imageops::rotate90(&image),
-        };
-        let mut data = std::io::Cursor::new(vec![]);
-        image::DynamicImage::ImageRgba8(image).write_to(&mut data, image::ImageFormat::Png)?;
+        let data = signature_pdf_page(&appearance, page.rotation())?;
         let rect = page
             .initial_transform(true)
             .to_kurbo()
@@ -950,11 +1004,7 @@ pub async fn sign_custom(
                 urx: rect.x1 as f32,
                 ury: rect.y1 as f32,
             },
-            layout: SignatureLayout::ImageOnly(ImageConfig {
-                data: data.into_inner(),
-                format: ImageFormat::Png,
-                scale: ImageScale::Stretch,
-            }),
+            layout: SignatureLayout::PdfPage(data),
             background_color: None,
             border: None,
         })

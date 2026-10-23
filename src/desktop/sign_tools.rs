@@ -5,6 +5,7 @@ pub(super) struct State {
     signing: SigningPreferences,
     preference_root: PathBuf,
     preference_error: Option<String>,
+    armed: Option<&'static str>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -45,6 +46,7 @@ impl State {
             signing,
             preference_root: root,
             preference_error,
+            armed: None,
         }
     }
     fn save_signing(&mut self) {
@@ -81,8 +83,16 @@ impl Viewer {
             (Icon::Sign, "Quick Sign", "sign_quick"),
             (Icon::Settings, "Manage Signs", "sign_manage"),
         ] {
-            if ui.add(ActionButton::new(icon, label)).clicked() {
-                action = Some(key);
+            let selected = self.signing_tool_selected(key);
+            if ui
+                .add(ActionButton::new(icon, label).selected(selected))
+                .clicked()
+            {
+                if selected {
+                    self.cancel_signing_tool();
+                } else {
+                    action = Some(key);
+                }
             }
             if key != "sign_manage" {
                 ui.separator();
@@ -106,6 +116,22 @@ impl Viewer {
         action
     }
 
+    fn signing_tool_selected(&self, action: &str) -> bool {
+        self.sign_tools.armed == Some(action)
+            && (self.editor.tool == editing::Tool::SignArea
+                || self.editor.signature_open
+                || self.workbench.paste.is_some())
+    }
+    fn cancel_signing_tool(&mut self) {
+        self.sign_tools.armed = None;
+        self.editor.signature_open = false;
+        self.editor.pending_sign_rect = None;
+        self.editor.select_tool(editing::Tool::Select);
+        self.workbench.paste = None;
+        self.digital.quick = false;
+        self.status = None;
+    }
+
     pub(super) fn signing_ribbon_action(&mut self, action: &str) {
         if !self.apply_pending_annotation() {
             return;
@@ -114,6 +140,12 @@ impl Viewer {
         self.editor.signature_open = false;
         self.editor.pending_sign_rect = None;
         self.editor.mode = editing::Mode::Sign;
+        self.sign_tools.armed = match action {
+            "sign_ink" => Some("sign_ink"),
+            "sign_quick" => Some("sign_quick"),
+            "sign_digital" => Some("sign_digital"),
+            _ => None,
+        };
         match action {
             "sign_ink" => {
                 self.editor.tool = editing::Tool::Select;
@@ -238,6 +270,19 @@ mod tests {
                 assert!(!app.digital.open && !app.digital.quick);
                 assert!(app.editor.tool == editing::Tool::SignArea);
                 assert!(app.editor.pending_sign_rect.is_none());
+                click(&mut app, &ctx, at);
+                assert!(app.editor.tool == editing::Tool::Select);
+                assert!(app.editor.mode == editing::Mode::Sign);
+                let action = if label == "Quick Sign" {
+                    "sign_quick"
+                } else {
+                    "sign_digital"
+                };
+                // Commands keep arming; only a ribbon re-click toggles off.
+                app.signing_ribbon_action(action);
+                app.signing_ribbon_action(action);
+                assert!(app.editor.tool == editing::Tool::SignArea);
+                app.cancel_signing_tool();
             }
             // An absent default opens the ink picker rather than dropping the action.
             let at = bounds(&mut app, &ctx, "Sign in ink")[0];

@@ -457,8 +457,18 @@ pub(super) fn nudge(
         .filter(|a| ids.contains(&a.id))
         .cloned()
         .collect();
+    if marks
+        .iter()
+        .any(|mark| mark.object.locked || mark.object.hidden)
+    {
+        return None;
+    }
     let page = tab.pages.get(marks.first()?.page).copied()?;
-    commit(tab, &moved(&marks, d, page), None, status)
+    let changed = moved(&marks, d, page);
+    if changed == marks {
+        return None;
+    }
+    commit(tab, &changed, None, status)
 }
 
 fn corners(b: Box2) -> [[f32; 2]; 4] {

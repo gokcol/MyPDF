@@ -1,53 +1,73 @@
+//! Fictional visual proof of editable, vector annotation appearances.
 use mypdf_milestone0::{
-    annotations::{self as ann, Annotation, Kind, Style, Symbol},
-    document, write_new,
+    annotations::{self, Annotation, FillPattern, Kind, Markup, Style},
+    content, convert,
 };
+
 fn main() -> anyhow::Result<()> {
-    let out = std::path::PathBuf::from(
-        std::env::args()
-            .nth(1)
-            .unwrap_or_else(|| "artifacts/milestone3-proof".into()),
-    );
-    std::fs::create_dir_all(&out)?;
-    let source = document::fixture(&document::default_font()?)?;
-    let mut a = vec![
-        Annotation::new(
+    let root = std::path::PathBuf::from(std::env::args().nth(1).expect("output directory"));
+    std::fs::create_dir_all(&root)?;
+    let mut source = convert::blank(595., 842.)?;
+    for (text, y, size) in [
+        ("Annotation review", 45., 24.),
+        ("Select this sentence to review or bookmark.", 100., 16.),
+        ("Continuous squiggly underline", 142., 16.),
+    ] {
+        source = content::add_text(
+            &source,
+            1,
+            text,
+            [50., y, 500., 34.],
+            size,
+            [0.1, 0.15, 0.2],
+        )?;
+    }
+    let mut marks = vec![Annotation::new(
+        0,
+        [50., 145., 300., 164.],
+        Kind::Markup {
+            kind: Markup::Squiggly,
+            quads: vec![[0., 0., 1., 1.]],
+        },
+        Style {
+            color: [0.8, 0.15, 0.25],
+            width: 1.2,
+            ..Default::default()
+        },
+    )];
+    for (i, pattern) in FillPattern::ALL.into_iter().enumerate() {
+        let x = 50. + (i % 2) as f32 * 260.;
+        let y = 220. + (i / 2) as f32 * 145.;
+        source = content::add_text(
+            &source,
+            1,
+            pattern.label(),
+            [x, y - 30., 220., 25.],
+            13.,
+            [0.15, 0.2, 0.25],
+        )?;
+        marks.push(Annotation::new(
             0,
-            [72.0, 270.0, 530.0, 332.0],
-            Kind::Text {
-                text: "İstanbul: sözleşme gözden geçirildi. Native Rust annotation.".into(),
-            },
-            Style::default(),
-        ),
-        Annotation::new(
-            0,
-            [420.0, 390.0, 490.0, 440.0],
-            Kind::Symbol(Symbol::Check),
-            Style::default(),
-        ),
-        Annotation::new(
-            0,
-            [180.0, 390.0, 370.0, 445.0],
-            Kind::Stamp {
-                text: "APPROVED".into(),
+            [x, y, x + 210., y + 90.],
+            if i % 2 == 0 {
+                Kind::Rectangle
+            } else {
+                Kind::Ellipse
             },
             Style {
-                font_size: 20.0,
+                color: [0.1, 0.35, 0.55],
+                fill: Some([0.2, 0.55, 0.65]),
+                fill_pattern: pattern,
+                opacity: 0.85,
+                width: 1.5,
                 ..Default::default()
             },
-        ),
-        Annotation::new(
-            1,
-            [310.0, 380.0, 472.0, 458.0],
-            Kind::Text {
-                text: "Rotated page\nİstanbul, Türkçe.".into(),
-            },
-            Style::default(),
-        ),
-    ];
-    a[2].rotation = -8.0;
-    let output = ann::export(&source, &a)?;
-    write_new(&out.join("annotations.pdf"), &output)?;
-    document::render(&output, &out.join("hayro"), 1.0)?;
+        ));
+    }
+    std::fs::write(
+        root.join("annotations.pdf"),
+        annotations::export(&source, &marks)?,
+    )?;
+    std::fs::write(root.join("selection.pdf"), source)?;
     Ok(())
 }

@@ -1,6 +1,6 @@
 ﻿; The MyPDF installer for 64-bit Windows, built with Inno Setup 6 by the
 ; "Windows build" workflow:
-;   ISCC /DAppVersion=2.0.0 /DSource=pack\MyPDF /O<folder> /F<file name> MyPDF.iss
+;   ISCC /DAppVersion=2.1.0 /DSource=pack\MyPDF /O<folder> /F<file name> MyPDF.iss
 ; It installs for the current user without asking for administrator rights
 ; (or for everyone, if chosen), adds a Start menu entry and an uninstaller,
 ; and, when ticked, lists MyPDF in the "Open with" menu for PDF files.

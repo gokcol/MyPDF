@@ -258,7 +258,7 @@ pub(super) fn appearance(ui: &mut egui::Ui, preset: &mut Preset) {
                     });
                 }
                 Preset::Drawing(style) => {
-                    row(ui, "Pattern", |ui| patterns(ui, &mut style.stroke));
+                    row(ui, "Border style", |ui| patterns(ui, &mut style.stroke));
                     row(ui, "Line color", |ui| {
                         editing::color_palette(ui, &mut style.color);
                     });
@@ -278,6 +278,20 @@ pub(super) fn appearance(ui: &mut egui::Ui, preset: &mut Preset) {
                         }
                         if let Some(fill) = &mut style.fill {
                             ui::color_swatch(ui, fill, "Fill color");
+                        }
+                        if style.fill.is_some() {
+                            egui::ComboBox::from_id_salt("saved_style_fill_pattern")
+                                .selected_text(style.fill_pattern.label())
+                                .width(100.)
+                                .show_ui(ui, |ui| {
+                                    for pattern in mypdf_milestone0::annotations::FillPattern::ALL {
+                                        ui.selectable_value(
+                                            &mut style.fill_pattern,
+                                            pattern,
+                                            pattern.label(),
+                                        );
+                                    }
+                                });
                         }
                     });
                     egui::CollapsingHeader::new("More options").show(ui, |ui| {

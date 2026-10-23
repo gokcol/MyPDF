@@ -34,6 +34,8 @@ pub mod appearance;
 pub mod font;
 pub mod image;
 pub mod layout;
+#[cfg(feature = "visual")]
+mod pdf;
 
 // Re-export key types for convenience
 pub use appearance::{

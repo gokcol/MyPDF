@@ -7,16 +7,19 @@ MAKE IT YOUR WORKSPACE
 Choose Graphite, Glacier or Calico styling and Selective accents, Color families or Soft duotone icons. Appearance choices keep the controls in their familiar positions. Signature settings are grouped together for easy management.
 
 EDIT AND ANNOTATE
-Add text directly on the page and edit supported existing text and images. Highlight passages, add notes, draw shapes and arrows, and use standard stamps or your own SVG and image artwork. Move, resize, recolor, rotate, and flip supported objects.
+Add text directly on the page and select supported existing text or images automatically in Edit mode. Highlight, underline, use squiggly underlines or strike out passages, add notes and callouts, and draw with the pen or eraser. Choose grouped shapes, lines and arrows with stroke styles, pattern fills and independent start/end heads. Use standard stamps or your own SVG and image artwork. Move, resize, recolor, rotate, and flip supported objects. Save and manage reusable styles for different purposes.
+
+WORK WITH TABLES
+Create movable or embedded tables, edit cells, resize rows and columns, set colors and spacing, and apply built-in templates. Detect supported bordered tables in a selected area and detach them for editing.
 
 SIGN AND FILL
-Create a visual signature by drawing, typing, or importing an image. Add certificate-based digital signatures using a P12/PFX file or a supported Windows certificate-store identity. Fill PDF forms, create form fields, and import or export form data.
+Create a visual signature by drawing, typing, or importing an image. Add certificate-based digital signatures using a P12/PFX file or a supported Windows certificate-store identity, with sharp vector text and ink in the visible signature. Fill PDF forms, create form fields, and import or export form data.
 
 ORGANIZE YOUR PAGES
 Reorder, insert, delete, extract, merge, split, rotate, and crop pages. Export multiple PDF pages onto each sheet using preset or custom grids, with adjustable margins, headers, footers, and watermarks.
 
 CONVERT AND KEEP WORK MOVING
-Convert images to PDF, export pages as PNG or JPEG, and work with plain text, Markdown, and DOCX conversions. Use undo, safe saving, and local recovery copies while you work.
+Convert images to PDF and use the compact Export ribbon for Word, Text, Markdown and Image, with advanced options in the side panel. Export pages as PNG or JPEG. Use undo, safe saving, and local recovery copies while you work.
 
 EVERYDAY WORKFLOWS
 Reuse local document templates, batch-compress PDFs or add page numbers and watermarks, and prepare separate sharing copies with selected comments, attachments and metadata removed. Match nearby text styling and align objects using optional table and baseline guides.

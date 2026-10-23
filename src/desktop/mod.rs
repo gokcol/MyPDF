@@ -16,6 +16,7 @@ mod navigation_editor;
 mod nup;
 pub mod open_with;
 mod organize;
+mod pen_tools;
 #[cfg(any(not(target_os = "macos"), test))]
 mod portable_menu;
 mod preferences;
@@ -31,6 +32,7 @@ mod redaction;
 mod review;
 mod save;
 mod selection;
+mod selection_keys;
 mod shell_menu;
 mod shrink;
 mod sign_tools;
@@ -681,11 +683,12 @@ impl Viewer {
         }
     }
     fn action(&mut self, action: &str, ctx: &egui::Context) {
-        if self.productivity.owns_input()
-            && !matches!(
-                action,
-                "workflow_settings" | "templates" | "batch" | "sharing_copy"
-            )
+        if self.content.context.bookmark.is_some()
+            || self.productivity.owns_input()
+                && !matches!(
+                    action,
+                    "workflow_settings" | "templates" | "batch" | "sharing_copy"
+                )
         {
             match action {
                 "copy" => ctx.send_viewport_cmd(egui::ViewportCommand::RequestCopy),
@@ -715,6 +718,18 @@ impl Viewer {
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
             }
+            return;
+        }
+        if action == "paste"
+            && self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| self.table.has_editor(t.id))
+            && !self.table.chooser
+            && !self.digital.open
+            && !self.workbench_owns_shortcuts()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
             return;
         }
         if action == "paste" && self.live_text_has_focus(ctx) {
@@ -790,16 +805,18 @@ impl Viewer {
             "window_maximize" => ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(
                 !ctx.input(|i| i.viewport().maximized.unwrap_or(false)),
             )),
-            "annotate_highlight" | "annotate_underline" | "annotate_strikeout"
-            | "annotate_note" | "annotate_text" | "annotate_pen" | "annotate_rectangle"
-            | "annotate_ellipse" | "annotate_arrow" => {
+            "annotate_highlight" | "annotate_underline" | "annotate_squiggly"
+            | "annotate_strikeout" | "annotate_note" | "annotate_text" | "annotate_pen"
+            | "annotate_callout" | "annotate_rectangle" | "annotate_ellipse" | "annotate_arrow" => {
                 if !self.home.visible && self.apply_pending_annotation() {
                     self.editor.mode = editing::Mode::Annotate;
                     self.editor.select_tool(match action {
                         "annotate_highlight" => editing::Tool::Highlight,
                         "annotate_underline" => editing::Tool::Underline,
+                        "annotate_squiggly" => editing::Tool::Squiggly,
                         "annotate_strikeout" => editing::Tool::Strikeout,
                         "annotate_note" => editing::Tool::Note,
+                        "annotate_callout" => editing::Tool::Callout,
                         "annotate_text" => editing::Tool::Text,
                         "annotate_pen" => editing::Tool::Pen,
                         "annotate_rectangle" => editing::Tool::Rectangle,
@@ -1131,7 +1148,7 @@ impl Viewer {
             && !self.editor.text_editing
     }
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if self.productivity.owns_input() {
+        if self.productivity.owns_input() || self.content.context.bookmark.is_some() {
             return;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma)) {
@@ -1158,6 +1175,8 @@ impl Viewer {
             self.paste_image_over_text(ctx, clip);
             return;
         }
+        self.table_keys(ctx);
+        self.selection_keys(ctx);
         if self.context_shortcuts(ctx) {
             return;
         }
@@ -1239,12 +1258,6 @@ impl Viewer {
                 self.editor_undo(true);
             } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
                 self.editor_undo(false);
-            }
-            if matches!(
-                self.editor.mode,
-                editing::Mode::Annotate | editing::Mode::Draw
-            ) {
-                self.selection_keys(ctx);
             }
         }
         // Before ⌘F, which would also match ⇧⌘F.
@@ -1460,49 +1473,47 @@ impl Viewer {
                         + 6.
                 };
                 let full = ui.available_width();
-                // Reserve space for file actions and the search, translation and panel controls.
-                let compact = full < track_width(ui, false) + 354.;
+                // Three file/navigation controls on the left, four view controls
+                // on the right. Mode tabs remain centered whenever both groups fit.
+                const LEFT_WIDTH: f32 = 3. * 32. + 2. * 4.;
+                const RIGHT_WIDTH: f32 = 4. * 32. + 3. * 4.;
+                const GROUP_GAP: f32 = 8.;
+                let compact =
+                    full < track_width(ui, false) + LEFT_WIDTH + RIGHT_WIDTH + GROUP_GAP * 2.;
                 ui.horizontal(|ui| {
-                    for (icon, label, key) in [
-                        (Icon::Blank, "New blank PDF", "new"),
-                        (Icon::Open, "Open…", "open"),
-                        (
-                            Icon::Save,
-                            if cfg!(target_os = "macos") {
-                                "Save · ⌘S"
-                            } else {
-                                "Save · Ctrl+S"
-                            },
-                            "save",
-                        ),
-                        (
-                            Icon::SaveAs,
-                            if cfg!(target_os = "macos") {
-                                "Save As… · ⇧⌘S"
-                            } else {
-                                "Save As… · Ctrl+Shift+S"
-                            },
-                            "save_as",
-                        ),
-                        (Icon::Compare, "Compare Documents…", "compare"),
-                    ] {
-                        let enabled = !matches!(key, "save" | "save_as")
-                            || (!self.saving
-                                && self
-                                    .tabs
-                                    .get(self.active)
-                                    .is_some_and(|t| t.bytes.is_some()));
-                        if ui
-                            .add_enabled(enabled, ActionButton::new(icon, label).compact())
-                            .clicked()
-                        {
-                            action = Some(key);
-                        }
+                    if ui
+                        .add(ActionButton::new(Icon::Blank, "New blank PDF").compact())
+                        .clicked()
+                    {
+                        action = Some("new");
+                    }
+                    let can_save = !self.saving
+                        && self
+                            .tabs
+                            .get(self.active)
+                            .is_some_and(|tab| tab.bytes.is_some());
+                    if let Some(choice) = toolbar_file_button(ui, can_save) {
+                        action = Some(choice);
+                    }
+                    if ui
+                        .add(
+                            ActionButton::new(Icon::Sidebar, "Toggle left panel")
+                                .compact()
+                                .selected(self.sidebar),
+                        )
+                        .on_hover_text(if cfg!(target_os = "macos") {
+                            "Toggle left panel · ⇧⌘L"
+                        } else {
+                            "Toggle left panel · Ctrl+Shift+L"
+                        })
+                        .clicked()
+                    {
+                        action = Some("sidebar");
                     }
                     let used = ui.min_rect().width();
                     let track = track_width(ui, compact);
                     let centered = (full - track) / 2. - used;
-                    let room = full - track - used - 186.;
+                    let room = full - track - used - RIGHT_WIDTH - GROUP_GAP;
                     ui.add_space(centered.min(room).max(8.));
                     ui::segment_track(ui, |ui| {
                         for (mode, icon, label) in MODES {
@@ -1519,6 +1530,9 @@ impl Viewer {
                                 {
                                     self.content.new_commit = true;
                                     self.content.exit_text_tool = true;
+                                }
+                                if self.editor.mode != mode {
+                                    self.editor.eraser.finish();
                                 }
                                 self.editor.mode = mode;
                                 if mode == editing::Mode::Edit {
@@ -1547,16 +1561,6 @@ impl Viewer {
                             .clicked()
                         {
                             self.inspector = !self.inspector;
-                        }
-                        if ui
-                            .add(
-                                ActionButton::new(Icon::Sidebar, "Toggle left panel")
-                                    .compact()
-                                    .selected(self.sidebar),
-                            )
-                            .clicked()
-                        {
-                            self.sidebar = !self.sidebar;
                         }
                         if ui
                             .add(
@@ -2548,6 +2552,102 @@ impl eframe::App for Viewer {
     }
 }
 
+/// Open is the primary action, regardless of the last menu choice. The
+/// attached menu contains file actions without adding toolbar buttons.
+fn toolbar_file_button(ui: &mut egui::Ui, can_save: bool) -> Option<&'static str> {
+    let response = ui.add(ActionButton::new(Icon::Open, "Open…").compact());
+    let id = response.id.with("toolbar_file_actions");
+    let block_id = id.with("hover_blocked");
+    let mut blocked = ui
+        .ctx()
+        .data(|data| data.get_temp::<bool>(block_id))
+        .unwrap_or(false);
+    if !response.hovered() {
+        blocked = false;
+    }
+    if response.clicked() {
+        ui.ctx().data_mut(|data| data.insert_temp(block_id, true));
+        egui::Popup::close_id(ui.ctx(), id);
+        return Some("open");
+    }
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(block_id, blocked));
+    let popup_rect = ui
+        .ctx()
+        .data(|data| data.get_temp::<Rect>(id.with("bounds")));
+    if egui::Popup::is_id_open(ui.ctx(), id)
+        && ui
+            .ctx()
+            .input(|input| input.pointer.latest_pos())
+            .is_none_or(|point| {
+                !response.rect.expand(5.).contains(point)
+                    && popup_rect.is_none_or(|rect| !rect.expand(5.).contains(point))
+            })
+    {
+        egui::Popup::close_id(ui.ctx(), id);
+    }
+    let open = (response.hovered() && !blocked).then_some(egui::SetOpenCommand::Bool(true));
+    let mut chosen = None;
+    let popup = egui::Popup::new(id, ui.ctx().clone(), &response, ui.layer_id())
+        .kind(egui::PopupKind::Menu)
+        .layout(egui::Layout::top_down_justified(egui::Align::Min))
+        .style(egui::containers::menu::menu_style)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .gap(0.)
+        .open_memory(open)
+        .show(|ui| {
+            let shortcut = |modifiers, key| Some(egui::KeyboardShortcut::new(modifiers, key));
+            let choices = [
+                (
+                    Icon::Open,
+                    "Open…",
+                    "open",
+                    shortcut(egui::Modifiers::COMMAND, egui::Key::O),
+                ),
+                (
+                    Icon::Save,
+                    "Save",
+                    "save",
+                    shortcut(egui::Modifiers::COMMAND, egui::Key::S),
+                ),
+                (
+                    Icon::SaveAs,
+                    "Save As…",
+                    "save_as",
+                    shortcut(
+                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                        egui::Key::S,
+                    ),
+                ),
+            ];
+            let width = ui::menu_width(
+                ui,
+                choices
+                    .iter()
+                    .map(|(_, label, _, shortcut)| (*label, *shortcut)),
+            );
+            for (icon, label, command, shortcut) in choices {
+                if ui
+                    .add_enabled(
+                        command == "open" || can_save,
+                        ui::MenuItem::new(icon, label)
+                            .shortcut(shortcut)
+                            .width(width),
+                    )
+                    .clicked()
+                {
+                    chosen = Some(command);
+                    ui.close();
+                }
+            }
+        });
+    if let Some(popup) = popup {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(id.with("bounds"), popup.response.rect));
+    }
+    chosen
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3469,6 +3569,229 @@ mod tests {
         assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
     }
 
+    fn file_menu_frame(
+        ctx: &egui::Context,
+        can_save: bool,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, Option<&'static str>) {
+        let mut action = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(720., 480.))),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    action = toolbar_file_button(ui, can_save);
+                });
+            },
+        );
+        (output, action)
+    }
+    fn test_button_center(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        let r = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(label))
+            .unwrap_or_else(|| panic!("Missing {label}"))
+            .1
+            .bounds()
+            .unwrap();
+        pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32)
+    }
+    fn click_event(at: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+    #[test]
+    fn open_hover_is_passive_and_file_choices_never_replace_its_primary_action() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let (output, _) = file_menu_frame(&ctx, true, vec![]);
+        let at = test_button_center(&output, "Open…");
+        let (_, action) = file_menu_frame(&ctx, true, vec![egui::Event::PointerMoved(at)]);
+        assert_eq!(action, None);
+        let (output, action) = file_menu_frame(&ctx, true, vec![]);
+        assert_eq!(action, None);
+        let choice = test_button_center(&output, "Save As…");
+        assert_eq!(
+            file_menu_frame(&ctx, true, click_event(choice, true)).1,
+            None
+        );
+        assert_eq!(
+            file_menu_frame(&ctx, true, click_event(choice, false)).1,
+            Some("save_as")
+        );
+        assert!(!egui::Popup::is_any_open(&ctx));
+        // A direct click always opens. It must not repeat the previous Save As.
+        file_menu_frame(&ctx, true, click_event(at, true));
+        assert_eq!(
+            file_menu_frame(&ctx, true, click_event(at, false)).1,
+            Some("open")
+        );
+        for _ in 0..3 {
+            assert_eq!(file_menu_frame(&ctx, true, vec![]).1, None);
+            assert!(
+                !egui::Popup::is_any_open(&ctx),
+                "A direct click blocks immediate hover reopening"
+            );
+        }
+        file_menu_frame(
+            &ctx,
+            true,
+            vec![egui::Event::PointerMoved(pos2(600., 400.))],
+        );
+        file_menu_frame(&ctx, true, vec![egui::Event::PointerMoved(at)]);
+        assert!(
+            egui::Popup::is_any_open(&ctx),
+            "Leaving and returning restores the hover menu"
+        );
+    }
+    #[test]
+    fn open_hover_disables_save_actions_without_a_ready_document() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let (output, _) = file_menu_frame(&ctx, false, vec![]);
+        let at = test_button_center(&output, "Open…");
+        file_menu_frame(&ctx, false, vec![egui::Event::PointerMoved(at)]);
+        let (output, _) = file_menu_frame(&ctx, false, vec![]);
+        for label in ["Save", "Save As…"] {
+            let nodes = &output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes;
+            assert!(
+                nodes
+                    .iter()
+                    .find(|(_, node)| node.label() == Some(label))
+                    .unwrap()
+                    .1
+                    .is_disabled()
+            );
+            let choice = test_button_center(&output, label);
+            assert_eq!(
+                file_menu_frame(&ctx, false, click_event(choice, true)).1,
+                None
+            );
+            assert_eq!(
+                file_menu_frame(&ctx, false, click_event(choice, false)).1,
+                None
+            );
+        }
+    }
+    fn toolbar_only_frame(
+        app: &mut Viewer,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1100., 760.))),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.toolbar(ctx),
+        )
+    }
+    #[test]
+    fn toolbar_save_as_routes_existing_save_guard_and_sidebar_remains_a_single_left_toggle() {
+        use mypdf_milestone0::annotations::{Annotation, Kind, Style};
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        until(&mut app, &ctx, |app| app.tabs[0].session.is_some());
+        let mark = Annotation::new(
+            0,
+            [100., 100., 200., 150.],
+            Kind::Rectangle,
+            Style::default(),
+        );
+        app.tabs[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .commit(vec![mark.clone()])
+            .unwrap();
+        app.tabs[0].selected_annotation = Some(mark.id.clone());
+        let mut invalid = mark;
+        invalid.style.opacity = 0.;
+        app.editor.draft = Some(invalid.clone());
+        let revision = app.tabs[0].session.as_ref().unwrap().revision();
+        for _ in 0..3 {
+            toolbar_only_frame(&mut app, &ctx, vec![]);
+        }
+        let output = toolbar_only_frame(&mut app, &ctx, vec![]);
+        let open = test_button_center(&output, "Open…");
+        toolbar_only_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(open)]);
+        let output = toolbar_only_frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), revision);
+        let choice = test_button_center(&output, "Save As…");
+        toolbar_only_frame(&mut app, &ctx, click_event(choice, true));
+        toolbar_only_frame(&mut app, &ctx, click_event(choice, false));
+        assert_eq!(
+            app.save_intent,
+            save::Intent::As,
+            "The menu choice routes to the existing Save As command"
+        );
+        assert_eq!(
+            app.editor.draft,
+            Some(invalid),
+            "An invalid edit is preserved before any native dialog"
+        );
+        assert!(!app.saving && !egui::Popup::is_any_open(&ctx));
+        let output = toolbar_only_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(pos2(0., 400.))],
+        );
+        let at = test_button_center(&output, "Toggle left panel");
+        let was = app.sidebar;
+        toolbar_only_frame(&mut app, &ctx, click_event(at, true));
+        toolbar_only_frame(&mut app, &ctx, click_event(at, false));
+        assert_eq!(app.sidebar, !was);
+        let output = toolbar_only_frame(&mut app, &ctx, vec![]);
+        let nodes = &output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes;
+        let buttons: Vec<_> = nodes
+            .iter()
+            .filter(|(_, node)| node.label() == Some("Toggle left panel"))
+            .collect();
+        assert_eq!(buttons.len(), 1);
+        assert_eq!(buttons[0].1.toggled(), Some((!was).into()));
+        let modifiers = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers,
+                events: key(egui::Key::L, modifiers),
+                ..Default::default()
+            },
+            |ctx| app.shortcuts(ctx),
+        );
+        assert_eq!(
+            app.sidebar, was,
+            "The existing sidebar shortcut still works"
+        );
+    }
+
     #[test]
     fn responsive_mode_controls_have_accessible_labels_and_stay_in_bounds() {
         for width in [720., 1200.] {
@@ -3509,12 +3832,39 @@ mod tests {
                 );
                 previous = r.x1;
             }
+            let left = nodes
+                .iter()
+                .filter(|(_, node)| node.label() == Some("Toggle left panel"))
+                .collect::<Vec<_>>();
+            assert_eq!(left.len(), 1, "The sidebar button is shown once");
+            let sidebar = left[0].1.bounds().unwrap();
+            let first_mode = nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.label() == Some("Read") && node.bounds().is_some_and(|r| r.y0 == ribbon_y)
+                })
+                .unwrap()
+                .1
+                .bounds()
+                .unwrap();
+            assert!(
+                sidebar.x0 >= 0. && sidebar.x1 < first_mode.x0,
+                "Sidebar belongs to the left group"
+            );
             for label in [
-                "Toggle left panel",
-                "Toggle right panel",
-                "Find",
-                "Translate",
+                "Save · ⌘S",
+                "Save · Ctrl+S",
+                "Save As… · ⇧⌘S",
+                "Save As… · Ctrl+Shift+S",
+                "Compare Documents…",
             ] {
+                assert!(
+                    !nodes.iter().any(|(_, node)| node.label() == Some(label)
+                        && node.bounds().is_some_and(|r| r.y0 == ribbon_y)),
+                    "{label} is absent from the toolbar"
+                );
+            }
+            for label in ["Toggle right panel", "Find", "Translate"] {
                 let r = nodes
                     .iter()
                     .find(|(_, n)| n.label() == Some(label))

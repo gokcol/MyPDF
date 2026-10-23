@@ -107,37 +107,52 @@ pub(super) fn preview(ui: &mut egui::Ui, preset: &Preset, size: egui::Vec2) {
         }
         Preset::Drawing(style) => {
             let inner = rect.shrink(7.);
-            if let Some(fill) = style.fill {
-                painter.rect_filled(inner, 0., color(fill, style.opacity));
-            }
-            let width = style.width.clamp(0.6, 5.);
-            let points = vec![
-                inner.left_top(),
-                inner.right_top(),
-                inner.right_bottom(),
-                inner.left_bottom(),
-            ];
-            for primitive in mypdf_milestone0::stroke::path(
-                points.into_iter().map(|p| [p.x, p.y]).collect(),
-                true,
-                width,
-                style.stroke,
-            ) {
+            let mut style = style.clone();
+            style.width = style.width.clamp(0.6, 5.);
+            let annotation = mypdf_milestone0::annotations::Annotation::new(
+                0,
+                [inner.left(), inner.top(), inner.right(), inner.bottom()],
+                mypdf_milestone0::annotations::Kind::Rectangle,
+                style,
+            );
+            for primitive in mypdf_milestone0::annotations::primitives(&annotation) {
                 match primitive {
-                    Primitive::Path { points, closed, .. } => {
-                        let points = points.into_iter().map(|p| pos2(p[0], p[1])).collect();
-                        let stroke = Stroke::new(width, color(style.color, style.opacity));
-                        painter.add(if closed {
-                            egui::Shape::closed_line(points, stroke)
+                    Primitive::Path {
+                        mut points,
+                        closed,
+                        fill,
+                    } => {
+                        let rgb = if fill {
+                            annotation.style.fill.unwrap_or(annotation.style.color)
                         } else {
-                            egui::Shape::line(points, stroke)
-                        });
+                            annotation.style.color
+                        };
+                        let tint = color(rgb, annotation.style.opacity);
+                        if fill {
+                            let mut mesh = egui::Mesh::default();
+                            for triangle in mypdf_milestone0::annotations::triangulate(&points) {
+                                let start = mesh.vertices.len() as u32;
+                                for p in triangle {
+                                    mesh.colored_vertex(pos2(p[0], p[1]), tint);
+                                }
+                                mesh.add_triangle(start, start + 1, start + 2);
+                            }
+                            painter.add(egui::Shape::mesh(mesh));
+                        } else {
+                            if closed && let Some(first) = points.first().copied() {
+                                points.push(first);
+                            }
+                            painter.add(egui::Shape::line(
+                                points.into_iter().map(|p| pos2(p[0], p[1])).collect(),
+                                Stroke::new(annotation.style.width, tint),
+                            ));
+                        }
                     }
                     Primitive::Dot { center } => {
                         painter.circle_filled(
                             pos2(center[0], center[1]),
-                            width / 2.,
-                            color(style.color, style.opacity),
+                            annotation.style.width / 2.,
+                            color(annotation.style.color, annotation.style.opacity),
                         );
                     }
                     _ => {}
@@ -561,13 +576,14 @@ mod tests {
         };
         style.width = 4.;
         style.fill = Some([1., 0.9, 0.7]);
+        style.fill_pattern = mypdf_milestone0::annotations::FillPattern::Crosshatch;
         assert!(edit.save(&mut state));
         let disk = load(&state.root).unwrap();
         assert_eq!(disk.len(), 3);
         assert!(disk[0].appearance == builtin.appearance);
         assert_eq!(disk[2].purpose, "Audits");
         assert!(
-            matches!(&disk[2].appearance, Preset::Drawing(s) if s.width == 4. && s.fill == Some([1., 0.9, 0.7]))
+            matches!(&disk[2].appearance, Preset::Drawing(s) if s.width == 4. && s.fill == Some([1., 0.9, 0.7]) && s.fill_pattern == mypdf_milestone0::annotations::FillPattern::Crosshatch)
         );
         let mut rename = Edit::existing(&state.entries[2], true);
         rename.value.name = state.entries[1].name.clone();

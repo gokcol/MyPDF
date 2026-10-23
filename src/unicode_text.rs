@@ -609,6 +609,35 @@ impl Writer {
     pub fn measure(&mut self, text: &str, size: f32) -> Result<f32> {
         Ok(self.shape_inner(text, false)?.width(size))
     }
+    /// Actual ascent, positive descent and line gap of the faces used by a
+    /// shaped line, in points. Layout and auto-sizing can share PDF metrics even
+    /// when a line uses fallback fonts.
+    pub fn line_metrics(&self, line: &Line, size: f32) -> [f32; 3] {
+        let mut metrics = [0_f32; 3];
+        let mut found = false;
+        let faces: Vec<_> = if line.pieces.is_empty() {
+            self.chain.first().into_iter().collect()
+        } else {
+            line.pieces
+                .iter()
+                .filter_map(|piece| self.used.get(piece.font).map(|used| &used.face))
+                .collect()
+        };
+        for face in faces {
+            if let Some(parsed) = face.parse() {
+                let scale = size / parsed.units_per_em() as f32;
+                metrics[0] = metrics[0].max(parsed.ascender() as f32 * scale);
+                metrics[1] = metrics[1].max(-(parsed.descender() as f32) * scale);
+                metrics[2] = metrics[2].max(parsed.line_gap() as f32 * scale);
+                found = true;
+            }
+        }
+        if found {
+            metrics
+        } else {
+            [size * 0.8, size * 0.2, size * 0.1]
+        }
+    }
     /// Greedy line breaking at spaces, and between characters of scripts written
     /// without spaces. Returns each line and whether it ends a paragraph.
     pub fn wrap(&mut self, text: &str, size: f32, width: f32) -> Result<Vec<(String, bool)>> {

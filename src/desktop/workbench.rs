@@ -440,12 +440,16 @@ fn commands(query: &str) -> Vec<usize> {
 impl Viewer {
     pub(super) fn workbench_owns_shortcuts(&self) -> bool {
         self.productivity.owns_input()
+            || self.content.context.bookmark.is_some()
             || self.workbench.palette
             || self.workbench.crop.is_some()
             || self.workbench.repeat.is_some()
             || self.workbench.paste.is_some()
     }
     pub(super) fn workbench_keys(&mut self, ctx: &egui::Context) -> bool {
+        if self.content.context.bookmark.is_some() {
+            return true;
+        }
         let owns_keys = !cfg!(target_os = "macos") || self._native_menu.is_none();
         if owns_keys
             && ctx.input_mut(|i| {

@@ -1,5 +1,5 @@
 use hayro::hayro_interpret::TransformExt;
-use mypdf_milestone0::{annotations as ann, document, identity, signing};
+use mypdf_milestone0::{annotations as ann, convert, document, identity, signing};
 use std::sync::OnceLock;
 use underskrift::CryptoSigner;
 const PASSWORD: &str = "synthetic-test-password-only";
@@ -538,8 +538,283 @@ async fn visible_signatures_use_acrobat_layered_appearances_and_keep_the_trailer
             .and_then(|o| o.as_stream().ok())
             .and_then(|s| s.dict.get(b"Subtype").ok())
             .and_then(|s| s.as_name().ok())
-            == Some(b"Image")
+            == Some(b"Form")
     }));
+}
+
+/// Follow only the signature's appearance graph, excluding the original page
+/// and historical revisions. Every resource reference must resolve after import.
+fn signature_graph(bytes: &[u8], field: &str) -> lopdf::Document {
+    use lopdf::{Document, Object, dictionary};
+    let mut doc = Document::load_mem(bytes).unwrap();
+    let normal = doc
+        .objects
+        .values()
+        .filter_map(|o| o.as_dict().ok())
+        .find(|d| d.get(b"T").and_then(Object::as_str).ok() == Some(field.as_bytes()))
+        .unwrap()
+        .get(b"AP")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"N")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    doc.trailer = dictionary! { "Root" => normal };
+    doc.prune_objects();
+    for id in doc.traverse_objects(|_| {}) {
+        doc.get_object(id).unwrap();
+    }
+    doc
+}
+
+#[tokio::test]
+async fn signed_lettering_and_handwriting_remain_vector_at_any_zoom() {
+    use mypdf_milestone0::{assets::Asset, signature_art};
+    let signer = identity::FileSigner::load(&id().pkcs12, PASSWORD, None).unwrap();
+    let (source_svg, height) = signature_art::lettering(
+        "İmza Örneği",
+        &document::default_font().unwrap(),
+        30.,
+        [0., 0., 0.65],
+        300.,
+        0,
+    )
+    .unwrap();
+    let vector = Asset::new(
+        "Vector signature",
+        ann::Kind::Svg {
+            source: source_svg,
+            tint: false,
+        },
+        ann::Style::default(),
+        300. / height,
+    );
+    let ink = Asset::new(
+        "Drawn signature",
+        ann::Kind::Ink {
+            strokes: vec![vec![
+                [0.05, 0.8],
+                [0.2, 0.1],
+                [0.4, 0.75],
+                [0.7, 0.3],
+                [0.95, 0.6],
+            ]],
+        },
+        ann::Style::default(),
+        3.,
+    );
+    let mut bytes = convert::blank(600., 800.).unwrap();
+    for (index, artwork) in [vector, ink].into_iter().enumerate() {
+        let request = signing::DesktopSigningRequest {
+            field: format!("Vector{index}"),
+            rect: Some([
+                60.,
+                80. + index as f32 * 160.,
+                360.,
+                220. + index as f32 * 160.,
+            ]),
+            name: "İstanbul, Gökçöl, Şişli".into(),
+            show_date: false,
+            artwork: Some(artwork),
+            ..Default::default()
+        };
+        let signed = signing::sign_custom(&bytes, &signer, &request)
+            .await
+            .unwrap();
+        assert!(signed.starts_with(&bytes));
+        let graph = signature_graph(&signed, &request.field);
+        let mut vector_operations = 0;
+        for object in graph.objects.values() {
+            if let Ok(stream) = object.as_stream() {
+                assert_ne!(
+                    stream
+                        .dict
+                        .get(b"Subtype")
+                        .and_then(lopdf::Object::as_name)
+                        .ok(),
+                    Some(b"Image".as_slice()),
+                    "Text and ink must not be rasterized"
+                );
+                if stream
+                    .dict
+                    .get(b"Subtype")
+                    .and_then(lopdf::Object::as_name)
+                    .ok()
+                    == Some(b"Form")
+                {
+                    let operations =
+                        lopdf::content::Content::decode(&stream.get_plain_content().unwrap())
+                            .unwrap()
+                            .operations;
+                    vector_operations += operations
+                        .iter()
+                        .filter(|op| matches!(op.operator.as_str(), "m" | "l" | "c"))
+                        .count();
+                }
+            }
+        }
+        assert!(
+            vector_operations > 100,
+            "Signature lettering must retain its outlines"
+        );
+        bytes = signed;
+    }
+    let report = signing::verify(&bytes, None).unwrap();
+    assert_eq!(report.len(), 2);
+    assert!(
+        report
+            .iter()
+            .all(|s| s.crypto_valid && s.digest_matches && s.certificate_binding_valid)
+    );
+}
+
+#[tokio::test]
+async fn signed_raster_artwork_keeps_source_resolution_and_alpha_samples() {
+    use mypdf_milestone0::assets::Asset;
+    let source = image::RgbaImage::from_fn(1536, 512, |x, y| {
+        image::Rgba([(x % 251) as u8, (y % 239) as u8, 90, ((x + y) % 256) as u8])
+    });
+    let mut png = std::io::Cursor::new(vec![]);
+    source.write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let request = signing::DesktopSigningRequest {
+        field: "OriginalImage".into(),
+        rect: Some([60., 80., 360., 200.]),
+        name: "Image quality test".into(),
+        show_date: false,
+        artwork: Some(Asset::from_image_bytes("Original pixels", png.get_ref()).unwrap()),
+        transform: signing::AppearanceTransform {
+            rotation: 27.,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let signer = identity::FileSigner::load(&id().pkcs12, PASSWORD, None).unwrap();
+    let signed = signing::sign_custom(&convert::blank(600., 800.).unwrap(), &signer, &request)
+        .await
+        .unwrap();
+    let graph = signature_graph(&signed, &request.field);
+    let rgb = graph
+        .objects
+        .values()
+        .filter_map(|o| o.as_stream().ok())
+        .find(|s| {
+            s.dict
+                .get(b"ColorSpace")
+                .and_then(lopdf::Object::as_name)
+                .ok()
+                == Some(b"DeviceRGB")
+        })
+        .unwrap();
+    assert_eq!(rgb.dict.get(b"Width").unwrap().as_i64().unwrap(), 1536);
+    assert_eq!(rgb.dict.get(b"Height").unwrap().as_i64().unwrap(), 512);
+    assert!(rgb.dict.get(b"Interpolate").unwrap().as_bool().unwrap());
+    assert_eq!(
+        rgb.get_plain_content().unwrap(),
+        source
+            .pixels()
+            .flat_map(|p| p.0[..3].to_vec())
+            .collect::<Vec<_>>()
+    );
+    let mask = graph
+        .get_object(rgb.dict.get(b"SMask").unwrap().as_reference().unwrap())
+        .unwrap()
+        .as_stream()
+        .unwrap();
+    assert_eq!(
+        mask.get_plain_content().unwrap(),
+        source.pixels().map(|p| p[3]).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn vector_signature_matches_live_preview_with_rotation_overlay_and_fitting() {
+    use mypdf_milestone0::assets::Asset;
+    let signer = identity::FileSigner::load(&id().pkcs12, PASSWORD, None).unwrap();
+    for rotation in [0, 90, 180, 270] {
+        for fit in [false, true] {
+            let mut doc = lopdf::Document::load_mem(&convert::blank(600., 800.).unwrap()).unwrap();
+            let page = doc.get_pages()[&1];
+            let dict = doc.get_dictionary_mut(page).unwrap();
+            dict.set("Rotate", rotation);
+            dict.set(
+                "CropBox",
+                vec![36.into(), 36.into(), 576.into(), 756.into()],
+            );
+            let mut bytes = vec![];
+            doc.save_to(&mut bytes).unwrap();
+            let request = signing::DesktopSigningRequest {
+                field: "MatchingPreview".into(),
+                rect: Some([50., 80., 350., 200.]),
+                name: "İstanbul Test".into(),
+                show_date: false,
+                background: signing::Background::Tinted,
+                artwork: Some(Asset::new(
+                    "Vector shape",
+                    ann::Kind::Symbol(ann::Symbol::Check),
+                    ann::Style {
+                        color: [0., 0., 0.7],
+                        ..Default::default()
+                    },
+                    2.,
+                )),
+                transform: signing::AppearanceTransform {
+                    rotation: -23.,
+                    image_opacity: 0.5,
+                    image_overlay: fit,
+                    fit_to_content: fit,
+                    outer_padding: Some(4.),
+                    image_text_gap: Some(3.),
+                    ..Default::default()
+                },
+                text_style: signing::SignatureTextStyle {
+                    offset: [5., 15.],
+                    insets: [3., 2., 4., 5.],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let preview = signing::signature_appearance(&request).unwrap();
+            let expected = image::load_from_memory(&preview.png).unwrap().into_rgba8();
+            let rect = preview.page_rect(request.rect.unwrap());
+            let signed = signing::sign_custom(&bytes, &signer, &request)
+                .await
+                .unwrap();
+            let pdf = hayro::hayro_syntax::Pdf::new(signed).unwrap();
+            let raster = hayro::render(
+                &pdf.pages()[0],
+                &hayro::RenderCache::new(),
+                &Default::default(),
+                &Default::default(),
+                &hayro::PixmapSettings {
+                    x_scale: 2.,
+                    y_scale: 2.,
+                    bg_color: hayro::vello_cpu::color::palette::css::WHITE,
+                },
+            );
+            let actual = image::load_from_memory(&raster.into_png().unwrap())
+                .unwrap()
+                .into_rgb8();
+            let mut difference = 0u64;
+            for (x, y, pixel) in expected.enumerate_pixels() {
+                let actual = actual.get_pixel(
+                    (rect[0] * 2.).round() as u32 + x,
+                    (rect[1] * 2.).round() as u32 + y,
+                );
+                for c in 0..3 {
+                    let white_composite =
+                        (pixel[c] as u32 * pixel[3] as u32 + 255 * (255 - pixel[3] as u32)) / 255;
+                    difference += (actual[c] as i32 - white_composite as i32).unsigned_abs() as u64;
+                }
+            }
+            let error = difference as f64 / (expected.width() * expected.height() * 3) as f64;
+            assert!(
+                error < 2.,
+                "Preview differs at rotation={rotation}, fit={fit}: mean error {error}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

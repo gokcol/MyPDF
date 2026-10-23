@@ -4,7 +4,7 @@ use mypdf_milestone0::image_background::{self, Options};
 pub(super) enum Target {
     SavedSignature {
         signature: String,
-        asset: Asset,
+        asset: Box<Asset>,
     },
     ContentImage {
         tab: u64,
@@ -61,7 +61,7 @@ impl Viewer {
             self.editor.background = Some(Draft::new(
                 Target::SavedSignature {
                     signature,
-                    asset: asset.clone(),
+                    asset: Box::new(asset.clone()),
                 },
                 png.clone(),
             ));
@@ -205,7 +205,7 @@ impl Viewer {
             let png = draft.preview.unwrap().0;
             match draft.target {
                 Target::SavedSignature { signature, asset } => {
-                    self.use_transparent_signature_image(&signature, asset, png);
+                    self.use_transparent_signature_image(&signature, *asset, png);
                 }
                 Target::ContentImage {
                     tab,

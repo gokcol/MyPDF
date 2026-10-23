@@ -171,6 +171,10 @@ pub enum SignatureLayout {
     /// Image-only signature appearance (e.g., scanned signature image).
     #[cfg(feature = "visual")]
     ImageOnly(ImageConfig),
+    /// A self-contained, single-page PDF appearance. Its vector paths, fonts and
+    /// original image samples are embedded without rasterizing the page.
+    #[cfg(feature = "visual")]
+    PdfPage(Vec<u8>),
     /// Combined image and text.
     #[cfg(feature = "visual")]
     ImageAndText {
@@ -195,6 +199,8 @@ impl fmt::Debug for SignatureLayout {
             #[cfg(feature = "visual")]
             SignatureLayout::ImageOnly(ic) => f.debug_tuple("ImageOnly").field(ic).finish(),
             #[cfg(feature = "visual")]
+            SignatureLayout::PdfPage(_) => f.debug_tuple("PdfPage").field(&"<PDF>").finish(),
+            #[cfg(feature = "visual")]
             SignatureLayout::ImageAndText {
                 image,
                 text,
@@ -216,6 +222,8 @@ impl Clone for SignatureLayout {
             SignatureLayout::TextOnly(tc) => SignatureLayout::TextOnly(tc.clone()),
             #[cfg(feature = "visual")]
             SignatureLayout::ImageOnly(ic) => SignatureLayout::ImageOnly(ic.clone()),
+            #[cfg(feature = "visual")]
+            SignatureLayout::PdfPage(data) => SignatureLayout::PdfPage(data.clone()),
             #[cfg(feature = "visual")]
             SignatureLayout::ImageAndText {
                 image,

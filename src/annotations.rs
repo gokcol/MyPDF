@@ -1,4 +1,5 @@
 //! Standard PDF annotations, revision history, and geometry in displayed-page points.
+pub use crate::fill::FillPattern;
 pub use crate::stroke::StrokeStyle;
 use anyhow::{Context, Result, ensure};
 use hayro::hayro_interpret::TransformExt;
@@ -13,6 +14,7 @@ pub type Point2 = [f32; 2];
 pub enum Markup {
     Highlight,
     Underline,
+    Squiggly,
     Strikeout,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -22,6 +24,162 @@ pub enum Symbol {
     Star,
     Circle,
     Arrow,
+}
+/// Routing is part of editable geometry, rather than a rasterized arrow asset.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Route {
+    Elbow,
+    Stepped,
+    Curved,
+}
+/// Native line-ending styles. Size is a length in displayed-page PDF points.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum LineEnd {
+    None,
+    OpenArrow,
+    ClosedArrow,
+    FilledArrow,
+    Circle,
+    Square,
+    Diamond,
+    Bar,
+    Slash,
+}
+impl LineEnd {
+    pub const ALL: [Self; 9] = [
+        Self::None,
+        Self::OpenArrow,
+        Self::ClosedArrow,
+        Self::FilledArrow,
+        Self::Circle,
+        Self::Square,
+        Self::Diamond,
+        Self::Bar,
+        Self::Slash,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::OpenArrow => "Open arrow",
+            Self::ClosedArrow => "Closed arrow",
+            Self::FilledArrow => "Filled arrow",
+            Self::Circle => "Circle",
+            Self::Square => "Square",
+            Self::Diamond => "Diamond",
+            Self::Bar => "Bar",
+            Self::Slash => "Slash",
+        }
+    }
+    pub fn pdf_name(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::OpenArrow => "OpenArrow",
+            Self::ClosedArrow | Self::FilledArrow => "ClosedArrow",
+            Self::Circle => "Circle",
+            Self::Square => "Square",
+            Self::Diamond => "Diamond",
+            Self::Bar => "Butt",
+            Self::Slash => "Slash",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LineEndings {
+    pub start: LineEnd,
+    pub end: LineEnd,
+    /// Arrow length or the diameter/length of a terminal symbol, in PDF points.
+    pub size: f32,
+}
+/// A missing override keeps old annotations' exact appearance. Controls can use
+/// this inferred value without creating metadata until the user changes it.
+pub fn line_endings(kind: &Kind, style: &Style) -> Option<LineEndings> {
+    let (start, end) = match kind {
+        Kind::Line { arrow: true, .. } | Kind::RoutedArrow { .. } => {
+            (LineEnd::None, LineEnd::OpenArrow)
+        }
+        Kind::DoubleArrow { .. } | Kind::RoutedDoubleArrow { .. } => {
+            (LineEnd::OpenArrow, LineEnd::OpenArrow)
+        }
+        Kind::Line { arrow: false, .. } | Kind::DoubleLine { .. } | Kind::RoutedLine { .. } => {
+            (LineEnd::None, LineEnd::None)
+        }
+        _ => return None,
+    };
+    Some(style.line_endings.unwrap_or(LineEndings {
+        start,
+        end,
+        size: (style.width * 5.).max(9.),
+    }))
+}
+/// Named closed shapes retain their identity after saving or editing.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Shape {
+    Square,
+    Diamond,
+    Triangle,
+    Pentagon,
+    Hexagon,
+    Circle,
+    Semicircle,
+}
+impl Shape {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Square => "Square",
+            Self::Diamond => "Diamond",
+            Self::Triangle => "Triangle",
+            Self::Pentagon => "Pentagon",
+            Self::Hexagon => "Hexagon",
+            Self::Circle => "Circle",
+            Self::Semicircle => "Semicircle",
+        }
+    }
+    /// The last vertex closes to the first. Geometry is shared by the page,
+    /// interactive preview, hit testing, pattern clipping and PDF appearance.
+    pub fn outline(self) -> Vec<Point2> {
+        match self {
+            Self::Square => vec![[0., 0.], [1., 0.], [1., 1.], [0., 1.]],
+            Self::Diamond => vec![[0.5, 0.], [1., 0.5], [0.5, 1.], [0., 0.5]],
+            Self::Triangle => vec![[0.5, 0.], [1., 1.], [0., 1.]],
+            Self::Pentagon => {
+                let points: Vec<_> = (0..5)
+                    .map(|i| {
+                        let angle =
+                            i as f32 / 5. * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+                        [angle.cos(), angle.sin()]
+                    })
+                    .collect();
+                let b = bounds(&points);
+                points
+                    .into_iter()
+                    .map(|p| [(p[0] - b[0]) / (b[2] - b[0]), (p[1] - b[1]) / (b[3] - b[1])])
+                    .collect()
+            }
+            Self::Hexagon => vec![
+                [0.25, 0.],
+                [0.75, 0.],
+                [1., 0.5],
+                [0.75, 1.],
+                [0.25, 1.],
+                [0., 0.5],
+            ],
+            Self::Circle => (0..64)
+                .map(|i| {
+                    let angle = i as f32 / 64. * std::f32::consts::TAU;
+                    [0.5 + 0.5 * angle.cos(), 0.5 + 0.5 * angle.sin()]
+                })
+                .collect(),
+            Self::Semicircle => (0..=64)
+                .map(|i| {
+                    let angle = std::f32::consts::PI * (1. + i as f32 / 64.);
+                    [
+                        (0.5 + 0.5 * angle.cos()).clamp(0., 1.),
+                        (1. + angle.sin()).clamp(0., 1.),
+                    ]
+                })
+                .collect(),
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum Kind {
@@ -40,14 +198,45 @@ pub enum Kind {
     },
     Rectangle,
     Ellipse,
+    Shape {
+        shape: Shape,
+    },
     Line {
         start: Point2,
         end: Point2,
         arrow: bool,
     },
+    DoubleLine {
+        start: Point2,
+        end: Point2,
+    },
+    RoutedLine {
+        start: Point2,
+        end: Point2,
+        route: Route,
+    },
     DoubleArrow {
         start: Point2,
         end: Point2,
+    },
+    RoutedArrow {
+        start: Point2,
+        end: Point2,
+        route: Route,
+    },
+    RoutedDoubleArrow {
+        start: Point2,
+        end: Point2,
+        route: Route,
+    },
+    /// All geometry is normalized within the annotation rectangle. The leader's
+    /// connection to the text box is recomputed from its knee when resized.
+    Callout {
+        text: String,
+        box_rect: Box2,
+        tip: Point2,
+        knee: Point2,
+        text_color: [f32; 3],
     },
     Polygon {
         points: Vec<Point2>,
@@ -70,6 +259,15 @@ pub enum Kind {
     },
 }
 impl Kind {
+    pub fn callout(text: impl Into<String>) -> Self {
+        Self::Callout {
+            text: text.into(),
+            box_rect: [0.30, 0.04, 0.98, 0.62],
+            tip: [0.02, 0.94],
+            knee: [0.64, 0.86],
+            text_color: [0.15, 0.17, 0.21],
+        }
+    }
     pub fn label(&self) -> &'static str {
         match self {
             Self::Markup {
@@ -81,6 +279,10 @@ impl Kind {
                 ..
             } => "Underline",
             Self::Markup {
+                kind: Markup::Squiggly,
+                ..
+            } => "Squiggly underline",
+            Self::Markup {
                 kind: Markup::Strikeout,
                 ..
             } => "Strikeout",
@@ -89,7 +291,46 @@ impl Kind {
             Self::Text { .. } => "Text box",
             Self::Rectangle => "Rectangle",
             Self::Ellipse => "Ellipse",
+            Self::Shape { shape } => shape.label(),
+            Self::DoubleLine { .. } => "Double line",
+            Self::RoutedLine {
+                route: Route::Elbow,
+                ..
+            } => "Elbow line",
+            Self::RoutedLine {
+                route: Route::Stepped,
+                ..
+            } => "Stepped line",
+            Self::RoutedLine {
+                route: Route::Curved,
+                ..
+            } => "Curved line",
             Self::DoubleArrow { .. } => "Double arrow",
+            Self::RoutedArrow {
+                route: Route::Elbow,
+                ..
+            } => "Elbow arrow",
+            Self::RoutedArrow {
+                route: Route::Stepped,
+                ..
+            } => "Stepped arrow",
+            Self::RoutedArrow {
+                route: Route::Curved,
+                ..
+            } => "Curved arrow",
+            Self::RoutedDoubleArrow {
+                route: Route::Elbow,
+                ..
+            } => "Double elbow arrow",
+            Self::RoutedDoubleArrow {
+                route: Route::Stepped,
+                ..
+            } => "Double stepped arrow",
+            Self::RoutedDoubleArrow {
+                route: Route::Curved,
+                ..
+            } => "Double curved arrow",
+            Self::Callout { .. } => "Callout",
             Self::Polygon { closed: true, .. } => "Polygon",
             Self::Polygon { .. } => "Polyline",
             Self::Line { arrow: true, .. } => "Arrow",
@@ -103,13 +344,19 @@ impl Kind {
     }
     pub fn text(&self) -> Option<&str> {
         match self {
-            Self::Note { text } | Self::Text { text } | Self::Stamp { text } => Some(text),
+            Self::Note { text }
+            | Self::Text { text }
+            | Self::Stamp { text }
+            | Self::Callout { text, .. } => Some(text),
             _ => None,
         }
     }
     pub fn text_mut(&mut self) -> Option<&mut String> {
         match self {
-            Self::Note { text } | Self::Text { text } | Self::Stamp { text } => Some(text),
+            Self::Note { text }
+            | Self::Text { text }
+            | Self::Stamp { text }
+            | Self::Callout { text, .. } => Some(text),
             _ => None,
         }
     }
@@ -169,7 +416,36 @@ impl Kind {
                         .all(|v| v.is_finite() && (0.0..=1.0).contains(v)),
                 "Invalid polygon geometry"
             ),
-            Self::Line { start, end, .. } | Self::DoubleArrow { start, end } => ensure!(
+            Self::Callout {
+                box_rect,
+                tip,
+                knee,
+                text_color,
+                ..
+            } => {
+                ensure!(
+                    box_rect
+                        .iter()
+                        .chain(tip)
+                        .chain(knee)
+                        .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                        && box_rect[2] - box_rect[0] >= 0.05
+                        && box_rect[3] - box_rect[1] >= 0.05,
+                    "Invalid callout geometry"
+                );
+                ensure!(
+                    text_color
+                        .iter()
+                        .all(|v| v.is_finite() && (0.0..=1.0).contains(v)),
+                    "Invalid callout text color"
+                );
+            }
+            Self::Line { start, end, .. }
+            | Self::DoubleArrow { start, end }
+            | Self::DoubleLine { start, end }
+            | Self::RoutedLine { start, end, .. }
+            | Self::RoutedArrow { start, end, .. }
+            | Self::RoutedDoubleArrow { start, end, .. } => ensure!(
                 start
                     .iter()
                     .chain(end)
@@ -219,10 +495,14 @@ pub mod image_bytes {
 pub struct Style {
     pub color: [f32; 3],
     pub fill: Option<[f32; 3]>,
+    #[serde(default)]
+    pub fill_pattern: FillPattern,
     pub opacity: f32,
     pub width: f32,
     #[serde(default)]
     pub stroke: StrokeStyle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_endings: Option<LineEndings>,
     pub font_size: f32,
     #[serde(default)]
     pub image_blur: f32,
@@ -234,9 +514,11 @@ impl Default for Style {
         Self {
             color: [0.11, 0.43, 0.35],
             fill: None,
+            fill_pattern: FillPattern::Solid,
             opacity: 1.0,
             width: 2.0,
             stroke: StrokeStyle::Solid,
+            line_endings: None,
             font_size: 14.0,
             image_blur: 0.,
             image_border: false,
@@ -331,6 +613,12 @@ impl Annotation {
                 && (1.0..=144.0).contains(&self.style.font_size),
             "Invalid annotation style"
         );
+        if let Some(endings) = self.style.line_endings {
+            ensure!(
+                endings.size.is_finite() && (0.5..=256.).contains(&endings.size),
+                "Line-ending size must be between 0.5 and 256 points"
+            );
+        }
         ensure!(
             self.object.name.chars().count() <= 200,
             "Object name is too long"
@@ -372,6 +660,9 @@ impl Annotation {
             crate::image_effects::blurred(png, self.style.image_blur)?;
         }
         Ok(())
+    }
+    pub fn line_endings(&self) -> Option<LineEndings> {
+        line_endings(&self.kind, &self.style)
     }
     pub fn local(&self, p: Point2) -> Point2 {
         [
@@ -420,7 +711,9 @@ impl Annotation {
         ];
         for primitive in primitives(self) {
             match primitive {
-                Primitive::Path { points: extra, .. } => points.extend(extra),
+                Primitive::Path { points: extra, .. } | Primitive::Head { points: extra, .. } => {
+                    points.extend(extra)
+                }
                 Primitive::Dot { center } => points.push(center),
                 _ => {}
             }
@@ -450,7 +743,7 @@ impl Annotation {
             raw_primitives(self)
         };
         paths.into_iter().any(|primitive| match primitive {
-            Primitive::Path { points, closed, .. } => {
+            Primitive::Path { points, closed, .. } | Primitive::Head { points, closed, .. } => {
                 let near = |a: Point2, b: Point2| {
                     let d = [b[0] - a[0], b[1] - a[1]];
                     let length2 = d[0] * d[0] + d[1] * d[1];
@@ -1110,11 +1403,20 @@ pub enum Primitive {
         closed: bool,
         fill: bool,
     },
+    /// Explicit line endings use the stroke color for both their outline and
+    /// fill. They bypass dash/wave processing so heads remain recognizable.
+    Head {
+        points: Vec<Point2>,
+        closed: bool,
+        fill: bool,
+    },
     Text {
         text: String,
         rect: Box2,
         size: f32,
         centered: bool,
+        /// Separate text and border colors for callouts. Other text follows its style.
+        color: Option<[f32; 3]>,
     },
     Image {
         png: Arc<Vec<u8>>,
@@ -1194,9 +1496,13 @@ pub fn primitives(a: &Annotation) -> Vec<Primitive> {
                     closed,
                     fill: true,
                 } if a.style.stroke == StrokeStyle::Wave
+                    && a.style.fill_pattern == FillPattern::Solid
                     && matches!(
                         a.kind,
-                        Kind::Rectangle | Kind::Ellipse | Kind::Polygon { closed: true, .. }
+                        Kind::Rectangle
+                            | Kind::Ellipse
+                            | Kind::Polygon { closed: true, .. }
+                            | Kind::Shape { .. }
                     ) =>
                 {
                     crate::stroke::path(points, closed, a.style.width, a.style.stroke)
@@ -1218,9 +1524,23 @@ pub fn primitives(a: &Annotation) -> Vec<Primitive> {
                 } => {
                     // Preserve arrowheads and comment glyphs as recognizable
                     // icons, even when a drawing stroke style was selected.
-                    let style = if matches!(a.kind, Kind::Note { .. })
-                        || index > 0
-                            && matches!(a.kind, Kind::Line { .. } | Kind::DoubleArrow { .. })
+                    let style = if matches!(
+                        a.kind,
+                        Kind::Note { .. }
+                            | Kind::Markup {
+                                kind: Markup::Squiggly,
+                                ..
+                            }
+                    ) || a.style.line_endings.is_none()
+                        && index > 0
+                        && matches!(
+                            a.kind,
+                            Kind::Line { .. }
+                                | Kind::DoubleArrow { .. }
+                                | Kind::RoutedArrow { .. }
+                                | Kind::RoutedDoubleArrow { .. }
+                        )
+                        || index == 1 && !closed && matches!(a.kind, Kind::Callout { .. })
                     {
                         StrokeStyle::Solid
                     } else {
@@ -1243,6 +1563,11 @@ pub fn primitives(a: &Annotation) -> Vec<Primitive> {
         .collect()
 }
 fn raw_primitives(a: &Annotation) -> Vec<Primitive> {
+    if a.style.line_endings.is_some()
+        && let Some(primitives) = ended_line_primitives(a)
+    {
+        return primitives;
+    }
     let r = a.rect;
     let box_path = |r: Box2, fill| Primitive::Path {
         points: vec![[r[0], r[1]], [r[2], r[1]], [r[2], r[3]], [r[0], r[3]]],
@@ -1253,6 +1578,16 @@ fn raw_primitives(a: &Annotation) -> Vec<Primitive> {
         points: points.into_iter().map(|p| a.local(p)).collect(),
         closed,
         fill,
+    };
+    let fill_paths = |points: Vec<Point2>| {
+        crate::fill::paths(&points, a.style.fill_pattern, a.style.width)
+            .into_iter()
+            .map(|points| Primitive::Path {
+                points,
+                closed: true,
+                fill: true,
+            })
+            .collect::<Vec<_>>()
     };
     match &a.kind {
         Kind::Vector { polygons } if a.style.stroke != StrokeStyle::Solid => {
@@ -1269,32 +1604,67 @@ fn raw_primitives(a: &Annotation) -> Vec<Primitive> {
                 fill: true,
             })
             .collect(),
-        Kind::Markup { kind, quads } => quads
-            .iter()
-            .map(|q| {
-                let q = [
-                    r[0] + q[0] * (r[2] - r[0]),
-                    r[1] + q[1] * (r[3] - r[1]),
-                    r[0] + q[2] * (r[2] - r[0]),
-                    r[1] + q[3] * (r[3] - r[1]),
-                ];
-                match kind {
-                    Markup::Highlight => box_path(q, true),
-                    Markup::Underline | Markup::Strikeout => {
-                        let y = if *kind == Markup::Underline {
-                            q[3]
-                        } else {
-                            (q[1] + q[3]) / 2.0
-                        };
-                        Primitive::Path {
-                            points: vec![[q[0], y], [q[2], y]],
-                            closed: false,
-                            fill: false,
+        Kind::Markup { kind, quads } => {
+            let mut quads: Vec<_> = quads
+                .iter()
+                .map(|q| {
+                    [
+                        r[0] + q[0] * (r[2] - r[0]),
+                        r[1] + q[1] * (r[3] - r[1]),
+                        r[0] + q[2] * (r[2] - r[0]),
+                        r[1] + q[3] * (r[3] - r[1]),
+                    ]
+                })
+                .collect();
+            if *kind == Markup::Squiggly {
+                quads = squiggly_lines(quads);
+            }
+            quads
+                .into_iter()
+                .map(|q| {
+                    match kind {
+                        Markup::Highlight => box_path(q, true),
+                        Markup::Squiggly => {
+                            // A text wave has its own small, font-relative cadence. It
+                            // must remain a continuous underline even if a drawing's
+                            // dash pattern was previously selected.
+                            let width = q[2] - q[0];
+                            let amplitude =
+                                ((q[3] - q[1]) * 0.08).clamp(0.4, 1.2).min(width * 0.25);
+                            let cycles = (width / (amplitude * 6.0)).round().clamp(1.0, 512.0);
+                            let steps = cycles as usize * 12;
+                            let points = (0..=steps)
+                                .map(|i| {
+                                    let t = i as f32 / steps as f32;
+                                    [
+                                        q[0] + width * t,
+                                        q[3] + (t * cycles * std::f32::consts::TAU).sin()
+                                            * amplitude,
+                                    ]
+                                })
+                                .collect();
+                            Primitive::Path {
+                                points,
+                                closed: false,
+                                fill: false,
+                            }
+                        }
+                        Markup::Underline | Markup::Strikeout => {
+                            let y = if *kind == Markup::Underline {
+                                q[3]
+                            } else {
+                                (q[1] + q[3]) / 2.0
+                            };
+                            Primitive::Path {
+                                points: vec![[q[0], y], [q[2], y]],
+                                closed: false,
+                                fill: false,
+                            }
                         }
                     }
-                }
-            })
-            .collect(),
+                })
+                .collect()
+        }
         Kind::Ink { strokes } => strokes
             .iter()
             .map(|p| path(p.clone(), false, false))
@@ -1302,7 +1672,12 @@ fn raw_primitives(a: &Annotation) -> Vec<Primitive> {
         Kind::Rectangle => {
             let mut result = vec![];
             if a.style.fill.is_some() {
-                result.push(box_path(r, true));
+                result.extend(fill_paths(vec![
+                    [r[0], r[1]],
+                    [r[2], r[1]],
+                    [r[2], r[3]],
+                    [r[0], r[3]],
+                ]));
             }
             result.push(box_path(r, false));
             result
@@ -1316,15 +1691,24 @@ fn raw_primitives(a: &Annotation) -> Vec<Primitive> {
                 .collect();
             let mut result = vec![];
             if a.style.fill.is_some() {
-                result.push(path(points.clone(), true, true));
+                result.extend(fill_paths(points.iter().map(|p| a.local(*p)).collect()));
             }
             result.push(path(points, true, false));
             result
         }
+        Kind::Shape { shape } => {
+            let points = shape.outline();
+            let mut paths = vec![];
+            if a.style.fill.is_some() {
+                paths.extend(fill_paths(points.iter().map(|p| a.local(*p)).collect()));
+            }
+            paths.push(path(points, true, false));
+            paths
+        }
         Kind::Polygon { points, closed } => {
             let mut paths = vec![];
             if *closed && a.style.fill.is_some() {
-                paths.push(path(points.clone(), true, true));
+                paths.extend(fill_paths(points.iter().map(|p| a.local(*p)).collect()));
             }
             paths.push(path(points.clone(), *closed, false));
             paths
@@ -1362,6 +1746,79 @@ fn raw_primitives(a: &Annotation) -> Vec<Primitive> {
                 }
             }
             paths
+        }
+        Kind::DoubleLine { start, end } => {
+            double_line(a.local(*start), a.local(*end), a.style.width)
+                .into_iter()
+                .map(|points| Primitive::Path {
+                    points: points.to_vec(),
+                    closed: false,
+                    fill: false,
+                })
+                .collect()
+        }
+        Kind::RoutedLine { start, end, route } => vec![Primitive::Path {
+            points: routed_arrow(a.local(*start), a.local(*end), *route),
+            closed: false,
+            fill: false,
+        }],
+        Kind::RoutedArrow { start, end, route } | Kind::RoutedDoubleArrow { start, end, route } => {
+            let points = routed_arrow(a.local(*start), a.local(*end), *route);
+            let mut result = vec![Primitive::Path {
+                points: points.clone(),
+                closed: false,
+                fill: false,
+            }];
+            if let Some(head) = arrow_head(&points, a.style.width) {
+                result.push(head);
+            }
+            if matches!(a.kind, Kind::RoutedDoubleArrow { .. }) {
+                let reversed: Vec<_> = points.into_iter().rev().collect();
+                if let Some(head) = arrow_head(&reversed, a.style.width) {
+                    result.push(head);
+                }
+            }
+            result
+        }
+        Kind::Callout {
+            text,
+            box_rect,
+            tip,
+            knee,
+            text_color,
+        } => {
+            let first = a.local([box_rect[0], box_rect[1]]);
+            let last = a.local([box_rect[2], box_rect[3]]);
+            let body = [first[0], first[1], last[0], last[1]];
+            let tip = a.local(*tip);
+            let knee = a.local(*knee);
+            let connection = callout_connection(body, knee);
+            let leader = vec![connection, knee, tip];
+            let mut result = vec![Primitive::Path {
+                points: leader.clone(),
+                closed: false,
+                fill: false,
+            }];
+            if let Some(head) = arrow_head(&leader, a.style.width) {
+                result.push(head);
+            }
+            if a.style.fill.is_some() {
+                result.extend(fill_paths(vec![
+                    [body[0], body[1]],
+                    [body[2], body[1]],
+                    [body[2], body[3]],
+                    [body[0], body[3]],
+                ]));
+            }
+            result.push(box_path(body, false));
+            result.push(Primitive::Text {
+                text: text.clone(),
+                rect: body,
+                size: a.style.font_size,
+                centered: false,
+                color: Some(*text_color),
+            });
+            result
         }
         Kind::Symbol(symbol) => match symbol {
             Symbol::Check => vec![path(
@@ -1457,6 +1914,7 @@ fn raw_primitives(a: &Annotation) -> Vec<Primitive> {
                 rect: r,
                 size: a.style.font_size,
                 centered: false,
+                color: None,
             });
             p
         }
@@ -1467,6 +1925,7 @@ fn raw_primitives(a: &Annotation) -> Vec<Primitive> {
                 rect: r,
                 size: a.style.font_size,
                 centered: true,
+                color: None,
             },
         ],
         Kind::Svg { source, tint } => crate::svg::preview(source, tint.then_some(a.style.color))
@@ -1489,6 +1948,363 @@ fn raw_primitives(a: &Annotation) -> Vec<Primitive> {
             result
         }
     }
+}
+
+/// Center-to-knee ray intersects the text box boundary, so the leader remains
+/// attached after resizing, moving its knee, or reflecting the whole callout.
+pub fn callout_connection(body: Box2, knee: Point2) -> Point2 {
+    let center = [(body[0] + body[2]) / 2., (body[1] + body[3]) / 2.];
+    let d = [knee[0] - center[0], knee[1] - center[1]];
+    let half = [(body[2] - body[0]) / 2., (body[3] - body[1]) / 2.];
+    let scale = (if d[0].abs() > 0.0001 {
+        half[0] / d[0].abs()
+    } else {
+        f32::INFINITY
+    })
+    .min(if d[1].abs() > 0.0001 {
+        half[1] / d[1].abs()
+    } else {
+        f32::INFINITY
+    });
+    if !scale.is_finite() {
+        [center[0], body[3]]
+    } else {
+        [center[0] + d[0] * scale, center[1] + d[1] * scale]
+    }
+}
+
+/// Untransformed shaft paths, without heads, in displayed-page PDF points.
+/// Parallel lines share one ending at each centerline endpoint, rather than
+/// stacking two overlapping terminal symbols beside each other.
+pub fn line_paths(a: &Annotation) -> Option<Vec<Vec<Point2>>> {
+    let center = line_center_path(a)?;
+    if let Kind::DoubleLine { start, end } = a.kind {
+        Some(
+            double_line(a.local(start), a.local(end), a.style.width)
+                .into_iter()
+                .map(|p| p.to_vec())
+                .collect(),
+        )
+    } else {
+        Some(vec![center])
+    }
+}
+fn line_center_path(a: &Annotation) -> Option<Vec<Point2>> {
+    match a.kind {
+        Kind::Line { start, end, .. }
+        | Kind::DoubleLine { start, end }
+        | Kind::DoubleArrow { start, end } => Some(vec![a.local(start), a.local(end)]),
+        Kind::RoutedLine { start, end, route }
+        | Kind::RoutedArrow { start, end, route }
+        | Kind::RoutedDoubleArrow { start, end, route } => {
+            Some(routed_arrow(a.local(start), a.local(end), route))
+        }
+        _ => None,
+    }
+}
+fn ended_line_primitives(a: &Annotation) -> Option<Vec<Primitive>> {
+    let endings = line_endings(&a.kind, &a.style)?;
+    let center = line_center_path(a)?;
+    let offset = if matches!(a.kind, Kind::DoubleLine { .. }) {
+        a.style.width
+    } else {
+        0.
+    };
+    let mut primitives: Vec<_> = line_paths(a)?
+        .into_iter()
+        .map(|path| Primitive::Path {
+            points: trim_line_path(
+                &path,
+                ending_setback(endings.start, endings.size, offset),
+                ending_setback(endings.end, endings.size, offset),
+            ),
+            closed: false,
+            fill: false,
+        })
+        .collect();
+    if let Some(head) = line_head(&center, endings.end, endings.size) {
+        primitives.push(head);
+    }
+    let reversed: Vec<_> = center.into_iter().rev().collect();
+    if let Some(head) = line_head(&reversed, endings.start, endings.size) {
+        primitives.push(head);
+    }
+    Some(primitives)
+}
+fn ending_setback(ending: LineEnd, size: f32, offset: f32) -> f32 {
+    let radius = size / 2.;
+    match ending {
+        LineEnd::OpenArrow if offset > 0. => (offset / 0.45_f32.tan()).min(size * 0.45_f32.cos()),
+        LineEnd::ClosedArrow | LineEnd::FilledArrow => size * 0.45_f32.cos(),
+        LineEnd::Circle => (radius * radius - offset * offset).max(0.).sqrt(),
+        LineEnd::Square => {
+            if offset <= radius {
+                radius
+            } else {
+                0.
+            }
+        }
+        LineEnd::Diamond => (radius - offset).max(0.),
+        _ => 0.,
+    }
+}
+/// Leave an open stroke between terminal bodies. Trims are bounded so very
+/// large symbols on a short line remain editable rather than reversing a path.
+fn trim_line_path(path: &[Point2], mut start: f32, mut end: f32) -> Vec<Point2> {
+    let length: f32 = path
+        .windows(2)
+        .map(|p| (p[1][0] - p[0][0]).hypot(p[1][1] - p[0][1]))
+        .sum();
+    if length < 0.0001 || start + end == 0. {
+        return path.to_vec();
+    }
+    if start + end > length * 0.9 {
+        let factor = length * 0.9 / (start + end);
+        start *= factor;
+        end *= factor;
+    }
+    let at = |target: f32| {
+        let mut distance = 0.;
+        for pair in path.windows(2) {
+            let segment = (pair[1][0] - pair[0][0]).hypot(pair[1][1] - pair[0][1]);
+            if segment > 0.0001 && distance + segment >= target {
+                let t = ((target - distance) / segment).clamp(0., 1.);
+                return [
+                    pair[0][0] + (pair[1][0] - pair[0][0]) * t,
+                    pair[0][1] + (pair[1][1] - pair[0][1]) * t,
+                ];
+            }
+            distance += segment;
+        }
+        *path.last().unwrap()
+    };
+    let last = length - end;
+    let mut result = vec![at(start)];
+    let mut distance = 0.;
+    for pair in path.windows(2) {
+        distance += (pair[1][0] - pair[0][0]).hypot(pair[1][1] - pair[0][1]);
+        if distance > start && distance < last {
+            result.push(pair[1]);
+        }
+    }
+    result.push(at(last));
+    result
+}
+fn line_head(path: &[Point2], ending: LineEnd, size: f32) -> Option<Primitive> {
+    if ending == LineEnd::None {
+        return None;
+    }
+    let tip = *path.last()?;
+    let from = *path
+        .iter()
+        .rev()
+        .skip(1)
+        .find(|p| (tip[0] - p[0]).hypot(tip[1] - p[1]) > 0.0001)?;
+    let delta = [tip[0] - from[0], tip[1] - from[1]];
+    let length = delta[0].hypot(delta[1]);
+    let forward = [delta[0] / length, delta[1] / length];
+    let normal = [-forward[1], forward[0]];
+    let point = |x: f32, y: f32| {
+        [
+            tip[0] + forward[0] * x + normal[0] * y,
+            tip[1] + forward[1] * x + normal[1] * y,
+        ]
+    };
+    let radius = size / 2.;
+    let (points, closed, fill) = match ending {
+        LineEnd::None => return None,
+        LineEnd::OpenArrow | LineEnd::ClosedArrow | LineEnd::FilledArrow => (
+            vec![
+                point(-size * 0.45_f32.cos(), -size * 0.45_f32.sin()),
+                tip,
+                point(-size * 0.45_f32.cos(), size * 0.45_f32.sin()),
+            ],
+            ending != LineEnd::OpenArrow,
+            ending == LineEnd::FilledArrow,
+        ),
+        LineEnd::Circle => (
+            (0..48)
+                .map(|i| {
+                    let angle = i as f32 / 48. * std::f32::consts::TAU;
+                    point(radius * angle.cos(), radius * angle.sin())
+                })
+                .collect(),
+            true,
+            false,
+        ),
+        LineEnd::Square => (
+            vec![
+                point(-radius, -radius),
+                point(radius, -radius),
+                point(radius, radius),
+                point(-radius, radius),
+            ],
+            true,
+            false,
+        ),
+        LineEnd::Diamond => (
+            vec![
+                point(-radius, 0.),
+                point(0., -radius),
+                point(radius, 0.),
+                point(0., radius),
+            ],
+            true,
+            false,
+        ),
+        LineEnd::Bar => (vec![point(0., -radius), point(0., radius)], false, false),
+        LineEnd::Slash => (
+            vec![
+                point(-radius * 0.5, -radius * 0.866_025_4),
+                point(radius * 0.5, radius * 0.866_025_4),
+            ],
+            false,
+            false,
+        ),
+    };
+    Some(Primitive::Head {
+        points,
+        closed,
+        fill,
+    })
+}
+
+/// Parallel centerlines have a one-stroke clear gap. The separation is in page
+/// points, independent of line length or zoom. Geometry bounds include both
+/// strokes, and a coincident pair of endpoints uses a finite vertical offset.
+pub fn double_line(start: Point2, end: Point2, width: f32) -> [[Point2; 2]; 2] {
+    let delta = [end[0] - start[0], end[1] - start[1]];
+    let length = delta[0].hypot(delta[1]);
+    let normal = if length > 0.0001 {
+        [-delta[1] / length, delta[0] / length]
+    } else {
+        [0., 1.]
+    };
+    let offset = width.max(0.1);
+    [-1., 1.].map(|sign| {
+        [start, end].map(|p| {
+            [
+                p[0] + normal[0] * offset * sign,
+                p[1] + normal[1] * offset * sign,
+            ]
+        })
+    })
+}
+
+/// Points shared by routed lines/arrows, their interactive appearance and the
+/// native PDF PolyLine. Arrowheads are added separately by the arrow kind.
+pub fn routed_arrow(start: Point2, end: Point2, route: Route) -> Vec<Point2> {
+    let mut result = match route {
+        Route::Elbow => vec![start, [end[0], start[1]], end],
+        Route::Stepped => {
+            let mid = (start[0] + end[0]) / 2.;
+            vec![start, [mid, start[1]], [mid, end[1]], end]
+        }
+        Route::Curved => {
+            let mid = (start[0] + end[0]) / 2.;
+            let a = [mid, start[1]];
+            let b = [mid, end[1]];
+            (0..=48)
+                .map(|i| {
+                    let t = i as f32 / 48.;
+                    let u = 1. - t;
+                    [
+                        u * u * u * start[0]
+                            + 3. * u * u * t * a[0]
+                            + 3. * u * t * t * b[0]
+                            + t * t * t * end[0],
+                        u * u * u * start[1]
+                            + 3. * u * u * t * a[1]
+                            + 3. * u * t * t * b[1]
+                            + t * t * t * end[1],
+                    ]
+                })
+                .collect()
+        }
+    };
+    result.dedup_by(|a, b| (a[0] - b[0]).hypot(a[1] - b[1]) < 0.0001);
+    result
+}
+
+fn arrow_head(points: &[Point2], width: f32) -> Option<Primitive> {
+    let tip = *points.last()?;
+    let from = *points
+        .iter()
+        .rev()
+        .skip(1)
+        .find(|p| (tip[0] - p[0]).hypot(tip[1] - p[1]) > 0.0001)?;
+    let angle = (tip[1] - from[1]).atan2(tip[0] - from[0]);
+    let length: f32 = points
+        .windows(2)
+        .map(|p| (p[1][0] - p[0][0]).hypot(p[1][1] - p[0][1]))
+        .sum();
+    let len = (width * 5.).max(9.).min(length * 0.4);
+    Some(Primitive::Path {
+        points: vec![
+            [
+                tip[0] - len * (angle - 0.45).cos(),
+                tip[1] - len * (angle - 0.45).sin(),
+            ],
+            tip,
+            [
+                tip[0] - len * (angle + 0.45).cos(),
+                tip[1] - len * (angle + 0.45).sin(),
+            ],
+        ],
+        closed: false,
+        fill: false,
+    })
+}
+
+fn set_text_defaults(
+    d: &mut lopdf::Dictionary,
+    a: &Annotation,
+    font: Option<&crate::pdf_font::PdfFont>,
+) {
+    let color = if let Kind::Callout { text_color, .. } = a.kind {
+        text_color
+    } else {
+        a.style.color
+    };
+    d.set(
+        "DA",
+        Object::string_literal(format!(
+            "/UF {} Tf {} {} {} rg",
+            a.style.font_size, color[0], color[1], color[2]
+        )),
+    );
+    if let Some(font) = font {
+        d.set(
+            "DR",
+            dictionary! { "Font" => dictionary! { "UF" => font.id } },
+        );
+    }
+}
+
+/// Selected text can supply one quad per glyph. Join neighboring quads before
+/// making a wave so its cadence is continuous across letters and word spaces.
+/// The original PDF QuadPoints are kept unchanged when exporting.
+fn squiggly_lines(mut quads: Vec<Box2>) -> Vec<Box2> {
+    quads.sort_unstable_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    let mut lines: Vec<Box2> = vec![];
+    for q in quads {
+        if let Some(line) = lines.iter_mut().find(|line| {
+            let height = (line[3] - line[1]).max(q[3] - q[1]);
+            let overlap = line[3].min(q[3]) - line[1].max(q[1]);
+            let min_height = (line[3] - line[1]).min(q[3] - q[1]);
+            q[0] <= line[2] + (height * 0.65).clamp(1.0, 8.0)
+                && overlap >= min_height * 0.5
+                && (line[3] - q[3]).abs() <= height * 0.35
+        }) {
+            line[0] = line[0].min(q[0]);
+            line[1] = line[1].min(q[1]);
+            line[2] = line[2].max(q[2]);
+            line[3] = line[3].max(q[3]);
+        } else {
+            lines.push(q);
+        }
+    }
+    lines
 }
 
 fn pdf_numbers(r: impl IntoIterator<Item = f32>) -> Object {
@@ -1632,12 +2448,33 @@ pub fn appearance(
                     }
                 }
             }
+            Primitive::Head {
+                points,
+                closed,
+                fill,
+            } => {
+                if let Some(first) = points.first() {
+                    content.push_str(&format!(
+                        "q {} {} {} rg {} {} m\n",
+                        color[0], color[1], color[2], first[0], first[1]
+                    ));
+                    for p in &points[1..] {
+                        content.push_str(&format!("{} {} l\n", p[0], p[1]));
+                    }
+                    if closed {
+                        content.push_str("h\n");
+                    }
+                    content.push_str(if fill { "f Q\n" } else { "S Q\n" });
+                }
+            }
             Primitive::Text {
                 text,
                 rect,
                 size,
                 centered,
+                color: text_color,
             } => {
+                let color = text_color.unwrap_or(color);
                 let font = font.context("Text appearance needs an embedded font")?;
                 let lines = font.wrap(&text.replace('\t', "    "), size, rect[2] - rect[0] - 8.0);
                 let height = lines.len() as f32 * size * 1.25;
@@ -1710,13 +2547,25 @@ pub fn export(bytes: &[u8], annotations: &[Annotation]) -> Result<Vec<u8>> {
     remove_managed(&mut doc)?;
     let text: String = annotations
         .iter()
-        .filter(|a| matches!(a.kind, Kind::Text { .. } | Kind::Stamp { .. }))
+        .filter(|a| {
+            matches!(
+                a.kind,
+                Kind::Text { .. } | Kind::Stamp { .. } | Kind::Callout { .. }
+            )
+        })
         .filter_map(|a| a.kind.text())
         .collect();
-    let font = if text.is_empty() {
-        None
-    } else {
+    let font = if annotations.iter().any(|a| {
+        matches!(
+            a.kind,
+            Kind::Text { .. } | Kind::Stamp { .. } | Kind::Callout { .. }
+        )
+    }) {
+        // Empty text boxes and callouts remain valid editable geometry. Their
+        // appearance still uses the text primitive even before text is entered.
         Some(crate::pdf_font::PdfFont::embed(&mut doc, &text)?)
+    } else {
+        None
     };
     for a in annotations {
         let page_id = pages[&(a.page as u32 + 1)];
@@ -1732,21 +2581,43 @@ pub fn export(bytes: &[u8], annotations: &[Annotation]) -> Result<Vec<u8>> {
                 ..
             } => "Underline",
             Kind::Markup {
+                kind: Markup::Squiggly,
+                ..
+            } => "Squiggly",
+            Kind::Markup {
                 kind: Markup::Strikeout,
                 ..
             } => "StrikeOut",
-            Kind::Ink { .. } => "Ink",
+            Kind::Ink { .. } | Kind::DoubleLine { .. } => "Ink",
             Kind::Note { .. } => "Text",
-            Kind::Text { .. } => "FreeText",
+            Kind::Text { .. } | Kind::Callout { .. } => "FreeText",
             Kind::Rectangle => "Square",
-            Kind::Ellipse => "Circle",
+            Kind::Ellipse
+            | Kind::Shape {
+                shape: Shape::Circle,
+            } => "Circle",
+            Kind::Shape {
+                shape: Shape::Square,
+            } => "Square",
+            Kind::Shape { .. } => "Polygon",
             Kind::Line { .. } | Kind::DoubleArrow { .. } => "Line",
+            Kind::RoutedArrow { .. } | Kind::RoutedDoubleArrow { .. } | Kind::RoutedLine { .. } => {
+                "PolyLine"
+            }
             Kind::Polygon { closed: true, .. } => "Polygon",
             Kind::Polygon { .. } => "PolyLine",
             _ => "Stamp",
         };
         let mut d = dictionary! { "Type" => "Annot", "Subtype" => subtype, "Rect" => pdf_numbers(rect), "P" => page_id, "F" => (if a.object.hidden { 2 } else { 4 } | if a.object.locked { 128 } else { 0 }), "NM" => Object::string_literal(format!("MyPDF-{}", a.id)), "T" => text_string("MyPDF"), "C" => pdf_numbers(a.style.color), "CA" => a.style.opacity, "BS" => dictionary! { "W" => a.style.width, "S" => "S" }, "AP" => dictionary! { "N" => ap }, "MyPDFData" => Object::string_literal(serde_json::to_string(a)?) };
-        if let Some(dash) = a.style.stroke.dash_array(a.style.width) {
+        if let Some(dash) = a.style.stroke.dash_array(a.style.width).filter(|_| {
+            !matches!(
+                a.kind,
+                Kind::Markup {
+                    kind: Markup::Squiggly,
+                    ..
+                }
+            )
+        }) {
             d.set(
                 "BS",
                 dictionary! { "W" => a.style.width, "S" => "D", "D" => pdf_numbers(dash) },
@@ -1803,6 +2674,22 @@ pub fn export(bytes: &[u8], annotations: &[Annotation]) -> Result<Vec<u8>> {
                     d.set("IC", pdf_numbers(fill));
                 }
             }
+            Kind::Shape { shape } => {
+                if !matches!(shape, Shape::Square | Shape::Circle) {
+                    d.set(
+                        "Vertices",
+                        pdf_numbers(shape.outline().into_iter().flat_map(|p| point(a.local(p)))),
+                    );
+                }
+                if let Some(fill) = a.style.fill {
+                    d.set("IC", pdf_numbers(fill));
+                }
+            }
+            Kind::Rectangle | Kind::Ellipse => {
+                if let Some(fill) = a.style.fill {
+                    d.set("IC", pdf_numbers(fill));
+                }
+            }
             Kind::Line { start, end, .. } | Kind::DoubleArrow { start, end } => {
                 d.set(
                     "L",
@@ -1829,26 +2716,143 @@ pub fn export(bytes: &[u8], annotations: &[Annotation]) -> Result<Vec<u8>> {
                     );
                 }
             }
-            Kind::Note { .. } => d.set("Name", "Comment"),
-            Kind::Text { .. } => {
+            Kind::DoubleLine { start, end } => {
+                // A PDF PolyLine would connect the two parallel paths at an end.
+                // InkList preserves their two independent native strokes.
                 d.set(
-                    "DA",
-                    Object::string_literal(format!(
-                        "/UF {} Tf {} {} {} rg",
-                        a.style.font_size, a.style.color[0], a.style.color[1], a.style.color[2]
-                    )),
+                    "InkList",
+                    Object::Array(
+                        double_line(a.local(*start), a.local(*end), a.style.width)
+                            .into_iter()
+                            .map(|stroke| pdf_numbers(stroke.into_iter().flat_map(point)))
+                            .collect(),
+                    ),
                 );
-                if let Some(font) = &font {
-                    d.set(
-                        "DR",
-                        dictionary! { "Font" => dictionary! { "UF" => font.id } },
-                    );
-                }
             }
+            Kind::RoutedLine { start, end, route } => {
+                d.set(
+                    "Vertices",
+                    pdf_numbers(
+                        routed_arrow(a.local(*start), a.local(*end), *route)
+                            .into_iter()
+                            .flat_map(point),
+                    ),
+                );
+            }
+            Kind::RoutedArrow { start, end, route }
+            | Kind::RoutedDoubleArrow { start, end, route } => {
+                d.set(
+                    "Vertices",
+                    pdf_numbers(
+                        routed_arrow(a.local(*start), a.local(*end), *route)
+                            .into_iter()
+                            .flat_map(point),
+                    ),
+                );
+                d.set(
+                    "LE",
+                    vec![
+                        Object::Name(if matches!(a.kind, Kind::RoutedDoubleArrow { .. }) {
+                            b"OpenArrow".to_vec()
+                        } else {
+                            b"None".to_vec()
+                        }),
+                        Object::Name(b"OpenArrow".to_vec()),
+                    ],
+                );
+            }
+            Kind::Callout {
+                box_rect,
+                tip,
+                knee,
+                ..
+            } => {
+                let first = a.local([box_rect[0], box_rect[1]]);
+                let last = a.local([box_rect[2], box_rect[3]]);
+                let body = [first[0], first[1], last[0], last[1]];
+                let connection = callout_connection(body, a.local(*knee));
+                d.set("IT", "FreeTextCallout");
+                d.set(
+                    "CL",
+                    pdf_numbers(
+                        [a.local(*tip), a.local(*knee), connection]
+                            .into_iter()
+                            .flat_map(point),
+                    ),
+                );
+                d.set("LE", "OpenArrow");
+                let body_box = bounds(
+                    &[
+                        [body[0], body[1]],
+                        [body[2], body[1]],
+                        [body[2], body[3]],
+                        [body[0], body[3]],
+                    ]
+                    .map(point),
+                );
+                d.set(
+                    "RD",
+                    pdf_numbers([
+                        body_box[0] - rect[0],
+                        body_box[1] - rect[1],
+                        rect[2] - body_box[2],
+                        rect[3] - body_box[3],
+                    ]),
+                );
+                if let Some(fill) = a.style.fill {
+                    d.set("IC", pdf_numbers(fill));
+                }
+                set_text_defaults(&mut d, a, font.as_ref());
+            }
+            Kind::Note { .. } => d.set("Name", "Comment"),
+            Kind::Text { .. } => set_text_defaults(&mut d, a, font.as_ref()),
             Kind::Stamp { .. } | Kind::Image { .. } | Kind::Symbol(_) => {
                 d.set("Name", "MyPDFStamp")
             }
             _ => {}
+        }
+        if let Some(endings) = a
+            .style
+            .line_endings
+            .filter(|_| line_endings(&a.kind, &a.style).is_some())
+        {
+            if matches!(a.kind, Kind::DoubleLine { .. }) {
+                // Ink has no per-stroke line-ending or dash settings. Export
+                // the same expanded shaft pattern plus solid marker outlines.
+                d.set("BS", dictionary! {"W"=>a.style.width,"S"=>"S"});
+                let strokes = primitives(a)
+                    .into_iter()
+                    .filter_map(|p| match p {
+                        Primitive::Path {
+                            mut points, closed, ..
+                        }
+                        | Primitive::Head {
+                            mut points, closed, ..
+                        } => {
+                            if closed && let Some(first) = points.first().copied() {
+                                points.push(first);
+                            }
+                            Some(pdf_numbers(points.into_iter().flat_map(point)))
+                        }
+                        Primitive::Dot { center } => Some(pdf_numbers(
+                            [point(center), point(center)].into_iter().flatten(),
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+                d.set("InkList", Object::Array(strokes));
+            } else {
+                d.set(
+                    "LE",
+                    vec![
+                        Object::Name(endings.start.pdf_name().as_bytes().to_vec()),
+                        Object::Name(endings.end.pdf_name().as_bytes().to_vec()),
+                    ],
+                );
+                if endings.start == LineEnd::FilledArrow || endings.end == LineEnd::FilledArrow {
+                    d.set("IC", pdf_numbers(a.style.color));
+                }
+            }
         }
         let mut state = d.clone();
         for key in [b"MyPDFData".as_slice(), b"AP", b"P", b"NM"] {

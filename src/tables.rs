@@ -49,6 +49,13 @@ pub enum Scope {
     Column,
     Table,
 }
+/// A merged rectangle, identified by its top-left physical cell.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellSpan {
+    pub anchor: usize,
+    pub rows: usize,
+    pub columns: usize,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Table {
     pub id: String,
@@ -65,6 +72,10 @@ pub struct Table {
     pub styles: Vec<CellStyle>,
     #[serde(default)]
     pub template: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<CellSpan>,
+    #[serde(default)]
+    pub auto_height: bool,
 }
 impl Table {
     pub fn new(rows: usize, columns: usize, rect: [f32; 4]) -> Self {
@@ -91,9 +102,12 @@ impl Table {
             header: false,
             styles: vec![],
             template: String::new(),
+            spans: vec![],
+            auto_height: false,
         }
     }
     pub fn style(&self, index: usize) -> CellStyle {
+        let index = self.anchor(index);
         self.styles
             .get(index)
             .cloned()
@@ -198,12 +212,193 @@ impl Table {
         ]
     }
     pub fn cell(&self, index: usize) -> [f32; 4] {
+        let index = self.anchor(index);
+        let c = index % self.columns();
+        let r = index / self.columns();
+        let [rows, columns] = self.span(index);
+        [
+            self.xs[c],
+            self.ys[r],
+            self.xs[c + columns],
+            self.ys[r + rows],
+        ]
+    }
+    pub fn raw_cell(&self, index: usize) -> [f32; 4] {
         let c = index % self.columns();
         let r = index / self.columns();
         [self.xs[c], self.ys[r], self.xs[c + 1], self.ys[r + 1]]
     }
+    pub fn anchor(&self, index: usize) -> usize {
+        let columns = self.columns();
+        if columns == 0 {
+            return index;
+        }
+        let (r, c) = (index / columns, index % columns);
+        self.spans
+            .iter()
+            .find(|s| {
+                let (top, left) = (s.anchor / columns, s.anchor % columns);
+                r >= top && r < top + s.rows && c >= left && c < left + s.columns
+            })
+            .map_or(index, |s| s.anchor)
+    }
+    pub fn is_covered(&self, index: usize) -> bool {
+        self.anchor(index) != index
+    }
+    pub fn span(&self, index: usize) -> [usize; 2] {
+        let anchor = self.anchor(index);
+        self.spans
+            .iter()
+            .find(|s| s.anchor == anchor)
+            .map_or([1, 1], |s| [s.rows, s.columns])
+    }
+    pub fn anchors(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.cells.len()).filter(|i| !self.is_covered(*i))
+    }
+    /// Merge a rectangular selection without dropping any cell's text.
+    /// Splitting later keeps the combined text in the top-left cell; Undo can
+    /// restore the former individual values.
+    pub fn merge_range(&mut self, first: usize, last: usize) -> Result<usize> {
+        self.validate()?;
+        ensure!(
+            first < self.cells.len() && last < self.cells.len(),
+            "Cell not found"
+        );
+        let cols = self.columns();
+        let (top, bottom) = (
+            (first / cols).min(last / cols),
+            (first / cols).max(last / cols),
+        );
+        let (left, right) = (
+            (first % cols).min(last % cols),
+            (first % cols).max(last % cols),
+        );
+        ensure!(
+            top != bottom || left != right,
+            "Select at least two cells to merge"
+        );
+        for s in &self.spans {
+            let (r, c) = (s.anchor / cols, s.anchor % cols);
+            let overlaps = r <= bottom && r + s.rows > top && c <= right && c + s.columns > left;
+            ensure!(
+                !overlaps
+                    || (r >= top
+                        && r + s.rows <= bottom + 1
+                        && c >= left
+                        && c + s.columns <= right + 1),
+                "Split the existing merged cell before merging part of it"
+            );
+        }
+        let mut updated = self.clone();
+        let anchor = top * cols + left;
+        let mut parts = vec![];
+        for r in top..=bottom {
+            for c in left..=right {
+                let i = r * cols + c;
+                if !self.cells[i].trim().is_empty() {
+                    parts.push(self.cells[i].as_str());
+                }
+                updated.cells[i].clear();
+            }
+        }
+        updated.cells[anchor] = parts.join("\n");
+        updated.spans.retain(|s| {
+            let (r, c) = (s.anchor / cols, s.anchor % cols);
+            !(r >= top && r <= bottom && c >= left && c <= right)
+        });
+        updated.spans.push(CellSpan {
+            anchor,
+            rows: bottom - top + 1,
+            columns: right - left + 1,
+        });
+        updated.spans.sort_by_key(|s| s.anchor);
+        updated.validate()?;
+        *self = updated;
+        Ok(anchor)
+    }
+    pub fn split_cell(&mut self, index: usize) -> Result<bool> {
+        self.validate()?;
+        ensure!(index < self.cells.len(), "Cell not found");
+        let anchor = self.anchor(index);
+        let old = self.spans.len();
+        self.spans.retain(|s| s.anchor != anchor);
+        Ok(old != self.spans.len())
+    }
+    /// Paste an Excel/TSV rectangle atomically, optionally appending rows and
+    /// columns. Existing merges must be split before pasting into their cells.
+    pub fn paste_grid(&mut self, start: usize, text: &str, grow: bool) -> Result<usize> {
+        self.validate()?;
+        ensure!(start < self.cells.len(), "Cell not found");
+        let grid = parse_grid(text)?;
+        let (row, column) = (start / self.columns(), start % self.columns());
+        let rows = row + grid.len();
+        let columns = column + grid[0].len();
+        ensure!(
+            rows <= 60 && columns <= 12,
+            "Pasted cells exceed the 60 row / 12 column limit"
+        );
+        ensure!(
+            grow || (rows <= self.rows() && columns <= self.columns()),
+            "The pasted cells do not fit. Allow table growth or choose a smaller range"
+        );
+        let mut updated = self.clone();
+        updated.grow_to(rows.max(self.rows()), columns.max(self.columns()))?;
+        for (r, values) in grid.iter().enumerate() {
+            for (c, value) in values.iter().enumerate() {
+                let i = (row + r) * updated.columns() + column + c;
+                ensure!(
+                    updated.span(i) == [1, 1],
+                    "Split merged cells before pasting into them"
+                );
+                updated.cells[i] = value.clone();
+            }
+        }
+        updated.validate()?;
+        *self = updated;
+        Ok(grid.len() * grid[0].len())
+    }
+    fn grow_to(&mut self, rows: usize, columns: usize) -> Result<()> {
+        let (old_rows, old_columns) = (self.rows(), self.columns());
+        if rows == old_rows && columns == old_columns {
+            return Ok(());
+        }
+        let mut cells = vec![String::new(); rows * columns];
+        let mut styles = vec![CellStyle::default(); rows * columns];
+        for r in 0..rows {
+            for c in 0..columns {
+                let previous = r.min(old_rows - 1) * old_columns + c.min(old_columns - 1);
+                styles[r * columns + c] = self
+                    .styles
+                    .get(previous)
+                    .cloned()
+                    .unwrap_or_else(|| self.style(previous));
+                if r < old_rows && c < old_columns {
+                    cells[r * columns + c] = self.cells[r * old_columns + c].clone();
+                }
+            }
+        }
+        let width = self.xs[old_columns] - self.xs[old_columns - 1];
+        let height = self.ys[old_rows] - self.ys[old_rows - 1];
+        for _ in old_columns..columns {
+            self.xs.push(self.xs.last().unwrap() + width);
+        }
+        for _ in old_rows..rows {
+            self.ys.push(self.ys.last().unwrap() + height);
+        }
+        for span in &mut self.spans {
+            span.anchor = span.anchor / old_columns * columns + span.anchor % old_columns;
+        }
+        self.cells = cells;
+        self.styles = styles;
+        self.validate()
+    }
+    /// Fit every row to the same wrapped/font-metric layout used for PDF and
+    /// vector rendering. No geometry changes are kept when it cannot fit.
+    pub fn fit_row_heights(&mut self, max_bottom: f32) -> Result<()> {
+        fit_heights(self, max_bottom)
+    }
     pub fn hit(&self, p: [f32; 2]) -> Option<usize> {
-        (0..self.cells.len()).find(|i| {
+        self.anchors().find(|i| {
             let [l, t, r, b] = self.cell(*i);
             p[0] >= l && p[0] <= r && p[1] >= t && p[1] <= b
         })
@@ -241,6 +436,32 @@ impl Table {
             self.styles.is_empty() || self.styles.len() == self.cells.len(),
             "Invalid cell properties"
         );
+        let mut covered = vec![false; self.cells.len()];
+        for span in &self.spans {
+            ensure!(
+                span.anchor < self.cells.len()
+                    && span.rows > 0
+                    && span.columns > 0
+                    && (span.rows > 1 || span.columns > 1),
+                "Invalid merged cell"
+            );
+            let (r, c) = (span.anchor / self.columns(), span.anchor % self.columns());
+            ensure!(
+                span.rows <= self.rows() - r && span.columns <= self.columns() - c,
+                "Merged cell extends outside the table"
+            );
+            for row in r..r + span.rows {
+                for col in c..c + span.columns {
+                    let i = row * self.columns() + col;
+                    ensure!(!covered[i], "Merged cells overlap");
+                    ensure!(
+                        i == span.anchor || self.cells[i].is_empty(),
+                        "Covered cells cannot contain hidden text"
+                    );
+                    covered[i] = true;
+                }
+            }
+        }
         for s in &self.styles {
             ensure!(
                 (4. ..=72.).contains(&s.size)
@@ -260,6 +481,10 @@ impl Table {
     }
     pub fn resize_structure(&mut self, row: bool, at: usize, insert: bool) -> Result<()> {
         self.validate()?;
+        ensure!(
+            self.spans.is_empty(),
+            "Split merged cells before adding or removing rows and columns"
+        );
         let (rows, cols) = (self.rows(), self.columns());
         let count = if row { rows } else { cols };
         ensure!(
@@ -327,6 +552,98 @@ impl Table {
         Ok(())
     }
 }
+/// Excel's text clipboard format uses tabs, quoted fields and doubled quotes.
+/// Parsing is bounded before it can change a table; a terminal line ending is
+/// a terminator rather than an extra blank row.
+pub fn parse_grid(text: &str) -> Result<Vec<Vec<String>>> {
+    ensure!(text.len() <= 1024 * 1024, "Pasted table text is too long");
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut closed = false;
+    let mut row_ended = false;
+    let mut chars = text
+        .strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .chars()
+        .peekable();
+    while let Some(c) = chars.next() {
+        if quoted {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    quoted = false;
+                    closed = true;
+                }
+            } else if c == '\r' {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                field.push('\n');
+            } else {
+                field.push(c);
+            }
+            ensure!(field.len() <= 32768, "A pasted cell exceeds 32 KB of text");
+            row_ended = false;
+            continue;
+        }
+        ensure!(
+            !closed || matches!(c, '\t' | '\r' | '\n'),
+            "Unexpected text after a quoted cell"
+        );
+        match c {
+            '"' if field.is_empty() && !closed => {
+                quoted = true;
+                row_ended = false;
+            }
+            '\t' | '\r' | '\n' => {
+                ensure!(row.len() < 12, "Pasted cells exceed the 12 column limit");
+                row.push(std::mem::take(&mut field));
+                closed = false;
+                row_ended = c != '\t';
+                if row_ended {
+                    if c == '\r' && chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    ensure!(rows.len() < 60, "Pasted cells exceed the 60 row limit");
+                    rows.push(std::mem::take(&mut row));
+                }
+            }
+            _ => {
+                field.push(c);
+                row_ended = false;
+            }
+        }
+        ensure!(field.len() <= 32768, "A pasted cell exceeds 32 KB of text");
+    }
+    ensure!(
+        !quoted,
+        "The pasted table contains an unfinished quoted cell"
+    );
+    if !row_ended || !row.is_empty() || !field.is_empty() {
+        ensure!(
+            row.len() < 12 && rows.len() < 60,
+            "Pasted cells exceed the 60 row / 12 column limit"
+        );
+        row.push(field);
+        rows.push(row);
+    }
+    if rows.is_empty() {
+        rows.push(vec![String::new()]);
+    }
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(1);
+    for row in &mut rows {
+        row.resize(columns, String::new());
+    }
+    ensure!(
+        rows.iter().flatten().map(String::len).sum::<usize>() <= 512 * 1024,
+        "Pasted table text exceeds 512 KB"
+    );
+    Ok(rows)
+}
 fn table_writers() -> Result<Vec<crate::unicode_text::Writer>> {
     let fallback = crate::document::default_font()?;
     let fonts = crate::text_style::fonts();
@@ -349,12 +666,97 @@ struct LayoutLine {
     style: CellStyle,
     writer: usize,
 }
+struct MeasuredLine {
+    line: crate::unicode_text::Line,
+    text: String,
+    width: f32,
+    baseline: f32,
+    height: f32,
+}
+fn measured_lines(
+    text: &str,
+    style: &CellStyle,
+    width: f32,
+    writer: &mut crate::unicode_text::Writer,
+) -> Result<Vec<MeasuredLine>> {
+    ensure!(width > 0. && width.is_finite(), "Reduce cell edge spacing");
+    writer
+        .wrap(text, style.size, width)?
+        .into_iter()
+        .map(|(text, _)| {
+            let line = writer.shape(&text)?;
+            let advance = line.width(style.size);
+            ensure!(advance <= width + 0.1, "A character is wider than the cell");
+            let [ascent, descent, gap] = writer.line_metrics(&line, style.size);
+            let height = (ascent + descent + gap).max(style.size * 1.1);
+            Ok(MeasuredLine {
+                line,
+                text,
+                width: advance,
+                baseline: ascent + (height - ascent - descent) / 2.,
+                height,
+            })
+        })
+        .collect()
+}
+fn fit_heights(table: &mut Table, max_bottom: f32) -> Result<()> {
+    table.validate()?;
+    ensure!(
+        max_bottom.is_finite() && max_bottom > table.ys[0],
+        "Invalid page bottom"
+    );
+    let mut writers = table_writers()?;
+    let mut heights = vec![12_f32; table.rows()];
+    let mut spanning = vec![];
+    for i in table.anchors() {
+        let style = table.style(i);
+        let [l, _, r, _] = table.cell(i);
+        let writer = usize::from(style.bold) + usize::from(style.italic) * 2;
+        let lines = measured_lines(
+            &table.cells[i],
+            &style,
+            r - l - style.insets[0] - style.insets[2],
+            &mut writers[writer],
+        )?;
+        let need =
+            lines.iter().map(|line| line.height).sum::<f32>() + style.insets[1] + style.insets[3];
+        let row = i / table.columns();
+        let rows = table.span(i)[0];
+        if rows == 1 {
+            heights[row] = heights[row].max(need);
+        } else {
+            spanning.push((row, rows, need));
+        }
+    }
+    spanning.sort_by_key(|(_, rows, _)| *rows);
+    for (row, rows, need) in spanning {
+        let spare = (need - heights[row..row + rows].iter().sum::<f32>()).max(0.);
+        for height in &mut heights[row..row + rows] {
+            *height += spare / rows as f32;
+        }
+    }
+    let bottom = table.ys[0] + heights.iter().sum::<f32>();
+    ensure!(
+        bottom <= max_bottom + 0.01,
+        "The fitted table would extend beyond the page. Shorten the text, widen columns or reduce font size"
+    );
+    let mut updated = table.clone();
+    updated.ys.truncate(1);
+    for height in heights {
+        updated.ys.push(updated.ys.last().unwrap() + height);
+    }
+    updated.validate()?;
+    layout_lines(&updated, &mut writers)?;
+    *table = updated;
+    Ok(())
+}
 fn layout_lines(
     table: &Table,
     writers: &mut [crate::unicode_text::Writer],
 ) -> Result<Vec<LayoutLine>> {
     let mut out = vec![];
-    for (i, text) in table.cells.iter().enumerate() {
+    for i in table.anchors() {
+        let text = &table.cells[i];
         let [l, t, r, b] = table.cell(i);
         let style = table.style(i);
         let [left, top, right, bottom] = style.insets;
@@ -363,38 +765,36 @@ fn layout_lines(
         ensure!(width > 0. && height > 0., "Reduce cell edge spacing");
         let index = usize::from(style.bold) + usize::from(style.italic) * 2;
         let writer = &mut writers[index];
-        let lines = writer.wrap(text, style.size, width)?;
-        let used = lines.len() as f32 * style.size * 1.25;
+        let lines = measured_lines(text, &style, width, writer)?;
+        let used = lines.iter().map(|line| line.height).sum::<f32>();
         ensure!(
             text.trim().is_empty() || used <= height + 0.1,
             "Text in row {}, column {} does not fit. Enlarge the row or reduce font size.",
             i / table.columns() + 1,
             i % table.columns() + 1
         );
-        let y = t
+        let mut y = t
             + top
             + match style.vertical {
                 1 => (height - used).max(0.) / 2.,
                 2 => (height - used).max(0.),
                 _ => 0.,
             };
-        for (row, (text, _)) in lines.into_iter().enumerate() {
-            let line = writer.shape(&text)?;
-            let advance = line.width(style.size);
-            ensure!(advance <= width + 0.1, "A word is wider than the cell");
+        for line in lines {
             let x = match style.alignment {
-                1 => l + left + (width - advance) / 2.,
-                2 => r - right - advance,
+                1 => l + left + (width - line.width) / 2.,
+                2 => r - right - line.width,
                 _ => l + left,
             };
             out.push(LayoutLine {
-                line,
-                text,
+                line: line.line,
+                text: line.text,
                 x,
-                y: y + style.size * (0.9 + row as f32 * 1.25),
+                y: y + line.baseline,
                 style: style.clone(),
                 writer: index,
             });
+            y += line.height;
         }
     }
     Ok(out)
@@ -424,7 +824,7 @@ pub fn layer(
         r - l,
         b - t
     );
-    for i in 0..table.cells.len() {
+    for i in table.anchors() {
         let [x, y, right, bottom] = table.cell(i);
         let s = table.style(i);
         // Keep the outside stroke inside the SVG viewport and annotation bounds.
@@ -506,7 +906,8 @@ pub fn owned(bytes: &[u8], page: u32) -> Result<Vec<Table>> {
     Ok(tables
         .into_iter()
         .filter(|table| {
-            table.cells.iter().enumerate().all(|(i, text)| {
+            table.anchors().all(|i| {
+                let text = &table.cells[i];
                 text_from_runs(&runs, table.cell(i))
                     .is_ok_and(|(actual, _)| normalized(&actual) == normalized(text))
             })
@@ -593,7 +994,7 @@ pub fn write(bytes: &[u8], page: u32, table: &Table) -> Result<Vec<u8>> {
             transform.iter().map(|v| Object::Real(*v as f32)).collect(),
         ),
     ];
-    for i in 0..table.cells.len() {
+    for i in table.anchors() {
         let [l, t, r, b] = table.cell(i);
         let style = table.style(i);
         if let Some(fill) = style.fill {
@@ -718,6 +1119,7 @@ pub fn edit_cell(
 ) -> Result<Vec<u8>> {
     table.validate()?;
     ensure!(index < table.cells.len(), "Cell not found");
+    let index = table.anchor(index);
     if owned(bytes, page)?.iter().any(|t| t.id == table.id) {
         let mut updated = table.clone();
         updated.cells[index] = text.into();
@@ -897,12 +1299,13 @@ fn paint_cell_style(bytes: &[u8], page: u32, rect: [f32; 4], style: &CellStyle) 
 /// Apply cell/row/column styling to a detected grid in one document transaction.
 pub fn edit_detected(bytes: &[u8], page: u32, table: &Table, base: &Table) -> Result<Vec<u8>> {
     table.validate()?;
+    base.validate()?;
     ensure!(
-        table.xs == base.xs && table.ys == base.ys,
+        table.xs == base.xs && table.ys == base.ys && table.spans == base.spans,
         "Detach the detected grid before resizing it"
     );
     let mut current = bytes.to_vec();
-    for i in 0..table.cells.len() {
+    for i in table.anchors() {
         if table.cells[i] != base.cells[i] || table.style(i) != base.style(i) {
             current = edit_cell(&current, page, table, i, &table.cells[i])?;
         }
@@ -1060,6 +1463,92 @@ fn detected_style(
     style
 }
 
+fn infer_spans(table: &mut Table, hs: &[[f32; 3]], vs: &[[f32; 3]]) -> Result<()> {
+    let covers = |edges: &[[f32; 3]], line: f32, start: f32, end: f32| {
+        edges
+            .iter()
+            .any(|e| (e[0] - line).abs() < 1.5 && e[1] <= start + 1.5 && e[2] >= end - 1.5)
+    };
+    let complete_or_empty = |edges: &[[f32; 3]], line: f32, start: f32, end: f32| -> Result<bool> {
+        let complete = covers(edges, line, start, end);
+        ensure!(
+            complete
+                || !edges
+                    .iter()
+                    .any(|e| (e[0] - line).abs() < 1.5 && e[1] < end - 1.5 && e[2] > start + 1.5),
+            "An incomplete border is not a rectangular merged cell"
+        );
+        Ok(complete)
+    };
+    let [l, t, r, b] = table.rect();
+    ensure!(
+        covers(hs, t, l, r) && covers(hs, b, l, r) && covers(vs, l, t, b) && covers(vs, r, t, b),
+        "The table's outer border is incomplete"
+    );
+    let columns = table.columns();
+    let mut parents: Vec<_> = (0..table.cells.len()).collect();
+    fn root(parents: &[usize], mut i: usize) -> usize {
+        while parents[i] != i {
+            i = parents[i];
+        }
+        i
+    }
+    let mut present = vec![];
+    for row in 0..table.rows() {
+        for col in 1..columns {
+            let a = row * columns + col - 1;
+            let b = a + 1;
+            if complete_or_empty(vs, table.xs[col], table.ys[row], table.ys[row + 1])? {
+                present.push((a, b));
+            } else {
+                let a = root(&parents, a);
+                let b = root(&parents, b);
+                parents[b] = a;
+            }
+        }
+    }
+    for row in 1..table.rows() {
+        for col in 0..columns {
+            let a = (row - 1) * columns + col;
+            let b = row * columns + col;
+            if complete_or_empty(hs, table.ys[row], table.xs[col], table.xs[col + 1])? {
+                present.push((a, b));
+            } else {
+                let a = root(&parents, a);
+                let b = root(&parents, b);
+                parents[b] = a;
+            }
+        }
+    }
+    ensure!(
+        present
+            .iter()
+            .all(|(a, b)| root(&parents, *a) != root(&parents, *b)),
+        "Borders inside a merged cell are ambiguous"
+    );
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+    for i in 0..parents.len() {
+        groups.entry(root(&parents, i)).or_default().push(i);
+    }
+    for cells in groups.values().filter(|cells| cells.len() > 1) {
+        let top = cells.iter().map(|i| i / columns).min().unwrap();
+        let bottom = cells.iter().map(|i| i / columns).max().unwrap();
+        let left = cells.iter().map(|i| i % columns).min().unwrap();
+        let right = cells.iter().map(|i| i % columns).max().unwrap();
+        ensure!(
+            cells.len() == (bottom - top + 1) * (right - left + 1),
+            "A merged cell must be rectangular"
+        );
+        table.spans.push(CellSpan {
+            anchor: top * columns + left,
+            rows: bottom - top + 1,
+            columns: right - left + 1,
+        });
+    }
+    table.spans.sort_by_key(|s| s.anchor);
+    table.validate()
+}
+
 pub fn detect(bytes: &[u8], page: u32) -> Result<Vec<Table>> {
     let mut doc = lopdf::Document::load_mem(bytes)?;
     let clean = crate::annotations::clean_render_copy(bytes, &mut doc)?;
@@ -1100,7 +1589,7 @@ pub fn detect(bytes: &[u8], page: u32) -> Result<Vec<Table>> {
     let hs = merge(false);
     let vs = merge(true);
     let mut groups: Vec<Vec<[f32; 3]>> = vec![];
-    for h in hs {
+    for h in hs.iter().copied() {
         if let Some(g) = groups
             .iter_mut()
             .find(|g| (g[0][1] - h[1]).abs() < 1.5 && (g[0][2] - h[2]).abs() < 1.5)
@@ -1126,7 +1615,7 @@ pub fn detect(bytes: &[u8], page: u32) -> Result<Vec<Table>> {
                 let mut xs: Vec<_> = vs
                     .iter()
                     .filter(|v| {
-                        v[0] >= l - 1.5 && v[0] <= r + 1.5 && v[1] <= t + 1.5 && v[2] >= b - 1.5
+                        v[0] >= l - 1.5 && v[0] <= r + 1.5 && v[1] < b - 1.5 && v[2] > t + 1.5
                     })
                     .map(|v| v[0])
                     .collect();
@@ -1136,15 +1625,27 @@ pub fn detect(bytes: &[u8], page: u32) -> Result<Vec<Table>> {
                     || xs.len() > 13
                     || (xs[0] - l).abs() > 1.5
                     || (*xs.last().unwrap() - r).abs() > 1.5
-                    || span * (xs.len() - 1) < 2
                 {
                     continue;
                 }
-                let mut table = Table::new(span, xs.len() - 1, [l, t, r, b]);
+                let mut ys: Vec<_> = hs
+                    .iter()
+                    .filter(|h| {
+                        h[0] >= t - 1.5 && h[0] <= b + 1.5 && h[1] < r - 1.5 && h[2] > l + 1.5
+                    })
+                    .map(|h| h[0])
+                    .collect();
+                ys.sort_by(f32::total_cmp);
+                ys.dedup_by(|a, b| (*a - *b).abs() < 1.5);
+                if ys.len() < 2 || ys.len() > 61 || (ys.len() - 1) * (xs.len() - 1) < 2 {
+                    continue;
+                }
+                let mut table = Table::new(ys.len() - 1, xs.len() - 1, [l, t, r, b]);
                 table.id.clear();
                 table.xs = xs;
-                table.ys = group[start..=end].iter().map(|h| h[0]).collect();
+                table.ys = ys;
                 if table.validate().is_err()
+                    || infer_spans(&mut table, &hs, &vs).is_err()
                     || own.iter().any(|o| {
                         let a = o.rect();
                         contains(a, [l, t]) && contains(a, [r, b])
@@ -1156,7 +1657,7 @@ pub fn detect(bytes: &[u8], page: u32) -> Result<Vec<Table>> {
                 {
                     continue;
                 }
-                for i in 0..table.cells.len() {
+                for i in table.anchors().collect::<Vec<_>>() {
                     table.cells[i] = text_from_runs(&runs, table.cell(i))
                         .map(|v| v.0)
                         .unwrap_or_default();
@@ -1216,7 +1717,7 @@ fn remove_embedded(bytes: &[u8], page: u32, table: &Table) -> Result<Vec<u8>> {
             runs: vec![],
             annotations: vec![],
         };
-        for i in 0..table.cells.len() {
+        for i in table.anchors() {
             selection
                 .runs
                 .extend(cell_text(bytes, page, table.cell(i))?.1.runs);

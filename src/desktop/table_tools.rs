@@ -15,7 +15,6 @@ pub(super) struct State {
     detected: Vec<Table>,
     error: Option<String>,
     pub chooser: bool,
-    area_after: bool,
     area: Option<(Key, [f32; 4])>,
     pub(super) show_panel: bool,
     rows: usize,
@@ -27,6 +26,8 @@ pub(super) struct State {
     layer: Option<egui::LayerId>,
     handoff: Option<Handoff>,
     resume_text: Option<(u64, usize)>,
+    pending_nudge: egui::Vec2,
+    pending_enter: bool,
 }
 struct Handoff {
     tab: u64,
@@ -46,6 +47,9 @@ struct Editor {
     confirmed: bool,
     owned: bool,
     focus: bool,
+    editing: bool,
+    range: Option<(usize, usize)>,
+    fitted: Option<(Table, Option<String>)>,
     layer: Option<String>,
     scope: usize,
     drag: Option<(Table, egui::Pos2, usize, usize)>,
@@ -57,9 +61,57 @@ struct Waiting {
     save: Option<save::Intent>,
     detach: bool,
 }
+#[derive(Clone, Copy, Default)]
+enum TableAction {
+    #[default]
+    Merge,
+    Split,
+    FitRows,
+}
 impl Editor {
     fn dirty(&self) -> bool {
         self.table != self.base || self.text != self.table.cells[self.cell]
+    }
+    fn selection(&self) -> (usize, usize) {
+        let (a, b) = self.range.unwrap_or((self.cell, self.cell));
+        let columns = self.table.columns();
+        let (ar, ac, br, bc) = (a / columns, a % columns, b / columns, b % columns);
+        let (sa, sb) = (self.table.span(a), self.table.span(b));
+        (
+            ar.min(br) * columns + ac.min(bc),
+            (ar.saturating_add(sa[0]).max(br.saturating_add(sb[0])) - 1) * columns
+                + ac.saturating_add(sa[1]).max(bc.saturating_add(sb[1]))
+                - 1,
+        )
+    }
+    fn range_rect(&self) -> [f32; 4] {
+        let (a, b) = self.selection();
+        let a = self.table.cell(a);
+        let b = self.table.cell(b);
+        [
+            a[0].min(b[0]),
+            a[1].min(b[1]),
+            a[2].max(b[2]),
+            a[3].max(b[3]),
+        ]
+    }
+    fn auto_fit(&mut self, bottom: f32) -> Result<bool, String> {
+        self.table.cells[self.cell] = self.text.clone();
+        if !self.owned || !self.table.auto_height {
+            return Ok(false);
+        }
+        if let Some((input, error)) = &self.fitted
+            && input == &self.table
+        {
+            return error.as_ref().map_or(Ok(false), |e| Err(e.clone()));
+        }
+        let before = self.table.clone();
+        let result = self
+            .table
+            .fit_row_heights(bottom)
+            .map_err(|e| format!("{e:#}"));
+        self.fitted = Some((self.table.clone(), result.as_ref().err().cloned()));
+        result.map(|()| self.table != before)
     }
 }
 impl State {
@@ -69,6 +121,9 @@ impl State {
             columns: 3,
             ..Default::default()
         }
+    }
+    pub fn has_editor(&self, tab: u64) -> bool {
+        self.editor.as_ref().is_some_and(|e| e.key.0 == tab)
     }
     pub fn editing_layer(&self) -> Option<&str> {
         self.editor.as_ref().and_then(|e| e.layer.as_deref())
@@ -85,6 +140,298 @@ impl State {
     }
 }
 impl Viewer {
+    pub(super) fn table_keys(&mut self, ctx: &egui::Context) {
+        if self.home.visible
+            || self.table.chooser
+            || self.workbench_owns_shortcuts()
+            || self.organizer.busy
+            || self.redaction.active
+            || self.about_open
+            || self.recovery.open
+            || self.close_intent.is_some()
+            || self.link_confirm.is_some()
+            || self.accessible_text
+            || self.comparison.is_some()
+            || self.editor.selection_dialog_open()
+            || ctx.memory(|m| m.top_modal_layer().is_some())
+            || self.digital.open
+            || self.editor.signature_open
+            || self.editor.library_open
+            || egui::Popup::is_any_open(ctx)
+        {
+            return;
+        }
+        let Some(e) = &self.table.editor else {
+            self.table.pending_nudge = egui::Vec2::ZERO;
+            self.table.pending_enter = false;
+            return;
+        };
+        let Some(tab) = self.tabs.get(self.active).filter(|t| t.id == e.key.0) else {
+            return;
+        };
+        let key = e.key;
+        let page_size = tab.pages.get(key.2).copied();
+        let cell_id = egui::Id::new((key.0, "table_cell_text"));
+        let cell_focus = ctx.memory(|m| m.has_focus(cell_id));
+        if ctx.wants_keyboard_input() && !cell_focus {
+            return;
+        }
+        // Replacing embedded content briefly makes its session read-only while
+        // the document worker reloads it. Keep queued movement through that gap,
+        // too; otherwise content_change declines the next write after its
+        // preview has already moved and the queued keys have been consumed.
+        let reloading = self.table_reloading(key.0);
+        if self.content.busy || self.table.waiting.is_some() || reloading {
+            let delta = table_arrow_delta(ctx);
+            if e.owned && !e.editing {
+                self.table.pending_nudge += delta;
+            }
+            if !cell_focus
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+            {
+                self.table.pending_enter = true;
+                let e = self.table.editor.as_mut().unwrap();
+                e.range = None;
+                e.editing = true;
+                e.focus = false;
+            }
+            if content::context::paste_requested(ctx) {
+                content::context::consume_action(ctx, "paste");
+                self.status = Some((
+                    "Finishing the table change. Paste again in a moment.".into(),
+                    false,
+                ));
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                if let Some(wait) = &mut self.table.waiting {
+                    wait.close = true;
+                }
+                self.table.pending_nudge = egui::Vec2::ZERO;
+                self.table.pending_enter = false;
+                self.content.context.clear_selection = Some(key.0);
+            }
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.table.pending_enter = false;
+            if e.confirmed && e.dirty() {
+                self.table_commit(ctx, None, true, None);
+            } else {
+                self.table.editor = None;
+            }
+            if self.table.editor.is_none() || self.table.waiting.is_some() {
+                ctx.memory_mut(|m| m.surrender_focus(cell_id));
+                self.content.table_selection = None;
+                self.content.context.clear_selection = Some(key.0);
+            }
+            return;
+        }
+        let paste = ctx.input(|i| {
+            i.events.iter().find_map(|event| match event {
+                egui::Event::Paste(text)
+                    if !cell_focus
+                        || text.contains('\t')
+                        || text.contains('\n')
+                        || text.contains('\r') =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+        });
+        if let Some(text) = paste {
+            content::context::consume_action(ctx, "paste");
+            ctx.input_mut(|i| {
+                i.events
+                    .retain(|event| !matches!(event, egui::Event::Paste(_)))
+            });
+            self.paste_table_grid(ctx, &text);
+            return;
+        }
+        if cell_focus && self.table.pending_nudge == egui::Vec2::ZERO && !self.table.pending_enter {
+            return;
+        }
+        let enter = std::mem::take(&mut self.table.pending_enter)
+            || (!cell_focus
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)));
+        let mut delta = if e.owned {
+            std::mem::take(&mut self.table.pending_nudge)
+                + if cell_focus {
+                    egui::Vec2::ZERO
+                } else {
+                    table_arrow_delta(ctx)
+                }
+        } else {
+            egui::Vec2::ZERO
+        };
+        if delta != egui::Vec2::ZERO
+            && let Some(size) = page_size
+        {
+            let e = self.table.editor.as_mut().unwrap();
+            let [l, t, r, b] = e.table.rect();
+            delta.x = delta.x.clamp(-l, (size.width - r).max(-l));
+            delta.y = delta.y.clamp(-t, (size.height - b).max(-t));
+            if delta != egui::Vec2::ZERO {
+                e.table.translate(delta.x, delta.y);
+                e.editing = false;
+                e.focus = false;
+                if self.table_commit(ctx, None, false, None) {
+                    self.name_table_change("Move table");
+                }
+            }
+        }
+        if enter && let Some(e) = &mut self.table.editor {
+            e.range = None;
+            e.editing = true;
+            // A queued move must finish before the text field takes focus;
+            // otherwise caret handling strands the earlier arrow input.
+            self.table.pending_enter = self.content.busy || self.table.waiting.is_some();
+            e.focus = !self.table.pending_enter;
+        }
+    }
+
+    fn paste_table_grid(&mut self, ctx: &egui::Context, text: &str) {
+        let Some(e) = &mut self.table.editor else {
+            return;
+        };
+        if !e.confirmed {
+            return;
+        }
+        let Some(size) = self
+            .tabs
+            .get(self.active)
+            .filter(|t| t.id == e.key.0)
+            .and_then(|t| t.pages.get(e.key.2))
+        else {
+            return;
+        };
+        e.table.cells[e.cell] = e.text.clone();
+        let mut candidate = e.table.clone();
+        let (row, column) = (e.cell / candidate.columns(), e.cell % candidate.columns());
+        let result = (|| -> anyhow::Result<usize> {
+            let count = candidate.paste_grid(e.cell, text, e.owned)?;
+            if e.owned && candidate.auto_height {
+                candidate.fit_row_heights(size.height)?;
+            }
+            let [l, t, r, b] = candidate.rect();
+            anyhow::ensure!(
+                l >= 0. && t >= 0. && r <= size.width + 0.1 && b <= size.height + 0.1,
+                "The pasted cells would extend beyond the page. Resize or move the table first."
+            );
+            Ok(count)
+        })();
+        match result {
+            Ok(count) => {
+                e.table = candidate;
+                e.cell = e.table.anchor(row * e.table.columns() + column);
+                e.text = e.table.cells[e.cell].clone();
+                e.range = None;
+                e.editing = false;
+                e.focus = false;
+                e.fitted = None;
+                ctx.memory_mut(|m| m.surrender_focus(egui::Id::new((e.key.0, "table_cell_text"))));
+                if self.table_commit(ctx, None, false, None) {
+                    self.name_table_change("Paste table cells");
+                }
+                if self.status.as_ref().is_none_or(|s| !s.1) {
+                    self.status =
+                        Some((format!("Pasted {count} cells · Undo is available"), false));
+                }
+            }
+            Err(error) => self.status = Some((format!("{error:#}"), true)),
+        }
+    }
+
+    /// The content transaction and document worker finish independently. The
+    /// next write can start only after the worker has loaded the new source.
+    fn table_reloading(&self, id: u64) -> bool {
+        self.tabs.iter().find(|t| t.id == id).is_none_or(|tab| {
+            tab.session.as_ref().is_none_or(|session| {
+                !session.editable
+                    || tab
+                        .bytes
+                        .as_ref()
+                        .is_none_or(|bytes| !Arc::ptr_eq(bytes, &session.source))
+            })
+        })
+    }
+
+    fn table_action(&mut self, ctx: &egui::Context, key: Key, cell: usize, action: TableAction) {
+        if self.content.busy || self.table.waiting.is_some() || self.table_reloading(key.0) {
+            return;
+        }
+        let Some(e) = self
+            .table
+            .editor
+            .as_mut()
+            .filter(|e| e.key == key && e.confirmed && e.owned)
+        else {
+            return;
+        };
+        let Some(size) = self
+            .tabs
+            .get(self.active)
+            .filter(|t| t.id == key.0)
+            .and_then(|t| t.pages.get(key.2))
+        else {
+            return;
+        };
+        e.table.cells[e.cell] = e.text.clone();
+        let mut candidate = e.table.clone();
+        let mut target = candidate.anchor(cell.min(candidate.cells.len() - 1));
+        let result = (|| -> anyhow::Result<()> {
+            match action {
+                TableAction::Merge => {
+                    let (a, b) = e.selection();
+                    target = candidate.merge_range(a, b)?;
+                }
+                TableAction::Split => {
+                    candidate.split_cell(target)?;
+                }
+                TableAction::FitRows => {
+                    candidate.auto_height = true;
+                    candidate.fit_row_heights(size.height)?;
+                }
+            }
+            if candidate.auto_height {
+                candidate.fit_row_heights(size.height)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                e.table = candidate;
+                e.cell = target;
+                e.text = e.table.cells[target].clone();
+                e.range = None;
+                e.editing = false;
+                e.focus = false;
+                e.fitted = None;
+                ctx.memory_mut(|m| m.surrender_focus(egui::Id::new((key.0, "table_cell_text"))));
+                if self.table_commit(ctx, None, false, None) {
+                    self.name_table_change(match action {
+                        TableAction::Merge => "Merge cells",
+                        TableAction::Split => "Split cell",
+                        TableAction::FitRows => "Fit table rows",
+                    });
+                }
+            }
+            Err(error) => self.status = Some((format!("{error:#}"), true)),
+        }
+    }
+
+    fn name_table_change(&mut self, name: &'static str) {
+        if self.content.busy {
+            self.content.name_pending_change(name);
+        } else if let Some(s) = self
+            .tabs
+            .get_mut(self.active)
+            .and_then(|t| t.session.as_mut())
+        {
+            s.name_last_change(name);
+        }
+    }
+
     pub(super) fn choose_table(&mut self) {
         self.editor.select_tool(editing::Tool::Select);
         self.content.image_mode = false;
@@ -108,7 +455,17 @@ impl Viewer {
         }
     }
     pub(super) fn table_tick(&mut self, ctx: &egui::Context) {
-        if self.table.waiting.is_some() && !self.content.busy {
+        let reloading = self.table.waiting.as_ref().is_some_and(|wait| {
+            self.tabs
+                .iter()
+                .find(|t| t.id == wait.key.0)
+                .and_then(|t| t.session.as_ref())
+                .is_some_and(|s| s.revision() > wait.key.1)
+                && self.table_reloading(wait.key.0)
+        });
+        // Do not unlock the inspector between content_events committing the
+        // source and page_events starting its reload later in the same frame.
+        if self.table.waiting.is_some() && !self.content.busy && !reloading {
             let wait = self.table.waiting.take().unwrap();
             let revision = self
                 .tabs
@@ -138,7 +495,9 @@ impl Viewer {
                         e.confirmed = true;
                     }
                     if let Some(next) = wait.next {
-                        e.cell = next.min(e.table.cells.len() - 1);
+                        e.cell = e.table.anchor(next.min(e.table.cells.len() - 1));
+                        e.range = None;
+                        e.editing = true;
                         e.text = e.table.cells[e.cell].clone();
                         e.focus = true;
                     }
@@ -157,8 +516,13 @@ impl Viewer {
                         self.active = previous.min(self.tabs.len().saturating_sub(1));
                     }
                 }
-            } else if wait.close {
-                self.restore_table_input();
+            } else {
+                // A failed transaction retains its draft and error. Do not
+                // automatically resubmit it because movement was queued.
+                self.table.pending_nudge = egui::Vec2::ZERO;
+                if wait.close {
+                    self.restore_table_input();
+                }
             }
         }
         if let Some(rx) = &self.table.rx
@@ -313,6 +677,9 @@ impl Viewer {
                 confirmed: owned,
                 owned,
                 focus: true,
+                editing: true,
+                range: None,
+                fitted: None,
                 layer,
                 scope: 0,
                 drag: None,
@@ -339,7 +706,28 @@ impl Viewer {
         close: bool,
         save: Option<save::Intent>,
     ) -> bool {
-        if self.table.waiting.is_some() || self.content.busy {
+        if self.table.waiting.is_some()
+            || self.content.busy
+            || self
+                .table
+                .editor
+                .as_ref()
+                .is_some_and(|e| self.table_reloading(e.key.0))
+        {
+            return false;
+        }
+        let bottom = self.tabs.get(self.active).and_then(|t| {
+            self.table
+                .editor
+                .as_ref()
+                .and_then(|e| t.pages.get(e.key.2))
+                .map(|p| p.height)
+        });
+        if let Some(bottom) = bottom
+            && let Some(e) = &mut self.table.editor
+            && let Err(error) = e.auto_fit(bottom)
+        {
+            self.status = Some((error, true));
             return false;
         }
         let Some(e) = &mut self.table.editor else {
@@ -347,8 +735,10 @@ impl Viewer {
         };
         if !e.dirty() {
             if let Some(n) = next {
-                e.cell = n;
-                e.text = e.table.cells[n].clone();
+                e.cell = e.table.anchor(n);
+                e.range = None;
+                e.editing = true;
+                e.text = e.table.cells[e.cell].clone();
                 e.focus = true;
             }
             if close {
@@ -389,8 +779,10 @@ impl Viewer {
                     e.key.1 = revision;
                     e.base = e.table.clone();
                     if let Some(n) = next {
-                        e.cell = n;
-                        e.text = e.table.cells[n].clone();
+                        e.cell = e.table.anchor(n);
+                        e.range = None;
+                        e.editing = true;
+                        e.text = e.table.cells[e.cell].clone();
                         e.focus = true;
                     }
                     if close {
@@ -453,6 +845,39 @@ impl Viewer {
         } else {
             false
         }
+    }
+    /// End a table tool from its active ribbon button. A failed validation keeps
+    /// the draft and its boundary available instead of silently discarding it.
+    pub(super) fn finish_table_selection(&mut self, ctx: &egui::Context) -> bool {
+        let Some(id) = self.tabs.get(self.active).map(|t| t.id) else {
+            return false;
+        };
+        if self.table.waiting.is_some()
+            || self.content.busy
+            || self.table.pending_nudge != egui::Vec2::ZERO
+            || self.table.pending_enter
+        {
+            return false;
+        }
+        if self.table.has_editor(id) {
+            let editor = self.table.editor.as_ref().unwrap();
+            if editor.confirmed && editor.dirty() {
+                if !self.table_commit(ctx, None, true, None) {
+                    return false;
+                }
+            } else {
+                self.table.editor = None;
+            }
+        }
+        self.table.chooser = false;
+        self.table.placing = false;
+        self.table.area = None;
+        self.table.resume_text = None;
+        self.table.handoff = None;
+        self.content.table_selection = None;
+        self.content.context.clear_selection = Some(id);
+        ctx.memory_mut(|m| m.surrender_focus(egui::Id::new((id, "table_cell_text"))));
+        true
     }
     /// Finish the cell before handing the canvas to another editor or tool.
     /// Layer commits are immediate; embedded writes retain the pointer gesture
@@ -828,7 +1253,6 @@ impl Viewer {
         let waiting = self.table.waiting.is_some();
         let (mut apply, mut cancel, mut confirm, mut detach, mut delete) =
             (false, false, false, false, false);
-        let mut structure = None;
         let e = self.table.editor.as_mut().unwrap();
         egui::SidePanel::right("content_inspector")
             .default_width(300.)
@@ -866,7 +1290,13 @@ impl Viewer {
                             });
                             confirm = ui.add_enabled(!waiting, ActionButton::new(Icon::Text, "Edit cells").primary()).clicked();
                         } else {
-                            ui.small(format!("Row {} · Column {}", e.cell / e.table.columns() + 1, e.cell % e.table.columns() + 1));
+                            if e.range.is_some() {
+                                ui.small("Cell range selected · Table actions to merge");
+                            } else {
+                                let span = e.table.span(e.cell);
+                                ui.small(format!("Row {} · Column {}{}", e.cell / e.table.columns() + 1, e.cell % e.table.columns() + 1,
+                                    if span != [1,1] { format!(" · {} × {} merged", span[0],span[1]) } else { String::new() }));
+                            }
                             egui::CollapsingHeader::new("Layout").default_open(true).show(ui, |ui| {
                                 if e.owned {
                                     let (r, c) = (e.cell / e.table.columns(), e.cell % e.table.columns());
@@ -890,17 +1320,10 @@ impl Viewer {
                                     e.table.translate(x - l, y - t);
                                     for v in &mut e.table.xs[c + 1..] { *v += width - oldw; }
                                     for v in &mut e.table.ys[r + 1..] { *v += height - oldh; }
-                                    ui.menu_button("Rows & columns", |ui| {
-                                        for (label, row, at, insert) in [
-                                            ("Insert row above", true, r, true),
-                                            ("Delete row", true, r, false),
-                                            ("Insert column before", false, c, true),
-                                            ("Delete column", false, c, false),
-                                        ] {
-                                            if ui.button(label).clicked() { structure = Some((row, at, insert)); ui.close(); }
-                                        }
-                                    });
-                                    ui.weak("Top handle moves · Edge handles resize");
+                                    if height != oldh { e.table.auto_height = false; }
+                                    ui.menu_button("Table actions", |ui| cell_menu(ui, e, e.cell));
+                                    ui.weak("Shift-click cells to select a range")
+                                        .on_hover_text("Top handle selects or moves the table · Arrows move · Enter edits · Esc finishes");
                                 } else {
                                     ui.weak("Detach the table to move or resize its borders.");
                                 }
@@ -913,7 +1336,17 @@ impl Viewer {
                                 let before = style.clone();
                                 cell_properties(ui, &mut style);
                                 if style != before {
-                                    e.table.set_style(e.cell, match e.scope { 1 => tables::Scope::Row, 2 => tables::Scope::Column, 3 => tables::Scope::Table, _ => tables::Scope::Cell }, style);
+                                    if e.scope == 0 && e.range.is_some() {
+                                        let area = e.range_rect();
+                                        let selected: Vec<_> = e.table.anchors().filter(|i| {
+                                            let rect = e.table.cell(*i);
+                                            rect[0] >= area[0] && rect[1] >= area[1] && rect[2] <= area[2] && rect[3] <= area[3]
+                                        }).collect();
+                                        for i in selected { e.table.set_style(i, tables::Scope::Cell, style.clone()); }
+                                    } else {
+                                        e.table.set_style(e.cell, match e.scope { 1 => tables::Scope::Row, 2 => tables::Scope::Column, 3 => tables::Scope::Table, _ => tables::Scope::Cell }, style);
+                                    }
+                                    e.fitted = None;
                                 }
                             });
                             egui::CollapsingHeader::new("Templates").show(ui, |ui| {
@@ -948,8 +1381,11 @@ impl Viewer {
             let result = (|| -> anyhow::Result<()> {
                 e.table.validate()?;
                 for i in 0..e.table.cells.len() {
-                    e.table.cells[i] =
-                        tables::cell_text(&source, e.key.2 as u32 + 1, e.table.cell(i))?.0;
+                    e.table.cells[i] = if e.table.is_covered(i) {
+                        String::new()
+                    } else {
+                        tables::cell_text(&source, e.key.2 as u32 + 1, e.table.cell(i))?.0
+                    };
                 }
                 Ok(())
             })();
@@ -962,18 +1398,6 @@ impl Viewer {
                     e.focus = true;
                 }
                 Err(err) => self.status = Some((format!("{err:#}"), true)),
-            }
-        }
-        if let Some((row, at, insert)) = structure {
-            let e = self.table.editor.as_mut().unwrap();
-            e.table.cells[e.cell] = e.text.clone();
-            match e.table.resize_structure(row, at, insert) {
-                Ok(()) => {
-                    e.cell = e.cell.min(e.table.cells.len() - 1);
-                    e.text = e.table.cells[e.cell].clone();
-                    e.focus = true;
-                }
-                Err(err) => self.status = Some((err.to_string(), true)),
             }
         }
         if delete {
@@ -992,6 +1416,38 @@ impl Viewer {
         true
     }
     pub(super) fn table_window(&mut self, ctx: &egui::Context) {
+        if self.table.waiting.is_none() && !self.content.busy {
+            if let Some(e) = &mut self.table.editor
+                && let Some(size) = self
+                    .tabs
+                    .get(self.active)
+                    .filter(|t| t.id == e.key.0)
+                    .and_then(|t| t.pages.get(e.key.2))
+            {
+                match e.auto_fit(size.height) {
+                    Ok(true) => ctx.request_repaint(),
+                    Err(error) => self.status = Some((error, true)),
+                    _ => {}
+                }
+            }
+            if let Some((key, cell)) =
+                ctx.data_mut(|d| d.remove_temp::<(Key, usize)>(egui::Id::new("table_paste_target")))
+                && let Some(e) = self.table.editor.as_mut().filter(|e| e.key == key)
+            {
+                e.table.cells[e.cell] = e.text.clone();
+                e.cell = e.table.anchor(cell.min(e.table.cells.len() - 1));
+                e.text = e.table.cells[e.cell].clone();
+                e.range = None;
+                e.editing = false;
+                e.focus = false;
+                ctx.memory_mut(|m| m.surrender_focus(egui::Id::new((key.0, "table_cell_text"))));
+            }
+        }
+        if let Some((key, cell, action)) = ctx
+            .data_mut(|d| d.remove_temp::<(Key, usize, TableAction)>(egui::Id::new("table_action")))
+        {
+            self.table_action(ctx, key, cell, action);
+        }
         if ctx
             .data_mut(|d| d.remove_temp::<bool>(egui::Id::new("table_delete")))
             .is_some()
@@ -1007,30 +1463,15 @@ impl Viewer {
             e.table.cells[e.cell] = e.text.clone();
             match e.table.resize_structure(row, at, insert) {
                 Ok(()) => {
-                    e.cell = e.cell.min(e.table.cells.len() - 1);
+                    e.cell = e.table.anchor(e.cell.min(e.table.cells.len() - 1));
                     e.text = e.table.cells[e.cell].clone();
+                    e.range = None;
+                    e.editing = true;
                     e.focus = true;
+                    e.fitted = None;
                 }
                 Err(err) => self.status = Some((err.to_string(), true)),
             }
-        }
-        if ctx
-            .data_mut(|d| d.remove_temp::<bool>(egui::Id::new("table_select_area")))
-            .is_some()
-            && self.table.waiting.is_none()
-            && !self.content.busy
-        {
-            self.table.area_after = true;
-            if self.table.editor.as_ref().is_some_and(Editor::dirty) {
-                self.table_commit(ctx, None, true, None);
-            } else {
-                self.table.editor = None;
-            }
-        }
-        if self.table.area_after && self.table.editor.is_none() && !self.content.busy {
-            self.table.area_after = false;
-            self.content.area_mode = true;
-            self.content.image_mode = false;
         }
         if !self.table.chooser {
             return;
@@ -1179,6 +1620,7 @@ pub(super) fn overlay(
             let b = (area.max - rect.min) / scale;
             let mut table = Table::new(state.rows, state.columns, [a.x, a.y, b.x, b.y]);
             table.apply_template(state.template);
+            table.auto_height = true;
             paint_grid(ui, &table, screen, false);
             if response.drag_stopped() {
                 if table.validate().is_ok()
@@ -1197,6 +1639,9 @@ pub(super) fn overlay(
                         confirmed: true,
                         owned: true,
                         focus: true,
+                        editing: true,
+                        range: None,
+                        fitted: None,
                         layer: state.layer_mode.then(String::new),
                         scope: 0,
                         drag: None,
@@ -1250,6 +1695,9 @@ pub(super) fn overlay(
                 confirmed: true,
                 owned: true,
                 focus: true,
+                editing: true,
+                range: None,
+                fitted: None,
                 layer: Some(layer_id),
                 scope: 0,
                 drag: None,
@@ -1272,6 +1720,9 @@ pub(super) fn overlay(
                 confirmed: true,
                 owned: true,
                 focus: true,
+                editing: true,
+                range: None,
+                fitted: None,
                 layer: None,
                 scope: 0,
                 drag: None,
@@ -1299,7 +1750,7 @@ pub(super) fn overlay(
     }
     let waiting = state.waiting.is_some();
     let mut next = None;
-    for i in 0..e.table.cells.len() {
+    for i in e.table.anchors().collect::<Vec<_>>() {
         let r = screen(e.table.cell(i)).intersect(rect);
         if i == e.cell {
             continue;
@@ -1310,11 +1761,47 @@ pub(super) fn overlay(
             egui::Sense::click(),
         );
         if response.clicked() && !waiting {
-            next = Some(i);
+            if ui.input(|i| i.modifiers.shift) {
+                let first = e.range.map_or(e.cell, |range| range.0);
+                e.range = Some((first, i));
+                e.editing = false;
+                e.focus = false;
+                ui.ctx()
+                    .memory_mut(|m| m.surrender_focus(egui::Id::new((tab.id, "table_cell_text"))));
+            } else {
+                next = Some(i);
+            }
         }
         if !waiting {
-            response.context_menu(|ui| cell_menu(ui, &e.table, i, e.owned));
+            response.context_menu(|ui| cell_menu(ui, e, i));
         }
+    }
+    if e.range.is_some() {
+        let selected = screen(e.range_rect()).intersect(rect);
+        ui.painter()
+            .rect_filled(selected, 0., theme::accent().gamma_multiply(0.12));
+        ui.painter().rect_stroke(
+            selected,
+            0.,
+            Stroke::new(1.5, theme::accent()),
+            egui::StrokeKind::Inside,
+        );
+    }
+    if !e.editing {
+        if e.range.is_none() {
+            ui.painter().rect_stroke(
+                screen(e.table.rect()),
+                0.,
+                Stroke::new(1.5, theme::accent()),
+                egui::StrokeKind::Outside,
+            );
+        }
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) && !waiting {
+            e.range = None;
+            e.editing = true;
+            e.focus = true;
+        }
+        return true;
     }
     let r = screen(e.table.cell(e.cell));
     let cell_style = e.table.style(e.cell);
@@ -1349,9 +1836,13 @@ pub(super) fn overlay(
         egui::StrokeKind::Inside,
     );
     if !waiting && ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab)) {
-        next = Some((e.cell + e.table.cells.len() - 1) % e.table.cells.len());
+        let cells: Vec<_> = e.table.anchors().collect();
+        let at = cells.iter().position(|i| *i == e.cell).unwrap_or(0);
+        next = Some(cells[(at + cells.len() - 1) % cells.len()]);
     } else if !waiting && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)) {
-        next = Some((e.cell + 1) % e.table.cells.len());
+        let cells: Vec<_> = e.table.anchors().collect();
+        let at = cells.iter().position(|i| *i == e.cell).unwrap_or(0);
+        next = Some(cells[(at + 1) % cells.len()]);
     }
     ui.scope_builder(egui::UiBuilder::new().max_rect(textrect), |ui| {
         ui.set_clip_rect(textrect.intersect(rect));
@@ -1384,8 +1875,11 @@ pub(super) fn overlay(
                     ui.ctx().copy_text(e.text.clone());
                     ui.close();
                 }
-                cell_menu(ui, &e.table, e.cell, e.owned);
+                cell_menu(ui, e, e.cell);
             });
+            if response.changed() {
+                e.fitted = None;
+            }
             if e.focus {
                 response.request_focus();
                 e.focus = false;
@@ -1402,7 +1896,7 @@ pub(super) fn overlay(
 fn paint_grid(ui: &egui::Ui, table: &Table, screen: impl Fn([f32; 4]) -> Rect, owned: bool) {
     let painter = ui.painter().with_clip_rect(ui.clip_rect());
     let scale = screen([0., 0., 1., 1.]).width();
-    for i in 0..table.cells.len() {
+    for i in table.anchors() {
         let r = screen(table.cell(i));
         let style = table.style(i);
         if owned {
@@ -1502,7 +1996,7 @@ fn table_handles(
             .interact(
                 rect,
                 egui::Id::new((tab.id, page, "table_handle", kind, index)),
-                egui::Sense::drag(),
+                egui::Sense::click_and_drag(),
             )
             .on_hover_cursor(match kind {
                 1 => egui::CursorIcon::ResizeHorizontal,
@@ -1520,9 +2014,17 @@ fn table_handles(
             ui.painter()
                 .circle_stroke(center, 3.5, Stroke::new(1., theme::accent()));
         }
+        if response.clicked() || response.drag_started() {
+            e.editing = false;
+            e.focus = false;
+            e.range = None;
+            ui.ctx()
+                .memory_mut(|m| m.surrender_focus(egui::Id::new((tab.id, "table_cell_text"))));
+        }
         if response.drag_started()
             && let Some(start) = ui.input(|i| i.pointer.press_origin())
         {
+            e.table.cells[e.cell] = e.text.clone();
             e.drag = Some((e.table.clone(), start, kind, index));
         }
         if e.drag
@@ -1548,6 +2050,7 @@ fn table_handles(
                     }
                 }
                 _ => {
+                    updated.auto_height = false;
                     let minimum = 12. - (original.ys[index] - original.ys[index - 1]);
                     let d = delta.y.clamp(minimum, (size.height - bottom).max(minimum));
                     for y in &mut updated.ys[index..] {
@@ -1565,9 +2068,60 @@ fn table_handles(
     moving || e.drag.is_some()
 }
 
-fn cell_menu(ui: &mut egui::Ui, table: &Table, cell: usize, owned: bool) {
-    let (r, c) = (cell / table.columns(), cell % table.columns());
-    if owned {
+fn table_arrow_delta(ctx: &egui::Context) -> egui::Vec2 {
+    let mut delta = egui::Vec2::ZERO;
+    ctx.input_mut(|i| {
+        for (key, direction) in [
+            (egui::Key::ArrowLeft, vec2(-1., 0.)),
+            (egui::Key::ArrowRight, vec2(1., 0.)),
+            (egui::Key::ArrowUp, vec2(0., -1.)),
+            (egui::Key::ArrowDown, vec2(0., 1.)),
+        ] {
+            for (modifiers, step) in [(egui::Modifiers::SHIFT, 10.), (egui::Modifiers::NONE, 1.)] {
+                if i.consume_key(modifiers, key) {
+                    delta += direction * step;
+                }
+            }
+        }
+    });
+    delta
+}
+fn cell_menu(ui: &mut egui::Ui, e: &mut Editor, cell: usize) {
+    let cell = e.table.anchor(cell);
+    let (r, c) = (cell / e.table.columns(), cell % e.table.columns());
+    if e.owned {
+        let merge = e.range.is_some_and(|(a, b)| a != b);
+        for (label, action, enabled) in [
+            ("Merge selected cells", TableAction::Merge, merge),
+            (
+                "Split cell",
+                TableAction::Split,
+                e.table.span(cell) != [1, 1],
+            ),
+            ("Fit rows to text", TableAction::FitRows, true),
+        ] {
+            if ui
+                .add_enabled(enabled, egui::Button::new(label))
+                .on_hover_text(if matches!(action, TableAction::Merge) {
+                    "Shift-click another cell to select a rectangular range"
+                } else {
+                    ""
+                })
+                .clicked()
+            {
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(egui::Id::new("table_action"), (e.key, cell, action))
+                });
+                ui.close();
+            }
+        }
+        if ui
+            .checkbox(&mut e.table.auto_height, "Auto row height")
+            .changed()
+        {
+            e.fitted = None;
+        }
+        ui.separator();
         for (label, row, at, insert) in [
             ("Insert row above", true, r, true),
             ("Delete row", true, r, false),
@@ -1584,16 +2138,22 @@ fn cell_menu(ui: &mut egui::Ui, table: &Table, cell: usize, owned: bool) {
         ui.separator();
     }
     if ui
+        .add(ui::MenuItem::new(Icon::Paste, "Paste cells"))
+        .on_hover_text("Paste rows and columns from Excel at this cell")
+        .clicked()
+    {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(egui::Id::new("table_paste_target"), (e.key, cell)));
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+        ui.close();
+    }
+    if ui
         .add(ui::MenuItem::new(Icon::Trash, "Delete table"))
         .clicked()
     {
         ui.ctx()
             .data_mut(|d| d.insert_temp(egui::Id::new("table_delete"), true));
-        ui.close();
-    }
-    if ui.button("Select area…").clicked() {
-        ui.ctx()
-            .data_mut(|d| d.insert_temp(egui::Id::new("table_select_area"), true));
         ui.close();
     }
 }
@@ -1750,6 +2310,8 @@ mod tests {
     fn frame(app: &mut Viewer, ctx: &egui::Context, events: Vec<egui::Event>) {
         app.content_events(ctx);
         app.table_tick(ctx);
+        app.page_events(ctx);
+        app.events(ctx);
         let _ = ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(700., 700.))),
@@ -1798,6 +2360,9 @@ mod tests {
             confirmed: true,
             owned: true,
             focus: true,
+            editing: true,
+            range: None,
+            fitted: None,
             layer: None,
             scope: 0,
             drag: None,
@@ -1863,6 +2428,9 @@ mod tests {
             confirmed: true,
             owned: true,
             focus: true,
+            editing: true,
+            range: None,
+            fitted: None,
             layer: None,
             scope: 0,
             drag: None,
@@ -2374,9 +2942,15 @@ mod tests {
             app.table.waiting.as_ref().unwrap().key.1,
             submitted_revision
         );
+        app.table.pending_nudge = vec2(2., 0.);
         desktop_until(&mut app, &ctx, |a| a.table.waiting.is_none());
         assert_eq!(app.table.editor.as_ref().unwrap().text, invalid);
         assert!(app.table.editor.as_ref().unwrap().dirty());
+        assert_eq!(app.table.pending_nudge, egui::Vec2::ZERO);
+        assert!(
+            !app.content.busy,
+            "queued movement must not retry a failed write"
+        );
         assert_eq!(
             app.tabs[0].session.as_ref().unwrap().revision(),
             submitted_revision
@@ -2430,6 +3004,425 @@ mod tests {
         assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
     }
 
+    fn desktop_key(
+        app: &mut Viewer,
+        ctx: &egui::Context,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) {
+        desktop_frame(
+            app,
+            ctx,
+            vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+        );
+    }
+    #[test]
+    fn table_actions_wait_for_reload_and_undo_restores_the_previous_structure() {
+        let (mut app, ctx) = open_table_fixture(false);
+        let e = app.table.editor.as_mut().unwrap();
+        e.range = Some((0, 1));
+        e.editing = false;
+        let key = e.key;
+        app.table_action(&ctx, key, 0, TableAction::Merge);
+        assert!(app.content.busy);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.content.busy {
+            app.content_events(&ctx);
+            assert!(std::time::Instant::now() < until);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Reproduce the frame gap exactly: the content write has committed,
+        // but page_events has not started loading that source yet.
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 1);
+        assert!(app.tabs[0].session.as_ref().unwrap().editable);
+        assert!(app.table_reloading(key.0));
+        app.table_tick(&ctx);
+        assert!(app.table.waiting.is_some());
+        let merged = app.table.editor.as_ref().unwrap().table.clone();
+        app.table_action(&ctx, key, 0, TableAction::Split);
+        assert_eq!(app.table.editor.as_ref().unwrap().table, merged);
+        app.page_events(&ctx);
+        assert!(!app.tabs[0].session.as_ref().unwrap().editable);
+        app.table_tick(&ctx);
+        assert!(app.table.waiting.is_some());
+
+        desktop_until(&mut app, &ctx, |a| a.table.waiting.is_none());
+        assert!(!app.table_reloading(key.0));
+        let key = app.table.editor.as_ref().unwrap().key;
+        // A read-only reload also blocks commands when no table write owns the
+        // waiting state; it must not leave a split preview with no undo entry.
+        app.tabs[0].session.as_mut().unwrap().editable = false;
+        app.table_action(&ctx, key, 0, TableAction::Split);
+        assert_eq!(app.table.editor.as_ref().unwrap().table, merged);
+        app.tabs[0].session.as_mut().unwrap().editable = true;
+        app.table_action(&ctx, key, 0, TableAction::Split);
+        desktop_until(&mut app, &ctx, |a| a.table.waiting.is_none());
+        assert_eq!(
+            app.tabs[0].session.as_ref().unwrap().undo_label(),
+            Some("Split cell".into())
+        );
+        app.table.editor = None;
+        let session = app.tabs[0].session.as_mut().unwrap();
+        assert_eq!(
+            tables::owned(&session.source, 1).unwrap()[0].span(0),
+            [1, 1]
+        );
+        session.undo();
+        assert_eq!(
+            tables::owned(&session.source, 1).unwrap()[0].span(0),
+            [1, 2]
+        );
+    }
+
+    #[test]
+    fn cell_range_merges_splits_persists_and_navigation_skips_covered_cells() {
+        for layer in [false, true] {
+            let (mut app, ctx) = open_table_fixture(layer);
+            let last = page_point(&app, [330., 100.]);
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1200., 900.))),
+                    modifiers: egui::Modifiers::SHIFT,
+                    events: click_events(last)
+                        .into_iter()
+                        .map(|event| match event {
+                            egui::Event::PointerButton {
+                                pos,
+                                button,
+                                pressed,
+                                ..
+                            } => egui::Event::PointerButton {
+                                pos,
+                                button,
+                                pressed,
+                                modifiers: egui::Modifiers::SHIFT,
+                            },
+                            event => event,
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+            );
+            assert!(app.table.editor.as_ref().unwrap().range.is_some());
+            let key = app.table.editor.as_ref().unwrap().key;
+            app.table_action(&ctx, key, 0, TableAction::Merge);
+            desktop_until(&mut app, &ctx, |a| a.table.waiting.is_none());
+            let e = app.table.editor.as_ref().unwrap();
+            assert_eq!(e.table.span(0), [1, 2]);
+            assert!(!e.editing);
+            desktop_key(&mut app, &ctx, egui::Key::Enter, egui::Modifiers::NONE);
+            assert!(app.table.editor.as_ref().unwrap().editing);
+            desktop_frame(&mut app, &ctx, vec![]);
+            desktop_key(&mut app, &ctx, egui::Key::Tab, egui::Modifiers::NONE);
+            desktop_until(&mut app, &ctx, |a| a.table.waiting.is_none());
+            assert_eq!(app.table.editor.as_ref().unwrap().cell, 2);
+            let key = app.table.editor.as_ref().unwrap().key;
+            app.table_action(&ctx, key, 0, TableAction::Split);
+            desktop_until(&mut app, &ctx, |a| a.table.waiting.is_none());
+            assert_eq!(app.table.editor.as_ref().unwrap().table.span(0), [1, 1]);
+            app.table.editor = None;
+            let s = app.tabs[0].session.as_mut().unwrap();
+            s.undo();
+            let restored = if layer {
+                tables::from_layer(&s.annotations[0]).unwrap()
+            } else {
+                tables::owned(&s.source, 1).unwrap().remove(0)
+            };
+            assert_eq!(
+                restored.span(0),
+                [1, 2],
+                "layer={layer} rev={} undo={:?} redo={:?}",
+                s.revision(),
+                s.undo_label(),
+                s.redo_label()
+            );
+            assert_eq!(restored.cells[0], "Table cell");
+        }
+    }
+    #[test]
+    fn spreadsheet_paste_and_plain_text_use_their_respective_editors() {
+        let (mut app, ctx) = open_table_fixture(false);
+        desktop_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Paste("Item\tOwner\r\nAudit\tOrhan\r\n".into())],
+        );
+        desktop_until(&mut app, &ctx, |a| {
+            a.table.waiting.is_none() && !a.content.busy
+        });
+        assert_eq!(
+            app.table.editor.as_ref().unwrap().table.cells,
+            ["Item", "Owner", "Audit", "Orhan"]
+        );
+        assert!(!app.table.editor.as_ref().unwrap().editing);
+        desktop_key(&mut app, &ctx, egui::Key::Enter, egui::Modifiers::NONE);
+        desktop_frame(&mut app, &ctx, vec![]);
+        desktop_frame(&mut app, &ctx, vec![egui::Event::Paste(" appended".into())]);
+        let e = app.table.editor.as_ref().unwrap();
+        assert!(e.text.contains("appended"));
+        assert_eq!(e.table.rows(), 2);
+        assert_eq!(e.table.columns(), 2);
+    }
+    #[test]
+    fn native_paste_and_single_cell_paste_stay_inside_the_selected_table() {
+        let (mut app, ctx) = open_table_fixture(false);
+        let id = app.tabs[0].id;
+        app.table.editor.as_mut().unwrap().editing = false;
+        app.table.editor.as_mut().unwrap().focus = false;
+        ctx.memory_mut(|m| m.surrender_focus(egui::Id::new((id, "table_cell_text"))));
+        let out = ctx.run(egui::RawInput::default(), |ctx| app.action("paste", ctx));
+        assert!(out.viewport_output.values().any(|v| {
+            v.commands
+                .iter()
+                .any(|cmd| matches!(cmd, egui::ViewportCommand::RequestPaste))
+        }));
+        assert!(app.workbench.paste.is_none());
+        desktop_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Paste("Single value".into())],
+        );
+        desktop_until(&mut app, &ctx, |a| {
+            a.table.waiting.is_none() && !a.content.busy
+        });
+        assert_eq!(
+            app.table.editor.as_ref().unwrap().table.cells[0],
+            "Single value"
+        );
+        assert!(app.workbench.paste.is_none());
+        assert!(app.content.pending_text().is_none());
+        assert_eq!(
+            tables::owned(&app.tabs[0].session.as_ref().unwrap().source, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    #[test]
+    fn pasted_growth_preserves_active_row_column_and_rejects_page_overflow_atomically() {
+        let (mut app, ctx) = open_table_fixture(false);
+        let e = app.table.editor.as_mut().unwrap();
+        e.table.fit_rect([40., 80., 240., 200.]);
+        e.cell = 3;
+        e.text.clear();
+        e.table.auto_height = true;
+        app.paste_table_grid(&ctx, "A\tB\nC\tD");
+        desktop_until(&mut app, &ctx, |a| {
+            a.table.waiting.is_none() && !a.content.busy
+        });
+        let e = app.table.editor.as_ref().unwrap();
+        assert_eq!((e.table.rows(), e.table.columns(), e.cell), (3, 3, 4));
+        assert_eq!(e.text, "A");
+        let before = e.table.clone();
+        let source = app.tabs[0].session.as_ref().unwrap().source.clone();
+        app.paste_table_grid(&ctx, &vec!["overflow\tmore"; 59].join("\n"));
+        assert!(!app.content.busy);
+        assert_eq!(app.table.editor.as_ref().unwrap().table, before);
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().source, source);
+    }
+    #[test]
+    fn auto_row_height_updates_preview_and_saved_geometry_without_expanding_past_page() {
+        let (mut app, ctx) = open_table_fixture(false);
+        app.table.editor.as_mut().unwrap().table.auto_height = true;
+        app.table.editor.as_mut().unwrap().text =
+            "First line\nSecond line\nThird line\nFourth line".into();
+        desktop_frame(&mut app, &ctx, vec![]);
+        let e = app.table.editor.as_ref().unwrap();
+        let height = e.table.ys[1] - e.table.ys[0];
+        assert!(height > 50. && height < 100., "{height}");
+        desktop_key(&mut app, &ctx, egui::Key::Escape, egui::Modifiers::NONE);
+        desktop_until(&mut app, &ctx, |a| {
+            a.table.editor.is_none() && !a.content.busy
+        });
+        let table = tables::owned(&app.tabs[0].session.as_ref().unwrap().source, 1)
+            .unwrap()
+            .remove(0);
+        assert!((table.ys[1] - table.ys[0] - height).abs() < 0.1);
+        assert!(table.cells[0].contains("Fourth line"));
+    }
+    #[test]
+    fn table_arrows_enter_escape_and_typing_do_not_conflict() {
+        let (mut app, ctx) = open_table_fixture(true);
+        let before = app.table.editor.as_ref().unwrap().table.rect();
+        desktop_key(&mut app, &ctx, egui::Key::ArrowRight, egui::Modifiers::NONE);
+        assert_eq!(
+            app.table.editor.as_ref().unwrap().table.rect(),
+            before,
+            "typing arrows keep the caret"
+        );
+        let e = app.table.editor.as_mut().unwrap();
+        e.editing = false;
+        e.focus = false;
+        ctx.memory_mut(|m| m.surrender_focus(egui::Id::new((app.tabs[0].id, "table_cell_text"))));
+        desktop_key(
+            &mut app,
+            &ctx,
+            egui::Key::ArrowRight,
+            egui::Modifiers::SHIFT,
+        );
+        assert_eq!(
+            app.table.editor.as_ref().unwrap().table.rect()[0],
+            before[0] + 10.
+        );
+        desktop_key(&mut app, &ctx, egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(app.table.editor.as_ref().unwrap().editing);
+        desktop_frame(&mut app, &ctx, vec![]);
+        app.table.editor.as_mut().unwrap().text = "Kept on Escape".into();
+        desktop_key(&mut app, &ctx, egui::Key::Escape, egui::Modifiers::NONE);
+        desktop_until(&mut app, &ctx, |a| {
+            a.table.editor.is_none() && !a.content.busy
+        });
+        assert_eq!(
+            tables::from_layer(&app.tabs[0].session.as_ref().unwrap().annotations[0])
+                .unwrap()
+                .cells[0],
+            "Kept on Escape"
+        );
+        assert!(app.editor.mode == editing::Mode::Annotate);
+    }
+
+    #[test]
+    fn rapid_arrow_nudges_are_retained_across_embedded_writes() {
+        let (mut app, ctx) = open_table_fixture(false);
+        let id = app.tabs[0].id;
+        let before = app.table.editor.as_ref().unwrap().table.rect();
+        app.table.editor.as_mut().unwrap().editing = false;
+        app.table.editor.as_mut().unwrap().focus = false;
+        ctx.memory_mut(|m| m.surrender_focus(egui::Id::new((id, "table_cell_text"))));
+        for _ in 0..5 {
+            desktop_key(&mut app, &ctx, egui::Key::ArrowRight, egui::Modifiers::NONE);
+        }
+        desktop_until(&mut app, &ctx, |a| {
+            a.table.waiting.is_none() && a.table.pending_nudge == egui::Vec2::ZERO
+        });
+        assert_eq!(
+            app.table.editor.as_ref().unwrap().table.rect()[0],
+            before[0] + 5.
+        );
+        assert_eq!(
+            tables::owned(&app.tabs[0].session.as_ref().unwrap().source, 1).unwrap()[0].rect()[0],
+            before[0] + 5.
+        );
+    }
+    #[test]
+    fn table_nudges_wait_for_the_document_reload_before_moving_the_preview() {
+        let (mut app, ctx) = open_table_fixture(false);
+        let id = app.tabs[0].id;
+        let before = app.table.editor.as_ref().unwrap().table.rect();
+        let e = app.table.editor.as_mut().unwrap();
+        e.editing = false;
+        e.focus = false;
+        ctx.memory_mut(|m| m.surrender_focus(egui::Id::new((id, "table_cell_text"))));
+        app.tabs[0].session.as_mut().unwrap().editable = false;
+        for _ in 0..3 {
+            desktop_key(&mut app, &ctx, egui::Key::ArrowRight, egui::Modifiers::NONE);
+        }
+        assert!(!app.content.busy);
+        assert_eq!(app.table.pending_nudge, vec2(3., 0.));
+        assert_eq!(app.table.editor.as_ref().unwrap().table.rect(), before);
+
+        app.tabs[0].session.as_mut().unwrap().editable = true;
+        desktop_until(&mut app, &ctx, |a| {
+            a.table.waiting.is_none()
+                && !a.content.busy
+                && a.table.pending_nudge == egui::Vec2::ZERO
+        });
+        let table = tables::owned(&app.tabs[0].session.as_ref().unwrap().source, 1)
+            .unwrap()
+            .remove(0);
+        assert_eq!(table.rect()[0], before[0] + 3.);
+        assert_eq!(
+            app.table.editor.as_ref().unwrap().table.rect(),
+            table.rect()
+        );
+    }
+    #[test]
+    fn enter_during_reload_flushes_earlier_movement_then_focuses_the_cell() {
+        let (mut app, ctx) = open_table_fixture(false);
+        let id = app.tabs[0].id;
+        let cell_id = egui::Id::new((id, "table_cell_text"));
+        let before = app.table.editor.as_ref().unwrap().table.rect();
+        let e = app.table.editor.as_mut().unwrap();
+        e.editing = false;
+        e.focus = false;
+        ctx.memory_mut(|m| m.surrender_focus(cell_id));
+        app.tabs[0].session.as_mut().unwrap().editable = false;
+        desktop_key(&mut app, &ctx, egui::Key::ArrowRight, egui::Modifiers::NONE);
+        desktop_key(&mut app, &ctx, egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(app.table.editor.as_ref().unwrap().editing);
+        assert!(app.table.pending_enter);
+        assert!(!ctx.memory(|m| m.has_focus(cell_id)));
+        assert_eq!(app.table.pending_nudge, vec2(1., 0.));
+        assert_eq!(app.table.editor.as_ref().unwrap().table.rect(), before);
+
+        app.tabs[0].session.as_mut().unwrap().editable = true;
+        desktop_until(&mut app, &ctx, |a| {
+            a.table.waiting.is_none()
+                && !a.content.busy
+                && a.table.pending_nudge == egui::Vec2::ZERO
+                && !a.table.pending_enter
+        });
+        assert!(app.table.editor.as_ref().unwrap().editing);
+        assert!(ctx.memory(|m| m.has_focus(cell_id)));
+        let table = tables::owned(&app.tabs[0].session.as_ref().unwrap().source, 1)
+            .unwrap()
+            .remove(0);
+        assert_eq!(table.rect()[0], before[0] + 1.);
+        desktop_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Text("Entered after reload".into())],
+        );
+        assert!(
+            app.table
+                .editor
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("Entered after reload")
+        );
+    }
+    #[test]
+    fn table_tool_reclick_finishes_valid_drafts_and_preserves_invalid_ones() {
+        let (mut app, ctx) = open_table_fixture(true);
+        app.table.editor.as_mut().unwrap().text = "Keep this cell".into();
+        assert!(app.finish_table_selection(&ctx));
+        assert!(app.table.editor.is_none());
+        assert!(app.editor.mode == editing::Mode::Annotate);
+        let table =
+            tables::from_layer(&app.tabs[0].session.as_ref().unwrap().annotations[0]).unwrap();
+        assert_eq!(table.cells[0], "Keep this cell");
+
+        let (mut app, ctx) = open_table_fixture(true);
+        let revision = app.tabs[0].session.as_ref().unwrap().revision();
+        let editor = app.table.editor.as_mut().unwrap();
+        editor.text = "Retain the invalid draft".into();
+        editor.table.xs[1] = editor.table.xs[0];
+        assert!(!app.finish_table_selection(&ctx));
+        assert_eq!(
+            app.table.editor.as_ref().unwrap().text,
+            "Retain the invalid draft"
+        );
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), revision);
+        assert!(app.status.as_ref().is_some_and(|(_, error)| *error));
+    }
+    #[test]
+    fn table_tool_reclick_cancels_placement_without_creating_a_table() {
+        let (mut app, ctx) = fixture();
+        app.table.chooser = true;
+        app.table.placing = true;
+        let revision = app.tabs[0].session.as_ref().unwrap().revision();
+        assert!(app.finish_table_selection(&ctx));
+        assert!(!app.table.chooser && !app.table.placing);
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), revision);
+    }
     #[test]
     fn table_controls_stay_inside_a_compact_edit_ribbon() {
         let (mut app, ctx) = fixture();

@@ -106,11 +106,13 @@ impl Viewer {
                     "Click to add corners · Double-click or Return finishes · Esc cancels"
                 }
                 Tool::Asset => "Click or drag to place artwork · Select it to move or resize",
-                Tool::Highlight | Tool::Underline | Tool::Strikeout => {
+                Tool::Highlight | Tool::Underline | Tool::Squiggly | Tool::Strikeout => {
                     "Drag across text to mark it"
                 }
                 Tool::Note => "Click a page to add a note",
                 Tool::Text => "Click or drag to add a text box",
+                Tool::Callout => "Click or drag to add a callout · Reclick the tool to select",
+                Tool::Eraser => "Drag across pen strokes to erase · Reclick the tool to select",
                 _ => "Drag on the page to draw · Esc cancels",
             },
             Mode::Forms => "Fill a field or choose Design to add and arrange fields",

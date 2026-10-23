@@ -249,6 +249,11 @@ impl Viewer {
     /// Paste places clipboard content in Read, Annotate, Draw and Edit.
     pub(super) fn paste_keys(&self, ctx: &egui::Context) -> bool {
         !self.home.visible
+            && !self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| self.table.has_editor(t.id))
+            && !self.table.deferring_input()
             && matches!(
                 self.editor.mode,
                 editing::Mode::Read

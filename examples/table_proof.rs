@@ -71,5 +71,33 @@ fn main() -> anyhow::Result<()> {
             tables::write(&source, 1, &t)?,
         )?;
     }
+    let mut merged = t.clone();
+    merged.merge_range(0, 2)?;
+    merged.cells[0] = "Quarterly review · status".into();
+    merged.auto_height = true;
+    merged.fit_row_heights(790.)?;
+    std::fs::write(
+        root.join("merged-table.pdf"),
+        tables::write(&source, 1, &merged)?,
+    )?;
+    let mark = tables::layer(&merged, 0, None)?;
+    std::fs::write(
+        root.join("merged-layer.pdf"),
+        mypdf_milestone0::annotations::export(&source, &[mark])?,
+    )?;
+    merged.split_cell(0)?;
+    std::fs::write(
+        root.join("split-table.pdf"),
+        tables::write(&source, 1, &merged)?,
+    )?;
+    let mut pasted = Table::new(2, 2, [50., 130., 380., 230.]);
+    pasted.apply_template(1);
+    pasted.paste_grid(0, "Item\tOwner\tStatus\r\nSupplier review\tDeniz\tApproved\r\nA longer follow-up note that wraps within the cell\tSelin\tIn progress\r\n", true)?;
+    pasted.auto_height = true;
+    pasted.fit_row_heights(790.)?;
+    std::fs::write(
+        root.join("pasted-table.pdf"),
+        tables::write(&source, 1, &pasted)?,
+    )?;
     Ok(())
 }

@@ -80,6 +80,10 @@ pub struct AppearanceStream {
     /// The signer pipeline must create Image XObject streams from these.
     #[cfg(feature = "visual")]
     pub image_resources: Vec<ImageResource>,
+    /// A Form XObject and its reachable resources. The trailer's Root points to
+    /// the form, not a document catalog; used only for importing the object graph.
+    #[cfg(feature = "visual")]
+    pub pdf_resources: Option<lopdf::Document>,
     /// The bounding box of the appearance [0, 0, width, height].
     pub bbox: [f32; 4],
 }
@@ -192,6 +196,8 @@ pub fn build_text_appearance(
         embedded_font_resources: embedded_fonts,
         #[cfg(feature = "visual")]
         image_resources: Vec::new(),
+        #[cfg(feature = "visual")]
+        pdf_resources: None,
         bbox: [0.0, 0.0, width, height],
     })
 }
@@ -243,6 +249,14 @@ pub fn build_appearance_with_context(
         #[cfg(feature = "visual")]
         SignatureLayout::ImageOnly(image_config) => build_image_appearance(
             image_config,
+            width,
+            height,
+            config.background_color.as_ref(),
+            config.border.as_ref(),
+        ),
+        #[cfg(feature = "visual")]
+        SignatureLayout::PdfPage(data) => super::pdf::build_pdf_appearance(
+            data,
             width,
             height,
             config.background_color.as_ref(),
@@ -343,6 +357,8 @@ fn build_custom_appearance(
         embedded_font_resources: Vec::new(),
         #[cfg(feature = "visual")]
         image_resources: Vec::new(),
+        #[cfg(feature = "visual")]
+        pdf_resources: None,
         bbox: [0.0, 0.0, width, height],
     })
 }
@@ -406,6 +422,7 @@ pub fn build_image_appearance(
         font_resources: Vec::new(),
         embedded_font_resources: Vec::new(),
         image_resources: vec![image_resource],
+        pdf_resources: None,
         bbox: [0.0, 0.0, width, height],
     })
 }
@@ -516,6 +533,7 @@ pub fn build_image_and_text_appearance(
         font_resources: text_result.font_resources,
         embedded_font_resources: text_result.embedded_font_resources,
         image_resources: vec![image_resource],
+        pdf_resources: None,
         bbox: [0.0, 0.0, width, height],
     })
 }

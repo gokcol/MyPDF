@@ -493,6 +493,17 @@ impl PdfSigner {
             }
 
             // Build the resource dictionary for the Form XObject
+            // Import the vector appearance using fresh object numbers. Include
+            // every reachable dependency in the incremental signing revision.
+            if let Some(mut imported) = appearance.pdf_resources {
+                imported.renumber_objects_with(doc.max_id + 1);
+                let root = imported.trailer.get(b"Root")
+                    .and_then(Object::as_reference).map_err(CoreError::from)?;
+                appearance_object_ids.extend(imported.objects.keys().copied());
+                doc.max_id = doc.max_id.max(imported.max_id);
+                doc.objects.extend(imported.objects);
+                xobj_res_dict.set("PdfAppearance", Object::Reference(root));
+            }
             let mut resources = Dictionary::new();
             if !font_dict.is_empty() {
                 resources.set("Font", Object::Dictionary(font_dict));

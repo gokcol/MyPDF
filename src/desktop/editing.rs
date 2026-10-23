@@ -1,6 +1,10 @@
 use super::*;
 #[path = "image_background.rs"]
 mod background;
+#[path = "callout_properties.rs"]
+mod callout_properties;
+#[path = "drawing_properties.rs"]
+mod drawing_properties;
 #[path = "note_reader.rs"]
 mod note_reader;
 use mypdf_milestone0::{
@@ -26,16 +30,36 @@ pub(super) enum Tool {
     Select,
     Lasso,
     Pen,
+    Eraser,
     Highlight,
     Underline,
+    Squiggly,
     Strikeout,
     Note,
+    Callout,
     Text,
     Rectangle,
+    Square,
+    Diamond,
+    Triangle,
+    Pentagon,
+    Hexagon,
     Ellipse,
+    Circle,
+    Semicircle,
     Line,
+    DoubleLine,
+    ElbowLine,
+    SteppedLine,
+    CurvedLine,
     Arrow,
     DoubleArrow,
+    ElbowArrow,
+    SteppedArrow,
+    CurvedArrow,
+    DoubleElbowArrow,
+    DoubleSteppedArrow,
+    DoubleCurvedArrow,
     Polyline,
     Polygon,
     Asset,
@@ -47,16 +71,36 @@ impl Tool {
             Self::Select => "Select",
             Self::Lasso => "Lasso select",
             Self::Pen => "Pen",
+            Self::Eraser => "Eraser",
             Self::Highlight => "Highlight",
             Self::Underline => "Underline",
+            Self::Squiggly => "Squiggly underline",
             Self::Strikeout => "Strikeout",
             Self::Note => "Note",
+            Self::Callout => "Callout",
             Self::Text => "Text box",
             Self::Rectangle => "Rectangle",
+            Self::Square => "Square",
+            Self::Diamond => "Diamond",
+            Self::Triangle => "Triangle",
+            Self::Pentagon => "Pentagon",
+            Self::Hexagon => "Hexagon",
             Self::Ellipse => "Ellipse",
-            Self::Line => "Line",
+            Self::Circle => "Circle",
+            Self::Semicircle => "Semicircle",
+            Self::Line => "Straight line",
+            Self::DoubleLine => "Double line",
+            Self::ElbowLine => "Elbow line",
+            Self::SteppedLine => "Stepped line",
+            Self::CurvedLine => "Curved line",
             Self::Arrow => "Arrow",
             Self::DoubleArrow => "Double arrow",
+            Self::ElbowArrow => "Elbow arrow",
+            Self::SteppedArrow => "Stepped arrow",
+            Self::CurvedArrow => "Curved arrow",
+            Self::DoubleElbowArrow => "Double elbow arrow",
+            Self::DoubleSteppedArrow => "Double stepped arrow",
+            Self::DoubleCurvedArrow => "Double curved arrow",
             Self::Polyline => "Polyline",
             Self::Polygon => "Polygon",
             Self::Asset => "Place asset",
@@ -65,26 +109,260 @@ impl Tool {
     }
 }
 impl Tool {
+    fn route(self) -> Option<ann::Route> {
+        match self {
+            Self::ElbowLine | Self::ElbowArrow | Self::DoubleElbowArrow => Some(ann::Route::Elbow),
+            Self::SteppedLine | Self::SteppedArrow | Self::DoubleSteppedArrow => {
+                Some(ann::Route::Stepped)
+            }
+            Self::CurvedLine | Self::CurvedArrow | Self::DoubleCurvedArrow => {
+                Some(ann::Route::Curved)
+            }
+            _ => None,
+        }
+    }
+    fn is_rectangle(self) -> bool {
+        matches!(
+            self,
+            Self::Rectangle
+                | Self::Square
+                | Self::Diamond
+                | Self::Triangle
+                | Self::Pentagon
+                | Self::Hexagon
+        )
+    }
+    fn is_ellipse(self) -> bool {
+        matches!(self, Self::Ellipse | Self::Circle | Self::Semicircle)
+    }
+    fn shape(self) -> Option<ann::Shape> {
+        Some(match self {
+            Self::Square => ann::Shape::Square,
+            Self::Diamond => ann::Shape::Diamond,
+            Self::Triangle => ann::Shape::Triangle,
+            Self::Pentagon => ann::Shape::Pentagon,
+            Self::Hexagon => ann::Shape::Hexagon,
+            Self::Circle => ann::Shape::Circle,
+            Self::Semicircle => ann::Shape::Semicircle,
+            _ => return None,
+        })
+    }
+    fn is_line(self) -> bool {
+        matches!(
+            self,
+            Self::Line | Self::DoubleLine | Self::ElbowLine | Self::SteppedLine | Self::CurvedLine
+        )
+    }
+    fn line_label(self, stroke: StrokeStyle) -> &'static str {
+        if self != Self::Line {
+            return self.label();
+        }
+        match stroke {
+            StrokeStyle::Solid => "Straight line",
+            StrokeStyle::Dashed => "Dashed line",
+            StrokeStyle::Dotted => "Dotted line",
+            StrokeStyle::DashDot => "Dash-dot line",
+            StrokeStyle::Wave => "Wavy line",
+        }
+    }
+    fn line_icon(self, stroke: StrokeStyle) -> Icon {
+        if self != Self::Line {
+            return self.icon();
+        }
+        match stroke {
+            StrokeStyle::Solid => Icon::Line,
+            StrokeStyle::Dashed => Icon::DashedLine,
+            StrokeStyle::Dotted => Icon::DottedLine,
+            StrokeStyle::DashDot => Icon::DashDotLine,
+            StrokeStyle::Wave => Icon::WavyLine,
+        }
+    }
+    fn is_arrow(self) -> bool {
+        matches!(
+            self,
+            Self::Arrow
+                | Self::DoubleArrow
+                | Self::ElbowArrow
+                | Self::SteppedArrow
+                | Self::CurvedArrow
+                | Self::DoubleElbowArrow
+                | Self::DoubleSteppedArrow
+                | Self::DoubleCurvedArrow
+        )
+    }
     fn icon(self) -> Icon {
         match self {
             Self::Select => Icon::Select,
             Self::Lasso => Icon::Lasso,
             Self::Pen => Icon::Pen,
+            Self::Eraser => Icon::Eraser,
             Self::Highlight => Icon::Highlight,
             Self::Underline => Icon::Underline,
+            Self::Squiggly => Icon::Squiggly,
             Self::Strikeout => Icon::Strikeout,
             Self::Note => Icon::Note,
+            Self::Callout => Icon::Callout,
             Self::Text => Icon::Text,
             Self::Rectangle | Self::SignArea => Icon::Rectangle,
-            Self::Ellipse => Icon::Circle,
+            Self::Square => Icon::Square,
+            Self::Diamond => Icon::Diamond,
+            Self::Triangle => Icon::Triangle,
+            Self::Pentagon => Icon::Pentagon,
+            Self::Hexagon => Icon::Hexagon,
+            Self::Ellipse => Icon::Ellipse,
+            Self::Circle => Icon::Circle,
+            Self::Semicircle => Icon::Semicircle,
             Self::Line => Icon::Line,
+            Self::DoubleLine => Icon::DoubleLine,
+            Self::ElbowLine => Icon::ElbowLine,
+            Self::SteppedLine => Icon::SteppedLine,
+            Self::CurvedLine => Icon::CurvedLine,
             Self::Arrow => Icon::Arrow,
             Self::DoubleArrow => Icon::DoubleArrow,
+            Self::ElbowArrow => Icon::ElbowArrow,
+            Self::SteppedArrow => Icon::SteppedArrow,
+            Self::CurvedArrow => Icon::CurvedArrow,
+            Self::DoubleElbowArrow => Icon::DoubleElbowArrow,
+            Self::DoubleSteppedArrow => Icon::DoubleSteppedArrow,
+            Self::DoubleCurvedArrow => Icon::DoubleCurvedArrow,
             Self::Polyline => Icon::Polyline,
             Self::Polygon => Icon::Polygon,
             Self::Asset => Icon::Library,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum ToolFamily {
+    Rectangle,
+    Ellipse,
+    Line,
+    Arrow,
+}
+type ToolChoice = (Tool, Option<StrokeStyle>);
+enum ToolGroupAction {
+    Toggle,
+    Choose(ToolChoice),
+}
+impl ToolFamily {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Rectangle => "rectangle_variants",
+            Self::Ellipse => "ellipse_variants",
+            Self::Line => "line_variants",
+            Self::Arrow => "arrow_routes",
+        }
+    }
+    fn choices(self) -> &'static [ToolChoice] {
+        match self {
+            Self::Rectangle => &[
+                (Tool::Rectangle, None),
+                (Tool::Square, None),
+                (Tool::Diamond, None),
+                (Tool::Triangle, None),
+                (Tool::Pentagon, None),
+                (Tool::Hexagon, None),
+            ],
+            Self::Ellipse => &[
+                (Tool::Ellipse, None),
+                (Tool::Circle, None),
+                (Tool::Semicircle, None),
+            ],
+            Self::Line => &[
+                (Tool::Line, Some(StrokeStyle::Solid)),
+                (Tool::Line, Some(StrokeStyle::Dashed)),
+                (Tool::Line, Some(StrokeStyle::Dotted)),
+                (Tool::Line, Some(StrokeStyle::DashDot)),
+                (Tool::Line, Some(StrokeStyle::Wave)),
+                (Tool::DoubleLine, None),
+                (Tool::ElbowLine, None),
+                (Tool::SteppedLine, None),
+                (Tool::CurvedLine, None),
+            ],
+            Self::Arrow => &[
+                (Tool::Arrow, None),
+                (Tool::DoubleArrow, None),
+                (Tool::ElbowArrow, None),
+                (Tool::SteppedArrow, None),
+                (Tool::CurvedArrow, None),
+                (Tool::DoubleElbowArrow, None),
+                (Tool::DoubleSteppedArrow, None),
+                (Tool::DoubleCurvedArrow, None),
+            ],
+        }
+    }
+}
+fn hover_tool_group(
+    ui: &mut egui::Ui,
+    family: ToolFamily,
+    current: ToolChoice,
+    selected: bool,
+    blocked: &mut bool,
+) -> Option<ToolGroupAction> {
+    let label = |(tool, stroke): ToolChoice| {
+        stroke.map_or_else(|| tool.label(), |style| tool.line_label(style))
+    };
+    let icon = |(tool, stroke): ToolChoice| {
+        stroke.map_or_else(|| tool.icon(), |style| tool.line_icon(style))
+    };
+    let response = ui.add(
+        ActionButton::new(icon(current), label(current))
+            .compact()
+            .selected(selected),
+    );
+    let id = response.id.with(family.id());
+    if !response.hovered() {
+        *blocked = false;
+    }
+    if response.clicked() {
+        *blocked = true;
+        egui::Popup::close_id(ui.ctx(), id);
+        return Some(ToolGroupAction::Toggle);
+    }
+    let popup_rect = ui
+        .ctx()
+        .data(|data| data.get_temp::<Rect>(id.with("bounds")));
+    if egui::Popup::is_id_open(ui.ctx(), id)
+        && ui
+            .ctx()
+            .input(|input| input.pointer.latest_pos())
+            .is_none_or(|point| {
+                !response.rect.expand(5.).contains(point)
+                    && popup_rect.is_none_or(|rect| !rect.expand(5.).contains(point))
+            })
+    {
+        egui::Popup::close_id(ui.ctx(), id);
+    }
+    let open = (response.hovered() && !*blocked).then_some(egui::SetOpenCommand::Bool(true));
+    let mut chosen = None;
+    let popup = egui::Popup::new(id, ui.ctx().clone(), &response, ui.layer_id())
+        .kind(egui::PopupKind::Menu)
+        .layout(egui::Layout::top_down_justified(egui::Align::Min))
+        .style(egui::containers::menu::menu_style)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .gap(0.)
+        .open_memory(open)
+        .show(|ui| {
+            for (index, &choice) in family.choices().iter().enumerate() {
+                if matches!(family, ToolFamily::Line | ToolFamily::Arrow) && index == 5 {
+                    ui.separator();
+                }
+                if ui
+                    .add(ActionButton::new(icon(choice), label(choice)).selected(
+                        choice.0 == current.0 && (choice.1.is_none() || choice.1 == current.1),
+                    ))
+                    .clicked()
+                {
+                    chosen = Some(ToolGroupAction::Choose(choice));
+                    ui.close();
+                }
+            }
+        });
+    if let Some(popup) = popup {
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(id.with("bounds"), popup.response.rect));
+    }
+    chosen
 }
 
 struct VertexPath {
@@ -114,6 +392,7 @@ fn placement(editor: &EditorState, tab: &Tab, page: usize, at: [f32; 2], centere
     let (width, height) = match editor.tool {
         Tool::Note => (32.0, 32.0),
         Tool::Text => (240.0, 72.0),
+        Tool::Callout => (240.0, 120.0),
         Tool::Asset => {
             let aspect = editor.placed.as_ref().map_or(3.0, |a| a.aspect);
             let category = editor
@@ -179,6 +458,9 @@ fn keeps_proportions(kind: &ann::Kind) -> bool {
             | ann::Kind::Image { .. }
             | ann::Kind::Vector { .. }
             | ann::Kind::Ink { .. }
+            | ann::Kind::Shape {
+                shape: ann::Shape::Square | ann::Shape::Circle | ann::Shape::Semicircle
+            }
     )
 }
 
@@ -254,6 +536,18 @@ pub(super) struct EditorState {
     pub(super) style: Style,
     pub text_editing: bool,
     pub(super) snapping: bool,
+    pub(super) eraser: pen_tools::State,
+    arrow_tool: Tool,
+    arrow_hover_blocked: bool,
+    line_tool: Tool,
+    line_stroke: StrokeStyle,
+    ending_defaults: Option<(Tool, Option<ann::LineEndings>)>,
+    line_hover_blocked: bool,
+    rectangle_tool: Tool,
+    rectangle_hover_blocked: bool,
+    ellipse_tool: Tool,
+    ellipse_hover_blocked: bool,
+    callout_text_color: [f32; 3],
     pub library_open: bool,
     pub signature_open: bool,
     signature_placement: Option<SignaturePlacement>,
@@ -343,11 +637,16 @@ impl EditorState {
         before - bytes
     }
 
+    pub(super) fn selection_dialog_open(&self) -> bool {
+        self.background.is_some() || self.svg.open || self.asset_details.is_some()
+    }
+
     pub(super) fn interaction_active(&self) -> bool {
         self.gesture.is_some()
             || self.group_gesture.is_some()
             || self.marquee.is_some()
             || self.vertices.is_some()
+            || self.eraser.active()
     }
 
     pub(super) fn is_building_path(&self) -> bool {
@@ -375,6 +674,18 @@ impl EditorState {
             style: Style::default(),
             text_editing: false,
             snapping: true,
+            eraser: pen_tools::State::default(),
+            arrow_tool: Tool::Arrow,
+            arrow_hover_blocked: false,
+            line_tool: Tool::Line,
+            line_stroke: StrokeStyle::Solid,
+            ending_defaults: None,
+            line_hover_blocked: false,
+            rectangle_tool: Tool::Rectangle,
+            rectangle_hover_blocked: false,
+            ellipse_tool: Tool::Ellipse,
+            ellipse_hover_blocked: false,
+            callout_text_color: [0.15, 0.17, 0.21],
             library_open: false,
             signature_open: false,
             signature_placement: None,
@@ -474,6 +785,39 @@ impl EditorState {
         Ok(())
     }
     pub(super) fn select_tool(&mut self, tool: Tool) {
+        self.eraser.finish();
+        // A reclick and rearm keeps this tool's custom heads. A different
+        // geometry starts with its own inferred ends, including arrowheads.
+        if self.tool.is_line() || self.tool.is_arrow() {
+            self.ending_defaults = Some((self.tool, self.style.line_endings));
+        }
+        if tool.is_line() || tool.is_arrow() {
+            self.style.line_endings = self
+                .ending_defaults
+                .filter(|(last, _)| *last == tool)
+                .and_then(|(_, endings)| endings);
+            self.ending_defaults = Some((tool, self.style.line_endings));
+        } else {
+            self.style.line_endings = None;
+        }
+        // The inspector can change a line's style, including Wave. Remember it
+        // before leaving or rearming instead of restoring a stale preset.
+        if self.tool.is_line() {
+            self.line_stroke = self.style.stroke;
+        }
+        if tool.is_line() {
+            self.line_tool = tool;
+            self.style.stroke = self.line_stroke;
+        }
+        if tool.is_rectangle() {
+            self.rectangle_tool = tool;
+        }
+        if tool.is_ellipse() {
+            self.ellipse_tool = tool;
+        }
+        if tool.is_arrow() {
+            self.arrow_tool = tool;
+        }
         self.tool = tool;
         self.vertices = None;
         self.gesture = None;
@@ -482,7 +826,7 @@ impl EditorState {
             self.style.color = HIGHLIGHT;
             self.style.opacity = 0.35;
             self.style.fill = None;
-        } else {
+        } else if !matches!(tool, Tool::Select | Tool::Lasso | Tool::Eraser) {
             self.style.opacity = 1.0;
             if self.style.color == HIGHLIGHT {
                 self.style.color = DEFAULT_INK;
@@ -504,9 +848,31 @@ impl EditorState {
         points: &[[f32; 2]],
     ) -> Annotation {
         let mut r = r;
+        if let Some(ratio) = match self.tool {
+            Tool::Square | Tool::Circle => Some(1.),
+            Tool::Semicircle => Some(2.),
+            _ => None,
+        } {
+            // Fit the fixed aspect inside the drag, keeping its origin and
+            // quadrant. No constrained shape can spill past the pointer.
+            let width = (end[0] - start[0])
+                .abs()
+                .min((end[1] - start[1]).abs() * ratio)
+                .max(2. * ratio);
+            let finish = [
+                start[0] + width * if end[0] < start[0] { -1. } else { 1. },
+                start[1] + width / ratio * if end[1] < start[1] { -1. } else { 1. },
+            ];
+            r = [
+                start[0].min(finish[0]),
+                start[1].min(finish[1]),
+                start[0].max(finish[0]),
+                start[1].max(finish[1]),
+            ];
+        }
         if matches!(
             self.tool,
-            Tool::Highlight | Tool::Underline | Tool::Strikeout
+            Tool::Highlight | Tool::Underline | Tool::Squiggly | Tool::Strikeout
         ) && let Some(text) = tab.text.get(page).and_then(Option::as_ref)
         {
             let original = r;
@@ -533,7 +899,7 @@ impl EditorState {
             Tool::Pen => Kind::Ink {
                 strokes: vec![points.iter().map(|p| local(*p)).collect()],
             },
-            Tool::Highlight | Tool::Underline | Tool::Strikeout => {
+            Tool::Highlight | Tool::Underline | Tool::Squiggly | Tool::Strikeout => {
                 let quads: Vec<_> = tab
                     .text
                     .get(page)
@@ -559,6 +925,8 @@ impl EditorState {
                 Kind::Markup {
                     kind: if self.tool == Tool::Highlight {
                         Markup::Highlight
+                    } else if self.tool == Tool::Squiggly {
+                        Markup::Squiggly
                     } else if self.tool == Tool::Underline {
                         Markup::Underline
                     } else {
@@ -577,14 +945,45 @@ impl EditorState {
                     text: "New note".into(),
                 }
             }
+            Tool::Callout => {
+                let mut kind = Kind::callout("Comment");
+                if let Kind::Callout { text_color, .. } = &mut kind {
+                    *text_color = self.callout_text_color;
+                }
+                kind
+            }
             Tool::Text => Kind::Text {
                 text: "Your text".into(),
             },
             Tool::Ellipse => Kind::Ellipse,
+            tool if tool.shape().is_some() => Kind::Shape {
+                shape: tool.shape().unwrap(),
+            },
+            Tool::DoubleLine => Kind::DoubleLine {
+                start: local(start),
+                end: local(end),
+            },
+            Tool::ElbowLine | Tool::SteppedLine | Tool::CurvedLine => Kind::RoutedLine {
+                start: local(start),
+                end: local(end),
+                route: self.tool.route().unwrap(),
+            },
             Tool::DoubleArrow => Kind::DoubleArrow {
                 start: local(start),
                 end: local(end),
             },
+            Tool::ElbowArrow | Tool::SteppedArrow | Tool::CurvedArrow => Kind::RoutedArrow {
+                start: local(start),
+                end: local(end),
+                route: self.tool.route().unwrap(),
+            },
+            Tool::DoubleElbowArrow | Tool::DoubleSteppedArrow | Tool::DoubleCurvedArrow => {
+                Kind::RoutedDoubleArrow {
+                    start: local(start),
+                    end: local(end),
+                    route: self.tool.route().unwrap(),
+                }
+            }
             Tool::Line | Tool::Arrow => Kind::Line {
                 start: local(start),
                 end: local(end),
@@ -914,13 +1313,28 @@ pub(super) fn paint_annotation(
                     ));
                 }
             }
+            Primitive::Head {
+                points,
+                closed,
+                fill,
+            } => {
+                drawing_properties::paint_head(
+                    painter,
+                    points.into_iter().map(point).collect(),
+                    closed,
+                    fill,
+                    a.style.width * scale,
+                    color(a.style.color, a.style.opacity),
+                );
+            }
             Primitive::Text {
                 text,
                 rect,
                 size,
                 centered,
+                color: text_color,
             } => {
-                let c = color(a.style.color, a.style.opacity);
+                let c = color(text_color.unwrap_or(a.style.color), a.style.opacity);
                 let font =
                     egui::FontId::new(size * scale, egui::FontFamily::Name("annotation".into()));
                 let galley = ctx.fonts_mut(|f| {
@@ -1028,6 +1442,30 @@ pub(super) fn page_interaction(
         egui::Id::new((tab.id, page, "page_actions")),
         egui::Sense::click_and_drag(),
     );
+    if editor.tool == Tool::Eraser && matches!(editor.mode, Mode::Draw | Mode::Annotate) {
+        pen_tools::overlay(
+            &mut editor.eraser,
+            tab,
+            ctx,
+            ui,
+            &response,
+            page,
+            page_rect,
+            scale,
+            status,
+        );
+        let painter = ui
+            .painter()
+            .with_clip_rect(page_rect.intersect(ui.clip_rect()));
+        if let Some(session) = &tab.session
+            && session.editable
+        {
+            for annotation in session.annotations.iter().filter(|a| a.page == page) {
+                paint_annotation(editor, ctx, &painter, page_rect, scale, annotation);
+            }
+        }
+        return;
+    }
     if editor.mode == Mode::Read {
         text_selection::interact(
             &mut editor.text_selection,
@@ -1264,7 +1702,10 @@ pub(super) fn page_interaction(
             }
         } else if matches!(editor.mode, Mode::Annotate | Mode::Draw)
             && editable
-            && matches!(editor.tool, Tool::Note | Tool::Text | Tool::Asset)
+            && matches!(
+                editor.tool,
+                Tool::Note | Tool::Text | Tool::Callout | Tool::Asset
+            )
         {
             place(editor, tab, page, p, false, status);
         } else if !shift {
@@ -2040,72 +2481,6 @@ impl Viewer {
             }
         }
     }
-    /// Keyboard actions on selected marks in Annotate and Draw. The caller ensures
-    /// no text field has focus; an in-progress shape keeps its own keys.
-    pub(super) fn selection_keys(&mut self, ctx: &egui::Context) {
-        if self.editor.vertices.is_some()
-            || self.editor.gesture.is_some()
-            || self.editor.marquee.is_some()
-            || self.editor.group_gesture.is_some()
-        {
-            return;
-        }
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            return;
-        };
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
-            let page = tab.page;
-            let ids = tab
-                .session
-                .as_ref()
-                .map(|s| {
-                    s.annotations
-                        .iter()
-                        .filter(|a| a.page == page && !a.object.hidden)
-                        .map(|a| a.id.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-            selection::set(tab, &mut self.editor, ids);
-            return;
-        }
-        let ids = selection::selected_ids(tab);
-        if ids.is_empty() {
-            return;
-        }
-        if ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
-                || i.consume_key(egui::Modifiers::NONE, egui::Key::Backspace)
-        }) {
-            self.editor_delete();
-            return;
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !egui::Popup::is_any_open(ctx) {
-            selection::set(tab, &mut self.editor, vec![]);
-            return;
-        }
-        let step = if ctx.input(|i| i.modifiers.shift) {
-            10.
-        } else {
-            1.
-        };
-        let mut d = [0., 0.];
-        for (key, x, y) in [
-            (egui::Key::ArrowLeft, -1., 0.),
-            (egui::Key::ArrowRight, 1., 0.),
-            (egui::Key::ArrowUp, 0., -1.),
-            (egui::Key::ArrowDown, 0., 1.),
-        ] {
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key)) {
-                d = [d[0] + x * step, d[1] + y * step];
-            }
-        }
-        if d != [0., 0.] && tab.session.as_ref().is_some_and(|s| s.editable) {
-            selection::nudge(tab, d, &mut self.status);
-            // Refresh the single-mark inspector draft so it does not undo the nudge.
-            selection::set(tab, &mut self.editor, ids);
-        }
-    }
     pub(super) fn editor_events(&mut self) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             selection::normalize(tab, &mut self.editor);
@@ -2138,6 +2513,84 @@ impl Viewer {
             }
         }
     }
+    /// Ribbon clicks toggle; native menu commands deliberately keep arming.
+    fn toggle_editor_tool(&mut self, ctx: &egui::Context, tool: Tool) {
+        if !self.apply_pending_annotation() {
+            return;
+        }
+        let next = if self.editor.tool == tool && !self.editor.library_open {
+            Tool::Select
+        } else {
+            tool
+        };
+        self.editor.select_tool(next);
+        self.editor.library_open = false;
+        self.editor.signature_open = false;
+        self.editor.pending_sign_rect = None;
+        self.inspector = true;
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.signatures.panel = false;
+            if next != Tool::Select {
+                selection::set(tab, &mut self.editor, vec![]);
+            }
+        }
+        ctx.memory_mut(|memory| {
+            if let Some(focused) = memory.focused() {
+                memory.surrender_focus(focused);
+            }
+        });
+    }
+
+    /// Each drawing family occupies its original slot. All four groups use
+    /// the same hover/click behavior, without touching a draft on hover.
+    fn drawing_tool_group(&mut self, ui: &mut egui::Ui, family: ToolFamily) {
+        let line_stroke = if self.editor.tool.is_line() {
+            self.editor.style.stroke
+        } else {
+            self.editor.line_stroke
+        };
+        let (current, selected, blocked) = match family {
+            ToolFamily::Line => (
+                (self.editor.line_tool, Some(line_stroke)),
+                self.editor.tool.is_line(),
+                &mut self.editor.line_hover_blocked,
+            ),
+            ToolFamily::Arrow => (
+                (self.editor.arrow_tool, None),
+                self.editor.tool.is_arrow(),
+                &mut self.editor.arrow_hover_blocked,
+            ),
+            ToolFamily::Rectangle => (
+                (self.editor.rectangle_tool, None),
+                self.editor.tool.is_rectangle(),
+                &mut self.editor.rectangle_hover_blocked,
+            ),
+            ToolFamily::Ellipse => (
+                (self.editor.ellipse_tool, None),
+                self.editor.tool.is_ellipse(),
+                &mut self.editor.ellipse_hover_blocked,
+            ),
+        };
+        let selected = selected && !self.editor.library_open;
+        match hover_tool_group(ui, family, current, selected, blocked) {
+            Some(ToolGroupAction::Toggle) => self.toggle_editor_tool(ui.ctx(), current.0),
+            Some(ToolGroupAction::Choose((tool, stroke))) if self.apply_pending_annotation() => {
+                self.editor.select_tool(tool);
+                if let Some(stroke) = stroke {
+                    self.editor.line_stroke = stroke;
+                    self.editor.style.stroke = stroke;
+                }
+                self.editor.library_open = false;
+                self.inspector = true;
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    selection::set(tab, &mut self.editor, vec![]);
+                    tab.signatures.panel = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn editor_tools(&mut self, ctx: &egui::Context) {
         if matches!(
             self.editor.mode,
@@ -2170,99 +2623,67 @@ impl Viewer {
                             ui.add_enabled_ui(editable, |ui| {
                                 let tools: &[Tool] = if self.editor.mode == Mode::Draw {
                                     &[
-                                        Tool::Select,
-                                        Tool::Lasso,
-                                        Tool::Pen,
-                                        Tool::Polyline,
-                                        Tool::Polygon,
-                                        Tool::Rectangle,
-                                        Tool::Ellipse,
-                                        Tool::Line,
-                                        Tool::Arrow,
-                                        Tool::DoubleArrow,
+                                        Tool::Select, Tool::Lasso, Tool::Pen, Tool::Eraser,
+                                        Tool::Polyline, Tool::Polygon,
                                     ]
                                 } else {
                                     &[
-                                        Tool::Select,
-                                        Tool::Lasso,
-                                        Tool::Highlight,
-                                        Tool::Underline,
-                                        Tool::Strikeout,
-                                        Tool::Text,
-                                        Tool::Note,
+                                        Tool::Select, Tool::Lasso, Tool::Highlight, Tool::Underline,
+                                        Tool::Squiggly, Tool::Strikeout, Tool::Pen,
+                                        Tool::Text, Tool::Note, Tool::Callout,
                                     ]
                                 };
-                                // New marks use the current color; highlights stay yellow.
                                 let ink = if self.editor.style.color == HIGHLIGHT {
                                     DEFAULT_INK
-                                } else {
-                                    self.editor.style.color
-                                };
+                                } else { self.editor.style.color };
                                 for &tool in tools {
-                                    if matches!(tool, Tool::Highlight | Tool::Pen | Tool::Rectangle)
-                                    {
+                                    if matches!(tool, Tool::Highlight | Tool::Pen | Tool::Rectangle) {
                                         ui.separator();
                                     }
                                     let mut button = ActionButton::new(tool.icon(), tool.label())
                                         .compact()
-                                        .selected(
-                                            self.editor.tool == tool && !self.editor.library_open,
-                                        );
-                                    // Annotate shows each markup color; Draw only the active tool's.
+                                        .selected(self.editor.tool == tool && !self.editor.library_open);
                                     let tinted = self.editor.mode == Mode::Annotate
-                                        || tool == Tool::Pen
-                                        || self.editor.tool == tool;
-                                    if !matches!(tool, Tool::Select | Tool::Lasso) && tinted {
-                                        button = button.tint(color(
-                                            if tool == Tool::Highlight { HIGHLIGHT } else { ink },
-                                            1.,
-                                        ));
+                                        || tool == Tool::Pen || self.editor.tool == tool;
+                                    if !matches!(tool, Tool::Select | Tool::Lasso | Tool::Eraser) && tinted {
+                                        button = button.tint(color(if tool == Tool::Highlight { HIGHLIGHT } else { ink }, 1.));
                                     }
-                                    if ui
-                                        .add(button)
-                                        .clicked()
-                                    {
-                                        self.editor.select_tool(tool);
-                                        self.editor.library_open = false;
-                                        if let Some(tab) = self.tabs.get_mut(self.active) {
-                                            tab.signatures.panel = false;
+                                    if ui.add(button).clicked() {
+                                        self.toggle_editor_tool(ctx, tool);
+                                    }
+                                }
+                                if self.editor.mode == Mode::Draw {
+                                    ui.separator();
+                                    self.drawing_tool_group(ui, ToolFamily::Rectangle);
+                                    self.drawing_tool_group(ui, ToolFamily::Ellipse);
+                                    self.drawing_tool_group(ui, ToolFamily::Line);
+                                    self.drawing_tool_group(ui, ToolFamily::Arrow);
+                                } else {
+                                    if ui.add_enabled(!self.content.busy,
+                                        ActionButton::new(Icon::Table,"Table").compact()
+                                            .selected(self.table.chooser || self.table.placing || self.table.has_editor(self.tabs.get(self.active).map_or(0, |tab| tab.id))))
+                                        .on_hover_text("Place a movable table layer").clicked() {
+                                        if self.table.chooser || self.table.placing || self.table.has_editor(self.tabs.get(self.active).map_or(0, |tab| tab.id)) {
+                                            self.finish_table_selection(ctx);
+                                        } else if self.apply_pending_annotation() {
+                                            self.choose_table();
+                                        }
+                                    }
+                                    ui.separator();
+                                    let selected = self.editor.library_open;
+                                    let button = ActionButton::new(Icon::Stamp, "Stamps").selected(selected);
+                                    if ui.add(if compact { button.compact() } else { button })
+                                        .on_hover_text("Stamps, arrows, symbols and saved artwork").clicked() {
+                                        if selected {
+                                            self.editor.library_open = false;
+                                            self.editor.select_tool(Tool::Select);
+                                        } else if self.apply_pending_annotation() {
+                                            self.inspector = true;
+                                            self.editor.library_tab = "Stamps".into();
+                                            self.editor.library_open = true;
                                         }
                                     }
                                 }
-                                if self.editor.mode == Mode::Annotate && ui.add_enabled(self.tabs.get(self.active).is_some_and(|t|t.session.as_ref().is_some_and(|s|s.editable)) && !self.content.busy,ActionButton::new(Icon::Table,"Table").compact()).on_hover_text("Place a movable table layer").clicked(){self.choose_table();}
-                                ui.separator();
-                                let libraries: &[(&str, Icon)] = if self.editor.mode == Mode::Draw {
-                                    &[
-                                        ("Arrows", Icon::Arrow),
-                                        ("Symbols", Icon::Star),
-                                        ("Saved", Icon::Library),
-                                    ]
-                                } else {
-                                    &[("Stamps", Icon::Stamp), ("Saved", Icon::Library)]
-                                };
-                                for &(label, icon) in libraries {
-                                    if ui
-                                        .add({
-                                            let b = ActionButton::new(icon, label).selected(
-                                                self.editor.library_open
-                                                    && self.editor.library_tab == label,
-                                            );
-                                            if compact { b.compact() } else { b }
-                                        })
-                                        .clicked()
-                                    {
-                                        self.inspector = true;
-                                        self.editor.library_tab = label.into();
-                                        self.editor.library_open = true;
-                                    }
-                                }
-                                ui.separator();
-                                if ui.add(ActionButton::new(Icon::AlignObjectsCenter,"Snap to objects").compact().selected(self.editor.snapping)).on_hover_text("Snap edges and centers · ⌘ bypasses snapping while dragging").clicked() { self.editor.snapping = !self.editor.snapping; }
-                                ui::color_swatch(
-                                    ui,
-                                    &mut self.editor.style.color,
-                                    "Color for new annotations",
-                                );
                             });
                         } else if self.editor.mode == Mode::Sign {
                             action = self.signing_ribbon(ui);
@@ -2347,6 +2768,24 @@ impl Viewer {
                                 if ui.add_enabled(marks.iter().any(|a|a.object.group.is_some()), ActionButton::new(Icon::Ungroup,"Ungroup")).clicked() { self.workbench.request=Some("ungroup_objects".into()); }
                             });
                             if let Some(styles::Preset::Drawing(style))=styles::panel(ui,styles::Preset::Drawing(first.style.clone())) { apply(&mut changed,&|a|a.style=style.clone()); }
+                            if marks.iter().all(|a| drawing_properties::supports(&a.kind)) {
+                                let mut style = first.style.clone();
+                                let preview = marks.iter().find(|a| drawing_properties::fills(&a.kind)).unwrap_or(&first);
+                                focus |= drawing_properties::controls(ui, &preview.kind, &mut style).is_some();
+                                if style != first.style {
+                                    apply(&mut changed, &|a| {
+                                        if style.color != first.style.color { a.style.color = style.color; }
+                                        if style.width != first.style.width { a.style.width = style.width; }
+                                        if style.opacity != first.style.opacity { a.style.opacity = style.opacity; }
+                                        if style.stroke != first.style.stroke { a.style.stroke = style.stroke; }
+                                        if ann::line_endings(&a.kind, &a.style).is_some() && style.line_endings != first.style.line_endings { a.style.line_endings = style.line_endings; }
+                                        if drawing_properties::fills(&a.kind) {
+                                            if style.fill != first.style.fill { a.style.fill = style.fill; }
+                                            if style.fill_pattern != first.style.fill_pattern { a.style.fill_pattern = style.fill_pattern; }
+                                        }
+                                    });
+                                }
+                            } else {
                             ui::caption(ui, "Color");
                             let mut color = first.style.color;
                             if color_palette(ui, &mut color) {
@@ -2382,7 +2821,7 @@ impl Viewer {
                             if stroke != first.style.stroke {
                                 apply(&mut changed, &|a| a.style.stroke = stroke);
                             }
-                            if marks.iter().any(|a| matches!(a.kind, Kind::Rectangle | Kind::Ellipse | Kind::Polygon { closed: true, .. } | Kind::Text { .. } | Kind::Stamp { .. })) {
+                            if marks.iter().any(|a| matches!(a.kind, Kind::Rectangle | Kind::Ellipse | Kind::Shape { .. } | Kind::Polygon { closed: true, .. } | Kind::Text { .. } | Kind::Stamp { .. })) {
                                 let mut fill = first.style.fill;
                                 ui.horizontal(|ui| {
                                     let mut filled = fill.is_some();
@@ -2395,11 +2834,12 @@ impl Viewer {
                                 });
                                 if fill != first.style.fill {
                                     apply(&mut changed, &|a| {
-                                        if matches!(a.kind, Kind::Rectangle | Kind::Ellipse | Kind::Polygon { closed: true, .. } | Kind::Text { .. } | Kind::Stamp { .. }) {
+                                        if matches!(a.kind, Kind::Rectangle | Kind::Ellipse | Kind::Shape { .. } | Kind::Polygon { closed: true, .. } | Kind::Text { .. } | Kind::Stamp { .. }) {
                                             a.style.fill = fill;
                                         }
                                     });
                                 }
+                            }
                             }
                             if marks.iter().any(|a| matches!(a.kind, Kind::Text { .. } | Kind::Stamp { .. })) {
                                 let mut size = first.style.font_size;
@@ -2553,10 +2993,12 @@ impl Viewer {
                             if drawing { "Drawings" } else { "Annotations" }
                         } else { self.editor.tool.label() };
                         let hint = match self.editor.tool {
-                            Tool::Highlight | Tool::Underline | Tool::Strikeout => "Drag across PDF text to mark it. Click an existing annotation to edit its appearance.",
+                            Tool::Highlight | Tool::Underline | Tool::Squiggly | Tool::Strikeout => "Drag across PDF text to mark it. Click an existing annotation to edit its appearance.",
                             Tool::Note => "Click the page to add a note. Click an existing note to edit it.",
                             Tool::Text => "Click or drag on the page to add a text box.",
                             Tool::Pen => "Draw on the page with your mouse, pen, or touch input.",
+                            Tool::Eraser => "Drag across pen strokes to erase. Text, images and shapes stay intact.",
+                            Tool::Callout => "Click or drag to place a text box with a leader arrow.",
                             Tool::Polyline | Tool::Polygon => "Click to add corners. Double-click the last point to finish.",
                             Tool::Asset => "Choose artwork from the library, then click or drag on the page to place it.",
                             Tool::Select | Tool::Lasso if drawing => "Click a drawing to select it, or drag across several.",
@@ -2571,17 +3013,23 @@ impl Viewer {
                         );
                         ui.separator();
                         ui::caption(ui, if drawing { "New drawings" } else { "New annotations" });
-                        color_palette(ui, &mut self.editor.style.color);
-                        if drawing || self.editor.tool == Tool::Pen {
-                        self.editor.text_editing |= property_slider(
-                            ui,
-                            "Stroke",
-                            &mut self.editor.style.width,
-                            0.5..=20.,
-                            " pt",
-                        )
-                        .is_some();
-                        stroke_styles(ui, &mut self.editor.style.stroke);
+                        if let Some(mut kind) = drawing_properties::tool_kind(self.editor.tool)
+                            .filter(|_| drawing || matches!(self.editor.tool, Tool::Pen | Tool::Callout))
+                        {
+                            if let Kind::Callout { text_color, .. } = &mut kind { *text_color = self.editor.callout_text_color; }
+                            if let Some(styles::Preset::Drawing(style)) = styles::panel(ui, styles::Preset::Drawing(self.editor.style.clone())) { self.editor.style = style; }
+                            self.editor.text_editing |= drawing_properties::controls(ui, &kind, &mut self.editor.style).is_some();
+                            if self.editor.tool == Tool::Callout {
+                                let mut sample = Annotation::new(0, [0., 0., 240., 120.], kind, self.editor.style.clone());
+                                if let Kind::Callout { text_color, .. } = &mut sample.kind { *text_color = self.editor.callout_text_color; }
+                                self.editor.text_editing |= callout_properties::controls(ui, &mut sample).is_some();
+                                self.editor.style = sample.style;
+                                if let Kind::Callout { text_color, .. } = sample.kind { self.editor.callout_text_color = text_color; }
+                            }
+                        } else if self.editor.tool == Tool::Eraser {
+                            pen_tools::controls(ui, &mut self.editor.eraser);
+                        } else {
+                            color_palette(ui, &mut self.editor.style.color);
                         }
                     });
             }
@@ -2658,6 +3106,7 @@ impl Viewer {
                             if let Some(text) = a.kind.text_mut() {
                                 let r = ui.add(
                                     egui::TextEdit::multiline(text)
+                                        .id(egui::Id::new((tab.id, &selected.id, "annotation_text")))
                                         .margin(ui::FIELD_MARGIN)
                                         .desired_rows(3)
                                         .char_limit(8000)
@@ -2675,6 +3124,12 @@ impl Viewer {
                                 self.editor.background = Some(background::Draft::new(
                                     background::Target::Annotation { tab: tab.id, id: a.id.clone(), revision: tab.session.as_ref().unwrap().revision() }, png.clone()));
                             }
+                            if drawing_properties::supports(&a.kind) {
+                                property_focus = drawing_properties::controls(ui, &a.kind, &mut a.style).or(property_focus);
+                                if matches!(a.kind, Kind::Callout { .. }) {
+                                    property_focus = callout_properties::controls(ui, a).or(property_focus);
+                                }
+                            } else {
                             if !image {
                                 ui::caption(ui, "Color");
                                 if color_palette(ui, &mut a.style.color)
@@ -2693,6 +3148,7 @@ impl Viewer {
                                 a.kind,
                                 Kind::Rectangle
                                     | Kind::Ellipse
+                                    | Kind::Shape { .. }
                                     | Kind::Polygon { closed: true, .. }
                                     | Kind::Text { .. }
                                     | Kind::Stamp { .. }
@@ -2788,6 +3244,7 @@ impl Viewer {
                                     " pt",
                                 )
                                 .or(property_focus);
+                            }
                             }
                             ui.separator();
                             ui::caption(ui, "Rotate & flip");
@@ -5831,5 +6288,598 @@ mod tests {
         assert!((editor.signature_strokes[0][0][0] - 80.0 / rect.width()).abs() < 0.001);
         assert!((editor.signature_strokes[0][1][1] - 20.0 / rect.height()).abs() < 0.001);
         assert!((editor.signature_strokes[0][3][1] - 100.0 / rect.height()).abs() < 0.001);
+    }
+    fn ready_ribbon() -> (egui::Context, Viewer) {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        (ctx, app)
+    }
+    fn ribbon_frame(
+        app: &mut Viewer,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        width: f32,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(width, 780.))),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.editor_tools(ctx),
+        )
+    }
+    fn ribbon_button(app: &mut Viewer, ctx: &egui::Context, label: &str) -> egui::Pos2 {
+        for _ in 0..3 {
+            ribbon_frame(app, ctx, vec![], 900.);
+        }
+        let output = ribbon_frame(app, ctx, vec![], 900.);
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let r = nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.label() == Some(label))
+                    .then(|| node.bounds())
+                    .flatten()
+            })
+            .unwrap_or_else(|| panic!("Missing ribbon button {label}"));
+        pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32)
+    }
+    fn ribbon_click(app: &mut Viewer, ctx: &egui::Context, at: egui::Pos2) {
+        for pressed in [true, false] {
+            ribbon_frame(
+                app,
+                ctx,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                900.,
+            );
+        }
+    }
+    #[test]
+    fn compact_ribbons_hide_duplicate_controls_and_creation_tools_toggle_off() {
+        let (ctx, mut app) = ready_ribbon();
+        for (mode, tools) in [
+            (
+                Mode::Annotate,
+                vec![
+                    Tool::Highlight,
+                    Tool::Underline,
+                    Tool::Squiggly,
+                    Tool::Strikeout,
+                    Tool::Pen,
+                    Tool::Text,
+                    Tool::Note,
+                    Tool::Callout,
+                ],
+            ),
+            (
+                Mode::Draw,
+                vec![
+                    Tool::Pen,
+                    Tool::Eraser,
+                    Tool::Polyline,
+                    Tool::Polygon,
+                    Tool::Rectangle,
+                    Tool::Ellipse,
+                    Tool::Line,
+                ],
+            ),
+        ] {
+            app.editor.mode = mode;
+            for tool in tools {
+                let at = ribbon_button(&mut app, &ctx, tool.label());
+                ribbon_click(&mut app, &ctx, at);
+                assert!(app.editor.tool == tool, "{} should arm", tool.label());
+                ribbon_click(&mut app, &ctx, at);
+                assert!(
+                    app.editor.tool == Tool::Select,
+                    "{} should toggle off",
+                    tool.label()
+                );
+                assert!(app.editor.mode == mode);
+            }
+            for _ in 0..3 {
+                ribbon_frame(&mut app, &ctx, vec![], 720.);
+            }
+            let output = ribbon_frame(&mut app, &ctx, vec![], 720.);
+            let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+            let labels: Vec<_> = nodes.iter().filter_map(|(_, node)| node.label()).collect();
+            for absent in [
+                "Snap to objects",
+                "Color for new annotations",
+                "Saved",
+                "Arrows",
+                "Symbols",
+            ] {
+                assert!(!labels.contains(&absent), "Redundant {absent} stays hidden");
+            }
+            if mode == Mode::Annotate {
+                assert!(labels.contains(&"Stamps"));
+            }
+            let widest = nodes
+                .iter()
+                .filter(|(_, node)| node.role() == egui::accesskit::Role::Button)
+                .filter_map(|(_, node)| node.bounds())
+                .map(|r| r.x1)
+                .fold(0., f64::max);
+            assert!(widest <= 720.1, "Compact ribbon overflow: {widest}");
+        }
+        assert!(app.tabs[0].session.as_ref().unwrap().annotations.is_empty());
+    }
+    #[test]
+    fn arrow_hover_changes_no_document_and_direct_click_arms_remembered_route() {
+        let (ctx, mut app) = ready_ribbon();
+        app.editor.mode = Mode::Draw;
+        let revision = app.tabs[0].session.as_ref().unwrap().revision();
+        let at = ribbon_button(&mut app, &ctx, "Arrow");
+        ribbon_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(at)], 900.);
+        let output = ribbon_frame(&mut app, &ctx, vec![], 900.);
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let r = nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.label() == Some("Elbow arrow"))
+                    .then(|| node.bounds())
+                    .flatten()
+            })
+            .expect("Hover reveals arrow variants");
+        let variant = pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32);
+        assert!(app.editor.tool == Tool::Select);
+        ribbon_click(&mut app, &ctx, variant);
+        assert!(app.editor.tool == Tool::ElbowArrow);
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), revision);
+        let at = ribbon_button(&mut app, &ctx, "Elbow arrow");
+        ribbon_click(&mut app, &ctx, at);
+        assert!(app.editor.tool == Tool::Select);
+        ribbon_click(&mut app, &ctx, at);
+        assert!(app.editor.tool == Tool::ElbowArrow);
+        for _ in 0..3 {
+            ribbon_frame(&mut app, &ctx, vec![], 900.);
+        }
+        assert!(
+            !egui::Popup::is_any_open(&ctx),
+            "A clicked arrow must stay ready to draw"
+        );
+        input(&mut app, &ctx, vec![]);
+        pointer(&mut app, &ctx, [120., 150.], None);
+        pointer(&mut app, &ctx, [120., 150.], Some(true));
+        pointer(&mut app, &ctx, [240., 230.], None);
+        pointer(&mut app, &ctx, [240., 230.], Some(false));
+        let annotations = &app.tabs[0].session.as_ref().unwrap().annotations;
+        assert_eq!(annotations.len(), 1);
+        assert!(matches!(
+            annotations[0].kind,
+            Kind::RoutedArrow {
+                route: ann::Route::Elbow,
+                ..
+            }
+        ));
+    }
+
+    fn ribbon_choose(app: &mut Viewer, ctx: &egui::Context, parent: &str, choice: &str) {
+        ribbon_frame(
+            app,
+            ctx,
+            vec![egui::Event::PointerMoved(pos2(0., 200.))],
+            900.,
+        );
+        let at = ribbon_button(app, ctx, parent);
+        ribbon_frame(app, ctx, vec![egui::Event::PointerMoved(at)], 900.);
+        let output = ribbon_frame(app, ctx, vec![], 900.);
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let r = nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.label() == Some(choice))
+                    .then(|| node.bounds())
+                    .flatten()
+            })
+            .unwrap_or_else(|| panic!("Hover {parent} should offer {choice}"));
+        ribbon_click(
+            app,
+            ctx,
+            pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32),
+        );
+    }
+    fn draw_tool_once(app: &mut Viewer, ctx: &egui::Context) {
+        input(app, ctx, vec![]);
+        pointer(app, ctx, [120., 150.], None);
+        pointer(app, ctx, [120., 150.], Some(true));
+        pointer(app, ctx, [300., 250.], None);
+        pointer(app, ctx, [300., 250.], Some(false));
+    }
+    #[test]
+    fn line_hover_presets_draw_their_kind_and_reclick_arms_without_confirmation() {
+        for (label, tool, style) in [
+            ("Dashed line", Tool::Line, StrokeStyle::Dashed),
+            ("Dotted line", Tool::Line, StrokeStyle::Dotted),
+            ("Dash-dot line", Tool::Line, StrokeStyle::DashDot),
+            ("Wavy line", Tool::Line, StrokeStyle::Wave),
+            ("Double line", Tool::DoubleLine, StrokeStyle::Solid),
+            ("Elbow line", Tool::ElbowLine, StrokeStyle::Solid),
+            ("Stepped line", Tool::SteppedLine, StrokeStyle::Solid),
+            ("Curved line", Tool::CurvedLine, StrokeStyle::Solid),
+        ] {
+            let (ctx, mut app) = ready_ribbon();
+            app.editor.mode = Mode::Draw;
+            let revision = app.tabs[0].session.as_ref().unwrap().revision();
+            ribbon_choose(&mut app, &ctx, "Straight line", label);
+            assert!(app.editor.tool == tool, "{label} should arm");
+            assert_eq!(app.editor.style.stroke, style);
+            assert_eq!(
+                app.tabs[0].session.as_ref().unwrap().revision(),
+                revision,
+                "Hover and choosing a tool should not edit the PDF"
+            );
+            let at = ribbon_button(&mut app, &ctx, label);
+            ribbon_click(&mut app, &ctx, at);
+            assert!(app.editor.tool == Tool::Select);
+            ribbon_click(&mut app, &ctx, at);
+            assert!(app.editor.tool == tool);
+            for _ in 0..3 {
+                ribbon_frame(&mut app, &ctx, vec![], 900.);
+            }
+            assert!(
+                !egui::Popup::is_any_open(&ctx),
+                "Clicking the button leaves the page ready for drawing"
+            );
+            draw_tool_once(&mut app, &ctx);
+            let marks = &app.tabs[0].session.as_ref().unwrap().annotations;
+            assert_eq!(marks.len(), 1, "{label}");
+            assert_eq!(marks[0].style.stroke, style);
+            assert!(
+                matches!(
+                    (&marks[0].kind, tool),
+                    (Kind::Line { arrow: false, .. }, Tool::Line)
+                        | (Kind::DoubleLine { .. }, Tool::DoubleLine)
+                        | (
+                            Kind::RoutedLine {
+                                route: ann::Route::Elbow,
+                                ..
+                            },
+                            Tool::ElbowLine,
+                        )
+                        | (
+                            Kind::RoutedLine {
+                                route: ann::Route::Stepped,
+                                ..
+                            },
+                            Tool::SteppedLine,
+                        )
+                        | (
+                            Kind::RoutedLine {
+                                route: ann::Route::Curved,
+                                ..
+                            },
+                            Tool::CurvedLine,
+                        )
+                ),
+                "{label} created {:?}",
+                marks[0].kind
+            );
+            assert!(app.editor.mode == Mode::Draw);
+        }
+    }
+    #[test]
+    fn stepped_and_double_routed_arrows_hover_draw_and_toggle_in_one_slot() {
+        for tool in [
+            Tool::SteppedArrow,
+            Tool::DoubleElbowArrow,
+            Tool::DoubleSteppedArrow,
+            Tool::DoubleCurvedArrow,
+        ] {
+            let (ctx, mut app) = ready_ribbon();
+            app.editor.mode = Mode::Draw;
+            let revision = app.tabs[0].session.as_ref().unwrap().revision();
+            ribbon_choose(&mut app, &ctx, "Arrow", tool.label());
+            assert!(app.editor.tool == tool);
+            assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), revision);
+            let at = ribbon_button(&mut app, &ctx, tool.label());
+            ribbon_click(&mut app, &ctx, at);
+            assert!(app.editor.tool == Tool::Select);
+            ribbon_click(&mut app, &ctx, at);
+            assert!(app.editor.tool == tool);
+            for _ in 0..3 {
+                ribbon_frame(&mut app, &ctx, vec![], 900.);
+            }
+            assert!(!egui::Popup::is_any_open(&ctx));
+            draw_tool_once(&mut app, &ctx);
+            let marks = &app.tabs[0].session.as_ref().unwrap().annotations;
+            assert_eq!(marks.len(), 1, "{}", tool.label());
+            let route = match (&marks[0].kind, tool) {
+                (Kind::RoutedArrow { route, .. }, Tool::SteppedArrow) => route,
+                (
+                    Kind::RoutedDoubleArrow { route, .. },
+                    Tool::DoubleElbowArrow | Tool::DoubleSteppedArrow | Tool::DoubleCurvedArrow,
+                ) => route,
+                _ => panic!("{} created {:?}", tool.label(), marks[0].kind),
+            };
+            assert_eq!(Some(*route), tool.route());
+            assert!(app.editor.mode == Mode::Draw);
+            for _ in 0..3 {
+                ribbon_frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(pos2(0., 200.))],
+                    720.,
+                );
+            }
+            let output = ribbon_frame(&mut app, &ctx, vec![], 720.);
+            let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+            let buttons: Vec<_> = nodes
+                .iter()
+                .filter(|(_, n)| n.role() == egui::accesskit::Role::Button)
+                .filter_map(|(_, n)| n.bounds())
+                .collect();
+            assert_eq!(buttons.len(), 10);
+            assert!(buttons.iter().all(|r| r.x0 >= 0. && r.x1 <= 720.1));
+        }
+    }
+    #[test]
+    fn head_defaults_rearm_same_tool_and_reset_for_new_line_or_arrow_geometry() {
+        let (ctx, mut app) = ready_ribbon();
+        app.editor.mode = Mode::Draw;
+        let custom = ann::LineEndings {
+            start: ann::LineEnd::Diamond,
+            end: ann::LineEnd::FilledArrow,
+            size: 18.,
+        };
+        let at = ribbon_button(&mut app, &ctx, "Arrow");
+        ribbon_click(&mut app, &ctx, at);
+        app.editor.style.line_endings = Some(custom);
+        ribbon_click(&mut app, &ctx, at);
+        assert!(app.editor.tool == Tool::Select);
+        assert_eq!(
+            app.editor.style.line_endings, None,
+            "Neutral and closed-shape styles do not carry hidden head settings"
+        );
+        ribbon_click(&mut app, &ctx, at);
+        assert_eq!(app.editor.style.line_endings, Some(custom));
+        draw_tool_once(&mut app, &ctx);
+        assert_eq!(
+            app.tabs[0].session.as_ref().unwrap().annotations[0]
+                .style
+                .line_endings,
+            Some(custom)
+        );
+        let retained = app.editor.draft.clone().unwrap();
+        ribbon_choose(&mut app, &ctx, "Arrow", "Double curved arrow");
+        assert!(app.editor.tool == Tool::DoubleCurvedArrow);
+        assert_eq!(
+            app.editor.style.line_endings, None,
+            "A new geometry gets its own legacy arrow defaults"
+        );
+        assert_eq!(
+            app.tabs[0].session.as_ref().unwrap().annotations[0],
+            retained,
+            "Changing creation defaults leaves existing artwork intact"
+        );
+        let kind = drawing_properties::tool_kind(app.editor.tool).unwrap();
+        let effective = ann::line_endings(&kind, &app.editor.style).unwrap();
+        assert_eq!(effective.start, ann::LineEnd::OpenArrow);
+        assert_eq!(effective.end, ann::LineEnd::OpenArrow);
+        let at = ribbon_button(&mut app, &ctx, "Straight line");
+        ribbon_click(&mut app, &ctx, at);
+        let kind = drawing_properties::tool_kind(app.editor.tool).unwrap();
+        let effective = ann::line_endings(&kind, &app.editor.style).unwrap();
+        assert_eq!(
+            (effective.start, effective.end),
+            (ann::LineEnd::None, ann::LineEnd::None)
+        );
+        app.editor.style.line_endings = Some(custom);
+        ribbon_choose(&mut app, &ctx, "Straight line", "Dashed line");
+        assert_eq!(
+            app.editor.style.line_endings,
+            Some(custom),
+            "Changing a stroke style keeps this line's head defaults"
+        );
+        let bytes = app.tabs[0]
+            .session
+            .as_ref()
+            .unwrap()
+            .snapshot_bytes()
+            .unwrap();
+        let saved = ann::load(&lopdf::Document::load_mem(&bytes).unwrap());
+        assert_eq!(saved[0].style.line_endings, Some(custom));
+    }
+    #[test]
+    fn line_inspector_style_is_retained_and_invalid_drafts_block_preset_changes() {
+        let (ctx, mut app) = ready_ribbon();
+        app.editor.mode = Mode::Draw;
+        let at = ribbon_button(&mut app, &ctx, "Straight line");
+        ribbon_click(&mut app, &ctx, at);
+        app.editor.style.stroke = StrokeStyle::Wave;
+        let at = ribbon_button(&mut app, &ctx, "Wavy line");
+        ribbon_click(&mut app, &ctx, at);
+        assert!(app.editor.tool == Tool::Select);
+        app.editor.select_tool(Tool::Pen);
+        app.editor.style.stroke = StrokeStyle::Dotted;
+        let at = ribbon_button(&mut app, &ctx, "Wavy line");
+        ribbon_click(&mut app, &ctx, at);
+        assert!(app.editor.tool == Tool::Line);
+        assert_eq!(
+            app.editor.style.stroke,
+            StrokeStyle::Wave,
+            "Other tools cannot overwrite the line's remembered inspector setting"
+        );
+        draw_tool_once(&mut app, &ctx);
+        assert_eq!(
+            app.tabs[0].session.as_ref().unwrap().annotations[0]
+                .style
+                .stroke,
+            StrokeStyle::Wave
+        );
+        let mut invalid = app.editor.draft.clone().unwrap();
+        invalid.style.opacity = 0.;
+        app.editor.draft = Some(invalid.clone());
+        let revision = app.tabs[0].session.as_ref().unwrap().revision();
+        let before = app.editor.style.clone();
+        ribbon_choose(&mut app, &ctx, "Wavy line", "Dashed line");
+        assert_eq!(app.editor.draft, Some(invalid));
+        assert_eq!(app.editor.style, before);
+        assert_eq!(app.editor.line_stroke, StrokeStyle::Wave);
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), revision);
+        assert!(app.editor.tool == Tool::Line);
+    }
+    #[test]
+    fn shape_hover_groups_draw_exact_presets_and_preserve_compact_positions() {
+        for (parent, tool) in [
+            ("Rectangle", Tool::Square),
+            ("Rectangle", Tool::Diamond),
+            ("Rectangle", Tool::Triangle),
+            ("Rectangle", Tool::Pentagon),
+            ("Rectangle", Tool::Hexagon),
+            ("Ellipse", Tool::Circle),
+            ("Ellipse", Tool::Semicircle),
+        ] {
+            let (ctx, mut app) = ready_ribbon();
+            app.editor.mode = Mode::Draw;
+            let revision = app.tabs[0].session.as_ref().unwrap().revision();
+            ribbon_choose(&mut app, &ctx, parent, tool.label());
+            assert!(app.editor.tool == tool);
+            assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), revision);
+            let at = ribbon_button(&mut app, &ctx, tool.label());
+            ribbon_click(&mut app, &ctx, at);
+            assert!(app.editor.tool == Tool::Select);
+            ribbon_click(&mut app, &ctx, at);
+            assert!(app.editor.tool == tool);
+            for _ in 0..3 {
+                ribbon_frame(&mut app, &ctx, vec![], 900.);
+            }
+            assert!(!egui::Popup::is_any_open(&ctx));
+            draw_tool_once(&mut app, &ctx);
+            let marks = &app.tabs[0].session.as_ref().unwrap().annotations;
+            assert_eq!(marks.len(), 1, "{}", tool.label());
+            assert_eq!(
+                marks[0].kind,
+                Kind::Shape {
+                    shape: tool.shape().unwrap()
+                }
+            );
+            let r = marks[0].rect;
+            if matches!(tool, Tool::Square | Tool::Circle | Tool::Semicircle) {
+                let ratio = if tool == Tool::Semicircle { 2. } else { 1. };
+                assert!(((r[2] - r[0]) / (r[3] - r[1]) - ratio).abs() < 0.001);
+                assert!(keeps_proportions(&marks[0].kind));
+            }
+            assert!(app.editor.mode == Mode::Draw);
+            for _ in 0..3 {
+                ribbon_frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::PointerMoved(pos2(0., 200.))],
+                    720.,
+                );
+            }
+            let output = ribbon_frame(&mut app, &ctx, vec![], 720.);
+            let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+            let buttons: Vec<_> = nodes
+                .iter()
+                .filter(|(_, n)| n.role() == egui::accesskit::Role::Button)
+                .filter_map(|(_, n)| n.bounds())
+                .collect();
+            assert_eq!(
+                buttons.len(),
+                10,
+                "Each family must occupy exactly one button"
+            );
+            assert!(buttons.iter().all(|r| r.x0 >= 0. && r.x1 <= 720.1));
+        }
+    }
+    #[test]
+    fn constrained_shape_drags_keep_origin_and_aspect_in_all_quadrants() {
+        let (_, mut app) = ready_ribbon();
+        for tool in [Tool::Square, Tool::Circle, Tool::Semicircle] {
+            app.editor.select_tool(tool);
+            let ratio = if tool == Tool::Semicircle { 2. } else { 1. };
+            for end in [
+                [320., 290.],
+                [80., 290.],
+                [80., 110.],
+                [320., 110.],
+                [200., 300.],
+                [200., 200.],
+            ] {
+                let a = app.editor.base_annotation(
+                    &app.tabs[0],
+                    0,
+                    [80., 110., 320., 290.],
+                    [200., 200.],
+                    end,
+                    &[],
+                );
+                a.validate().unwrap();
+                assert!(((a.rect[2] - a.rect[0]) / (a.rect[3] - a.rect[1]) - ratio).abs() < 0.001);
+                assert!(a.rect[0] == 200. || a.rect[2] == 200.);
+                assert!(a.rect[1] == 200. || a.rect[3] == 200.);
+            }
+        }
+    }
+
+    #[test]
+    fn form_field_tools_reclick_to_neutral_without_leaving_forms_mode() {
+        let (ctx, mut app) = ready_ribbon();
+        app.editor.mode = Mode::Forms;
+        let frame = |app: &mut Viewer, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1400., 780.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.form_ribbon(ctx),
+            )
+        };
+        for kind in mypdf_milestone0::form_design::FieldType::ALL {
+            for _ in 0..3 {
+                frame(&mut app, vec![]);
+            }
+            let output = frame(&mut app, vec![]);
+            let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+            let r = nodes
+                .iter()
+                .find_map(|(_, node)| {
+                    (node.label() == Some(kind.label()))
+                        .then(|| node.bounds())
+                        .flatten()
+                })
+                .unwrap();
+            let at = pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32);
+            for selected in [true, false] {
+                for pressed in [true, false] {
+                    frame(
+                        &mut app,
+                        vec![
+                            egui::Event::PointerMoved(at),
+                            egui::Event::PointerButton {
+                                pos: at,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                }
+                assert_eq!(app.forms.tool, selected.then_some(kind));
+                assert!(app.editor.mode == Mode::Forms);
+            }
+        }
+        assert!(app.tabs[0].session.as_ref().unwrap().annotations.is_empty());
     }
 }

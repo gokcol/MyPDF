@@ -133,7 +133,7 @@ fn numbers(values: impl IntoIterator<Item = f32>) -> Object {
 
 /// Paint visible annotation appearances into the source page before turning it
 /// into a Form XObject. Unsupported visible marks fail rather than disappearing.
-fn flatten_appearances(doc: &mut Document, page: ObjectId) -> Result<()> {
+pub(crate) fn flatten_appearances(doc: &mut Document, page: ObjectId) -> Result<()> {
     let list = doc
         .get_dictionary(page)?
         .get(b"Annots")

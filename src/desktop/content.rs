@@ -196,6 +196,18 @@ pub(super) enum AfterText {
     PasteImage(u64, clipboard::Clip),
     SelectAt(u64, usize, [f32; 2]),
 }
+#[derive(Debug)]
+struct ImageReselect {
+    tab: u64,
+    page: usize,
+    /// Set to the committed revision before restoring this image selection.
+    revision: Option<u64>,
+    resolved: bool,
+    ordinal: usize,
+    name: String,
+    rect: [f32; 4],
+}
+
 pub(super) struct ContentState {
     pub(super) hide_guides: bool,
     pub(super) context: context::State,
@@ -235,6 +247,9 @@ pub(super) struct ContentState {
     pub(super) loading: bool,
     pub(super) inspection: Option<Inspection>,
     selected: Option<usize>,
+    /// Keep a keyboard-moved image selected after its fresh inspection arrives.
+    image_reselect: Option<ImageReselect>,
+    image_nudge_delta: [f32; 2],
     image_effects: Option<image_effects::EmbeddedEffects>,
     region: region::State,
     pub image_mode: bool,
@@ -251,6 +266,7 @@ pub(super) struct ContentState {
     output_tx: mpsc::Sender<Output>,
     output_rx: mpsc::Receiver<Output>,
     format: Format,
+    image_format: Format,
     range: String,
     dpi: f32,
     erased: Option<Erased>,
@@ -271,6 +287,21 @@ struct Erased {
     texture: Option<TextureHandle>,
 }
 impl ContentState {
+    pub(super) fn image_nudge_pending(&self, tab: u64) -> bool {
+        self.image_reselect
+            .as_ref()
+            .is_some_and(|target| target.tab == tab)
+    }
+    pub(super) fn queue_image_nudge(&mut self, tab: u64, delta: [f32; 2]) {
+        if self.image_nudge_pending(tab) {
+            self.image_nudge_delta[0] += delta[0];
+            self.image_nudge_delta[1] += delta[1];
+        }
+    }
+    pub(super) fn name_pending_change(&mut self, name: &'static str) {
+        self.change_name = name;
+    }
+
     pub(super) fn text_defaults(&self) -> mypdf_milestone0::workflows::TextDefaults {
         mypdf_milestone0::workflows::TextDefaults {
             font: text_style::fonts()
@@ -604,9 +635,21 @@ impl ContentState {
     /// A click away from the open text editor: keep changes, or close an
     /// untouched selection without rewriting anything.
     pub(super) fn click_outside(&mut self, tab: u64) {
-        if !self.busy && self.existing.as_ref().is_some_and(|e| e.key.0 == tab) {
+        if self.busy {
+            return;
+        }
+        if self.existing.as_ref().is_some_and(|e| e.key.0 == tab) {
             self.new_commit = true;
         }
+        if self.table_selection.is_some_and(|(key, _)| key.0 == tab) {
+            self.table_selection = None;
+            self.selection_hint = None;
+        }
+        self.selected = None;
+        self.image_reselect = None;
+        self.image_nudge_delta = [0.; 2];
+        self.image_mode = false;
+        self.context.clear_selection = Some(tab);
     }
     pub(super) fn interaction_page(&self, tab: u64) -> Option<usize> {
         self.existing
@@ -625,6 +668,14 @@ impl ContentState {
                     .filter(|v| v.0 == tab)
                     .map(|v| v.1)
             })
+    }
+    pub(super) fn has_keyboard_selection(&self, tab: u64) -> bool {
+        self.pending_text() == Some(tab)
+            || self.add_target.is_some_and(|target| target.0 == tab)
+            || self.selected.is_some()
+            || self.table_selection.is_some_and(|(key, _)| key.0 == tab)
+            || self.area_mode
+            || self.region.active
     }
     pub(super) fn region_active(&self) -> bool {
         self.region.active
@@ -769,6 +820,8 @@ impl ContentState {
             loading: false,
             inspection: None,
             selected: None,
+            image_reselect: None,
+            image_nudge_delta: [0.; 2],
             image_effects: None,
             region: region::State::default(),
             image_mode: false,
@@ -783,6 +836,7 @@ impl ContentState {
             output_tx,
             output_rx,
             format: Format::Png,
+            image_format: Format::Png,
             range: "1".into(),
             dpi: 144.,
             erased: None,
@@ -834,6 +888,8 @@ impl Viewer {
                         && let Some(s) = &mut tab.session
                     {
                         if s.revision() != revision {
+                            self.content.image_reselect = None;
+                            self.content.image_nudge_delta = [0.; 2];
                             self.content.inserting_text = false;
                             self.content.replacing_text = false;
                             self.content.next_existing = None;
@@ -852,6 +908,11 @@ impl Viewer {
                         };
                         match commit {
                             Ok(()) => {
+                                if let Some(target) = &mut self.content.image_reselect
+                                    && target.tab == id
+                                {
+                                    target.revision = Some(s.revision());
+                                }
                                 s.name_last_change(self.content.change_name);
                                 s.set_change_focus(self.content.change_page, None);
                                 tab.keep_stale = true;
@@ -896,6 +957,8 @@ impl Viewer {
                                 ));
                             }
                             Err(e) => {
+                                self.content.image_reselect = None;
+                                self.content.image_nudge_delta = [0.; 2];
                                 self.content.inserting_text = false;
                                 self.content.replacing_text = false;
                                 self.content.next_existing = None;
@@ -909,6 +972,8 @@ impl Viewer {
                     }
                 }
                 Err(e) => {
+                    self.content.image_reselect = None;
+                    self.content.image_nudge_delta = [0.; 2];
                     if let Some(draft) = &self.content.existing {
                         if let Some(index) = self.tabs.iter().position(|t| t.id == draft.key.0) {
                             self.active = index;
@@ -942,6 +1007,42 @@ impl Viewer {
                         inspection.guides.clone(),
                     ));
                 }
+                if let Some(target) = &mut self.content.image_reselect
+                    && (target.tab, target.revision, target.page)
+                        == (inspection.key.0, Some(inspection.key.1), inspection.key.2)
+                {
+                    if let Ok(images) = &inspection.images {
+                        // Place inserts PDF operators, so operator indices can change.
+                        // Verify the same image occurrence at its committed bounds.
+                        let matches = |image: &content::ImageObject| {
+                            image.name == target.name
+                                && image
+                                    .rect
+                                    .iter()
+                                    .zip(target.rect)
+                                    .all(|(a, b)| (a - b).abs() < 0.05)
+                        };
+                        let selected = images
+                            .get(target.ordinal)
+                            .filter(|image| matches(image))
+                            .map(|_| target.ordinal)
+                            .or_else(|| images.iter().position(matches));
+                        if let Some(selected) = selected {
+                            target.ordinal = selected;
+                            target.resolved = true;
+                            let rect = images[selected].rect;
+                            self.content.selected = Some(selected);
+                            self.content.rect =
+                                [rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]];
+                        } else {
+                            self.content.image_reselect = None;
+                            self.content.image_nudge_delta = [0.; 2];
+                        }
+                    } else {
+                        self.content.image_reselect = None;
+                        self.content.image_nudge_delta = [0.; 2];
+                    }
+                }
                 self.content.inspection = Some(inspection);
             }
         }
@@ -958,6 +1059,7 @@ impl Viewer {
                 Err(e) => self.status = Some((e, true)),
             }
         }
+        self.resume_image_nudge(ctx);
         if let Some(action) = after_text {
             match action {
                 AfterText::Save(id, intent) => {
@@ -976,6 +1078,52 @@ impl Viewer {
             }
         }
     }
+    /// Inspection can finish before the document worker re-enables editing.
+    /// Retain queued key presses until both workers agree on the same revision.
+    fn resume_image_nudge(&mut self, ctx: &egui::Context) {
+        let Some(target) = &self.content.image_reselect else {
+            return;
+        };
+        let active = self.tabs.get(self.active);
+        let current = active.and_then(|tab| tab.session.as_ref());
+        let valid = self.editor.mode == editing::Mode::Edit
+            && self.content.image_mode
+            && active.is_some_and(|tab| tab.id == target.tab && tab.page == target.page)
+            && current.is_some_and(|session| {
+                target
+                    .revision
+                    .is_none_or(|revision| revision == session.revision())
+            });
+        if !valid {
+            self.content.image_reselect = None;
+            self.content.image_nudge_delta = [0.; 2];
+            return;
+        }
+        if self.content.busy || !target.resolved || !current.unwrap().editable {
+            return;
+        }
+        let key = (target.tab, target.revision.unwrap(), target.page);
+        let selected_matches = self.content.selected == Some(target.ordinal)
+            && self.content.inspection.as_ref().is_some_and(|inspection| {
+                inspection.key == key
+                    && inspection.images.as_ref().ok().is_some_and(|images| {
+                        images.get(target.ordinal).is_some_and(|image| {
+                            image.name == target.name
+                                && image
+                                    .rect
+                                    .iter()
+                                    .zip(target.rect)
+                                    .all(|(a, b)| (a - b).abs() < 0.05)
+                        })
+                    })
+            });
+        self.content.image_reselect = None;
+        let delta = std::mem::take(&mut self.content.image_nudge_delta);
+        if selected_matches && delta != [0.; 2] {
+            self.nudge_content_selection(ctx, delta);
+        }
+    }
+
     pub(super) fn content_change(&mut self, ctx: &egui::Context, edit: Edit) {
         let active = self.tabs.get(self.active).map(|tab| tab.id);
         if !matches!(
@@ -1337,6 +1485,15 @@ impl Viewer {
         };
         let Some(s) = &tab.session else { return };
         let key = (tab.id, s.revision(), tab.page);
+        if self
+            .content
+            .image_reselect
+            .as_ref()
+            .is_some_and(|target| (target.tab, target.page) != (key.0, key.2))
+        {
+            self.content.image_reselect = None;
+            self.content.image_nudge_delta = [0.; 2];
+        }
         if self.content.key == Some(key) || self.content.loading {
             return;
         }
@@ -1566,6 +1723,10 @@ impl Viewer {
     }
 
     pub(super) fn content_tools(&mut self, ctx: &egui::Context) {
+        if self.editor.mode == editing::Mode::Convert {
+            self.conversion_tools(ctx);
+            return;
+        }
         if self.editor.mode != editing::Mode::Edit {
             return;
         }
@@ -1598,30 +1759,48 @@ impl Viewer {
                         && let Some(t) = self.tabs.get(self.active)
                         && !t.pages.is_empty()
                     {
-                        self.redaction.active = false;
-                        self.content.area_mode = false;
-                        self.content.marquee = None;
-                        if self.content.existing.is_some() {
-                            self.content.new_commit = true;
-                            self.content.add_after_existing = Some((t.id, t.page));
-                        } else if self.content.pending_text().is_none() {
-                            self.content.add_target = Some((t.id, t.page));
-                            self.content.new_placed = false;
-                            self.content.clear_new_text();
+                        if self.content.add_target.is_some() {
+                            self.finish_content_selection(ctx);
+                        } else {
+                            self.redaction.active = false;
+                            self.content.area_mode = false;
+                            self.content.marquee = None;
+                            if self.content.existing.is_some() {
+                                self.content.new_commit = true;
+                                self.content.add_after_existing = Some((t.id, t.page));
+                            } else if self.content.pending_text().is_none() {
+                                self.content.add_target = Some((t.id, t.page));
+                                self.content.new_placed = false;
+                                self.content.clear_new_text();
+                            }
+                            self.inspector = true;
                         }
-                        self.inspector = true;
                     }
                     ui.separator();
                     if ui
                         .add_enabled(
                             editable,
-                            ActionButton::new(Icon::Table, "Table")
-                                .selected(self.table.chooser || self.table.placing),
+                            ActionButton::new(Icon::Table, "Table").selected(
+                                self.table.chooser
+                                    || self.table.placing
+                                    || self.table.has_editor(
+                                        self.tabs.get(self.active).map_or(0, |tab| tab.id),
+                                    ),
+                            ),
                         )
                         .on_hover_text("Place a table or edit bordered tables on this page")
                         .clicked()
                     {
-                        self.table.chooser = !self.table.chooser;
+                        if self.table.chooser
+                            || self.table.placing
+                            || self
+                                .table
+                                .has_editor(self.tabs.get(self.active).map_or(0, |tab| tab.id))
+                        {
+                            self.finish_table_selection(ctx);
+                        } else {
+                            self.choose_table();
+                        }
                     }
                     if ui
                         .add_enabled(editable, ActionButton::new(Icon::FieldImage, "Image"))
@@ -1711,10 +1890,200 @@ impl Viewer {
                 }
             });
             ui.add_space(8.);
-            ui.label(RichText::new(if self.content.new_placed { "Type on the page. Drag the top handle to move; drag the circles to resize. Click elsewhere on the page or press ⌘Return to finish." } else { "Click anywhere on a page and start typing." }).size(12.).color(theme::muted()));
+            ui.label(RichText::new(if self.content.new_placed { "Type on the page. Drag the top handle to move; drag the circles to resize. Click elsewhere, press Esc or ⌘Return to finish." } else { "Click anywhere on a page and start typing." }).size(12.).color(theme::muted()));
             });
         });
     }
+    /// Escape ends an in-place edit by applying it; invalid edits remain visible.
+    pub(super) fn finish_content_selection(&mut self, ctx: &egui::Context) -> bool {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return false;
+        };
+        let id = tab.id;
+        let page = self.content.interaction_page(id).unwrap_or(tab.page);
+        let pending = self.content.pending_text() == Some(id);
+        let selected = pending
+            || self.content.add_target.is_some_and(|target| target.0 == id)
+            || self.content.selected.is_some()
+            || self.content.table_selection.is_some()
+            || self.content.area_mode
+            || self.content.region.active;
+        if !selected {
+            return false;
+        }
+        if self.content.busy {
+            return true;
+        }
+        self.content.next_existing = None;
+        self.content.add_after_existing = None;
+        self.content.after_text = None;
+        self.content.next_text = None;
+        self.content.exit_text_tool = true;
+        self.content.area_mode = false;
+        self.content.marquee = None;
+        self.content.region.active = false;
+        self.content.region.drag = None;
+        self.content.table_selection = None;
+        self.content.selection_hint = None;
+        self.content.selected = None;
+        self.content.image_reselect = None;
+        self.content.image_nudge_delta = [0.; 2];
+        self.content.image_mode = false;
+        self.content.context.select_after_text = None;
+        self.content.context.area_after_table = None;
+        if pending {
+            self.content.new_commit = true;
+            self.finish_new_text(ctx);
+        } else {
+            self.content.clear_new_text();
+            self.content.new_placed = false;
+            self.content.add_target = None;
+            self.content.exit_text_tool = false;
+        }
+        if self.content.busy || self.content.pending_text() != Some(id) {
+            ctx.memory_mut(|memory| {
+                for name in ["inline_existing_text", "inline_new_text"] {
+                    memory.surrender_focus(egui::Id::new((id, page, name)));
+                }
+            });
+        }
+        true
+    }
+
+    pub(super) fn focus_content_selection(&mut self) -> bool {
+        if self.editor.mode != editing::Mode::Edit {
+            return false;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            return false;
+        };
+        if let Some(draft) = self
+            .content
+            .existing
+            .as_mut()
+            .filter(|draft| draft.key.0 == tab.id && draft.key.2 == tab.page)
+        {
+            draft.focus = true;
+            self.inspector = true;
+            return true;
+        }
+        if self.content.new_placed && self.content.add_target == Some((tab.id, tab.page)) {
+            self.content.focus_new_text = true;
+            self.inspector = true;
+            return true;
+        }
+        if self.content.image_mode && self.content.selected.is_some() {
+            self.inspector = true;
+            return true;
+        }
+        false
+    }
+
+    /// Text nudges remain one pending placement edit (including Undo and Save).
+    /// Embedded images use the ordinary document worker and undo transaction.
+    pub(super) fn nudge_content_selection(&mut self, ctx: &egui::Context, delta: [f32; 2]) -> bool {
+        if self.editor.mode != editing::Mode::Edit {
+            return false;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            return false;
+        };
+        let Some(session) = &tab.session else {
+            return false;
+        };
+        if !session.editable {
+            return false;
+        }
+        let Some(page) = tab.pages.get(tab.page).copied() else {
+            return false;
+        };
+        let key = (tab.id, session.revision(), tab.page);
+        if let Some(draft) = self
+            .content
+            .existing
+            .as_mut()
+            .filter(|draft| draft.key == key)
+        {
+            if matches!(draft.target, InlineTarget::Annotation(_)) {
+                // Annotation text uses the annotation transaction below.
+                self.finish_existing_text(ctx);
+                return self.content.existing.is_some();
+            }
+            if draft.geometry.as_ref().is_some_and(|geometry| {
+                geometry.direction[0] < 0.999 || geometry.direction[1].abs() > 0.01
+            }) {
+                self.status = Some((
+                    "This rotated text cannot be moved safely. Select its artwork instead.".into(),
+                    false,
+                ));
+                return true;
+            }
+            if matches!(draft.target, InlineTarget::Run(_)) {
+                let original = draft.original.clone();
+                if let Some(mut block) = selected_block(vec![draft.clone()], draft.rect, page) {
+                    block.original = original;
+                    block.focus = false;
+                    *draft = block;
+                } else {
+                    return true;
+                }
+            }
+            draft.rect = moved_text_rect(draft.rect, vec2(delta[0], delta[1]), page);
+            draft.focus = false;
+            ctx.request_repaint();
+            return true;
+        }
+        if self.content.new_placed && self.content.add_target == Some((key.0, key.2)) {
+            let [x, y, width, height] = self.content.new_rect;
+            let moved = moved_text_rect(
+                [x, y, x + width, y + height],
+                vec2(delta[0], delta[1]),
+                page,
+            );
+            self.content.new_rect = [moved[0], moved[1], width, height];
+            ctx.request_repaint();
+            return true;
+        }
+        let image = self
+            .content
+            .inspection
+            .as_ref()
+            .filter(|inspection| inspection.key == key)
+            .and_then(|inspection| inspection.images.as_ref().ok())
+            .and_then(|images| images.get(self.content.selected?))
+            .cloned();
+        if self.content.image_mode
+            && let Some(image) = image
+        {
+            let moved = moved_text_rect(image.rect, vec2(delta[0], delta[1]), page);
+            if moved != image.rect {
+                self.content.image_reselect = Some(ImageReselect {
+                    tab: key.0,
+                    page: key.2,
+                    revision: None,
+                    resolved: false,
+                    ordinal: self.content.selected.unwrap(),
+                    name: image.name.clone(),
+                    rect: moved,
+                });
+                self.content_change(
+                    ctx,
+                    Edit::Image {
+                        page: key.2 as u32 + 1,
+                        index: image.index,
+                        edit: content::ImageEdit::Place(moved),
+                    },
+                );
+                if !self.content.busy {
+                    self.content.image_reselect = None;
+                    self.content.image_nudge_delta = [0.; 2];
+                }
+            }
+            return true;
+        }
+        false
+    }
+
     pub(super) fn finish_new_text(&mut self, ctx: &egui::Context) {
         if !self.content.new_commit || self.content.busy {
             return;
@@ -1757,40 +2126,151 @@ impl Viewer {
         }
         self.active = previous;
     }
+    fn conversion_tools(&mut self, ctx: &egui::Context) {
+        let ready = !self.content.busy
+            && self
+                .tabs
+                .get(self.active)
+                .is_some_and(|tab| !tab.pages.is_empty());
+        egui::TopBottomPanel::top("export_ribbon")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::surface())
+                    .inner_margin(egui::Margin::symmetric(16, 7)),
+            )
+            .show(ctx, |ui| {
+                let formats = [
+                    (
+                        Format::Word,
+                        Icon::Document,
+                        "Word",
+                        "Export text to Word (.docx)",
+                    ),
+                    (Format::Text, Icon::Text, "Text", "Export plain text (.txt)"),
+                    (
+                        Format::Markdown,
+                        Icon::Note,
+                        "Markdown",
+                        "Export Markdown (.md)",
+                    ),
+                    (
+                        self.content.image_format,
+                        Icon::FieldImage,
+                        "Image",
+                        "Export pages as PNG or JPEG images",
+                    ),
+                ];
+                let width = formats
+                    .iter()
+                    .map(|(_, icon, label, _)| ActionButton::new(*icon, label).width(ui))
+                    .sum::<f32>()
+                    + ui.spacing().item_spacing.x * (formats.len() - 1) as f32;
+                ui.horizontal(|ui| {
+                    ui.add_space(((ui.available_width() - width) / 2.).max(0.));
+                    for (format, icon, label, hint) in formats {
+                        if ui
+                            .add_enabled(
+                                ready,
+                                ActionButton::new(icon, label)
+                                    .selected(self.content.format == format),
+                            )
+                            .on_hover_text(hint)
+                            .clicked()
+                        {
+                            self.content.format = format;
+                            self.inspector = true;
+                        }
+                    }
+                });
+            });
+    }
+
     fn conversion_panel(&mut self, ctx: &egui::Context) {
         let mut action = "";
         let ready = self
             .tabs
             .get(self.active)
             .is_some_and(|t| !t.pages.is_empty());
-        egui::SidePanel::right("conversion_panel").exact_width(310.).resizable(false).frame(egui::Frame::new().fill(theme::paper()).inner_margin(18.)).show(ctx,|ui|{
-            ui.heading("Export");ui.label(RichText::new("Local files. Fresh output copies.").small().color(theme::muted()));ui.add_space(16.);
-            ui.add_enabled_ui(!self.content.busy,|ui|{
-                ui.label(RichText::new("Create a PDF").family(ui::semibold()));
-                for(icon,label,key)in[(Icon::Plus,"New blank PDF","blank"),(Icon::Import,"Images to PDF…","images"),(Icon::Text,"Markdown / Word to PDF…","document")]{if ui.add(ActionButton::new(icon,label)).clicked(){action=key;}}
-                ui.add_space(18.);ui.separator();ui.add_space(12.);ui.label(RichText::new("Export this PDF").family(ui::semibold()));
-                ui.add_enabled_ui(ready,|ui|{
-                    egui::ComboBox::from_id_salt("conversion_format").selected_text(match self.content.format{Format::Png=>"PNG images",Format::Jpeg=>"JPEG images",Format::Text=>"Plain text (.txt)",Format::Markdown=>"Markdown (.md)",Format::Word=>"Word (.docx)"}).width(270.).show_ui(ui,|ui|{for(f,label)in[(Format::Png,"PNG images"),(Format::Jpeg,"JPEG images"),(Format::Text,"Plain text (.txt)"),(Format::Markdown,"Markdown (.md)"),(Format::Word,"Word (.docx)")]{ui.selectable_value(&mut self.content.format,f,label);}});
-                    ui.add_space(10.);ui.label("Pages · e.g. 1, 3-5");let r=ui.text_edit_singleline(&mut self.content.range);self.editor.text_editing|=r.has_focus();
-                    if ui.small_button("All pages").clicked() && let Some(t)=self.tabs.get(self.active){self.content.range=format!("1-{}",t.pages.len());}
-                    if matches!(self.content.format,Format::Png|Format::Jpeg){ui.horizontal(|ui|{ui.label("Resolution");ui.add(egui::DragValue::new(&mut self.content.dpi).range(72.0..=300.0).suffix(" DPI"));});}
-                    ui.add_space(12.);if ui.add(ActionButton::new(Icon::Extract,"Export…").primary()).clicked(){action="export";}
+        egui::SidePanel::right("conversion_panel")
+            .exact_width(310.)
+            .resizable(false)
+            .frame(egui::Frame::new().fill(theme::paper()).inner_margin(18.))
+            .show(ctx, |ui| {
+                ui.heading("Export");
+                ui.label(RichText::new("Local files. Fresh output copies.").small().color(theme::muted()));
+                ui.add_space(14.);
+                egui::ScrollArea::vertical().id_salt("export_options").show(ui, |ui| {
+                    ui.add_enabled_ui(!self.content.busy, |ui| {
+                        let (label, hint) = match self.content.format {
+                            Format::Word => ("Word (.docx)", "Uses document text and basic paragraphs. Fonts, columns, tables and page layout are not reconstructed."),
+                            Format::Text => ("Plain text (.txt)", "Extracts selectable document text without formatting."),
+                            Format::Markdown => ("Markdown (.md)", "Uses document text and basic paragraphs, with a heading for each page. Page layout is not reconstructed."),
+                            Format::Png | Format::Jpeg => ("Page images", "Includes the page appearance, annotations and form fields."),
+                        };
+                        ui.label(RichText::new(label).family(ui::semibold()));
+                        ui.label(RichText::new(hint).small().color(theme::muted()));
+                        ui.add_space(12.);
+                        ui.add_enabled_ui(ready, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Pages");
+                                if ui.small_button("All pages").clicked() && let Some(tab) = self.tabs.get(self.active) {
+                                    self.content.range = format!("1-{}", tab.pages.len());
+                                }
+                            });
+                            let response = ui.add(egui::TextEdit::singleline(&mut self.content.range).hint_text("1, 3-5").desired_width(f32::INFINITY));
+                            self.editor.text_editing |= response.has_focus();
+                            if matches!(self.content.format, Format::Png | Format::Jpeg) {
+                                ui.add_space(10.);
+                                egui::Grid::new("export_image_options").num_columns(2).spacing([12., 8.]).show(ui, |ui| {
+                                    ui.label("Format");
+                                    egui::ComboBox::from_id_salt("export_image_format").selected_text(if self.content.image_format == Format::Jpeg { "JPEG" } else { "PNG" }).width(120.).show_ui(ui, |ui| {
+                                        for (format, label) in [(Format::Png, "PNG"), (Format::Jpeg, "JPEG")] {
+                                            if ui.selectable_value(&mut self.content.image_format, format, label).changed() {
+                                                self.content.format = format;
+                                            }
+                                        }
+                                    });
+                                    ui.end_row();
+                                    ui.label("Resolution");
+                                    ui.add(egui::DragValue::new(&mut self.content.dpi).range(72.0..=300.0).suffix(" DPI"));
+                                    ui.end_row();
+                                });
+                            }
+                            ui.add_space(14.);
+                            if ui.add(ActionButton::new(Icon::Export, "Export…").primary()).clicked() {
+                                action = "export";
+                            }
+                        });
+                        if !matches!(self.content.format, Format::Png | Format::Jpeg) {
+                            ui.add_space(8.);
+                            ui.label(RichText::new("Scanned pages need Recognize Text first.").small().color(theme::muted()));
+                        }
+                        ui.add_space(16.);
+                        ui.separator();
+                        ui.add_space(8.);
+                        ui.collapsing("More PDF tools", |ui| {
+                            ui.label(RichText::new("Create a PDF").family(ui::semibold()));
+                            for (icon, label, key) in [(Icon::Plus, "New blank PDF", "blank"), (Icon::Import, "Images to PDF…", "images"), (Icon::Text, "Markdown / Word to PDF…", "document")] {
+                                if ui.add(ActionButton::new(icon, label)).clicked() { action = key; }
+                            }
+                            ui.add_space(8.);
+                            ui.separator();
+                            for (icon, label, hint, key) in [
+                                (Icon::Library, "Multiple pages per sheet…", "Arrange smaller pages on new sheets, with margins, headers and a watermark.", "nup"),
+                                (Icon::Flatten, "Flatten PDF…", "Turn pages into images, burning in annotations and form fields. The result can still be signed.", "flatten"),
+                                (Icon::Extract, "Reduce File Size…", "Make pictures and scans smaller. Text and drawings stay sharp.", "shrink"),
+                                (Icon::Ocr, "Recognize Text…", "Make scanned pages searchable, selectable and copyable on this computer.", "ocr"),
+                            ] {
+                                if ui.add_enabled(ready, ActionButton::new(icon, label)).on_hover_text(hint).clicked() { action = key; }
+                            }
+                        });
+                    });
+                    if self.content.busy {
+                        ui.spinner();
+                        ui.label("Converting…");
+                    }
                 });
-                ui.add_space(18.);ui.separator();ui.add_space(12.);
-                if ui.add_enabled(ready,ActionButton::new(Icon::Library,"Multiple pages per sheet…")).clicked(){action="nup";}
-                ui.label(RichText::new("Arrange smaller pages on new sheets, with margins, headers, and a watermark.").small().color(theme::muted()));
-                ui.add_space(18.);ui.separator();ui.add_space(12.);ui.label(RichText::new("Flatten").family(ui::semibold()));
-                ui.label(RichText::new("Turn every page into an image so nothing on it can be edited. Annotations and form fields are burned in; the result can still be signed.").small().color(theme::muted()));
-                if ui.add_enabled(ready,ActionButton::new(Icon::Document,"Flatten PDF…")).clicked(){action="flatten";}
-                ui.add_space(18.);ui.separator();ui.add_space(12.);ui.label(RichText::new("Reduce file size").family(ui::semibold()));
-                ui.label(RichText::new("Make pictures and scans smaller for email or upload. Text and drawings stay sharp.").small().color(theme::muted()));
-                if ui.add_enabled(ready,ActionButton::new(Icon::Extract,"Reduce File Size…")).clicked(){action="shrink";}
-                ui.add_space(18.);ui.separator();ui.add_space(12.);ui.label(RichText::new("Recognize text").family(ui::semibold()));
-                ui.label(RichText::new("Make scanned pages searchable, so their words can be found, selected and copied. Happens on this Mac.").small().color(theme::muted()));
-                if ui.add_enabled(ready,ActionButton::new(Icon::Ocr,"Recognize Text…")).clicked(){action="ocr";}
-                ui.add_space(16.);ui.label(RichText::new("Word and Markdown conversions use document text and basic paragraphs. Fonts, columns, tables, headers and page layout are not reconstructed. Word import accepts text documents; drawings are reported. Scanned pages need Recognize Text first.").small().color(theme::muted()));
-            });if self.content.busy{ui.spinner();ui.label("Converting…");}
-        });
+            });
         match action {
             "shrink" => self.request_shrink(),
             "ocr" => self.request_ocr(),
@@ -2295,7 +2775,7 @@ impl Viewer {
                             });
                         });
                         ui.add_space(14.);
-                        ui.label(RichText::new("Type on the page. Drag the handle to move PDF text. Click outside or press ⌘Return to finish. Esc cancels.").size(12.).color(theme::muted()));
+                        ui.label(RichText::new("Type on the page. Drag the handle or use arrow keys to move. Click outside, press Esc or ⌘Return to finish.").size(12.).color(theme::muted()));
                     } else {
                         let empty = self.content.inspection.as_ref().is_some_and(|info| info.text.as_ref().is_ok_and(|runs| runs.is_empty()));
                         if empty {
@@ -2305,7 +2785,7 @@ impl Viewer {
                         } else {
                             ui.label(RichText::new(if self.content.area_mode { "Drag a rectangle around the text you want to edit together." } else { "Click text or an image on the page to edit it." }).size(15.).color(theme::ink()));
                             ui.add_space(12.);
-                            ui.label(RichText::new("Drag around text to edit several lines. Right-click for Select area.").color(theme::muted()));
+                            ui.label(RichText::new("Drag around text to edit several lines.").color(theme::muted()));
                         }
                         if let Some(hint) = &self.content.selection_hint { ui.add_space(12.); ui.label(RichText::new(hint).color(theme::muted())); }
                         if self.content.loading { ui.add_space(12.); ui.spinner(); }
@@ -2809,7 +3289,7 @@ fn existing_overlay(
             });
         }
     }
-    // Dragging across the page selects an area, with or without Select area.
+    // Dragging across the page selects an area directly.
     let background = ui.interact(
         page_rect,
         egui::Id::new((tab.id, page, "text_page_background")),
@@ -2985,7 +3465,12 @@ fn existing_overlay(
             state.existing = Some(draft);
             state.show_text_inspector = true;
         }
-    } else if background.clicked() {
+    } else if background.clicked()
+        && background.interact_pointer_pos().is_some_and(|pos| {
+            let point = (pos - page_rect.min) / scale;
+            editing::hit_annotation(tab, page, [point.x, point.y], scale).is_none()
+        })
+    {
         state.click_outside(tab.id);
     }
     let Some(draft) = state
@@ -2999,6 +3484,8 @@ fn existing_overlay(
         state.existing = None;
         state.next_existing = None;
         state.after_text = None;
+        state.table_selection = None;
+        state.selection_hint = None;
         return;
     }
     if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter)) && !state.busy {
@@ -5071,10 +5558,10 @@ mod tests {
                 egui::Event::Text("Cancel this block".into()),
             ],
         );
-        frame(
-            &mut app,
-            vec![key(egui::Key::Escape, egui::Modifiers::NONE)],
-        );
+        // Explicit Cancel discards the draft; Escape now applies and deselects.
+        app.content.context.cancel_text = true;
+        app.context_commands(&ctx);
+        frame(&mut app, vec![]);
         assert!(app.content.existing.is_none());
         assert_eq!(&*app.tabs[0].session.as_ref().unwrap().source, &source);
         for _ in 0..3 {
@@ -5246,11 +5733,19 @@ mod tests {
             page.min + vec2(-super::reading::GUTTER / 2., 300.),
         );
         assert!(app.content.existing.is_none());
+        assert!(
+            app.content.table_selection.is_none(),
+            "surround click clears the area outline"
+        );
         drag(&mut app, start, end);
         assert!(app.content.existing.is_some());
         click(&mut app, page.min + vec2(300., 420.) * scale);
         wait(&mut app);
         assert!(app.content.existing.is_none());
+        assert!(
+            app.content.table_selection.is_none(),
+            "page click clears the area outline"
+        );
         assert_eq!(
             &*app.tabs[0].session.as_ref().unwrap().source,
             &source,
@@ -5275,6 +5770,10 @@ mod tests {
         click(&mut app, page.min + vec2(300., 420.) * scale);
         wait(&mut app);
         assert!(app.content.existing.is_none(), "{:?}", app.status);
+        assert!(
+            app.content.table_selection.is_none(),
+            "committed edits leave no area outline"
+        );
         let bytes = app.tabs[0]
             .session
             .as_ref()
@@ -5287,6 +5786,23 @@ mod tests {
             text.contains("Rewritten block") && !text.contains("First line"),
             "{text}"
         );
+        let revision = app.tabs[0].session.as_ref().unwrap().revision();
+        drag(
+            &mut app,
+            page.min + vec2(250., 300.) * scale,
+            page.min + vec2(400., 360.) * scale,
+        );
+        assert!(app.content.existing.is_none());
+        assert!(
+            app.content.table_selection.is_some(),
+            "empty area still has a selectable boundary"
+        );
+        click(&mut app, page.min + vec2(300., 500.) * scale);
+        assert!(
+            app.content.table_selection.is_none(),
+            "empty selection also deselects on outside click"
+        );
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), revision);
     }
     #[test]
     fn existing_text_and_text_annotations_edit_in_place_and_cancel_safely() {
@@ -5781,5 +6297,543 @@ mod tests {
         run(&mut app, vec![egui::Event::PointerMoved(pos2(220., 123.))]);
         run(&mut app, vec![button(pos2(220., 123.), false)]);
         assert_eq!(app.content.new_rect, [80., 110., 240., 110.]);
+    }
+
+    fn keyboard_fixture() -> (Viewer, egui::Context, Vec<u8>) {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        let source = content::add_text(
+            &convert::blank(400., 500.).unwrap(),
+            1,
+            "Original words",
+            [40., 60., 340., 100.],
+            16.,
+            [0.; 3],
+        )
+        .unwrap();
+        app.open_memory(
+            PathBuf::from("Selection keyboard.pdf"),
+            source.clone(),
+            &ctx,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.home.visible = false;
+        app.editor.mode = editing::Mode::Edit;
+        (app, ctx, source)
+    }
+    fn keyboard_wait(app: &mut Viewer, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.content.busy {
+            app.content_events(ctx);
+            assert!(std::time::Instant::now() < deadline, "{:?}", app.status);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    fn keyboard_run(app: &Viewer, source: &[u8]) -> InlineText {
+        let run = mypdf_milestone0::text_geometry::runs(source, 1)
+            .unwrap()
+            .remove(0);
+        InlineText {
+            key: (
+                app.tabs[0].id,
+                app.tabs[0].session.as_ref().unwrap().revision(),
+                0,
+            ),
+            target: InlineTarget::Run(0),
+            geometry: run.layout.clone(),
+            original: run.text.clone(),
+            text: run.text,
+            rect: run.rect.unwrap(),
+            size: run.size,
+            color: run.color,
+            font: run.base_font,
+            focus: false,
+        }
+    }
+
+    #[test]
+    fn keyboard_escape_keeps_typed_pdf_text_and_invalid_drafts_remain_available() {
+        let (mut app, ctx, source) = keyboard_fixture();
+        let mut draft = keyboard_run(&app, &source);
+        draft.text = "Preserved words".into();
+        app.content.existing = Some(draft);
+        assert!(app.finish_content_selection(&ctx));
+        keyboard_wait(&mut app, &ctx);
+        assert!(app.content.existing.is_none(), "{:?}", app.status);
+        let session = app.tabs[0].session.as_mut().unwrap();
+        assert!(
+            lopdf::Document::load_mem(&session.source)
+                .unwrap()
+                .extract_text(&[1])
+                .unwrap()
+                .contains("Preserved words")
+        );
+        session.undo();
+        assert_eq!(session.source.as_ref(), source);
+        let id = app.tabs[0].id;
+        app.content.add_target = Some((id, 0));
+        app.content.new_text = "CannotDiscardThisOversizedWord".into();
+        app.content.new_rect = [20., 20., 10., 20.];
+        app.content.new_size = 72.;
+        app.content.new_placed = true;
+        assert!(app.finish_content_selection(&ctx));
+        keyboard_wait(&mut app, &ctx);
+        assert_eq!(app.content.pending_text(), Some(id));
+        assert_eq!(app.content.new_text, "CannotDiscardThisOversizedWord");
+        assert!(app.content.new_placed);
+        assert!(app.status.as_ref().is_some_and(|(_, error)| *error));
+        assert_eq!(
+            app.tabs[0].session.as_ref().unwrap().source.as_ref(),
+            source
+        );
+    }
+
+    #[test]
+    fn keyboard_text_nudge_is_visible_and_saved_as_one_undoable_placement() {
+        let (mut app, ctx, source) = keyboard_fixture();
+        let draft = keyboard_run(&app, &source);
+        let before = draft.geometry.as_ref().unwrap().origin;
+        app.content.existing = Some(draft);
+        assert!(app.nudge_content_selection(&ctx, [1., 10.]));
+        let moved = app.content.existing.as_ref().unwrap().rect;
+        let InlineTarget::Block(block) = &app.content.existing.as_ref().unwrap().target else {
+            panic!()
+        };
+        assert!((moved[0] - block.initial_origin[0] - 1.).abs() < 0.01);
+        assert!((moved[1] - block.initial_origin[1] - 10.).abs() < 0.01);
+        assert!(app.content.has_pending_text_change(app.tabs[0].id));
+        app.finish_content_selection(&ctx);
+        keyboard_wait(&mut app, &ctx);
+        assert!(app.content.existing.is_none(), "{:?}", app.status);
+        let session = app.tabs[0].session.as_mut().unwrap();
+        let runs = mypdf_milestone0::text_geometry::runs(&session.source, 1).unwrap();
+        assert_eq!(
+            runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+            "Original words"
+        );
+        let origin = runs
+            .iter()
+            .find(|run| run.text == "Original words")
+            .unwrap()
+            .layout
+            .as_ref()
+            .unwrap()
+            .origin;
+        assert!((origin[0] - before[0] - 1.).abs() < 0.01);
+        assert!((origin[1] - before[1] - 10.).abs() < 0.01);
+        session.undo();
+        assert_eq!(session.source.as_ref(), source);
+        assert!(!session.can_undo());
+    }
+
+    #[test]
+    fn keyboard_image_nudge_retains_selection_after_inspection_and_is_undoable() {
+        let (mut app, ctx, source) = keyboard_fixture();
+        let png = clipboard::png(2, 2, &[20, 70, 200, 255].repeat(4)).unwrap();
+        let source = content::add_image(&source, 1, [100., 200., 180., 250.], &png).unwrap();
+        app.tabs[0].session = Some(mypdf_milestone0::annotations::Session::new(
+            source.clone().into(),
+            vec![],
+            true,
+        ));
+        let key = (app.tabs[0].id, 0, 0);
+        app.content.key = Some(key);
+        app.content.inspection = Some(Inspection {
+            key,
+            guides: Default::default(),
+            text: Ok(vec![]),
+            images: Ok(content::images(&source, 1).unwrap()),
+            fields: Ok(vec![]),
+            designed: Ok(vec![]),
+        });
+        app.content.image_mode = true;
+        app.content.selected = Some(0);
+        assert!(app.nudge_content_selection(&ctx, [-1., 10.]));
+        keyboard_wait(&mut app, &ctx);
+        app.inspect_content(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.content.loading {
+            app.content_events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            app.content.selected,
+            Some(0),
+            "status={:?}, deferred={:?}, key={:?}, images={:?}",
+            app.status,
+            app.content.image_reselect,
+            app.content.key,
+            app.content.inspection.as_ref().map(|i| &i.images)
+        );
+        assert!(app.content.image_mode);
+        let images = content::images(&app.tabs[0].session.as_ref().unwrap().source, 1).unwrap();
+        assert!(
+            images[0]
+                .rect
+                .iter()
+                .zip([99., 210., 179., 260.])
+                .all(|(a, b)| (a - b).abs() < 0.01)
+        );
+        app.editor_undo(false);
+        assert_eq!(
+            app.tabs[0].session.as_ref().unwrap().source.as_ref(),
+            source
+        );
+    }
+
+    #[test]
+    fn rapid_image_arrow_presses_queue_through_reinspection_and_document_reload() {
+        let (mut app, ctx, source) = keyboard_fixture();
+        let png = clipboard::png(2, 2, &[20, 70, 200, 255].repeat(4)).unwrap();
+        let source = content::add_image(&source, 1, [100., 200., 180., 250.], &png).unwrap();
+        app.tabs[0].session = Some(mypdf_milestone0::annotations::Session::new(
+            source.clone().into(),
+            vec![],
+            true,
+        ));
+        let key = (app.tabs[0].id, 0, 0);
+        app.content.key = Some(key);
+        app.content.inspection = Some(Inspection {
+            key,
+            guides: Default::default(),
+            text: Ok(vec![]),
+            images: Ok(content::images(&source, 1).unwrap()),
+            fields: Ok(vec![]),
+            designed: Ok(vec![]),
+        });
+        app.content.image_mode = true;
+        app.content.selected = Some(0);
+        assert!(app.nudge_content_selection(&ctx, [1., 0.]));
+        assert!(app.content.busy);
+        let press = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: true,
+            modifiers,
+        };
+        // Multiple physical/repeat presses can arrive together before the worker
+        // and then a new PDF inspection finish. Every press must still count.
+        for keys in [
+            vec![
+                press(egui::Key::ArrowRight, egui::Modifiers::NONE),
+                press(egui::Key::ArrowRight, egui::Modifiers::NONE),
+            ],
+            vec![press(egui::Key::ArrowDown, egui::Modifiers::SHIFT)],
+        ] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: keys,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.selection_keys(ctx);
+                    assert!(!ctx.input(|input| {
+                        input
+                            .events
+                            .iter()
+                            .any(|event| matches!(event, egui::Event::Key { pressed: true, .. }))
+                    }));
+                },
+            );
+        }
+        assert_eq!(app.content.image_nudge_delta, [2., 10.]);
+        keyboard_wait(&mut app, &ctx);
+        app.page_events(&ctx);
+        assert!(!app.tabs[0].session.as_ref().unwrap().editable);
+        app.inspect_content(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        // Deliberately withhold Event::Loaded: inspection may arrive first.
+        while !app
+            .content
+            .image_reselect
+            .as_ref()
+            .is_some_and(|target| target.resolved)
+        {
+            app.content_events(&ctx);
+            assert!(std::time::Instant::now() < deadline, "{:?}", app.status);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!app.content.busy);
+        assert_eq!(app.content.image_nudge_delta, [2., 10.]);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![press(egui::Key::ArrowRight, egui::Modifiers::NONE)],
+                ..Default::default()
+            },
+            |ctx| app.selection_keys(ctx),
+        );
+        assert_eq!(app.content.image_nudge_delta, [3., 10.]);
+        loop {
+            app.content_events(&ctx);
+            app.page_events(&ctx);
+            app.events(&ctx);
+            app.inspect_content(&ctx);
+            if !app.content.busy
+                && !app.content.loading
+                && app.content.image_reselect.is_none()
+                && app.content.image_nudge_delta == [0.; 2]
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{:?}", app.status);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.content.selected, Some(0));
+        let session = app.tabs[0].session.as_mut().unwrap();
+        let images = content::images(&session.source, 1).unwrap();
+        assert!(
+            images[0]
+                .rect
+                .iter()
+                .zip([104., 210., 184., 260.])
+                .all(|(a, b)| (a - b).abs() < 0.01)
+        );
+        session.undo();
+        let images = content::images(&session.source, 1).unwrap();
+        assert!(
+            images[0]
+                .rect
+                .iter()
+                .zip([101., 200., 181., 250.])
+                .all(|(a, b)| (a - b).abs() < 0.01)
+        );
+        session.undo();
+        assert_eq!(session.source.as_ref(), source);
+    }
+
+    #[test]
+    fn queued_image_arrows_do_not_apply_to_a_new_document_revision() {
+        let (mut app, ctx, source) = keyboard_fixture();
+        let png = clipboard::png(2, 2, &[20, 70, 200, 255].repeat(4)).unwrap();
+        let source = content::add_image(&source, 1, [100., 200., 180., 250.], &png).unwrap();
+        app.tabs[0].session = Some(mypdf_milestone0::annotations::Session::new(
+            source.clone().into(),
+            vec![],
+            true,
+        ));
+        let key = (app.tabs[0].id, 0, 0);
+        app.content.key = Some(key);
+        app.content.inspection = Some(Inspection {
+            key,
+            guides: Default::default(),
+            text: Ok(vec![]),
+            images: Ok(content::images(&source, 1).unwrap()),
+            fields: Ok(vec![]),
+            designed: Ok(vec![]),
+        });
+        app.content.image_mode = true;
+        app.content.selected = Some(0);
+        assert!(app.nudge_content_selection(&ctx, [1., 0.]));
+        app.content.queue_image_nudge(key.0, [10., 0.]);
+        keyboard_wait(&mut app, &ctx);
+        app.page_events(&ctx);
+        app.inspect_content(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !app
+            .content
+            .image_reselect
+            .as_ref()
+            .is_some_and(|target| target.resolved)
+        {
+            app.content_events(&ctx);
+            assert!(std::time::Instant::now() < deadline, "{:?}", app.status);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Another transaction (or Undo) invalidates the pending object's source.
+        let session = app.tabs[0].session.as_mut().unwrap();
+        session.editable = true;
+        session.commit_document(source.clone()).unwrap();
+        let revision = session.revision();
+        app.content_events(&ctx);
+        assert!(!app.content.busy);
+        assert!(app.content.image_reselect.is_none());
+        assert_eq!(app.content.image_nudge_delta, [0.; 2]);
+        let session = app.tabs[0].session.as_ref().unwrap();
+        assert_eq!(session.revision(), revision);
+        assert_eq!(session.source.as_ref(), source);
+    }
+    #[test]
+    fn export_ribbon_selects_formats_and_restores_options_without_losing_image_settings() {
+        let (mut app, ctx, source) = keyboard_fixture();
+        ctx.enable_accesskit();
+        app.editor.mode = editing::Mode::Convert;
+        app.content.range = "1".into();
+        app.content.dpi = 216.;
+        app.content.image_format = Format::Jpeg;
+        app.content.format = Format::Jpeg;
+        let frame = |app: &mut Viewer, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(720., 480.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.content_tools(ctx),
+            )
+        };
+        for _ in 0..3 {
+            frame(&mut app, vec![]);
+        }
+        let output = frame(&mut app, vec![]);
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let labels = ["Word", "Text", "Markdown", "Image"];
+        let points = labels.map(|label| {
+            let bounds = nodes
+                .iter()
+                .find_map(|(_, node)| {
+                    (node.label() == Some(label))
+                        .then(|| node.bounds())
+                        .flatten()
+                })
+                .unwrap_or_else(|| panic!("Missing format: {label}"));
+            assert!(
+                bounds.x0 >= 0. && bounds.x1 <= 720. && bounds.y1 <= 47.,
+                "Export ribbon must stay on one compact row: {label} {bounds:?}"
+            );
+            pos2(
+                ((bounds.x0 + bounds.x1) / 2.) as f32,
+                ((bounds.y0 + bounds.y1) / 2.) as f32,
+            )
+        });
+        for (at, expected) in
+            points
+                .into_iter()
+                .zip([Format::Word, Format::Text, Format::Markdown, Format::Jpeg])
+        {
+            app.inspector = false;
+            for pressed in [true, false] {
+                frame(
+                    &mut app,
+                    vec![
+                        egui::Event::PointerMoved(at),
+                        egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            assert_eq!(app.content.format, expected);
+            assert!(app.inspector, "A format choice reopens its options panel");
+            assert!(app.editor.mode == editing::Mode::Convert);
+            assert_eq!(app.content.range, "1");
+            assert_eq!(app.content.dpi, 216.);
+            assert_eq!(app.content.image_format, Format::Jpeg);
+        }
+        assert_eq!(
+            app.tabs[0].session.as_ref().unwrap().source.as_ref(),
+            source
+        );
+        assert!(
+            !app.content.busy,
+            "Choosing a format must not start an export before options are confirmed"
+        );
+        app.content.busy = true;
+        app.inspector = false;
+        for pressed in [true, false] {
+            frame(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(points[0]),
+                    egui::Event::PointerButton {
+                        pos: points[0],
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(app.content.format, Format::Jpeg);
+        assert!(!app.inspector);
+        app.content.busy = false;
+    }
+
+    #[test]
+    fn edit_ribbon_reclick_finishes_text_and_cancels_placement_without_changing_mode() {
+        let (mut app, ctx, _) = keyboard_fixture();
+        ctx.enable_accesskit();
+        let frame = |app: &mut Viewer, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1000., 700.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.content_tools(ctx),
+            )
+        };
+        let find = |app: &mut Viewer, label: &str| {
+            for _ in 0..3 {
+                frame(app, vec![]);
+            }
+            let output = frame(app, vec![]);
+            let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+            let r = nodes
+                .iter()
+                .find_map(|(_, node)| {
+                    (node.label() == Some(label))
+                        .then(|| node.bounds())
+                        .flatten()
+                })
+                .unwrap();
+            pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32)
+        };
+        let click = |app: &mut Viewer, at| {
+            for pressed in [true, false] {
+                frame(
+                    app,
+                    vec![
+                        egui::Event::PointerMoved(at),
+                        egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+        };
+        let at = find(&mut app, "Text");
+        click(&mut app, at);
+        assert!(app.content.add_target.is_some());
+        click(&mut app, at);
+        assert!(app.content.add_target.is_none());
+        assert!(app.editor.mode == editing::Mode::Edit);
+        click(&mut app, at);
+        app.content.new_text = "Preserved by tool reclick".into();
+        app.content.new_rect = [30., 170., 250., 24.];
+        app.content.new_size = 12.;
+        app.content.new_placed = true;
+        click(&mut app, at);
+        keyboard_wait(&mut app, &ctx);
+        assert!(app.content.add_target.is_none(), "{:?}", app.status);
+        let text = lopdf::Document::load_mem(&app.tabs[0].session.as_ref().unwrap().source)
+            .unwrap()
+            .extract_text(&[1])
+            .unwrap();
+        assert!(text.contains("Preserved by tool reclick"));
+        for label in ["Table", "Redact"] {
+            let at = find(&mut app, label);
+            click(&mut app, at);
+            if label == "Table" {
+                assert!(app.table.chooser);
+            } else {
+                assert!(app.redaction.active);
+            }
+            click(&mut app, at);
+            assert!(!app.table.chooser && !app.table.placing && !app.redaction.active);
+            assert!(app.editor.mode == editing::Mode::Edit);
+        }
     }
 }

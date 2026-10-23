@@ -67,6 +67,9 @@ impl NativeMenu {
             .and_then(|_| self.menu.insert(insert, 2))
         {
             eprintln!("Could not switch native text commands: {e}");
+        } else {
+            #[cfg(not(test))]
+            decorate_native_menu(&self.menu);
         }
     }
 }
@@ -140,7 +143,6 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             &MenuItem::with_id("nup", "Multiple Pages per Sheet…", true, None),
             &MenuItem::with_id("edit_navigation", "Bookmarks and Page Labels…", true, None),
             &MenuItem::with_id("review_comments", "Review Comments…", true, None),
-            &MenuItem::with_id("compare", "Compare Documents…", true, None),
             &P::separator(),
             &MenuItem::with_id("protect", "Protect with Password…", true, None),
             &MenuItem::with_id("unprotect", "Remove Password…", true, None),
@@ -305,6 +307,13 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
         ],
     );
     let tools = Submenu::new("Tools", true);
+    if let Err(e) = tools.append_items(&[
+        &MenuItem::with_id("compare", "Compare Documents…", true, None),
+        &P::separator(),
+    ]) {
+        eprintln!("Could not install Tools menu: {e}");
+        return (None, rx);
+    }
     for (id, label) in WORKFLOW_ITEMS {
         if let Err(e) = tools.append(&MenuItem::with_id(*id, *label, true, None)) {
             eprintln!("Could not install Tools menu: {e}");
@@ -345,6 +354,9 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
         menu.append_items(&[
             &app?, &file?, &edit, &edit_pdf?, &tools, &view?, &sign?, &window?,
         ])?;
+        // Keep muda's action targets, accelerators and predefined Cocoa commands.
+        // Only decorate each native row after the menu hierarchy exists.
+        decorate_native_menu(&menu);
         menu.init_for_nsapp();
         Ok(())
     })();
@@ -376,6 +388,170 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
         }),
         rx,
     )
+}
+
+/// SF Symbols are native template images: AppKit supplies selected, disabled and
+/// dark-mode colors. Keep standard MenuItem/Predefined objects so text panels,
+/// Undo labels and Window commands retain their original responder routing.
+#[cfg(all(target_os = "macos", not(test)))]
+fn decorate_native_menu(menu: &muda::Menu) {
+    use muda::ContextMenu;
+    let (icons, rows) = decorate_native_rows(menu.ns_menu().cast(), &menu.items(), false);
+    if std::env::var_os("MYPDF_MENU_ICON_REPORT").is_some() {
+        eprintln!("MyPDF native menu icons: {icons}/{rows} rows");
+    }
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn decorate_native_rows(
+    native: *mut objc2::runtime::AnyObject,
+    items: &[muda::MenuItemKind],
+    decorate_rows: bool,
+) -> (usize, usize) {
+    use muda::MenuItemKind;
+    use objc2::{
+        class, msg_send,
+        runtime::{AnyObject, Bool},
+    };
+    // SAFETY: install() and native menu changes run on AppKit's main thread.
+    // muda retains each menu/item; NSMenuItem retains the assigned NSImage.
+    let (mut icons, mut rows) = (0, 0);
+    unsafe {
+        for (index, item) in items.iter().enumerate() {
+            let row: *mut AnyObject = msg_send![native, itemAtIndex: index as isize];
+            let separator: Bool = msg_send![row, isSeparatorItem];
+            if separator.as_bool() {
+                continue;
+            }
+            if decorate_rows {
+                let label = match item {
+                    MenuItemKind::MenuItem(i) => i.text(),
+                    MenuItemKind::Submenu(i) => i.text(),
+                    MenuItemKind::Predefined(i) => i.text(),
+                    MenuItemKind::Check(i) => i.text(),
+                    MenuItemKind::Icon(i) => i.text(),
+                };
+                let symbol = native_symbol(&item.id().0, &label);
+                let name = std::ffi::CString::new(symbol).expect("static symbol name");
+                let name: *mut AnyObject =
+                    msg_send![class!(NSString), stringWithUTF8String: name.as_ptr()];
+                let mut image: *mut AnyObject = msg_send![class!(NSImage),
+                    imageWithSystemSymbolName: name, accessibilityDescription: std::ptr::null::<AnyObject>()];
+                if image.is_null() {
+                    // SF Symbols grow between macOS versions. Always leave a valid
+                    // template glyph on an older supported system.
+                    let name: *mut AnyObject = msg_send![class!(NSString), stringWithUTF8String: c"NSActionTemplate".as_ptr()];
+                    image = msg_send![class!(NSImage), imageNamed: name];
+                } else {
+                    let config: *mut AnyObject = msg_send![class!(NSImageSymbolConfiguration),
+                        configurationWithPointSize: 15.0_f64, weight: 0.0_f64];
+                    let sized: *mut AnyObject =
+                        msg_send![image, imageWithSymbolConfiguration: config];
+                    if !sized.is_null() {
+                        image = sized;
+                    }
+                }
+                if !image.is_null() {
+                    let _: () = msg_send![image, setTemplate: Bool::YES];
+                    let _: () = msg_send![row, setImage: image];
+                }
+                rows += 1;
+                let installed: *mut AnyObject = msg_send![row, image];
+                icons += usize::from(!installed.is_null());
+            }
+            if let Some(submenu) = item.as_submenu() {
+                // Muda creates a distinct NSMenu for every attachment. Walk
+                // this row's actual submenu, rather than its context-menu copy.
+                let child: *mut AnyObject = msg_send![row, submenu];
+                if !child.is_null() {
+                    let (child_icons, child_rows) =
+                        decorate_native_rows(child, &submenu.items(), true);
+                    icons += child_icons;
+                    rows += child_rows;
+                }
+            }
+        }
+    }
+    (icons, rows)
+}
+
+#[cfg(target_os = "macos")]
+fn native_symbol(id: &str, label: &str) -> &'static str {
+    match id {
+        "new" => "doc.badge.plus",
+        "open" => "folder",
+        "reopen_closed" | "recovery" => "arrow.clockwise",
+        "workspace" => "rectangle.3.group",
+        "save" => "square.and.arrow.down",
+        "save_as" | "sharing_copy" => "square.and.arrow.down.on.square",
+        "print" | "nup" => "printer",
+        "edit_navigation" => "list.bullet.indent",
+        "review_comments" => "text.bubble",
+        "compare" => "rectangle.split.2x1",
+        "protect" => "lock",
+        "unprotect" => "lock.open",
+        "shrink" => "arrow.down.right.and.arrow.up.left",
+        "close" | "quit" => "xmark",
+        "edit_undo" | "undo" => "arrow.uturn.backward",
+        "edit_redo" | "redo" => "arrow.uturn.forward",
+        "cut" => "scissors",
+        "copy" => "doc.on.doc",
+        "paste" | "paste_original" => "doc.on.clipboard",
+        "select_all" => "checkmark.square",
+        "context_copy_format" | "context_paste_format" => "paintbrush",
+        "find" | "tool_search" => "magnifyingglass",
+        "translate_selection" | "translate_page" | "translation_languages" => "character.bubble",
+        "hf_page_numbers" | "hf_bates" | "hf_text" => "text.append",
+        "hf_remove_numbers" | "hf_remove_all" | "form_clear" => "eraser",
+        "form_detect" => "viewfinder",
+        "form_fill_details" | "my_details" => "person.crop.rectangle",
+        "form_tab_rows" | "form_tab_columns" => "list.number",
+        "form_import" => "square.and.arrow.down",
+        "form_export" => "square.and.arrow.up",
+        "form_flatten" | "flatten" => "square.3.layers.3d.down.right",
+        "edit_text" | "page_text" => "text.cursor",
+        "add_image" => "photo",
+        "edit_table" => "tablecells",
+        "redact" => "rectangle.fill",
+        "watermark" => "drop",
+        "ocr" => "text.viewfinder",
+        "theme_system" => "circle.lefthalf.filled",
+        "theme_light" => "sun.max",
+        "theme_dark" => "moon",
+        "home" => "house",
+        "zen" => "viewfinder",
+        "zoom_in" => "plus.magnifyingglass",
+        "zoom_out" => "minus.magnifyingglass",
+        "actual" => "1.magnifyingglass",
+        "fit_width" => "arrow.left.and.right",
+        "fit_page" => "arrow.up.left.and.arrow.down.right",
+        "sidebar" => "sidebar.left",
+        "inspector" => "sidebar.right",
+        "guides" => "ruler",
+        "history" => "clock.arrow.circlepath",
+        "templates" => "doc.text",
+        "batch" => "square.stack.3d.up",
+        "workflow_settings" | "settings" => "gearshape",
+        "quick_sign" | "sign" | "validate" => "signature",
+        _ => match label {
+            "Translation" => "character.bubble",
+            "Header and Footer" => "text.append",
+            "Form" => "list.bullet.rectangle",
+            "Appearance" => "circle.lefthalf.filled",
+            "Undo" => "arrow.uturn.backward",
+            "Redo" => "arrow.uturn.forward",
+            "Cut" => "scissors",
+            "Copy" => "doc.on.doc",
+            "Paste" => "doc.on.clipboard",
+            "Select All" => "checkmark.square",
+            "Minimize" => "minus",
+            "Zoom" => "arrow.up.left.and.arrow.down.right",
+            "Hide MyPDF" | "Hide Others" => "eye.slash",
+            "Show All" => "eye",
+            "About MyPDF" => "info.circle",
+            _ => "doc",
+        },
+    }
 }
 
 #[cfg(any(not(target_os = "macos"), test))]
@@ -411,6 +587,32 @@ pub fn with_file_dialog<T>(menu: Option<&NativeMenu>, show: impl FnOnce() -> T) 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+    #[test]
+    fn native_icons_cover_edit_panels_submenus_and_standard_window_actions() {
+        assert_eq!(
+            native_symbol("save_as", "Save As…"),
+            "square.and.arrow.down.on.square"
+        );
+        assert_eq!(
+            native_symbol("compare", "Compare Documents…"),
+            "rectangle.split.2x1"
+        );
+        assert_eq!(
+            native_symbol("generated", "Undo"),
+            native_symbol("edit_undo", "Undo")
+        );
+        assert_eq!(
+            native_symbol("generated", "Copy"),
+            native_symbol("copy", "Copy")
+        );
+        assert_eq!(native_symbol("generated", "Form"), "list.bullet.rectangle");
+        assert_eq!(native_symbol("generated", "Minimize"), "minus");
+        assert_eq!(
+            native_symbol("generated", "Zoom"),
+            "arrow.up.left.and.arrow.down.right"
+        );
+    }
+
     #[test]
     fn native_commands_restore_only_after_outermost_panel_closes() {
         let depth = DialogDepth::default();

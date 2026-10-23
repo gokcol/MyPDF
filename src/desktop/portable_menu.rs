@@ -23,7 +23,6 @@ const MENUS: &[(&str, &[Entry])] = &[
             C("print", "Print…"),
             C("nup", "Multiple Pages per Sheet…"),
             C("merge_files", "Merge PDFs…"),
-            C("compare", "Compare Documents…"),
             S,
             C("protect", "Protect with Password…"),
             C("unprotect", "Remove Password…"),
@@ -97,8 +96,10 @@ const MENUS: &[(&str, &[Entry])] = &[
         &[
             C("annotate_highlight", "Highlight"),
             C("annotate_underline", "Underline"),
+            C("annotate_squiggly", "Squiggly underline"),
             C("annotate_strikeout", "Strikeout"),
             C("annotate_note", "Note"),
+            C("annotate_callout", "Callout"),
             C("annotate_text", "Text Box"),
             S,
             C("annotate_pen", "Pen"),
@@ -164,6 +165,7 @@ const MENUS: &[(&str, &[Entry])] = &[
         "Tools",
         &[
             C("tool_search", "Find a Tool…"),
+            C("compare", "Compare Documents…"),
             S,
             C("templates", "Document Templates…"),
             C("batch", "Batch Processing…"),
@@ -221,30 +223,76 @@ fn icon(id: &str) -> Icon {
     match id {
         "new" => Icon::Blank,
         "open" => Icon::Open,
+        "reopen_closed" | "recovery" => Icon::Reload,
+        "workspace" => Icon::Group,
         "save" => Icon::Save,
-        "save_as" => Icon::SaveAs,
+        "save_as" | "sharing_copy" => Icon::SaveAs,
         "print" | "nup" => Icon::Print,
-        "settings" | "workflow_settings" | "workspace" | "sign_manage" => Icon::Settings,
+        "merge_files" | "batch" => Icon::Library,
+        "compare" => Icon::Compare,
+        "settings" | "workflow_settings" | "sign_manage" => Icon::Settings,
         "copy" | "context_copy_format" => Icon::Copy,
         "cut" => Icon::Cut,
         "paste" | "paste_original" | "context_paste_format" => Icon::Paste,
+        "select_all" => Icon::Select,
         "undo" | "edit_undo" => Icon::Undo,
         "redo" | "edit_redo" => Icon::Redo,
         "find" | "tool_search" => Icon::Search,
+        "translate_selection" | "translate_page" | "translation_languages" => Icon::Translate,
         "home" => Icon::Home,
+        "zen" => Icon::Zen,
+        "theme_system" | "theme_light" | "theme_dark" => Icon::Theme,
+        "zoom_in" => Icon::Plus,
+        "zoom_out" | "window_minimize" => Icon::Minus,
+        "actual" | "fit_page" | "window_maximize" => Icon::Rectangle,
+        "fit_width" => Icon::FlipHorizontal,
+        "sidebar" => Icon::Sidebar,
+        "inspector" => Icon::Inspector,
+        "guides" => Icon::Guides,
+        "history" => Icon::History,
+        "edit_navigation" => Icon::Outline,
+        "review_comments" | "annotate_note" => Icon::Note,
+        "page_text" | "edit_text" | "annotate_text" => Icon::Text,
         "annotate_highlight" => Icon::Highlight,
         "annotate_underline" => Icon::Underline,
+        "annotate_squiggly" => Icon::Squiggly,
         "annotate_strikeout" => Icon::Strikeout,
-        "annotate_note" => Icon::Note,
         "annotate_pen" | "sign_ink" => Icon::Pen,
         "annotate_rectangle" => Icon::Rectangle,
         "annotate_ellipse" => Icon::Circle,
         "annotate_arrow" => Icon::Arrow,
-        "annotate_text" | "edit_text" => Icon::Text,
+        "annotate_callout" => Icon::Callout,
+        "objects" => Icon::Library,
         "sign_quick" | "sign_digital" | "validate" => Icon::Sign,
-        "protect" | "unprotect" => Icon::Shield,
+        "protect" => Icon::Lock,
+        "unprotect" => Icon::Unlock,
+        "shrink" => Icon::Crop,
+        "add_image" => Icon::FieldImage,
+        "edit_table" => Icon::Table,
+        "redact" => Icon::Redact,
+        "hf_page_numbers" | "hf_bates" | "hf_text" => Icon::HeaderFooter,
+        "hf_remove_numbers" | "hf_remove_all" | "form_clear" => Icon::Eraser,
+        "watermark" => Icon::Watermark,
+        "form_detect" => Icon::Search,
+        "form_fill_details" | "my_details" => Icon::Person,
+        "form_tab_rows" | "form_tab_columns" => Icon::TabOrder,
+        "form_import" => Icon::Import,
+        "form_export" => Icon::Export,
+        "form_flatten" | "flatten" => Icon::Flatten,
+        "ocr" => Icon::Ocr,
+        "templates" => Icon::Document,
         "close" | "quit" => Icon::Close,
+        "about" => Icon::Info,
         _ => Icon::Document,
+    }
+}
+fn submenu_icon(label: &str) -> Icon {
+    match label {
+        "Translation" => Icon::Translate,
+        "Appearance" => Icon::Theme,
+        "Header and Footer" => Icon::HeaderFooter,
+        "Form" => Icon::Form,
+        _ => Icon::Library,
     }
 }
 fn enabled(id: &str, document: bool, saving: bool) -> bool {
@@ -324,11 +372,33 @@ fn entries_contents(
                 }
             }
             M(label, children) => {
-                ui.menu_button(*label, |ui| {
-                    if let Some(id) = entries(ui, children, document, saving) {
-                        action = Some(id);
-                    }
-                });
+                let response = ui.add(ui::MenuItem::new(submenu_icon(label), label).width(width));
+                ui::draw_icon(
+                    ui.painter(),
+                    Rect::from_center_size(
+                        pos2(response.rect.right() - 12., response.rect.center().y),
+                        vec2(12., 12.),
+                    ),
+                    Icon::Right,
+                    ui.visuals().text_color(),
+                );
+                let popup_id = egui::containers::menu::SubMenu::id_from_widget_id(response.id);
+                let needs_measurement = egui::AreaState::load(ui.ctx(), popup_id)
+                    .is_none_or(|state| state.size.is_none());
+                let popup = egui::containers::menu::SubMenu::new()
+                    .config(
+                        egui::containers::menu::MenuConfig::new()
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                    )
+                    .show(ui, &response, |ui| {
+                        if let Some(id) = entries(ui, children, document, saving) {
+                            action = Some(id);
+                        }
+                    });
+                if needs_measurement && popup.is_some() {
+                    ui.ctx()
+                        .request_discard("Measure the application submenu before displaying it");
+                }
             }
             S => {
                 ui.separator();
@@ -373,6 +443,33 @@ pub(super) fn bar(ui: &mut egui::Ui, document: bool, saving: bool) -> Option<&'s
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compare_lives_in_tools_and_every_command_has_a_contextual_icon() {
+        fn check(entries: &[Entry]) {
+            for entry in entries {
+                match entry {
+                    C(id, _) => assert!(
+                        !matches!(icon(id), Icon::Document) || *id == "templates",
+                        "Missing contextual menu icon for {id}"
+                    ),
+                    M(label, children) => {
+                        assert!(!matches!(submenu_icon(label), Icon::Library));
+                        check(children);
+                    }
+                    S => {}
+                }
+            }
+        }
+        for (name, entries) in MENUS {
+            check(entries);
+            let compare = entries
+                .iter()
+                .filter(|e| matches!(e, C("compare", _)))
+                .count();
+            assert_eq!(compare, usize::from(*name == "Tools"));
+        }
+    }
+
     #[test]
     fn windows_menu_includes_all_main_menus_and_save_shortcuts() {
         assert_eq!(
