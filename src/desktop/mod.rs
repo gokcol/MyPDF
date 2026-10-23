@@ -1,3 +1,4 @@
+mod annotation_text;
 mod clipboard;
 mod comparison;
 mod content;
@@ -2148,6 +2149,7 @@ impl Viewer {
                             scale,
                             &mut self.status,
                         );
+                        annotation_text::overlay(&mut self.editor, tab, ui, page, page_rect, scale, &mut self.status);
                         }
                         self.content.hide_guides = self.editor.hide_guides;
                         self.content.paused = table_owns || self.table.deferring_input() || self.productivity.owns_input() || placing || self.redaction.active && self.editor.mode == editing::Mode::Edit;

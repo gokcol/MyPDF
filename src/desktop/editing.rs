@@ -558,6 +558,7 @@ pub(super) struct EditorState {
     library_error: Option<String>,
     placed: Option<Asset>,
     pub(super) draft: Option<Annotation>,
+    pub(super) annotation_text: Option<annotation_text::State>,
     // Document, annotation, last committed revision, and focused property field.
     pub(super) property_edit: Option<(u64, String, u64, Option<egui::Id>)>,
     pub(super) note_requested: Option<(u64, String)>,
@@ -696,6 +697,7 @@ impl EditorState {
             library_error,
             placed: None,
             draft: None,
+            annotation_text: None,
             property_edit: None,
             note_requested: None,
             marquee: None,
@@ -1234,7 +1236,7 @@ pub(super) fn paint_asset(
         &preview,
     );
 }
-fn color(rgb: [f32; 3], opacity: f32) -> Color32 {
+pub(super) fn color(rgb: [f32; 3], opacity: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(
         (rgb[0] * 255.0) as u8,
         (rgb[1] * 255.0) as u8,
@@ -1269,6 +1271,30 @@ pub(super) fn paint_annotation(
     page_rect: Rect,
     scale: f32,
     a: &Annotation,
+) {
+    // Thumbnails and reusable previews have no inline editor to replace text.
+    paint_annotation_impl(editor, ctx, painter, page_rect, scale, a, false);
+}
+
+fn paint_annotation_on_page(
+    editor: &mut EditorState,
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    page_rect: Rect,
+    scale: f32,
+    a: &Annotation,
+) {
+    paint_annotation_impl(editor, ctx, painter, page_rect, scale, a, true);
+}
+
+fn paint_annotation_impl(
+    editor: &mut EditorState,
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    page_rect: Rect,
+    scale: f32,
+    a: &Annotation,
+    inline_editor: bool,
 ) {
     let point = |p| {
         let p = a.rotated(p);
@@ -1335,6 +1361,12 @@ pub(super) fn paint_annotation(
                 centered,
                 color: text_color,
             } => {
+                if inline_editor
+                    && matches!(a.kind, Kind::Text { .. })
+                    && annotation_text::hides_text(editor, a)
+                {
+                    continue;
+                }
                 let c = color(text_color.unwrap_or(a.style.color), a.style.opacity);
                 let font =
                     egui::FontId::new(size * scale, egui::FontFamily::Name("annotation".into()));
@@ -1424,6 +1456,7 @@ pub(super) fn page_interaction(
     status: &mut Option<(String, bool)>,
 ) {
     let ctx = ui.ctx();
+    annotation_text::sync(editor, tab);
     let editable = tab.session.as_ref().is_some_and(|s| s.editable);
     if matches!(editor.mode, Mode::Edit | Mode::Forms | Mode::Convert) {
         let painter = ui
@@ -1433,7 +1466,7 @@ pub(super) fn page_interaction(
             && s.editable
         {
             for a in s.annotations.iter().filter(|a| a.page == page) {
-                paint_annotation(editor, ctx, &painter, page_rect, scale, a);
+                paint_annotation_on_page(editor, ctx, &painter, page_rect, scale, a);
             }
         }
         return;
@@ -1462,7 +1495,7 @@ pub(super) fn page_interaction(
             && session.editable
         {
             for annotation in session.annotations.iter().filter(|a| a.page == page) {
-                paint_annotation(editor, ctx, &painter, page_rect, scale, annotation);
+                paint_annotation_on_page(editor, ctx, &painter, page_rect, scale, annotation);
             }
         }
         return;
@@ -1501,7 +1534,7 @@ pub(super) fn page_interaction(
             let painter = ui
                 .painter()
                 .with_clip_rect(page_rect.intersect(ui.clip_rect()));
-            paint_annotation(editor, ctx, &painter, page_rect, scale, &ghost);
+            paint_annotation_on_page(editor, ctx, &painter, page_rect, scale, &ghost);
             ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
         }
         if let Some(asset) = response.dnd_release_payload::<Asset>()
@@ -1635,7 +1668,9 @@ pub(super) fn page_interaction(
     if multitouch {
         editor.touch_navigation = true;
     }
-    let navigation = editor.touch_navigation;
+    let inline_text_pointer =
+        annotation_text::owns_pointer(editor, tab, page, ui, page_rect, scale);
+    let navigation = editor.touch_navigation || inline_text_pointer;
     if navigation {
         editor.gesture = None;
         editor.pressed = None;
@@ -1682,6 +1717,7 @@ pub(super) fn page_interaction(
         editor.tool = Tool::Select;
     }
     if response.clicked()
+        && !inline_text_pointer
         && !vertex_tool
         && matches!(editor.mode, Mode::Read | Mode::Draw | Mode::Annotate)
         && let Some(pointer) = response.interact_pointer_pos()
@@ -1696,6 +1732,7 @@ pub(super) fn page_interaction(
                 if matches!(a.kind, Kind::Note { .. }) {
                     editor.note_requested = Some((tab.id, a.id.clone()));
                 }
+                annotation_text::start(editor, tab.id, &a, false);
             }
             editor.library_open = false;
             if editor.tool != Tool::Lasso {
@@ -1978,7 +2015,7 @@ pub(super) fn page_interaction(
                 .or(preview)
                 .cloned()
                 .unwrap_or_else(|| a.clone());
-            paint_annotation(editor, ctx, &painter, page_rect, scale, &actual);
+            paint_annotation_on_page(editor, ctx, &painter, page_rect, scale, &actual);
         }
     }
     if let Some(a) = editor
@@ -1987,7 +2024,7 @@ pub(super) fn page_interaction(
         .filter(|g| g.tab == tab.id && g.page == page && (g.original.is_none() || g.duplicate))
         .and_then(|g| g.preview.clone())
     {
-        paint_annotation(editor, ctx, &painter, page_rect, scale, &a);
+        paint_annotation_on_page(editor, ctx, &painter, page_rect, scale, &a);
     }
     if let Some(g) = &editor.gesture
         && g.tab == tab.id
@@ -1996,7 +2033,7 @@ pub(super) fn page_interaction(
         g.guides.paint(&painter, page_rect, scale);
     }
     for copy in selection::duplicates(editor, tab.id, page) {
-        paint_annotation(editor, ctx, &painter, page_rect, scale, &copy);
+        paint_annotation_on_page(editor, ctx, &painter, page_rect, scale, &copy);
     }
     selection::guides(editor, tab.id, page).paint(&painter, page_rect, scale);
     // The outline and handle must follow the same preview as the artwork in
@@ -2312,6 +2349,10 @@ fn commit_new(
                             editor.library_error = Some(format!("{e:#}"));
                         }
                     }
+                }
+                if matches!(a.kind, Kind::Text { .. }) {
+                    editor.tool = Tool::Select;
+                    annotation_text::start(editor, tab.id, &a, true);
                 }
                 editor.draft = Some(a);
                 *status = None;
@@ -3152,7 +3193,9 @@ impl Viewer {
                                     | Kind::Text { .. }
                                     | Kind::Stamp { .. }
                             ) {
-                                ui.horizontal(|ui| {
+                                if matches!(a.kind, Kind::Text { .. }) {
+                                    annotation_text::fill_controls(ui, &mut a.style);
+                                } else { ui.horizontal(|ui| {
                                     let mut fill = a.style.fill.is_some();
                                     if ui.checkbox(&mut fill, "Fill").changed() {
                                         a.style.fill = fill.then_some(a.style.color);
@@ -3160,7 +3203,7 @@ impl Viewer {
                                     if let Some(fill) = &mut a.style.fill {
                                         ui::color_swatch(ui, fill, "Fill color");
                                     }
-                                });
+                                }); }
                             }
                             let mut opacity = a.style.opacity * 100.;
                             property_focus =

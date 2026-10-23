@@ -149,6 +149,7 @@ pub(super) fn set(tab: &mut Tab, editor: &mut EditorState, mut ids: Vec<String>)
         tab.signatures.panel = false;
     }
     editor.property_edit = None;
+    editor.annotation_text = None;
     editor.group_edit = None;
     tab.group.clear();
     tab.selected_annotation = None;
