@@ -2766,6 +2766,11 @@ mod tests {
             editing::Tool::Select,
         ] {
             app.editor.select_tool(tool);
+            // A tool change can reflow its inspector controls. Measure the
+            // page only after that layout, so this checks deselection alone.
+            for _ in 0..3 {
+                frame(&mut app, &ctx, vec![]);
+            }
             let rect = page(&app);
             let scale = app.tabs[0].scale;
             click(&mut app, rect.min + vec2(110., 110.) * scale);
@@ -2777,7 +2782,11 @@ mod tests {
             frame(&mut app, &ctx, vec![]);
             assert!(
                 (page(&app).width() - rect.width()).abs() < 1.,
-                "deselection must not resize the page"
+                "deselection must not resize the page: {:?} old={rect:?} new={:?} scale={} layout={:?}",
+                std::mem::discriminant(&tool),
+                page(&app),
+                app.tabs[0].scale,
+                app.tabs[0].document_view
             );
             click(&mut app, rect.min + vec2(190., 180.) * scale);
             assert_eq!(
