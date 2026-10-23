@@ -364,7 +364,8 @@ impl State {
             );
         });
         if !self.prefs.recipe.watermark.is_empty() {
-            ui.add(
+            ui::numeric_slider(
+                ui,
                 egui::Slider::new(&mut self.prefs.recipe.opacity, 0.05..=1.)
                     .text("Watermark opacity"),
             );

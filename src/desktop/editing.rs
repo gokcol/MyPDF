@@ -1074,7 +1074,8 @@ pub(super) fn property_slider(
         ui.horizontal(|ui| {
             ui.label(RichText::new(label).size(12.).color(theme::muted()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let r = ui.add(
+                let r = ui::numeric_value(
+                    ui,
                     egui::DragValue::new(value)
                         .range(range.clone())
                         .speed(0.5)
@@ -1093,11 +1094,11 @@ pub(super) fn property_slider(
         ui.scope(|ui| {
             ui.spacing_mut().interact_size.y = 18.;
             ui.spacing_mut().slider_rail_height = 3.;
-            let r = ui.add(
+            let r = ui::numeric_slider(
+                ui,
                 egui::Slider::new(value, range)
                     .show_value(false)
-                    .trailing_fill(true)
-                    .handle_shape(egui::style::HandleShape::Circle),
+                    .trailing_fill(true),
             );
             r.widget_info(|| {
                 egui::WidgetInfo::labeled(egui::WidgetType::Slider, ui.is_enabled(), label)
@@ -2742,12 +2743,10 @@ impl Viewer {
             .default_width(254.)
             .width_range(230.0..=340.0)
             .resizable(true)
-            .frame(egui::Frame::new().fill(theme::paper()).inner_margin(16.))
+            .frame(ui::property_panel_frame())
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = vec2(8., 10.);
-                egui::ScrollArea::vertical()
-                    .id_salt("group_properties")
-                    .show(ui, |ui| {
+                ui::property_scroll(ui, "group_properties", |ui| {
                         ui.horizontal(|ui| {
                             ui::title(ui, &format!("{} objects", marks.len()), 17.);
                             ui.with_layout(
@@ -2985,9 +2984,10 @@ impl Viewer {
                     .default_width(254.)
                     .width_range(230.0..=340.0)
                     .resizable(true)
-                    .frame(egui::Frame::new().fill(theme::paper()).inner_margin(16.))
+                    .frame(ui::property_panel_frame())
                     .show(ctx, |ui| {
                         ui.spacing_mut().item_spacing = vec2(8., 10.);
+                        ui::property_scroll(ui, "new_annotation_properties", |ui| {
                         let drawing = self.editor.mode == Mode::Draw;
                         let title = if matches!(self.editor.tool, Tool::Select | Tool::Lasso) {
                             if drawing { "Drawings" } else { "Annotations" }
@@ -3031,6 +3031,7 @@ impl Viewer {
                         } else {
                             color_palette(ui, &mut self.editor.style.color);
                         }
+                        });
                     });
             }
             return;
@@ -3061,14 +3062,12 @@ impl Viewer {
             .default_width(254.)
             .width_range(230.0..=340.0)
             .resizable(true)
-            .frame(egui::Frame::new().fill(theme::paper()).inner_margin(16.))
+            .frame(ui::property_panel_frame())
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = vec2(8., 10.);
                 ui.spacing_mut().interact_size.y = 26.;
                 ui.spacing_mut().button_padding = vec2(8., 4.);
-                egui::ScrollArea::vertical()
-                    .id_salt("annotation_properties")
-                    .show(ui, |ui| {
+                ui::property_scroll(ui, "annotation_properties", |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(selected.kind.label())
@@ -4204,7 +4203,7 @@ impl Viewer {
                             self.editor.text_editing |= r.has_focus();
                         }
                         SignatureInput::Draw => {
-                            ui.add(egui::Slider::new(&mut self.editor.signature_ink_width, 0.5..=8.).text("Pen width"));
+                            ui::numeric_slider(ui, egui::Slider::new(&mut self.editor.signature_ink_width, 0.5..=8.).text("Pen width"));
                             draw_signature_pad(ui, &mut self.editor);
                         },
                         SignatureInput::Image => {
@@ -4913,6 +4912,9 @@ mod tests {
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;
         let b = nodes
             .iter()
+            // Dialog controls are rendered after the background inspector.
+            // Prefer the frontmost match when both contain, for example, Delete.
+            .rev()
             .find(|(_, n)| n.label() == Some(label))
             .unwrap_or_else(|| panic!("Missing {label}"))
             .1

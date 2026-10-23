@@ -87,13 +87,20 @@ impl EmbeddedEffects {
                 Color32::WHITE,
             );
         }
-        ui.add(egui::Slider::new(&mut self.options.opacity, 0.0..=1.).text("Opacity"));
-        ui.add(
+        ui::numeric_slider(
+            ui,
+            egui::Slider::new(&mut self.options.opacity, 0.0..=1.).text("Opacity"),
+        );
+        ui::numeric_slider(
+            ui,
             egui::Slider::new(&mut self.options.blur, 0.0..=32.)
                 .step_by(0.5)
                 .text("Blur · px"),
         );
-        ui.add(egui::Slider::new(&mut self.options.border, 0..=100).text("Border · px"));
+        ui::numeric_slider(
+            ui,
+            egui::Slider::new(&mut self.options.border, 0..=100).text("Border · px"),
+        );
         if self.options.border > 0 {
             ui.horizontal(|ui| {
                 ui.label("Border color");

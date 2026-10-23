@@ -172,7 +172,7 @@ impl Viewer {
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut draft.fit, "Fit across the page");
                                 if !draft.fit {
-                                    ui.add(egui::DragValue::new(&mut draft.size).range(6.0..=300.0).suffix(" pt"));
+                                    ui::numeric_value(ui, egui::DragValue::new(&mut draft.size).range(6.0..=300.0).suffix(" pt"));
                                 }
                             });
                         } else {
@@ -185,7 +185,7 @@ impl Viewer {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("Width").color(theme::muted()));
                                 let mut percent = draft.width * 100.;
-                                if ui.add(egui::Slider::new(&mut percent, 10.0..=100.0).suffix(" % of the page")).changed() {
+                                if ui::numeric_slider(ui, egui::Slider::new(&mut percent, 10.0..=100.0).suffix(" % of the page")).changed() {
                                     draft.width = percent / 100.;
                                 }
                             });
@@ -193,7 +193,7 @@ impl Viewer {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Opacity").color(theme::muted()));
                             let mut percent = draft.opacity * 100.;
-                            if ui.add(egui::Slider::new(&mut percent, 5.0..=100.0).suffix(" %")).changed() {
+                            if ui::numeric_slider(ui, egui::Slider::new(&mut percent, 5.0..=100.0).suffix(" %")).changed() {
                                 draft.opacity = percent / 100.;
                             }
                         });
@@ -204,7 +204,7 @@ impl Viewer {
                             if let Some(i) = ui::segmented(ui, &["45°", "0°", "90°", "−45°"], current) {
                                 draft.angle = angles[i];
                             }
-                            ui.add(egui::DragValue::new(&mut draft.angle).range(-180.0..=180.0).suffix("°"));
+                            ui::numeric_value(ui, egui::DragValue::new(&mut draft.angle).range(-180.0..=180.0).suffix("°"));
                         });
                         let current = if draft.behind { 1 } else { 0 };
                         if let Some(i) = ui::segmented(ui, &["In front of the page", "Behind the page"], current) {
@@ -221,9 +221,9 @@ impl Viewer {
                             ui.checkbox(&mut draft.all_pages, "All pages");
                             if !draft.all_pages {
                                 ui.label(RichText::new("Pages").color(theme::muted()));
-                                ui.add(egui::DragValue::new(&mut draft.from).range(1..=count));
+                                ui::numeric_value(ui, egui::DragValue::new(&mut draft.from).range(1..=count));
                                 ui.label("to");
-                                ui.add(egui::DragValue::new(&mut draft.to).range(1..=count));
+                                ui::numeric_value(ui, egui::DragValue::new(&mut draft.to).range(1..=count));
                                 draft.to = draft.to.max(draft.from);
                             }
                         });

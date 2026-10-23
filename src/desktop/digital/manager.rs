@@ -411,10 +411,12 @@ fn spacing_control(ui: &mut egui::Ui, label: &str, value: &mut Option<f32>, max:
             ui.add_sized(vec2(110., 24.), egui::Label::new(label));
             ui.spacing_mut().slider_width = (ui.available_width() - 90.).clamp(30., 100.);
             let mut points = value.unwrap_or(8.);
-            if ui
-                .add(egui::Slider::new(&mut points, 0. ..=max).show_value(false))
-                .on_hover_text(format!("{label} in PDF points; 0 removes this spacing"))
-                .changed()
+            if ui::numeric_slider(
+                ui,
+                egui::Slider::new(&mut points, 0. ..=max).show_value(false),
+            )
+            .on_hover_text(format!("{label} in PDF points; 0 removes this spacing"))
+            .changed()
             {
                 *value = Some(points);
             }
@@ -429,14 +431,14 @@ fn spacing_control(ui: &mut egui::Ui, label: &str, value: &mut Option<f32>, max:
                         }
                     }
                     ui.separator();
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut points)
-                                .range(0. ..=max)
-                                .speed(0.25)
-                                .suffix(" pt"),
-                        )
-                        .changed()
+                    if ui::numeric_value(
+                        ui,
+                        egui::DragValue::new(&mut points)
+                            .range(0. ..=max)
+                            .speed(0.25)
+                            .suffix(" pt"),
+                    )
+                    .changed()
                     {
                         *value = Some(points);
                     }
@@ -458,8 +460,11 @@ fn edge_spacing(ui: &mut egui::Ui, id: &str, edges: &mut [f32; 4]) {
                         ui.spacing_mut().item_spacing.x = 4.;
                         ui.spacing_mut().slider_width = slider_width;
                         ui.add_sized(vec2(42., 24.), egui::Label::new(label));
-                        ui.add(egui::Slider::new(&mut edges[index], 0. ..=45.).show_value(false))
-                            .on_hover_text(format!("{label} edge spacing"));
+                        ui::numeric_slider(
+                            ui,
+                            egui::Slider::new(&mut edges[index], 0. ..=45.).show_value(false),
+                        )
+                        .on_hover_text(format!("{label} edge spacing"));
                         egui::ComboBox::from_id_salt(index)
                             .width(56.)
                             .selected_text(format!("{:.1}%", edges[index]))
@@ -474,7 +479,8 @@ fn edge_spacing(ui: &mut egui::Ui, id: &str, edges: &mut [f32; 4]) {
                                 ui.separator();
                                 ui.horizontal(|ui| {
                                     ui.label("Exact");
-                                    ui.add(
+                                    ui::numeric_value(
+                                        ui,
                                         egui::DragValue::new(&mut edges[index])
                                             .range(0. ..=45.)
                                             .speed(0.25)
@@ -1330,7 +1336,8 @@ impl DigitalState {
                                         }
                                     }
                                 });
-                            ui.add(
+                            ui::numeric_value(
+                                ui,
                                 egui::DragValue::new(&mut style.size)
                                     .range(6. ..=36.)
                                     .speed(0.25)
@@ -1367,12 +1374,14 @@ impl DigitalState {
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().slider_width = 64.;
                             ui.label("X").on_hover_text("Horizontal position");
-                            ui.add(
+                            ui::numeric_slider(
+                                ui,
                                 egui::Slider::new(&mut style.offset[0], -100. ..=100.).suffix("%"),
                             )
                             .on_hover_text("Horizontal position within the signature box");
                             ui.label("Y").on_hover_text("Vertical position");
-                            ui.add(
+                            ui::numeric_slider(
+                                ui,
                                 egui::Slider::new(&mut style.offset[1], -100. ..=100.).suffix("%"),
                             )
                             .on_hover_text("Vertical position within the signature box");
@@ -1475,7 +1484,8 @@ impl DigitalState {
                                 }
                             },
                         );
-                        ui.add(
+                        ui::numeric_slider(
+                            ui,
                             egui::Slider::new(&mut signature.transform.image_opacity, 0.0..=1.0)
                                 .text("Image opacity")
                                 .custom_formatter(|v, _| format!("{:.0}%", v * 100.))
@@ -1507,7 +1517,8 @@ impl DigitalState {
                                 signature.transform.rotation =
                                     (signature.transform.rotation + 210.).rem_euclid(360.) - 180.;
                             }
-                            ui.add(
+                            ui::numeric_slider(
+                                ui,
                                 egui::Slider::new(
                                     &mut signature.transform.rotation,
                                     -180.0..=180.0,
@@ -1528,7 +1539,8 @@ impl DigitalState {
                                         );
                                     }
                                     ui.separator();
-                                    ui.add(
+                                    ui::numeric_value(
+                                        ui,
                                         egui::DragValue::new(&mut signature.transform.rotation)
                                             .range(-180. ..=180.)
                                             .suffix("°"),

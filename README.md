@@ -2,6 +2,8 @@
 
 # MyPDF — native Rust desktop PDF editor
 
+Version **2.1.1**, build **180**, adds sharper accent sliders and clearer number fields, including a live head-size slider for lines and arrows. Property panels reserve space for their scrollbars, and start/end head menus fit narrow panels.
+
 Version **2.1.0**, build **177**, adds vector-sharp digital signatures, editable tables and compact drawing controls. Tables support movable or embedded placement, bordered-table detection, cell editing, row/column sizing, five templates, merge/split, spreadsheet paste and fitting row heights to contents.
 
 Hover over **Line**, **Arrow**, **Rectangle** or **Ellipse** to choose a variation. Lines and arrows offer independent start/end heads and size controls; drawing properties include live previews and pattern fills. Annotate includes Pen, squiggly underlines, notes and bookmarks from selected text. Edit selects supported text and images automatically while preserving the chosen mode. A compact Export ribbon groups Word, Text, Markdown and Image; advanced options stay in the side panel. **Open** has a hover menu for Open, Save and Save As, Compare Documents is in Tools, and application menus have contextual icons.

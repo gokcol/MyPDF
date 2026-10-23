@@ -120,9 +120,8 @@ fn number(
             ui.scope(|ui| {
                 ui.spacing_mut().slider_width = (ui.available_width() - 80.).max(60.);
                 ui.spacing_mut().interact_size.y = 18.;
-                ui.spacing_mut().slider_rail_height = 4.;
-                ui.visuals_mut().widgets.inactive.bg_fill = theme::muted().gamma_multiply(0.3);
-                let response = ui.add(
+                let response = ui::numeric_slider(
+                    ui,
                     egui::Slider::new(value, range.clone())
                         .logarithmic(logarithmic)
                         .show_value(false)
@@ -133,14 +132,16 @@ fn number(
                 });
                 changed |= response.changed();
             });
-            let response = ui.add_sized(
-                vec2(72., 26.),
-                egui::DragValue::new(value)
-                    .range(range)
-                    .speed(0.1)
-                    .max_decimals(1)
-                    .suffix(suffix),
-            );
+            let response = ui.add_sized(vec2(72., 26.), |ui: &mut egui::Ui| {
+                ui::numeric_value(
+                    ui,
+                    egui::DragValue::new(value)
+                        .range(range)
+                        .speed(0.1)
+                        .max_decimals(1)
+                        .suffix(suffix),
+                )
+            });
             response.widget_info(|| {
                 egui::WidgetInfo::labeled(egui::WidgetType::DragValue, ui.is_enabled(), label)
             });

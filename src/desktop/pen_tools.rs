@@ -62,7 +62,8 @@ pub(super) fn controls(ui: &mut egui::Ui, state: &mut State) {
     ui.horizontal(|ui| {
         ui.label("Size");
         let mut diameter = state.radius * 2.;
-        ui.add(
+        ui::numeric_slider(
+            ui,
             egui::Slider::new(&mut diameter, 4.0..=64.0)
                 .suffix(" pt")
                 .clamping(egui::SliderClamping::Always),

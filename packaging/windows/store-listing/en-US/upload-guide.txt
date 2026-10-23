@@ -1,6 +1,7 @@
-MyPDF (OG) 2.1.0 — Microsoft Store, English (United States)
+MyPDF (OG) 2.1.1 — Microsoft Store, English (United States)
 
 Description: paste description.txt as plain text.
+Release notes: paste release-notes.txt as plain text.
 Screenshots: upload screenshots/01-read.png first, followed by the other three.
 Screenshot captions: use the corresponding entries from captions.txt.
 Optional Store logos: upload each PNG to its matching 300 x 300, 150 x 150, or 71 x 71 field.

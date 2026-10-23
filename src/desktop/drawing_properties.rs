@@ -152,6 +152,7 @@ fn line_ending_controls(ui: &mut egui::Ui, kind: &Kind, style: &mut Style) -> Op
             column.label(RichText::new(label).size(12.).color(theme::muted()));
             let combo = egui::ComboBox::from_id_salt(("drawing_line_end", label))
                 .width(column.available_width())
+                .truncate()
                 .selected_text(end.label())
                 .show_ui(column, |ui| {
                     for choice in ann::LineEnd::ALL {
@@ -178,7 +179,8 @@ fn line_ending_controls(ui: &mut egui::Ui, kind: &Kind, style: &mut Style) -> Op
     ui.horizontal(|ui| {
         ui.label(RichText::new("Head size").size(12.).color(theme::muted()));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let response = ui.add(
+            let response = ui::numeric_value(
+                ui,
                 egui::DragValue::new(&mut endings.size)
                     .range(0.5..=256.)
                     .clamp_existing_to_range(false)
@@ -197,6 +199,24 @@ fn line_ending_controls(ui: &mut egui::Ui, kind: &Kind, style: &mut Style) -> Op
                 focus = Some(response.id);
             }
         });
+    });
+    ui.scope(|ui| {
+        ui.spacing_mut().slider_width = ui.available_width();
+        ui.spacing_mut().interact_size.y = 18.;
+        let response = ui::numeric_slider(
+            ui,
+            egui::Slider::new(&mut endings.size, 0.5..=256.)
+                .logarithmic(true)
+                .clamping(egui::SliderClamping::Edits)
+                .max_decimals(1)
+                .show_value(false),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Slider, ui.is_enabled(), "Head size")
+        });
+        if response.has_focus() {
+            focus = Some(response.id);
+        }
     });
     if endings != before {
         style.line_endings = Some(endings);
@@ -653,7 +673,7 @@ mod tests {
         let ctx = egui::Context::default();
         let kind = tool_kind(Tool::Arrow).unwrap();
         let mut style = Style {
-            width: 30.,
+            width: 60.,
             ..Default::default()
         };
         let before = style.clone();
@@ -983,6 +1003,238 @@ mod tests {
                     "Preview text overflowed: {text_bounds:?} outside {clip:?}"
                 );
                 assert_eq!(text_shape.galley.job.text, text);
+            }
+        }
+    }
+
+    #[test]
+    fn property_scrollbars_keep_controls_clear_and_page_width_stable_in_all_inspectors() {
+        use eframe::App;
+        for panel_width in [230., 254.] {
+            for (case, scroll_id) in [
+                (0, "new_annotation_properties"),
+                (1, "annotation_properties"),
+                (2, "group_properties"),
+            ] {
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                // Exercise the portable menu's extra row on macOS too.
+                ctx.data_mut(|data| data.insert_temp(egui::Id::new("preview_portable_menu"), true));
+                let mut app =
+                    Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+                app.new_blank(&ctx);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while app.tabs[0].session.is_none() {
+                    app.events(&ctx);
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                app.editor.mode = Mode::Draw;
+                app.sidebar = false;
+                app.inspector = true;
+                let style = Style {
+                    stroke: StrokeStyle::DashDot,
+                    line_endings: Some(ann::LineEndings {
+                        start: ann::LineEnd::ClosedArrow,
+                        end: ann::LineEnd::FilledArrow,
+                        size: 256.,
+                    }),
+                    ..Default::default()
+                };
+                let marks: Vec<_> = [
+                    ([100., 100., 260., 200.], Tool::DoubleCurvedArrow),
+                    ([300., 300., 450., 450.], Tool::DoubleSteppedArrow),
+                ]
+                .into_iter()
+                .map(|(rect, tool)| {
+                    Annotation::new(0, rect, tool_kind(tool).unwrap(), style.clone())
+                })
+                .collect();
+                app.tabs[0]
+                    .session
+                    .as_mut()
+                    .unwrap()
+                    .commit(marks.clone())
+                    .unwrap();
+                if case == 0 {
+                    app.editor.select_tool(Tool::DoubleCurvedArrow);
+                    app.editor.style = style;
+                    selection::set(&mut app.tabs[0], &mut app.editor, vec![]);
+                } else {
+                    app.editor.select_tool(Tool::Select);
+                    selection::set(
+                        &mut app.tabs[0],
+                        &mut app.editor,
+                        marks
+                            .iter()
+                            .take(case)
+                            .map(|mark| mark.id.clone())
+                            .collect(),
+                    );
+                }
+                let revision = app.tabs[0].session.as_ref().unwrap().revision();
+                ctx.data_mut(|data| {
+                    data.insert_persisted(
+                        egui::Id::new("annotation_inspector"),
+                        egui::containers::panel::PanelState {
+                            rect: Rect::from_min_size(
+                                pos2(1100. - panel_width, 0.),
+                                vec2(panel_width, 1800.),
+                            ),
+                        },
+                    )
+                });
+                let frame = |app: &mut Viewer, height, events| {
+                    ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                pos2(0., 0.),
+                                vec2(1100., height),
+                            )),
+                            events,
+                            ..Default::default()
+                        },
+                        |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+                    )
+                };
+                let viewport = || {
+                    ctx.data(|data| {
+                        data.get_temp::<(Rect, egui::Vec2)>(egui::Id::new((
+                            "property_scroll_viewport",
+                            scroll_id,
+                        )))
+                    })
+                    .unwrap()
+                };
+                let page = |app: &Viewer| {
+                    ctx.read_response(egui::Id::new((app.tabs[0].id, 0_usize, "page_actions")))
+                        .unwrap()
+                        .rect
+                };
+                let check_bounds = |output: &egui::FullOutput| {
+                    let (inner, _) = viewport();
+                    let panel = egui::containers::panel::PanelState::load(
+                        &ctx,
+                        egui::Id::new("annotation_inspector"),
+                    )
+                    .unwrap()
+                    .rect;
+                    assert!(
+                        (panel.width() - panel_width).abs() < 0.5,
+                        "{scroll_id} grew from {panel_width} to {}",
+                        panel.width()
+                    );
+                    assert!(
+                        (inner.width() - (panel_width - 32.)).abs() < 0.5,
+                        "The permanent gutter must preserve the old control width: {inner:?}"
+                    );
+                    assert!(
+                        (panel.right() - inner.right() - 16.).abs() < 0.5,
+                        "The scrollbar must occupy the old right padding"
+                    );
+                    let mut controls = vec![];
+                    for id in [
+                        egui::Id::new("drawing_live_preview"),
+                        egui::Id::new(("drawing_head_combo", "Start")),
+                        egui::Id::new(("drawing_head_combo", "End")),
+                        egui::Id::new("drawing_head_size"),
+                    ] {
+                        controls.push(ctx.data(|data| data.get_temp::<Rect>(id)).unwrap());
+                    }
+                    for name in ["Ink", "Blue", "Green", "Coral", "Gold"] {
+                        controls.push(
+                            ctx.data(|data| {
+                                data.get_temp::<Rect>(egui::Id::new(("color_swatch", name)))
+                            })
+                            .unwrap(),
+                        );
+                    }
+                    for (_, node) in &output
+                        .platform_output
+                        .accesskit_update
+                        .as_ref()
+                        .unwrap()
+                        .nodes
+                    {
+                        if matches!(
+                            node.label(),
+                            Some("Width" | "Opacity" | "Head size" | "Custom color")
+                        ) && let Some(rect) = node.bounds()
+                        {
+                            controls.push(Rect::from_min_max(
+                                pos2(rect.x0 as f32, rect.y0 as f32),
+                                pos2(rect.x1 as f32, rect.y1 as f32),
+                            ));
+                        }
+                    }
+                    for control in controls {
+                        assert!(
+                            control.left() >= inner.left() - 0.5
+                                && control.right() <= inner.right() + 0.5,
+                            "{scroll_id} control {control:?} overlaps the gutter or clips at {inner:?}"
+                        );
+                    }
+                };
+                for _ in 0..4 {
+                    frame(&mut app, 1800., vec![]);
+                }
+                let output = frame(&mut app, 1800., vec![]);
+                check_bounds(&output);
+                let (tall, content) = viewport();
+                assert!(
+                    content.y < tall.height(),
+                    "Tall fixture must not need scrolling: {scroll_id}"
+                );
+                let page_width = page(&app).width();
+                for _ in 0..4 {
+                    frame(&mut app, 480., vec![]);
+                }
+                let output = frame(&mut app, 480., vec![]);
+                check_bounds(&output);
+                let (inner, content) = viewport();
+                assert!(
+                    content.y > inner.height(),
+                    "Short fixture must overflow: {scroll_id}"
+                );
+                assert!(
+                    (page(&app).width() - page_width).abs() < 0.5,
+                    "Overflow must not reflow the PDF"
+                );
+                let before = ctx
+                    .data(|data| data.get_temp::<Rect>(egui::Id::new("drawing_live_preview")))
+                    .unwrap();
+                // The 6pt solid rail starts after its permanent 4pt gap.
+                let start = pos2(inner.right() + 7., inner.top() + 4.);
+                for _ in 0..3 {
+                    frame(&mut app, 480., vec![egui::Event::PointerMoved(start)]);
+                }
+                check_bounds(&frame(&mut app, 480., vec![]));
+                assert!(
+                    (page(&app).width() - page_width).abs() < 0.5,
+                    "Hovering the rail must not resize the page"
+                );
+                frame(&mut app, 480., pointer(start, true));
+                let end = pos2(start.x, inner.bottom() - 4.);
+                frame(&mut app, 480., vec![egui::Event::PointerMoved(end)]);
+                frame(&mut app, 480., pointer(end, false));
+                let output = frame(&mut app, 480., vec![]);
+                check_bounds(&output);
+                let after = ctx
+                    .data(|data| data.get_temp::<Rect>(egui::Id::new("drawing_live_preview")))
+                    .unwrap();
+                assert!(
+                    after.top() < before.top() - 1.,
+                    "Dragging the rail must really scroll {scroll_id}: {before:?} -> {after:?}"
+                );
+                assert!(
+                    (page(&app).width() - page_width).abs() < 0.5,
+                    "Dragging the rail must not resize the page"
+                );
+                assert_eq!(
+                    app.tabs[0].session.as_ref().unwrap().revision(),
+                    revision,
+                    "Scrollbar gestures cannot edit the PDF"
+                );
             }
         }
     }

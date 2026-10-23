@@ -158,8 +158,8 @@ impl Viewer {
                 painter.image(texture.id(),Rect::from_center_size(rect.center(),texture.size_vec2()*scale),Rect::from_min_max(pos2(0.,0.),pos2(1.,1.)),Color32::WHITE);
             }
             ui.horizontal(|ui| { ui.label("Background color"); ui::color_swatch_srgb(ui, &mut draft.options.color, "Background color"); });
-            ui.add(egui::Slider::new(&mut draft.options.tolerance,0..=120).text("Tolerance"));
-            ui.add(egui::Slider::new(&mut draft.options.feather,0..=64).text("Soft edges"));
+            ui::numeric_slider(ui, egui::Slider::new(&mut draft.options.tolerance,0..=120).text("Tolerance"));
+            ui::numeric_slider(ui, egui::Slider::new(&mut draft.options.feather,0..=64).text("Soft edges"));
             ui.checkbox(&mut draft.options.edges_only,"Only remove background connected to an edge").on_hover_text("Preserves matching areas enclosed inside the image. Turn off for paper inside loops in a signature.");
             ui.weak("Best for scans, signatures, and images with a solid background.");
             if draft.busy || draft.dirty { ui.horizontal(|ui| {ui.spinner(); ui.label("Updating preview…");}); }

@@ -2180,14 +2180,10 @@ pub(super) fn color_picker_contents(
                             ui.scope(|ui| {
                                 ui.spacing_mut().slider_width = 126.;
                                 ui.spacing_mut().interact_size.y = 16.;
-                                ui.spacing_mut().slider_rail_height = 4.;
-                                ui.visuals_mut().widgets.inactive.bg_fill =
-                                    theme::muted().gamma_multiply(0.35);
                                 ui.visuals_mut().selection.bg_fill = tint;
-                                ui.add(
-                                    egui::Slider::new(channel, 0..=255)
-                                        .show_value(false)
-                                        .trailing_fill(true),
+                                numeric_slider(
+                                    ui,
+                                    egui::Slider::new(channel, 0..=255).show_value(false),
                                 )
                                 .widget_info(|| {
                                     egui::WidgetInfo::labeled(
@@ -2197,10 +2193,9 @@ pub(super) fn color_picker_contents(
                                     )
                                 });
                             });
-                            ui.add_sized(
-                                vec2(48., 26.),
-                                egui::DragValue::new(channel).range(0..=255),
-                            )
+                            ui.add_sized(vec2(48., 26.), |ui: &mut egui::Ui| {
+                                numeric_value(ui, egui::DragValue::new(channel).range(0..=255))
+                            })
                             .widget_info(|| {
                                 egui::WidgetInfo::labeled(
                                     egui::WidgetType::DragValue,
@@ -2352,6 +2347,107 @@ pub(super) fn color_swatch_srgb(ui: &mut egui::Ui, current: &mut [u8; 3], label:
 
 // ---------------------------------------------------------------------------
 // Dialogs
+
+/// A slim native slider, with the normal interaction and accessibility intact.
+/// Explicit selection colors (the RGB picker channels) remain their own accent.
+pub(super) fn numeric_slider(ui: &mut egui::Ui, slider: egui::Slider<'_>) -> egui::Response {
+    let accent = if ui.visuals().selection.bg_fill == theme::accent_soft() {
+        theme::accent()
+    } else {
+        ui.visuals().selection.bg_fill
+    };
+    ui.scope(|ui| {
+        ui.spacing_mut().slider_rail_height = 3.;
+        let visuals = ui.visuals_mut();
+        visuals.selection.bg_fill = accent;
+        visuals.widgets.inactive.bg_fill = theme::line();
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.2, accent);
+        visuals.widgets.hovered.bg_fill = accent.gamma_multiply(0.18);
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.5, accent);
+        visuals.widgets.active.bg_fill = accent.gamma_multiply(0.3);
+        visuals.widgets.active.fg_stroke = Stroke::new(1.5, accent);
+        for widget in [
+            &mut visuals.widgets.inactive,
+            &mut visuals.widgets.hovered,
+            &mut visuals.widgets.active,
+            &mut visuals.widgets.noninteractive,
+        ] {
+            widget.corner_radius = 2.into();
+            widget.expansion = 0.;
+        }
+        ui.add(
+            slider
+                .trailing_fill(true)
+                .handle_shape(egui::style::HandleShape::Rect { aspect_ratio: 0.45 }),
+        )
+    })
+    .inner
+}
+
+/// A compact value field. Its border clarifies hover/focus without changing
+/// sizing, numeric ranges, text entry, or the appearance of adjacent buttons.
+pub(super) fn numeric_value(ui: &mut egui::Ui, value: egui::DragValue<'_>) -> egui::Response {
+    ui.scope(|ui| {
+        let visuals = ui.visuals_mut();
+        visuals.text_edit_bg_color = Some(theme::surface());
+        visuals.selection.stroke = Stroke::new(1.5, theme::accent());
+        for widget in [
+            &mut visuals.widgets.inactive,
+            &mut visuals.widgets.hovered,
+            &mut visuals.widgets.active,
+            &mut visuals.widgets.open,
+        ] {
+            widget.corner_radius = 4.into();
+            widget.expansion = 0.;
+            widget.bg_fill = theme::surface();
+            widget.weak_bg_fill = theme::surface();
+            widget.fg_stroke = Stroke::new(1., theme::ink());
+        }
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1., theme::line());
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1., theme::accent());
+        visuals.widgets.active.bg_stroke = Stroke::new(1.5, theme::accent());
+        visuals.widgets.open.bg_stroke = Stroke::new(1.5, theme::accent());
+        ui.add(value)
+    })
+    .inner
+}
+
+/// Property panels keep their existing control width while reserving a gutter
+/// for the scrollbar, rather than letting it float over inputs on hover.
+pub(super) fn property_panel_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(theme::paper())
+        .inner_margin(egui::Margin {
+            left: 16,
+            right: 6,
+            top: 16,
+            bottom: 16,
+        })
+}
+
+pub(super) fn property_scroll<R>(
+    ui: &mut egui::Ui,
+    id: &str,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.scope(|ui| {
+        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+        let output = egui::ScrollArea::vertical()
+            .id_salt(id)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .auto_shrink([false, false])
+            .show(ui, content);
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new(("property_scroll_viewport", id)),
+                (output.inner_rect, output.content_size),
+            )
+        });
+        output.inner
+    })
+    .inner
+}
 
 /// Shared sizing for utility dialogs. The body scrolls; the action row does not.
 /// Reserve space for the title, frame and footer even on a 480-point-high window.
@@ -2897,6 +2993,210 @@ fn style_for(style: &mut egui::Style, p: &theme::Palette, dark: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn numeric_controls_keep_native_geometry_input_and_channel_tints() {
+        let ctx = egui::Context::default();
+        install_theme(&ctx);
+        ctx.enable_accesskit();
+        let mut values = [30_f32, 30., 12., 12.];
+        let frame = |values: &mut [f32; 4], events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(600., 400.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.spacing_mut().slider_width = 160.;
+                        ui.spacing_mut().interact_size.y = 18.;
+                        let old_rail = ui.spacing().slider_rail_height;
+                        let old_radius = ui.visuals().widgets.inactive.corner_radius;
+                        let slider = numeric_slider(
+                            ui,
+                            egui::Slider::new(&mut values[0], 0.0..=100.).show_value(false),
+                        );
+                        slider.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Slider,
+                                true,
+                                "Numeric slider",
+                            )
+                        });
+                        let raw_slider =
+                            ui.add(egui::Slider::new(&mut values[1], 0.0..=100.).show_value(false));
+                        let value = ui.add_sized(vec2(72., 26.), |ui: &mut egui::Ui| {
+                            numeric_value(
+                                ui,
+                                egui::DragValue::new(&mut values[2])
+                                    .range(0.0..=100.)
+                                    .suffix(" pt"),
+                            )
+                        });
+                        value.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::DragValue,
+                                true,
+                                "Numeric value",
+                            )
+                        });
+                        let raw_value = ui.add_sized(
+                            vec2(72., 26.),
+                            egui::DragValue::new(&mut values[3])
+                                .range(0.0..=100.)
+                                .suffix(" pt"),
+                        );
+                        assert_eq!(
+                            ui.spacing().slider_rail_height,
+                            old_rail,
+                            "Slider styling must stay local"
+                        );
+                        assert_eq!(
+                            ui.visuals().widgets.inactive.corner_radius,
+                            old_radius,
+                            "Value styling must not leak to buttons"
+                        );
+                        ui.ctx().data_mut(|data| {
+                            data.insert_temp(
+                                egui::Id::new("numeric_test_bounds"),
+                                (
+                                    slider.rect,
+                                    raw_slider.rect,
+                                    value.rect,
+                                    raw_value.rect,
+                                    slider.id,
+                                ),
+                            )
+                        });
+                        for tint in [
+                            Color32::from_rgb(224, 88, 82),
+                            Color32::from_rgb(54, 163, 110),
+                            Color32::from_rgb(66, 133, 224),
+                        ] {
+                            ui.scope(|ui| {
+                                ui.visuals_mut().selection.bg_fill = tint;
+                                let mut channel = 128_u8;
+                                numeric_slider(
+                                    ui,
+                                    egui::Slider::new(&mut channel, 0..=255).show_value(false),
+                                );
+                            });
+                        }
+                    });
+                },
+            )
+        };
+        for _ in 0..3 {
+            frame(&mut values, vec![]);
+        }
+        let output = frame(&mut values, vec![]);
+        let (slider, raw_slider, value, raw_value, slider_id) = ctx
+            .data(|data| {
+                data.get_temp::<(Rect, Rect, Rect, Rect, egui::Id)>(egui::Id::new(
+                    "numeric_test_bounds",
+                ))
+            })
+            .unwrap();
+        assert_eq!(slider.size(), raw_slider.size());
+        assert_eq!(value.size(), raw_value.size());
+        assert_eq!(
+            values,
+            [30., 30., 12., 12.],
+            "Passive rendering must not edit values"
+        );
+        let rects: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Rect(rect) = &shape.shape {
+                    Some(rect)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            rects.iter().any(|rect| slider.contains(rect.rect.center())
+                && (rect.rect.height() - 3.).abs() < 0.01
+                && rect.fill == theme::accent()),
+            "The track must show a solid accent fill"
+        );
+        assert!(
+            rects.iter().any(|rect| slider.contains(rect.rect.center())
+                && rect.rect.height() > 8.
+                && (rect.rect.width() / rect.rect.height() - 0.45).abs() < 0.01),
+            "The thumb must be a compact rectangle"
+        );
+        assert!(rects.iter().any(|rect|rect.rect==value && rect.corner_radius==egui::CornerRadius::same(4)),"The value field keeps a crisp four-point radius");
+        for tint in [
+            Color32::from_rgb(224, 88, 82),
+            Color32::from_rgb(54, 163, 110),
+            Color32::from_rgb(66, 133, 224),
+        ] {
+            assert!(
+                rects
+                    .iter()
+                    .any(|rect| (rect.rect.height() - 3.).abs() < 0.01 && rect.fill == tint),
+                "RGB channel accents must be retained"
+            );
+        }
+        let at = pos2(slider.left() + slider.width() * 0.8, slider.center().y);
+        let pointer = |at, pressed| {
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        frame(&mut values, pointer(at, true));
+        frame(&mut values, pointer(at, false));
+        assert!(
+            values[0] > 70. && values[0] < 90.,
+            "The styled slider must still accept pointer input"
+        );
+        let previous = values[0];
+        ctx.memory_mut(|memory| memory.request_focus(slider_id));
+        frame(
+            &mut values,
+            vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(
+            values[0] > previous,
+            "Keyboard adjustment must remain native"
+        );
+        let at = value.center();
+        frame(&mut values, pointer(at, true));
+        frame(&mut values, pointer(at, false));
+        frame(&mut values, vec![]);
+        frame(
+            &mut values,
+            vec![
+                egui::Event::Text("26".into()),
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(
+            values[2], 26.,
+            "The styled value field must still allow exact text entry"
+        );
+    }
+
     #[test]
     fn custom_picker_edits_exact_hex_without_idle_changes_or_more_space() {
         let ctx = egui::Context::default();

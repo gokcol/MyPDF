@@ -45,7 +45,8 @@ fn margins(ui: &mut egui::Ui, values: &mut [f32; 4]) {
         .show(ui, |ui| {
             for (i, label) in ["Top", "Bottom", "Left", "Right"].into_iter().enumerate() {
                 ui.label(label);
-                ui.add(
+                ui::numeric_value(
+                    ui,
                     egui::DragValue::new(&mut values[i])
                         .range(0. ..=2000.)
                         .speed(0.5)
@@ -203,8 +204,8 @@ impl Viewer {
                                 }
                             });
                             ui.horizontal(|ui| {
-                                ui.label("Columns"); ui.add(egui::DragValue::new(&mut d.layout.columns).range(1..=8));
-                                ui.label("Rows"); ui.add(egui::DragValue::new(&mut d.layout.rows).range(1..=8));
+                                ui.label("Columns"); ui::numeric_value(ui, egui::DragValue::new(&mut d.layout.columns).range(1..=8));
+                                ui.label("Rows"); ui::numeric_value(ui, egui::DragValue::new(&mut d.layout.rows).range(1..=8));
                             });
                             ui.add_space(10.); ui::caption(ui,"Source pages");
                             ui.add(egui::TextEdit::singleline(&mut d.range).margin(ui::FIELD_MARGIN).hint_text("1, 3-8").char_limit(2000).desired_width(f32::INFINITY));
@@ -223,14 +224,14 @@ impl Viewer {
                                 if ui.add(ActionButton::new(Icon::Swap,"Change orientation").compact()).clicked() { d.layout.sheet.swap(0,1); }
                             });
                             ui.horizontal(|ui| {
-                                ui.label("W");ui.add(egui::DragValue::new(&mut d.layout.sheet[0]).range(72. ..=14400.).suffix(" pt"));
-                                ui.label("H");ui.add(egui::DragValue::new(&mut d.layout.sheet[1]).range(72. ..=14400.).suffix(" pt"));
+                                ui.label("W");ui::numeric_value(ui, egui::DragValue::new(&mut d.layout.sheet[0]).range(72. ..=14400.).suffix(" pt"));
+                                ui.label("H");ui::numeric_value(ui, egui::DragValue::new(&mut d.layout.sheet[1]).range(72. ..=14400.).suffix(" pt"));
                             });
                             ui.add_space(10.);ui::caption(ui,"Sheet margins");
                             margins(ui,&mut d.layout.margins);
                             ui.horizontal(|ui| {
                                 if ui.button("No margins").clicked(){d.layout.margins=[0.;4];}
-                                ui.label("Gap");ui.add(egui::DragValue::new(&mut d.layout.gap).range(0. ..=144.).suffix(" pt"));
+                                ui.label("Gap");ui::numeric_value(ui, egui::DragValue::new(&mut d.layout.gap).range(0. ..=144.).suffix(" pt"));
                             });
                             egui::CollapsingHeader::new("Trim source page edges").show(ui,|ui| {
                                 ui.weak("Remove whitespace before fitting each page. Content in these edges is clipped.");
@@ -242,14 +243,14 @@ impl Viewer {
                             ui.add(egui::TextEdit::singleline(&mut d.layout.header).margin(ui::FIELD_MARGIN).hint_text("Header (optional)").char_limit(500).desired_width(f32::INFINITY));
                             ui.add(egui::TextEdit::singleline(&mut d.layout.footer).margin(ui::FIELD_MARGIN).hint_text("Footer · e.g. Sheet {page} of {pages}").char_limit(500).desired_width(f32::INFINITY));
                             ui.weak("{page} and {pages} refer to output sheets.");
-                            ui.horizontal(|ui| {ui.label("Text size");ui.add(egui::DragValue::new(&mut d.layout.text_size).range(6. ..=48.).suffix(" pt"));});
+                            ui.horizontal(|ui| {ui.label("Text size");ui::numeric_value(ui, egui::DragValue::new(&mut d.layout.text_size).range(6. ..=48.).suffix(" pt"));});
                             });
                             ui.separator();
                             egui::CollapsingHeader::new("Watermark").show(ui,|ui| {
                             ui.add(egui::TextEdit::singleline(&mut d.layout.watermark).margin(ui::FIELD_MARGIN).hint_text("Optional · e.g. CONFIDENTIAL").char_limit(200).desired_width(f32::INFINITY));
                             if !d.layout.watermark.trim().is_empty() {
-                                ui.add(egui::Slider::new(&mut d.layout.watermark_opacity,0.05..=1.).text("Opacity"));
-                                ui.add(egui::Slider::new(&mut d.layout.watermark_angle,-180. ..=180.).text("Angle").suffix("°"));
+                                ui::numeric_slider(ui, egui::Slider::new(&mut d.layout.watermark_opacity,0.05..=1.).text("Opacity"));
+                                ui::numeric_slider(ui, egui::Slider::new(&mut d.layout.watermark_angle,-180. ..=180.).text("Angle").suffix("°"));
                             }
                             });
                         });

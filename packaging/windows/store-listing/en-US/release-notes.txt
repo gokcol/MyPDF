@@ -1,0 +1,7 @@
+MyPDF 2.1.1 improves the property-panel controls:
+
+- Slimmer sliders and clearer handles for drawing, colors, signatures, images and page layouts.
+- Tidier numeric fields with clearer focus and exact value entry.
+- A head-size slider alongside the precise point-size field for lines and arrows.
+- Property-panel scrollbars have their own gutter, keeping controls clear and the document width steady while scrolling.
+- Start/end style dropdowns fit narrow inspectors cleanly.
