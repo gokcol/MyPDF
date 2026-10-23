@@ -16,6 +16,8 @@ pub struct NativeMenu {
     dialog_edit: muda::Submenu,
     undo: muda::MenuItem,
     redo: muda::MenuItem,
+    recent: muda::Submenu,
+    recent_items: Option<Vec<super::recent_menu::Recent>>,
     dialog_depth: DialogDepth,
 }
 #[cfg(target_os = "macos")]
@@ -50,6 +52,43 @@ impl NativeMenu {
             redo.map(|s| format!("Redo {s}"))
                 .unwrap_or_else(|| "Redo".into())
         });
+    }
+
+    pub(super) fn recent_files(&mut self, items: &[super::recent_menu::Recent]) {
+        if self.recent_items.as_deref() == Some(items) {
+            return;
+        }
+        while self.recent.remove_at(0).is_some() {}
+        let result = (|| -> muda::Result<()> {
+            if items.is_empty() {
+                self.recent.append(&muda::MenuItem::with_id(
+                    "recent_empty",
+                    "No Recent PDFs",
+                    false,
+                    None,
+                ))?;
+            } else {
+                for item in items {
+                    self.recent.append(&muda::MenuItem::with_id(
+                        format!(
+                            "shell:{}",
+                            super::shell_menu::Action::Document(item.path.clone()).encode()
+                        ),
+                        &item.label,
+                        true,
+                        None,
+                    ))?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("Could not refresh recent PDF menu: {error}");
+            return;
+        }
+        self.recent_items = Some(items.to_vec());
+        #[cfg(not(test))]
+        decorate_native_menu(&self.menu);
     }
 
     fn dialog(&self, active: bool) {
@@ -123,12 +162,14 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             &item("quit", "Quit MyPDF", Code::KeyQ, Modifiers::empty()),
         ],
     );
+    let recent = Submenu::with_id("open_recent", "Open Recent", true);
     let file = Submenu::with_items(
         "File",
         true,
         &[
             &item("new", "New Blank PDF", Code::KeyN, Modifiers::empty()),
             &item("open", "Open…", Code::KeyO, Modifiers::empty()),
+            &recent,
             &item(
                 "reopen_closed",
                 "Reopen Closed Tab",
@@ -384,6 +425,8 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             dialog_edit,
             undo,
             redo,
+            recent,
+            recent_items: None,
             dialog_depth: DialogDepth::default(),
         }),
         rx,
@@ -480,6 +523,7 @@ fn native_symbol(id: &str, label: &str) -> &'static str {
     match id {
         "new" => "doc.badge.plus",
         "open" => "folder",
+        "open_recent" => "clock.arrow.circlepath",
         "reopen_closed" | "recovery" => "arrow.clockwise",
         "workspace" => "rectangle.3.group",
         "save" => "square.and.arrow.down",

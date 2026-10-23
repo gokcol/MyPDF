@@ -6,14 +6,16 @@ enum Entry {
     Command(&'static str, &'static str),
     Submenu(&'static str, &'static [Entry]),
     Separator,
+    Recent,
 }
-use Entry::{Command as C, Separator as S, Submenu as M};
+use Entry::{Command as C, Recent as R, Separator as S, Submenu as M};
 const MENUS: &[(&str, &[Entry])] = &[
     (
         "File",
         &[
             C("new", "New Blank PDF"),
             C("open", "Open…"),
+            R,
             C("reopen_closed", "Reopen Closed Tab"),
             C("workspace", "Workspace…"),
             S,
@@ -334,10 +336,13 @@ fn entries(
     items: &[Entry],
     document: bool,
     saving: bool,
-) -> Option<&'static str> {
+    recent: &[recent_menu::Recent],
+) -> Option<recent_menu::Action> {
     egui::ScrollArea::vertical()
         .max_height((ui.ctx().content_rect().height() - 64.).max(120.))
-        .show(ui, |ui| entries_contents(ui, items, document, saving))
+        .show(ui, |ui| {
+            entries_contents(ui, items, document, saving, recent)
+        })
         .inner
 }
 fn entries_contents(
@@ -345,12 +350,14 @@ fn entries_contents(
     items: &[Entry],
     document: bool,
     saving: bool,
-) -> Option<&'static str> {
+    recent: &[recent_menu::Recent],
+) -> Option<recent_menu::Action> {
     let width = ui::menu_width(
         ui,
         items.iter().filter_map(|e| match e {
             C(id, label) => Some((*label, shortcut(id))),
             M(label, _) => Some((*label, None)),
+            R => Some(("Open Recent", None)),
             S => None,
         }),
     );
@@ -367,7 +374,7 @@ fn entries_contents(
                     )
                     .clicked()
                 {
-                    action = Some(*id);
+                    action = Some(recent_menu::Action::Command(id));
                     ui.close();
                 }
             }
@@ -391,13 +398,18 @@ fn entries_contents(
                             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
                     )
                     .show(ui, &response, |ui| {
-                        if let Some(id) = entries(ui, children, document, saving) {
+                        if let Some(id) = entries(ui, children, document, saving, recent) {
                             action = Some(id);
                         }
                     });
                 if needs_measurement && popup.is_some() {
                     ui.ctx()
                         .request_discard("Measure the application submenu before displaying it");
+                }
+            }
+            R => {
+                if let (Some(choice), _) = recent_menu::submenu(ui, recent, width) {
+                    action = Some(choice);
                 }
             }
             S => {
@@ -407,12 +419,17 @@ fn entries_contents(
     }
     action
 }
-pub(super) fn bar(ui: &mut egui::Ui, document: bool, saving: bool) -> Option<&'static str> {
+pub(super) fn bar(
+    ui: &mut egui::Ui,
+    document: bool,
+    saving: bool,
+    recent: &[recent_menu::Recent],
+) -> Option<recent_menu::Action> {
     let mut action = None;
     egui::MenuBar::new().ui(ui, |ui| {
         for (name, children) in MENUS {
             let response = ui.menu_button(*name, |ui| {
-                if let Some(id) = entries(ui, children, document, saving) {
+                if let Some(id) = entries(ui, children, document, saving, recent) {
                     action = Some(id);
                 }
             });
@@ -456,6 +473,7 @@ mod tests {
                         assert!(!matches!(submenu_icon(label), Icon::Library));
                         check(children);
                     }
+                    R => {}
                     S => {}
                 }
             }
@@ -494,9 +512,9 @@ mod tests {
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                assert!(bar(ui, true, false).is_none());
+                assert!(bar(ui, true, false, &[]).is_none());
                 for (_, items) in MENUS {
-                    assert!(entries(ui, items, true, false).is_none());
+                    assert!(entries(ui, items, true, false, &[]).is_none());
                 }
             });
         });

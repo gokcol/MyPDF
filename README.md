@@ -2,7 +2,7 @@
 
 # MyPDF — native Rust desktop PDF editor
 
-Version **2.1.1**, build **180**, adds sharper accent sliders and clearer number fields, including a live head-size slider for lines and arrows. Property panels reserve space for their scrollbars, and start/end head menus fit narrow panels.
+Version **2.1.1**, build **181**, adds sharper accent sliders and clearer number fields, including a live head-size slider for lines and arrows. Property panels reserve space for their scrollbars, and start/end head menus fit narrow panels. Open Recent in File and the Open hover menu lists the last 10 PDFs newest first on Mac and Windows, returning an already-open file to its existing tab and group.
 
 Version **2.1.0**, build **177**, adds vector-sharp digital signatures, editable tables and compact drawing controls. Tables support movable or embedded placement, bordered-table detection, cell editing, row/column sizing, five templates, merge/split, spreadsheet paste and fitting row heights to contents.
 

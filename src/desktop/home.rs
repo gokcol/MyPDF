@@ -98,11 +98,9 @@ impl Home {
         self.history
             .as_ref()
             .map(|h| {
-                h.entries
-                    .iter()
-                    .filter(|e| e.opened > 0)
-                    .map(|e| e.path.clone())
-                    .collect()
+                let mut entries: Vec<_> = h.entries.iter().filter(|e| e.opened > 0).collect();
+                entries.sort_by(|a, b| b.opened.cmp(&a.opened).then_with(|| a.path.cmp(&b.path)));
+                entries.into_iter().map(|e| e.path.clone()).collect()
             })
             .unwrap_or_default()
     }
@@ -895,6 +893,38 @@ impl Home {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_paths_are_newest_first_even_when_loaded_history_is_unordered() {
+        let ctx = egui::Context::default();
+        let mut home = Home::new(&ctx);
+        let root = home.root.clone();
+        let older = root.join("Older.pdf");
+        let newest = root.join("Newest.pdf");
+        let favorite = root.join("Favorite only.pdf");
+        home.history.as_mut().unwrap().entries = vec![
+            Entry {
+                path: older.clone(),
+                opened: 100,
+                favorite: false,
+                reading: None,
+            },
+            Entry {
+                path: favorite,
+                opened: 0,
+                favorite: true,
+                reading: None,
+            },
+            Entry {
+                path: newest.clone(),
+                opened: 300,
+                favorite: false,
+                reading: None,
+            },
+        ];
+        assert_eq!(home.recent_paths(), vec![newest, older]);
+    }
+
     use eframe::App;
     use std::time::{Duration, Instant};
     fn frame(

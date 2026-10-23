@@ -26,6 +26,7 @@ mod print;
 mod productivity;
 mod protect;
 mod reading;
+mod recent_menu;
 mod recognize;
 mod recovery;
 mod redaction;
@@ -1333,6 +1334,8 @@ impl Viewer {
             return;
         }
         let mut action = None;
+        let mut file_action = None;
+        let recent = recent_menu::items(self.home.recent_paths());
         if self.about_open {
             egui::Window::new("About MyPDF")
                 .open(&mut self.about_open)
@@ -1361,7 +1364,7 @@ impl Viewer {
                         .inner_margin(egui::Margin::symmetric(8, 2)),
                 )
                 .show(ctx, |ui| {
-                    action = portable_menu::bar(
+                    file_action = portable_menu::bar(
                         ui,
                         !self.home.visible
                             && self
@@ -1369,8 +1372,12 @@ impl Viewer {
                                 .get(self.active)
                                 .is_some_and(|t| t.bytes.is_some()),
                         self.saving,
+                        &recent,
                     );
                 });
+        }
+        if let Some(choice) = file_action.take() {
+            self.recent_menu_action(choice, ctx);
         }
         egui::TopBottomPanel::top("document_tabs")
             .frame(
@@ -1492,8 +1499,8 @@ impl Viewer {
                             .tabs
                             .get(self.active)
                             .is_some_and(|tab| tab.bytes.is_some());
-                    if let Some(choice) = toolbar_file_button(ui, can_save) {
-                        action = Some(choice);
+                    if let Some(choice) = toolbar_file_button(ui, can_save, &recent) {
+                        file_action = Some(choice);
                     }
                     if ui
                         .add(
@@ -1582,6 +1589,9 @@ impl Viewer {
                     });
                 });
             });
+        if let Some(choice) = file_action.take() {
+            self.recent_menu_action(choice, ctx);
+        }
         egui::TopBottomPanel::bottom("document_navigation")
             .frame(
                 egui::Frame::new()
@@ -2283,6 +2293,10 @@ impl eframe::App for Viewer {
         window_drag::configure(frame);
         theme::sync(ctx.theme());
         self.tick += 1;
+        #[cfg(target_os = "macos")]
+        if let Some(menu) = self._native_menu.as_mut() {
+            menu.recent_files(&recent_menu::items(self.home.recent_paths()));
+        }
         if let Some(menu) = &self._native_menu {
             let tab = self.tabs.get(self.active);
             let session = tab.and_then(|t| t.session.as_ref());
@@ -2554,7 +2568,11 @@ impl eframe::App for Viewer {
 
 /// Open is the primary action, regardless of the last menu choice. The
 /// attached menu contains file actions without adding toolbar buttons.
-fn toolbar_file_button(ui: &mut egui::Ui, can_save: bool) -> Option<&'static str> {
+fn toolbar_file_button(
+    ui: &mut egui::Ui,
+    can_save: bool,
+    recent: &[recent_menu::Recent],
+) -> Option<recent_menu::Action> {
     let response = ui.add(ActionButton::new(Icon::Open, "Open…").compact());
     let id = response.id.with("toolbar_file_actions");
     let block_id = id.with("hover_blocked");
@@ -2568,13 +2586,16 @@ fn toolbar_file_button(ui: &mut egui::Ui, can_save: bool) -> Option<&'static str
     if response.clicked() {
         ui.ctx().data_mut(|data| data.insert_temp(block_id, true));
         egui::Popup::close_id(ui.ctx(), id);
-        return Some("open");
+        return Some(recent_menu::Action::Command("open"));
     }
     ui.ctx()
         .data_mut(|data| data.insert_temp(block_id, blocked));
     let popup_rect = ui
         .ctx()
         .data(|data| data.get_temp::<Rect>(id.with("bounds")));
+    let recent_rect = ui
+        .ctx()
+        .data(|data| data.get_temp::<Rect>(id.with("recent_bounds")));
     if egui::Popup::is_id_open(ui.ctx(), id)
         && ui
             .ctx()
@@ -2582,6 +2603,7 @@ fn toolbar_file_button(ui: &mut egui::Ui, can_save: bool) -> Option<&'static str
             .is_none_or(|point| {
                 !response.rect.expand(5.).contains(point)
                     && popup_rect.is_none_or(|rect| !rect.expand(5.).contains(point))
+                    && recent_rect.is_none_or(|rect| !rect.expand(5.).contains(point))
             })
     {
         egui::Popup::close_id(ui.ctx(), id);
@@ -2636,11 +2658,29 @@ fn toolbar_file_button(ui: &mut egui::Ui, can_save: bool) -> Option<&'static str
                     )
                     .clicked()
                 {
-                    chosen = Some(command);
+                    chosen = Some(recent_menu::Action::Command(command));
                     ui.close();
+                }
+                if command == "open" {
+                    let (recent_choice, bounds) = recent_menu::submenu(ui, recent, width);
+                    ui.ctx().data_mut(|data| {
+                        if let Some(bounds) = bounds {
+                            data.insert_temp(id.with("recent_bounds"), bounds);
+                        } else {
+                            data.remove::<Rect>(id.with("recent_bounds"));
+                        }
+                    });
+                    if recent_choice.is_some() {
+                        chosen = recent_choice;
+                    }
+                    ui.separator();
                 }
             }
         });
+    if chosen.is_some() {
+        ui.ctx().data_mut(|data| data.insert_temp(block_id, true));
+        egui::Popup::close_id(ui.ctx(), id);
+    }
     if let Some(popup) = popup {
         ui.ctx()
             .data_mut(|data| data.insert_temp(id.with("bounds"), popup.response.rect));
@@ -3592,7 +3632,12 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    action = toolbar_file_button(ui, can_save);
+                    action = toolbar_file_button(ui, can_save, &[]).map(|choice| match choice {
+                        recent_menu::Action::Command(command) => command,
+                        recent_menu::Action::Recent(_) => {
+                            panic!("No recent entries in this fixture")
+                        }
+                    });
                 });
             },
         );

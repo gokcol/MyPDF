@@ -1,5 +1,6 @@
-MyPDF 2.1.1 improves the property-panel controls:
+New in MyPDF 2.1.1:
 
+- Open Recent in File and the Open hover menu shows the last 10 PDFs, newest first, on Mac and Windows. Already-open files return to their existing tab and group.
 - Slimmer sliders and clearer handles for drawing, colors, signatures, images and page layouts.
 - Tidier numeric fields with clearer focus and exact value entry.
 - A head-size slider alongside the precise point-size field for lines and arrows.
