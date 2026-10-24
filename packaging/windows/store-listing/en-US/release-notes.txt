@@ -1,5 +1,6 @@
-New in MyPDF 2.1.2:
+New in MyPDF 2.1.3:
 
-- Fixed on-page typing in upright added text boxes and synchronized it with the properties panel.
-- Compact White, light yellow, light blue and Mint background presets sit alongside the custom color picker. The existing opacity control adjusts text and background together.
-- Includes Open Recent in File and the Open hover menu, precise numeric controls, line/arrow head-size sliders and property-panel scrollbar spacing from 2.1.1.
+- Improved PDFs with nonembedded fonts: available installed substitutes restore Turkish and other supported characters.
+- Corrected wrong letters caused by duplicate glyph names in substitute fonts.
+- Viewing, thumbnails, text geometry and exports now share the same font fallback. Embedded PDF fonts and text positions remain unchanged.
+- Includes the on-page text-box typing and background-color improvements from 2.1.2.
