@@ -474,7 +474,7 @@ fn render_image_png(bytes: &[u8], page: u32, index: usize) -> Result<Vec<u8>> {
     let raster = hayro::render(
         &pdf.pages()[0],
         &hayro::RenderCache::new(),
-        &hayro::hayro_interpret::InterpreterSettings::default(),
+        &crate::render_fonts::settings(),
         &hayro::RenderSettings::default(),
         &hayro::PixmapSettings {
             x_scale: 1.,

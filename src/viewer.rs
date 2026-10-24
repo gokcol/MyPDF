@@ -306,7 +306,7 @@ pub fn extract_page<'a>(
         Rect::new(0.0, 0.0, w as f64, h as f64),
         cache,
         page.xref(),
-        interpret::InterpreterSettings::default(),
+        crate::render_fonts::settings(),
     );
     let mut device = TextDevice {
         result: PageText::default(),
@@ -545,7 +545,7 @@ fn run_worker(
             let raster = hayro::render(
                 page,
                 &render_cache,
-                &interpret::InterpreterSettings::default(),
+                &crate::render_fonts::settings(),
                 &hayro::RenderSettings::default(),
                 &hayro::PixmapSettings {
                     x_scale: scale,
@@ -598,7 +598,7 @@ pub fn render_page(bytes: &[u8], page: usize, scale: f32) -> Result<([usize; 2],
     let raster = hayro::render(
         page,
         &hayro::RenderCache::new(),
-        &interpret::InterpreterSettings::default(),
+        &crate::render_fonts::settings(),
         &hayro::RenderSettings::default(),
         &hayro::PixmapSettings {
             x_scale: scale,

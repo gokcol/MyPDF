@@ -225,7 +225,7 @@ pub fn export_images(
         let pix = hayro::render(
             page,
             &cache,
-            &hayro::hayro_interpret::InterpreterSettings::default(),
+            &crate::render_fonts::settings(),
             &hayro::RenderSettings::default(),
             &hayro::PixmapSettings {
                 x_scale: scale,

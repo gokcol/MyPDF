@@ -261,7 +261,7 @@ pub(crate) fn border_segments(bytes: &[u8], page_index: usize) -> Result<Vec<[f3
         Rect::new(0., 0., w as f64, h as f64),
         &cache,
         page.xref(),
-        interpret::InterpreterSettings::default(),
+        crate::render_fonts::settings(),
     );
     interpret::interpret_page(page, &mut context, &mut shapes);
     let mut result = Vec::new();
@@ -294,7 +294,7 @@ pub fn placement_guides(bytes: &[u8], page_index: usize) -> Result<PageGuides> {
         Rect::new(0., 0., w as f64, h as f64),
         &cache,
         page.xref(),
-        interpret::InterpreterSettings::default(),
+        crate::render_fonts::settings(),
     );
     interpret::interpret_page(page, &mut context, &mut shapes);
     let mut guides = PageGuides::default();
@@ -364,7 +364,7 @@ pub fn detect(bytes: &[u8]) -> Result<Vec<Suggestion>> {
             Rect::new(0., 0., w as f64, h as f64),
             &cache,
             page.xref(),
-            interpret::InterpreterSettings::default(),
+            crate::render_fonts::settings(),
         );
         interpret::interpret_page(page, &mut context, &mut shapes);
         let page_width = w as f64;

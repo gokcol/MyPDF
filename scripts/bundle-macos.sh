@@ -1,6 +1,7 @@
 #!/bin/sh
 # Build a native bundle, or pass --target aarch64-apple-darwin for release.
 # --output selects the destination bundle; --debug keeps development builds.
+# --review (also --no-document-handlers) excludes Finder document handlers.
 set -eu
 cd "$(dirname "$0")/.."
 if [ "$(uname -s)" != Darwin ]; then
@@ -10,15 +11,17 @@ fi
 profile=release
 target=${CARGO_BUILD_TARGET:-}
 output=dist/MyPDF.app
+document_handlers=true
 while [ $# -gt 0 ]; do
     case "$1" in
         --debug) profile=debug; shift ;;
+        --review|--no-document-handlers) document_handlers=false; shift ;;
         --target|--output)
             [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 1; }
             case "$1" in --target) target=$2 ;; --output) output=$2 ;; esac
             shift 2
             ;;
-        *) echo "Usage: $0 [--debug] [--target <macOS triple>] [--output <path.app>]" >&2; exit 1 ;;
+        *) echo "Usage: $0 [--debug] [--review|--no-document-handlers] [--target <macOS triple>] [--output <path.app>]" >&2; exit 1 ;;
     esac
 done
 case "$target" in
@@ -26,6 +29,10 @@ case "$target" in
     *) echo "Unsupported macOS target: $target" >&2; exit 1 ;;
 esac
 case "$output" in *.app) ;; *) echo "Bundle output must end in .app" >&2; exit 1 ;; esac
+# Review recipes often rename an optimized bundle without passing --debug.
+# Exclude those names too, so opening a test app cannot add another PDF handler.
+output_name=$(basename "$output" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+case "$profile:$output_name" in debug:*|*:*review.app) document_handlers=false ;; esac
 host=$(rustc -vV | sed -n 's/^host: //p')
 [ -n "$host" ] || { echo "Could not determine the Rust host target" >&2; exit 1; }
 target_dir=${CARGO_TARGET_DIR:-target}
@@ -71,6 +78,20 @@ app=$work/MyPDF.app
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$binary_dir/mypdf" "$app/Contents/MacOS/MyPDF"
 cp packaging/Info.plist "$app/Contents/Info.plist"
+if [ "$document_handlers" = false ]; then
+    # Change only the fresh bundle, before codesign. Signed release bundles and
+    # their rollback copies retain their original metadata and signatures.
+    python3 - "$app/Contents/Info.plist" <<'PY'
+from pathlib import Path
+import plistlib
+import sys
+
+path = Path(sys.argv[1])
+info = plistlib.loads(path.read_bytes())
+info.pop("CFBundleDocumentTypes", None)
+path.write_bytes(plistlib.dumps(info, sort_keys=False))
+PY
+fi
 mkdir -p "$work/MyPDF.iconset"
 "$icon_tool" "$work/MyPDF.png"
 for size in 16 32 128 256 512; do

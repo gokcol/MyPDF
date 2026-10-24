@@ -214,7 +214,7 @@ fn image_for_clipboard(marks: &[Annotation]) -> anyhow::Result<image::RgbaImage>
     let raster = hayro::render(
         &pdf.pages()[0],
         &hayro::RenderCache::new(),
-        &hayro::hayro_interpret::InterpreterSettings::default(),
+        &mypdf_milestone0::render_fonts::settings(),
         &hayro::RenderSettings::default(),
         &hayro::PixmapSettings {
             x_scale: scale,

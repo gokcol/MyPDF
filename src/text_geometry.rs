@@ -96,7 +96,7 @@ pub fn runs(bytes: &[u8], page: u32) -> Result<Vec<crate::document::TextRun>> {
         Rect::new(0., 0., w as f64, h as f64),
         &cache,
         page.xref(),
-        interpret::InterpreterSettings::default(),
+        crate::render_fonts::settings(),
     );
     let mut device = Geometry {
         boxes: HashMap::new(),

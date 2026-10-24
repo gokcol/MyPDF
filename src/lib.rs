@@ -31,6 +31,7 @@ pub mod pdf_font;
 pub mod proof;
 pub mod recovery;
 pub mod redact;
+pub mod render_fonts;
 pub mod review;
 pub mod security;
 pub mod signature_art;

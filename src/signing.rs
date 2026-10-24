@@ -548,7 +548,7 @@ pub fn signature_appearance(request: &DesktopSigningRequest) -> Result<Signature
         let raster = hayro::render(
             &pdf.pages()[0],
             &hayro::RenderCache::new(),
-            &hayro::hayro_interpret::InterpreterSettings::default(),
+            &crate::render_fonts::settings(),
             &hayro::RenderSettings::default(),
             &hayro::PixmapSettings {
                 x_scale: 2.0,

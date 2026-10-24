@@ -1,8 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
-use hayro::{
-    PixmapSettings, RenderCache, RenderSettings, hayro_interpret::InterpreterSettings,
-    hayro_syntax::Pdf,
-};
+use hayro::{PixmapSettings, RenderCache, RenderSettings, hayro_syntax::Pdf};
 use lopdf::{
     Dictionary, Document, Object, Stream, StringFormat,
     content::{Content, Operation},
@@ -404,7 +401,7 @@ pub fn render(bytes: &[u8], out: &Path, scale: f32) -> Result<Vec<RenderEvidence
         let pixmap = hayro::render(
             page,
             &cache,
-            &InterpreterSettings::default(),
+            &crate::render_fonts::settings(),
             &RenderSettings::default(),
             &PixmapSettings {
                 x_scale: scale,

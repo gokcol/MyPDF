@@ -306,7 +306,7 @@ fn render<'p>(bytes: &[u8], page: usize, areas: &'p [Rect], fill: [f32; 3]) -> R
         Rect::new(0., 0., w as f64, h as f64),
         &cache,
         page.xref(),
-        interpret::InterpreterSettings::default(),
+        crate::render_fonts::settings(),
     );
     let mut device = Probe::new(areas, fill);
     interpret::interpret_page(page, &mut context, &mut device);

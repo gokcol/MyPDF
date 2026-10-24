@@ -79,6 +79,7 @@ winresource = "0.1.34"
 
 [patch.crates-io]
 underskrift = { path = "vendor/underskrift" }
+hayro-interpret = { path = "vendor/hayro-interpret" }
 
 # Full symbols and incremental generations multiplied across the PDF engine,
 # desktop tests and examples used tens of GB. Keep everyday builds compact.

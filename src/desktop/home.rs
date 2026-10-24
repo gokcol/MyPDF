@@ -176,7 +176,7 @@ fn thumbnail(path: &Path) -> anyhow::Result<egui::ColorImage> {
     let raster = hayro::render(
         page,
         &hayro::RenderCache::new(),
-        &hayro::hayro_interpret::InterpreterSettings::default(),
+        &mypdf_milestone0::render_fonts::settings(),
         &hayro::RenderSettings::default(),
         &hayro::PixmapSettings {
             x_scale: scale,
