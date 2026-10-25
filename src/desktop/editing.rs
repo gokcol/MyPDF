@@ -7,6 +7,8 @@ mod callout_properties;
 mod drawing_properties;
 #[path = "note_reader.rs"]
 mod note_reader;
+#[path = "placement_sizes.rs"]
+mod placement_sizes;
 use mypdf_milestone0::{
     annotations::{
         self as ann, Annotation, Box2, Kind, Markup, Primitive, StrokeStyle, Style, Symbol,
@@ -405,7 +407,11 @@ fn placement(editor: &EditorState, tab: &Tab, page: usize, at: [f32; 2], centere
                 Some("Arrows") => 180.0,
                 _ => 240.0,
             };
-            (edge * aspect.min(1.0), edge / aspect.max(1.0))
+            let fallback = [edge * aspect.min(1.0), edge / aspect.max(1.0)];
+            let size = editor.placed.as_ref().map_or(fallback, |asset| {
+                editor.asset_placement_size(asset, fallback, tab.pages[page])
+            });
+            (size[0], size[1])
         }
         _ => (52.0, 52.0),
     };
@@ -436,7 +442,7 @@ fn place(
 ) {
     let r = placement(editor, tab, page, at, centered);
     let a = editor.base_annotation(tab, page, r, at, at, &[at]);
-    commit_new(editor, tab, a, status);
+    commit_new(editor, tab, a, false, status);
     editor.tool = Tool::Select;
 }
 
@@ -557,6 +563,7 @@ pub(super) struct EditorState {
     pub library: Option<Library>,
     library_error: Option<String>,
     placed: Option<Asset>,
+    placement_sizes: placement_sizes::State,
     pub(super) draft: Option<Annotation>,
     pub(super) annotation_text: Option<annotation_text::State>,
     // Document, annotation, last committed revision, and focused property field.
@@ -660,6 +667,7 @@ impl EditorState {
         #[cfg(test)]
         let root =
             std::env::temp_dir().join(format!("mypdf-headless-{:016x}", rand::random::<u64>()));
+        let placement_sizes = placement_sizes::State::load(root.clone());
         let (library, library_error) = match Library::open(root) {
             Ok(l) => (Some(l), None),
             Err(e) => (None, Some(format!("{e:#}"))),
@@ -694,8 +702,9 @@ impl EditorState {
             signature_picker: false,
             asset_busy: false,
             library,
-            library_error,
+            library_error: library_error.or_else(|| placement_sizes.error.clone()),
             placed: None,
+            placement_sizes,
             draft: None,
             annotation_text: None,
             property_edit: None,
@@ -850,6 +859,14 @@ impl EditorState {
         points: &[[f32; 2]],
     ) -> Annotation {
         let mut r = r;
+        if self.tool == Tool::Asset
+            && let Some(asset) = &self.placed
+        {
+            // Explicit drag sizing fits the original artwork inside the drag.
+            let aspect = asset.aspect.max(0.001);
+            let width = (r[2] - r[0]).min((r[3] - r[1]) * aspect);
+            r = [r[0], r[1], r[0] + width, r[1] + width / aspect];
+        }
         if let Some(ratio) = match self.tool {
             Tool::Square | Tool::Circle => Some(1.),
             Tool::Semicircle => Some(2.),
@@ -1320,16 +1337,7 @@ fn paint_annotation_impl(
                 }
                 if fill {
                     let c = color(a.style.fill.unwrap_or(a.style.color), a.style.opacity);
-                    let polygon: Vec<_> = p.iter().map(|p| [p.x, p.y]).collect();
-                    let mut mesh = egui::Mesh::default();
-                    for triangle in ann::triangulate(&polygon) {
-                        let start = mesh.vertices.len() as u32;
-                        for p in triangle {
-                            mesh.colored_vertex(pos2(p[0], p[1]), c);
-                        }
-                        mesh.add_triangle(start, start + 1, start + 2);
-                    }
-                    painter.add(egui::Shape::mesh(mesh));
+                    annotation_geometry::paint_fill(painter, &p, c);
                 } else {
                     if closed {
                         p.push(p[0]);
@@ -1354,77 +1362,23 @@ fn paint_annotation_impl(
                     color(a.style.color, a.style.opacity),
                 );
             }
-            Primitive::Text {
-                text,
-                rect,
-                size,
-                centered,
-                color: text_color,
-            } => {
+            text @ Primitive::Text { .. } => {
                 if inline_editor
                     && matches!(a.kind, Kind::Text { .. })
                     && annotation_text::hides_text(editor, a)
                 {
                     continue;
                 }
-                let c = color(text_color.unwrap_or(a.style.color), a.style.opacity);
-                let font =
-                    egui::FontId::new(size * scale, egui::FontFamily::Name("annotation".into()));
-                let galley = ctx.fonts_mut(|f| {
-                    f.layout(
-                        text.replace('\t', "    "),
-                        font,
-                        c,
-                        ((rect[2] - rect[0] - 8.0) * scale).max(1.0),
-                    )
-                });
-                let mut p = [rect[0] + 4.0, rect[1] + 4.0];
-                if centered {
-                    p = [
-                        (rect[0] + rect[2]) / 2.0 - galley.size().x / scale / 2.0,
-                        (rect[1] + rect[3]) / 2.0 - galley.size().y / scale / 2.0,
-                    ];
-                }
-                if a.flip_x || a.flip_y {
-                    // Transform glyph vertices as well as the text origin: mirrored
-                    // text must match its saved PDF appearance, not just move sides.
-                    for row in &galley.rows {
-                        let mut mesh = row.visuals.mesh.clone();
-                        for v in &mut mesh.vertices {
-                            v.pos = point([
-                                p[0] + (row.pos.x + v.pos.x) / scale,
-                                p[1] + (row.pos.y + v.pos.y) / scale,
-                            ]);
-                        }
-                        painter.add(egui::Shape::mesh(mesh));
-                    }
-                } else {
-                    painter.add(
-                        egui::epaint::TextShape::new(point(p), galley, c)
-                            .with_angle(a.rotation.to_radians()),
-                    );
-                }
+                annotation_render::paint_text(ctx, painter, a, page_rect, scale, text);
             }
             Primitive::Image { png, rect } => {
-                let key = mypdf_milestone0::identity::fingerprint(&png);
-                if !editor.images.contains_key(&key)
-                    && let Ok(image) = assets::decode_png(&png)
-                {
-                    let rgba = image.thumbnail(1024, 1024).into_rgba8();
-                    let size = [rgba.width() as usize, rgba.height() as usize];
-                    let texture = ctx.load_texture(
-                        key.clone(),
-                        egui::ColorImage::from_rgba_unmultiplied(size, &rgba),
-                        egui::TextureOptions::LINEAR,
-                    );
-                    let size = texture.size()[0] * texture.size()[1] * 4;
-                    editor.trim_image_cache_to((64 * 1024 * 1024_usize).saturating_sub(size));
-                    editor.images.insert(key.clone(), texture);
-                }
-                if let Some(image) = editor.images.get(&key) {
-                    editor
-                        .image_used
-                        .insert(key.clone(), ctx.cumulative_frame_nr());
+                if let Some(image) = annotation_image::texture(
+                    ctx,
+                    &png,
+                    vec2((rect[2] - rect[0]).abs(), (rect[3] - rect[1]).abs()) * scale,
+                    &mut editor.images,
+                    &mut editor.image_used,
+                ) {
                     let mut mesh = egui::Mesh::with_texture(image.id());
                     for (p, uv) in [
                         ([rect[0], rect[1]], [0.0, 0.0]),
@@ -1627,7 +1581,7 @@ pub(super) fn page_interaction(
                         },
                         editor.style.clone(),
                     );
-                    commit_new(editor, tab, a, status);
+                    commit_new(editor, tab, a, false, status);
                 } else {
                     *status = Some(("Add more points before finishing this shape".into(), false));
                     editor.vertices = Some(v);
@@ -1956,7 +1910,7 @@ pub(super) fn page_interaction(
                     let mut copy = a.clone();
                     copy.id = format!("{:032x}", rand::random::<u128>());
                     copy.object.group = None;
-                    commit_new(editor, tab, copy, status);
+                    commit_new(editor, tab, copy, false, status);
                 } else if gesture.original.is_some() {
                     if let Some(s) = &mut tab.session {
                         let mut entries = s.annotations.clone();
@@ -1964,12 +1918,17 @@ pub(super) fn page_interaction(
                             *target = a.clone();
                         }
                         match s.commit(entries) {
-                            Ok(()) => selection::set(tab, editor, vec![a.id.clone()]),
+                            Ok(()) => {
+                                if let Some(original) = &gesture.original {
+                                    editor.remember_asset_resize(original, &a);
+                                }
+                                selection::set(tab, editor, vec![a.id.clone()]);
+                            }
                             Err(e) => *status = Some((format!("{e:#}"), true)),
                         }
                     }
                 } else if !matches!(editor.tool, Tool::Pen) || gesture.points.len() > 1 {
-                    commit_new(editor, tab, a, status);
+                    commit_new(editor, tab, a, true, status);
                 }
             }
         } else {
@@ -2316,6 +2275,7 @@ fn commit_new(
     editor: &mut EditorState,
     tab: &mut Tab,
     a: Annotation,
+    explicitly_sized: bool,
     status: &mut Option<(String, bool)>,
 ) {
     if let Some(s) = &mut tab.session {
@@ -2323,6 +2283,9 @@ fn commit_new(
         entries.push(a.clone());
         match s.commit(entries) {
             Ok(()) => {
+                if explicitly_sized && editor.tool == Tool::Asset {
+                    editor.remember_asset_size(&a);
+                }
                 tab.group.clear();
                 tab.selected_annotation = Some(a.id.clone());
                 if matches!(a.kind, Kind::Note { .. }) {
@@ -2428,9 +2391,14 @@ impl Viewer {
         if target == draft {
             return true;
         }
+        let original = target.clone();
+        let draft = draft.clone();
         *target = draft.clone();
         match session.commit(entries) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.editor.remember_asset_resize(&original, &draft);
+                true
+            }
             Err(e) => {
                 self.status = Some((
                     format!("Could not apply annotation properties: {e:#}"),
@@ -2959,6 +2927,7 @@ impl Viewer {
                 .filter(|(id, _)| *id == tab.id && (pointer_active || focus))
                 .map(|(_, revision)| revision);
             if let Some(revision) = selection::commit(tab, &next, previous, &mut self.status) {
+                self.editor.remember_asset_resizes(&marks, &next);
                 self.editor.group_edit = Some((tab.id, revision));
             }
         }
@@ -2972,8 +2941,8 @@ impl Viewer {
                 b[0] < 0. || b[1] < 0. || b[2] > p.width || b[3] > p.height
             }) {
                 self.status=Some(("This arrangement would extend beyond the page. Move the objects inward or choose a smaller reference object.".into(),true));
-            } else {
-                selection::commit(tab, &next, None, &mut self.status);
+            } else if selection::commit(tab, &next, None, &mut self.status).is_some() {
+                self.editor.remember_asset_resizes(&marks, &next);
             }
         }
         if duplicate && let Some(s) = &mut tab.session {
@@ -3446,6 +3415,9 @@ impl Viewer {
                 self.status = Some((format!("{e:#}"), true));
             } else {
                 self.status = None;
+                if let Some(draft) = self.editor.draft.clone() {
+                    self.editor.remember_asset_resize(&selected, &draft);
+                }
                 self.editor.property_edit =
                     Some((tab.id, selected.id.clone(), s.revision(), property_focus));
             }
@@ -4063,9 +4035,12 @@ impl Viewer {
         let width = 180_f32
             .min(page.width * 0.6)
             .min(page.height * 0.6 * asset.aspect);
+        let [width, height] =
+            self.editor
+                .asset_placement_size(&asset, [width, width / asset.aspect], page);
         let mut mark = Annotation::new(
             tab.page,
-            [0., 0., width, width / asset.aspect],
+            [0., 0., width, height],
             asset.kind.clone(),
             asset.style.clone(),
         );

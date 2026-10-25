@@ -24,6 +24,149 @@ pub(super) struct PageClip {
     bytes: Vec<u8>,
     pages: usize,
     from: String,
+    followup: Option<ClipFollowup>,
+}
+struct ClipFollowup {
+    tab: u64,
+    revision: u64,
+    operation: ClipOperation,
+    selected: Vec<usize>,
+}
+#[derive(Clone, Copy, PartialEq)]
+enum ClipOperation {
+    Copy,
+    Cut,
+    Duplicate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum ThumbnailAction {
+    Copy,
+    Cut,
+    PasteBefore,
+    PasteAfter,
+    Duplicate,
+    RotateLeft,
+    RotateRight,
+    Extract,
+    Delete,
+    SelectAll,
+}
+impl ThumbnailAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Copy => "Copy pages",
+            Self::Cut => "Cut pages",
+            Self::PasteBefore => "Paste before",
+            Self::PasteAfter => "Paste after",
+            Self::Duplicate => "Duplicate pages",
+            Self::RotateLeft => "Rotate left",
+            Self::RotateRight => "Rotate right",
+            Self::Extract => "Extract pages…",
+            Self::Delete => "Delete pages",
+            Self::SelectAll => "Select all pages",
+        }
+    }
+    fn icon(self) -> Icon {
+        match self {
+            Self::Copy | Self::Duplicate => Icon::Copy,
+            Self::Cut => Icon::Cut,
+            Self::PasteBefore | Self::PasteAfter => Icon::Paste,
+            Self::RotateLeft => Icon::RotateLeft,
+            Self::RotateRight => Icon::RotateRight,
+            Self::Extract => Icon::Extract,
+            Self::Delete => Icon::Trash,
+            Self::SelectAll => Icon::Select,
+        }
+    }
+    fn shortcut(self) -> Option<egui::KeyboardShortcut> {
+        use egui::{Key, KeyboardShortcut, Modifiers as M};
+        let (modifiers, key) = match self {
+            Self::Copy => (M::COMMAND, Key::C),
+            Self::Cut => (M::COMMAND, Key::X),
+            Self::PasteAfter => (M::COMMAND, Key::V),
+            Self::Duplicate => (M::COMMAND, Key::D),
+            Self::SelectAll => (M::COMMAND, Key::A),
+            Self::Delete => (
+                M::NONE,
+                if cfg!(target_os = "macos") {
+                    Key::Backspace
+                } else {
+                    Key::Delete
+                },
+            ),
+            _ => return None,
+        };
+        Some(KeyboardShortcut::new(modifiers, key))
+    }
+}
+
+/// A secondary click targets that page without throwing away a multiselection.
+/// Both thumbnail views share this selection policy and compact menu.
+pub(super) fn thumbnail_context_menu(
+    ui: &mut egui::Ui,
+    response: &egui::Response,
+    organizer: &mut Organizer,
+    tab: &mut Tab,
+    page: usize,
+    blocked: bool,
+) -> Option<ThumbnailAction> {
+    if response.clicked() || response.secondary_clicked() {
+        organizer.select_thumbnail(
+            tab,
+            page,
+            ui.input(|i| i.modifiers),
+            response.secondary_clicked(),
+        );
+        if let Some(focus) = ui.ctx().memory(|m| m.focused()) {
+            ui.ctx().memory_mut(|m| m.surrender_focus(focus));
+        }
+    }
+    let mut action = None;
+    response.context_menu(|ui| {
+        let items = [
+            ThumbnailAction::Copy,
+            ThumbnailAction::Cut,
+            ThumbnailAction::PasteBefore,
+            ThumbnailAction::PasteAfter,
+            ThumbnailAction::Duplicate,
+            ThumbnailAction::RotateLeft,
+            ThumbnailAction::RotateRight,
+            ThumbnailAction::Extract,
+            ThumbnailAction::Delete,
+            ThumbnailAction::SelectAll,
+        ];
+        let width = ui::menu_width(ui, items.iter().map(|a| (a.label(), a.shortcut())));
+        ui.set_width(width);
+        ui.spacing_mut().interact_size.y = 24.;
+        ui.spacing_mut().item_spacing.y = 2.;
+        ui.spacing_mut().button_padding = vec2(6., 2.);
+        for item in items {
+            if matches!(
+                item,
+                ThumbnailAction::Duplicate
+                    | ThumbnailAction::RotateLeft
+                    | ThumbnailAction::Extract
+                    | ThumbnailAction::Delete
+                    | ThumbnailAction::SelectAll
+            ) {
+                ui.separator();
+            }
+            if ui
+                .add_enabled(
+                    organizer.action_enabled(tab, item, blocked),
+                    ui::MenuItem::new(item.icon(), item.label())
+                        .shortcut(item.shortcut())
+                        .width(width),
+                )
+                .clicked()
+            {
+                action = Some(item);
+                ui.close();
+            }
+        }
+    });
+    action
 }
 pub(super) struct Organizer {
     tab: u64,
@@ -46,6 +189,8 @@ pub(super) struct Organizer {
     clip_rx: mpsc::Receiver<Result<PageClip, String>>,
     /// Pages to select once a paste has reloaded: tab, page count, pages.
     pending_select: Option<(u64, usize, BTreeSet<usize>)>,
+    thumbnail_focus: Option<u64>,
+    thumbnail_bounds: Option<Rect>,
 }
 impl Organizer {
     pub fn new() -> Self {
@@ -72,6 +217,88 @@ impl Organizer {
             clip_tx,
             clip_rx,
             pending_select: None,
+            thumbnail_focus: None,
+            thumbnail_bounds: None,
+        }
+    }
+    pub(super) fn use_tab(&mut self, tab: &Tab) {
+        if self.tab != tab.id {
+            self.tab = tab.id;
+            self.pressed = None;
+            self.dragged = None;
+            self.selected = BTreeSet::from([tab.page]);
+            self.range = (tab.page + 1).to_string();
+            self.crop = false;
+        }
+        self.selected.retain(|page| *page < tab.pages.len());
+        // A new document may first be shown before Loaded supplies its pages.
+        // Restore the current page once ready, and after deleting/rotating pages,
+        // so sidebar actions have the same valid default target as Pages mode.
+        if self.selected.is_empty() && !tab.pages.is_empty() {
+            self.selected.insert(tab.page.min(tab.pages.len() - 1));
+        }
+        if let Some((id, count, pages)) = &self.pending_select
+            && *id == tab.id
+            && *count == tab.pages.len()
+        {
+            self.selected = pages.clone();
+            self.pending_select = None;
+        }
+    }
+    pub(super) fn thumbnail_area(&mut self, tab: u64, bounds: Rect) {
+        if self.thumbnail_focus.is_some_and(|id| id != tab) {
+            self.thumbnail_focus = None;
+        }
+        self.thumbnail_bounds = Some(bounds);
+    }
+    fn select_thumbnail(
+        &mut self,
+        tab: &mut Tab,
+        page: usize,
+        modifiers: egui::Modifiers,
+        secondary: bool,
+    ) {
+        self.use_tab(tab);
+        self.thumbnail_focus = Some(tab.id);
+        if secondary {
+            if !self.selected.contains(&page) {
+                self.selected = BTreeSet::from([page]);
+            }
+        } else if modifiers.command {
+            if !self.selected.remove(&page) {
+                self.selected.insert(page);
+            }
+        } else if modifiers.shift {
+            let anchor = self.selected.first().copied().unwrap_or(page);
+            self.selected.extend(anchor.min(page)..=anchor.max(page));
+        } else {
+            self.selected = BTreeSet::from([page]);
+        }
+        // The caller owns navigation: the sidebar must call Tab::jump while
+        // the previous reading position is still available for Back history.
+        self.range = self
+            .selected
+            .iter()
+            .map(|p| (p + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
+    fn action_enabled(&self, tab: &Tab, action: ThumbnailAction, blocked: bool) -> bool {
+        let selected = self.tab == tab.id && !self.selected.is_empty();
+        let readable = selected && tab.session.is_some() && !blocked;
+        let editable = readable && tab.session.as_ref().is_some_and(|s| s.editable);
+        match action {
+            ThumbnailAction::Copy | ThumbnailAction::Extract => readable,
+            ThumbnailAction::Cut | ThumbnailAction::Delete => {
+                editable && self.selected.len() < tab.pages.len()
+            }
+            ThumbnailAction::PasteBefore | ThumbnailAction::PasteAfter => {
+                editable && self.clipboard.is_some()
+            }
+            ThumbnailAction::Duplicate
+            | ThumbnailAction::RotateLeft
+            | ThumbnailAction::RotateRight => editable,
+            ThumbnailAction::SelectAll => !tab.pages.is_empty(),
         }
     }
 }
@@ -170,6 +397,31 @@ impl Tab {
     }
 }
 impl Viewer {
+    /// Page snapshots and document replacement must not leave an editor draft
+    /// behind on an old page index or silently omit it from a copied page.
+    fn page_edits_ready(&mut self, copying: bool) -> bool {
+        let Some(id) = self.tabs.get(self.active).map(|tab| tab.id) else {
+            return false;
+        };
+        let verb = if copying { "copying" } else { "changing" };
+        if self.pending_form_edits(id) {
+            self.focus_pending_form_edits(id);
+            self.status = Some((
+                format!("Apply or discard the pending form changes before {verb} pages."),
+                false,
+            ));
+            return false;
+        }
+        if self.unfinished_edit(Some(id)) {
+            self.status = Some((
+                format!("Finish the current edit with Done or Cancel before {verb} pages."),
+                false,
+            ));
+            return false;
+        }
+        self.apply_pending_annotation()
+    }
+
     pub(super) fn page_events(&mut self, ctx: &egui::Context) {
         for result in self.organizer.rx.try_iter() {
             self.organizer.busy = false;
@@ -214,9 +466,14 @@ impl Viewer {
                 Err(e) => self.status = Some((e, true)),
             }
         }
-        for result in self.organizer.clip_rx.try_iter() {
+        let copied: Vec<_> = self.organizer.clip_rx.try_iter().collect();
+        for result in copied {
             match result {
-                Ok(clip) => {
+                Ok(mut clip) => {
+                    let followup = clip.followup.take();
+                    let duplicate = followup
+                        .as_ref()
+                        .is_some_and(|f| f.operation == ClipOperation::Duplicate);
                     self.status = Some((
                         format!(
                             "Copied {} • Open another PDF in Pages and press ⌘V (or Paste pages) to insert after the selected page",
@@ -224,8 +481,37 @@ impl Viewer {
                         ),
                         false,
                     ));
-                    ctx.copy_text(format!("{} from {}", plural(clip.pages, "page"), clip.from));
-                    self.organizer.clipboard = Some(Arc::new(clip));
+                    let clip = Arc::new(clip);
+                    if !duplicate {
+                        ctx.copy_text(format!("{} from {}", plural(clip.pages, "page"), clip.from));
+                        self.organizer.clipboard = Some(clip.clone());
+                    }
+                    if let Some(followup) = followup {
+                        let unchanged = !self.organizer.busy
+                            && !self.content.busy
+                            && self.tabs.get(self.active).is_some_and(|tab| {
+                                tab.id == followup.tab
+                                    && tab.session.as_ref().is_some_and(|s| {
+                                        s.editable && s.revision() == followup.revision
+                                    })
+                            });
+                        if !unchanged {
+                            self.status = Some(("The document changed or another page operation is running. The original pages are unchanged.".into(), true));
+                            continue;
+                        }
+                        if followup.operation == ClipOperation::Cut {
+                            self.page_change(ctx, Operation::Delete(followup.selected));
+                            if self.organizer.busy {
+                                self.organizer.change_name = "Cut pages";
+                            }
+                        } else {
+                            let at = followup.selected.last().map_or(0, |page| page + 1);
+                            self.insert_page_clip(ctx, &clip, at);
+                            if self.organizer.busy {
+                                self.organizer.change_name = "Duplicate pages";
+                            }
+                        }
+                    }
                 }
                 Err(e) => self.status = Some((e, true)),
             }
@@ -258,7 +544,7 @@ impl Viewer {
         }
     }
     pub(super) fn page_change(&mut self, ctx: &egui::Context, operation: Operation) {
-        if self.organizer.busy || self.content.busy || !self.apply_pending_annotation() {
+        if self.organizer.busy || self.content.busy || !self.page_edits_ready(false) {
             return;
         }
         let Some(tab) = self.tabs.get(self.active) else {
@@ -323,14 +609,7 @@ impl Viewer {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
-        if self.organizer.tab != tab.id {
-            self.organizer.tab = tab.id;
-            self.organizer.pressed = None;
-            self.organizer.dragged = None;
-            self.organizer.selected = BTreeSet::from([tab.page]);
-            self.organizer.range = (tab.page + 1).to_string();
-            self.organizer.crop = false;
-        }
+        self.organizer.use_tab(tab);
         if let Some((id, count, pages)) = &self.organizer.pending_select
             && *id == tab.id
             && *count == tab.pages.len()
@@ -497,8 +776,128 @@ impl Viewer {
             _ => {}
         }
     }
+    fn thumbnail_owns_input(&mut self, ctx: &egui::Context) -> bool {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return false;
+        };
+        let pages_mode = self.editor.mode == editing::Mode::Pages;
+        if !pages_mode {
+            if !self.sidebar || self.search || self.outline || self.editor.annotation_sidebar {
+                self.organizer.thumbnail_focus = None;
+            }
+            if !egui::Popup::is_any_open(ctx)
+                && ctx.input(|i| {
+                    i.pointer.any_pressed()
+                        && i.pointer.interact_pos().is_some_and(|p| {
+                            self.organizer
+                                .thumbnail_bounds
+                                .is_none_or(|bounds| !bounds.contains(p))
+                        })
+                })
+            {
+                self.organizer.thumbnail_focus = None;
+            }
+        }
+        (pages_mode || self.organizer.thumbnail_focus == Some(tab.id))
+            && !self.home.visible
+            && !self.digital.open
+            && !self.editor.signature_open
+            && !self.editor.library_open
+            && !self.editor.selection_dialog_open()
+            && !self.about_open
+            && !self.recovery.open
+            && self.close_intent.is_none()
+            && !self.productivity.owns_input()
+            && !self.workbench_owns_shortcuts()
+            && !ctx.wants_keyboard_input()
+            && !self.editor.text_editing
+            && !ctx.memory(|m| m.top_modal_layer().is_some())
+    }
+    /// Thumbnail focus owns only whole-page commands, leaving normal PDF text,
+    /// annotation and numeric-field shortcuts untouched after a canvas click.
+    pub(super) fn thumbnail_command(&mut self, action: &str, ctx: &egui::Context) -> bool {
+        let command = match action {
+            "copy" => ThumbnailAction::Copy,
+            "cut" => ThumbnailAction::Cut,
+            "paste" => ThumbnailAction::PasteAfter,
+            "select_all" => ThumbnailAction::SelectAll,
+            "duplicate" | "object_duplicate" => ThumbnailAction::Duplicate,
+            "delete" => ThumbnailAction::Delete,
+            _ => return false,
+        };
+        if !self.thumbnail_owns_input(ctx) {
+            return false;
+        }
+        self.thumbnail_action(ctx, command);
+        true
+    }
+    pub(super) fn thumbnail_shortcuts(&mut self, ctx: &egui::Context) -> bool {
+        if !self.thumbnail_owns_input(ctx) {
+            return false;
+        }
+        for (key, action) in [
+            ("copy", ThumbnailAction::Copy),
+            ("cut", ThumbnailAction::Cut),
+            ("paste", ThumbnailAction::PasteAfter),
+            ("object_duplicate", ThumbnailAction::Duplicate),
+            ("all", ThumbnailAction::SelectAll),
+            ("delete", ThumbnailAction::Delete),
+        ] {
+            if content::context::consume_action(ctx, key) {
+                self.thumbnail_action(ctx, action);
+                return true;
+            }
+        }
+        false
+    }
+    pub(super) fn thumbnail_action(&mut self, ctx: &egui::Context, action: ThumbnailAction) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        self.organizer.use_tab(tab);
+        if !self
+            .organizer
+            .action_enabled(tab, action, self.organizer.busy || self.content.busy)
+        {
+            return;
+        }
+        let selected: Vec<_> = self.organizer.selected.iter().copied().collect();
+        match action {
+            ThumbnailAction::Copy => self.copy_pages(ctx),
+            ThumbnailAction::Cut => self.copy_pages_operation(ctx, ClipOperation::Cut),
+            ThumbnailAction::Duplicate => self.copy_pages_operation(ctx, ClipOperation::Duplicate),
+            ThumbnailAction::PasteAfter => self.paste_pages(ctx),
+            ThumbnailAction::PasteBefore => {
+                if let Some(clip) = self.organizer.clipboard.clone() {
+                    self.insert_page_clip(ctx, &clip, selected.first().copied().unwrap_or(0));
+                }
+            }
+            ThumbnailAction::RotateLeft | ThumbnailAction::RotateRight => self.page_change(
+                ctx,
+                Operation::Rotate {
+                    pages: selected,
+                    clockwise: action == ThumbnailAction::RotateRight,
+                },
+            ),
+            ThumbnailAction::Delete => self.page_change(ctx, Operation::Delete(selected)),
+            ThumbnailAction::Extract => self.export_pages(ctx, false),
+            ThumbnailAction::SelectAll => {
+                self.organizer.selected = (0..tab.pages.len()).collect();
+                self.organizer.range = format!("1-{}", tab.pages.len());
+            }
+        }
+    }
     /// Copy the selected pages, with their annotations, to the app's page clipboard.
     pub(super) fn copy_pages(&mut self, ctx: &egui::Context) {
+        self.copy_pages_operation(ctx, ClipOperation::Copy);
+    }
+    fn copy_pages_operation(&mut self, ctx: &egui::Context, operation: ClipOperation) {
+        if self.organizer.busy
+            || self.content.busy
+            || !self.page_edits_ready(operation == ClipOperation::Copy)
+        {
+            return;
+        }
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
@@ -508,9 +907,14 @@ impl Viewer {
         } else {
             vec![tab.page]
         };
-        if selected.is_empty() {
+        if selected.is_empty()
+            || (operation != ClipOperation::Copy
+                && (!s.editable
+                    || (operation == ClipOperation::Cut && selected.len() >= tab.pages.len())))
+        {
             return;
         }
+        let id = tab.id;
         let (source, annotations, revision) =
             (s.source.clone(), s.annotations.clone(), s.revision());
         let from = tab.name();
@@ -529,6 +933,12 @@ impl Viewer {
                         bytes: pages::extract(&current, &selected)?,
                         pages: selected.len(),
                         from,
+                        followup: (operation != ClipOperation::Copy).then_some(ClipFollowup {
+                            tab: id,
+                            revision,
+                            operation,
+                            selected,
+                        }),
                     })
                 },
             ))
@@ -556,7 +966,17 @@ impl Viewer {
         } else {
             count
         };
+        self.insert_page_clip(ctx, &clip, at);
+    }
+    fn insert_page_clip(&mut self, ctx: &egui::Context, clip: &PageClip, at: usize) {
+        if self.organizer.busy || self.content.busy {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
         let id = tab.id;
+        let count = tab.pages.len();
         self.page_change(
             ctx,
             Operation::InsertPdf {
@@ -687,7 +1107,7 @@ impl Viewer {
         }
     }
     fn export_pages(&mut self, ctx: &egui::Context, split: bool) {
-        if self.organizer.busy || self.content.busy || !self.apply_pending_annotation() {
+        if self.organizer.busy || self.content.busy || !self.page_edits_ready(true) {
             return;
         }
         let Some(tab) = self.tabs.get(self.active) else {
@@ -815,6 +1235,8 @@ impl Viewer {
     }
     pub(super) fn page_overview(&mut self, ctx: &egui::Context) {
         let mut drop_before = None;
+        let mut context_action = None;
+        let blocked = self.organizer.busy || self.content.busy;
         let first_press = ctx.input(|i| {
             i.events.iter().find_map(|e| match e {
                 egui::Event::PointerButton {
@@ -835,6 +1257,9 @@ impl Viewer {
                     ui.label("Open a PDF to organize its pages.");
                     return;
                 };
+                self.organizer.use_tab(tab);
+                self.organizer
+                    .thumbnail_area(tab.id, ui.max_rect().intersect(ui.clip_rect()));
                 let columns = ((ui.available_width() + 24.0) / 174.0).floor().max(1.0) as usize;
                 let cell = (ui.available_width() - (columns - 1) as f32 * 24.0) / columns as f32;
                 let count = tab.pages.len();
@@ -974,27 +1399,18 @@ impl Viewer {
                                             theme::muted()
                                         },
                                     );
+                                    if let Some(action) = thumbnail_context_menu(
+                                        ui,
+                                        &response,
+                                        &mut self.organizer,
+                                        tab,
+                                        i,
+                                        blocked,
+                                    ) {
+                                        context_action = Some(action);
+                                    }
                                     if response.clicked() {
-                                        let modifiers = ui.input(|i| i.modifiers);
-                                        if modifiers.command {
-                                            if !self.organizer.selected.remove(&i) {
-                                                self.organizer.selected.insert(i);
-                                            }
-                                        } else if modifiers.shift {
-                                            let start = self
-                                                .organizer
-                                                .selected
-                                                .first()
-                                                .copied()
-                                                .unwrap_or(i);
-                                            self.organizer
-                                                .selected
-                                                .extend(start.min(i)..=start.max(i));
-                                        } else {
-                                            self.organizer.selected = BTreeSet::from([i]);
-                                        }
                                         tab.page = i;
-                                        self.organizer.range = (i + 1).to_string();
                                     }
                                     if response.double_clicked() {
                                         self.editor.mode = editing::Mode::Read;
@@ -1031,6 +1447,9 @@ impl Viewer {
                         }
                     });
             });
+        if let Some(action) = context_action {
+            self.thumbnail_action(ctx, action);
+        }
         if let Some((start, origin)) = self.organizer.pressed
             && pointer.is_some_and(|p| p.distance(origin) > 4.0)
         {
@@ -1287,5 +1706,511 @@ mod tests {
         until(&mut app, &|a| {
             a.tabs[1].pages.len() == 2 && ready(&a.tabs[1])
         });
+    }
+
+    fn thumbnail_fixture() -> (Viewer, egui::Context) {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        let mut bytes = mypdf_milestone0::convert::blank(500., 500.).unwrap();
+        for width in [400., 300., 200.] {
+            bytes = pages::apply(
+                &bytes,
+                &Operation::InsertBlank {
+                    at: 0,
+                    width,
+                    height: 500.,
+                },
+            )
+            .unwrap();
+        }
+        app.open_memory(PathBuf::from("Thumbnail page commands.pdf"), bytes, &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.home.visible = false;
+        app.editor.mode = editing::Mode::Read;
+        app.sidebar = true;
+        app.organizer.use_tab(&app.tabs[0]);
+        (app, ctx)
+    }
+    fn thumbnail_frame(
+        app: &mut Viewer,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1200., 900.))),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                app.page_events(ctx);
+                app.events(ctx);
+                app.sidebar(ctx);
+                egui::CentralPanel::default().show(ctx, |_ui| {});
+            },
+        )
+    }
+    fn until_thumbnail(app: &mut Viewer, ctx: &egui::Context, ready: impl Fn(&Viewer) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !ready(app) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "status={:?}; active={}; busy={}; tabs={:?}",
+                app.status,
+                app.active,
+                app.organizer.busy,
+                app.tabs
+                    .iter()
+                    .map(|tab| (
+                        &tab.path,
+                        tab.pages.len(),
+                        tab.session.as_ref().map(|s| (s.editable, s.revision())),
+                        &tab.error
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            thumbnail_frame(app, ctx, vec![]);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    #[test]
+    fn thumbnail_secondary_selection_preserves_multiple_pages_and_command_shift_ranges() {
+        let (mut app, _ctx) = thumbnail_fixture();
+        let tab = &mut app.tabs[0];
+        let organizer = &mut app.organizer;
+        organizer.select_thumbnail(tab, 0, egui::Modifiers::NONE, false);
+        organizer.select_thumbnail(tab, 2, egui::Modifiers::COMMAND, false);
+        assert_eq!(organizer.selected, BTreeSet::from([0, 2]));
+        organizer.select_thumbnail(tab, 2, egui::Modifiers::NONE, true);
+        assert_eq!(organizer.selected, BTreeSet::from([0, 2]));
+        organizer.select_thumbnail(tab, 1, egui::Modifiers::NONE, true);
+        assert_eq!(organizer.selected, BTreeSet::from([1]));
+        organizer.select_thumbnail(tab, 3, egui::Modifiers::SHIFT, false);
+        assert_eq!(organizer.selected, BTreeSet::from([1, 2, 3]));
+        assert_eq!(organizer.range, "2, 3, 4");
+    }
+
+    #[test]
+    fn sidebar_thumbnail_navigation_records_history_and_secondary_click_only_selects() {
+        let (mut app, ctx) = thumbnail_fixture();
+        thumbnail_frame(&mut app, &ctx, vec![]);
+        let output = thumbnail_frame(&mut app, &ctx, vec![]);
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let thumbnail_point = |label| {
+            let bounds = nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .unwrap()
+                .1
+                .bounds()
+                .unwrap();
+            pos2(
+                ((bounds.x0 + bounds.x1) / 2.) as f32,
+                ((bounds.y0 + bounds.y1) / 2.) as f32,
+            )
+        };
+        let click = |app: &mut Viewer, point, button| {
+            for pressed in [true, false] {
+                thumbnail_frame(
+                    app,
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+        };
+
+        click(
+            &mut app,
+            thumbnail_point("Go to page 3"),
+            egui::PointerButton::Primary,
+        );
+        assert_eq!(app.tabs[0].page, 2);
+        assert_eq!(app.tabs[0].back, vec![(0, 0.)]);
+        app.tabs[0].history_step(false);
+        assert_eq!(app.tabs[0].page, 0);
+        assert_eq!(app.tabs[0].jump, Some((0, Some(0.))));
+
+        click(
+            &mut app,
+            thumbnail_point("Go to page 2"),
+            egui::PointerButton::Secondary,
+        );
+        assert_eq!(app.organizer.selected, BTreeSet::from([1]));
+        assert_eq!(app.tabs[0].page, 0);
+        assert!(app.tabs[0].back.is_empty());
+    }
+
+    #[test]
+    fn sidebar_context_menu_has_copy_and_paste_actions_and_keeps_multiselection() {
+        let (mut app, ctx) = thumbnail_fixture();
+        thumbnail_frame(&mut app, &ctx, vec![]);
+        thumbnail_frame(&mut app, &ctx, vec![]);
+        app.organizer.selected = BTreeSet::from([0, 1]);
+        let point = pos2(100., 120.);
+        let mut labels = BTreeSet::new();
+        for pressed in [true, false] {
+            let output = thumbnail_frame(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            if let Some(update) = output.platform_output.accesskit_update {
+                labels.extend(
+                    update
+                        .nodes
+                        .iter()
+                        .filter_map(|(_, node)| node.label().map(str::to_owned)),
+                );
+            }
+        }
+        let output = thumbnail_frame(&mut app, &ctx, vec![]);
+        if let Some(update) = output.platform_output.accesskit_update {
+            labels.extend(
+                update
+                    .nodes
+                    .iter()
+                    .filter_map(|(_, node)| node.label().map(str::to_owned)),
+            );
+        }
+        assert!(egui::Popup::is_any_open(&ctx));
+        assert_eq!(app.organizer.selected, BTreeSet::from([0, 1]));
+        for label in [
+            "Copy pages",
+            "Cut pages",
+            "Paste before",
+            "Paste after",
+            "Duplicate pages",
+            "Rotate left",
+            "Rotate right",
+            "Extract pages…",
+            "Delete pages",
+            "Select all pages",
+        ] {
+            assert!(
+                labels.contains(label),
+                "missing menu row {label}: {labels:?}"
+            );
+        }
+        assert!(app.editor.mode == editing::Mode::Read);
+    }
+    #[test]
+    fn sidebar_copy_shortcut_is_scoped_to_thumbnails_and_read_only_copy_does_not_enable_editing() {
+        let (mut app, ctx) = thumbnail_fixture();
+        thumbnail_frame(&mut app, &ctx, vec![]);
+        let tab = &mut app.tabs[0];
+        tab.session.as_mut().unwrap().editable = false;
+        app.organizer
+            .select_thumbnail(tab, 1, egui::Modifiers::NONE, false);
+        app.organizer
+            .thumbnail_area(tab.id, Rect::from_min_max(pos2(0., 0.), pos2(220., 900.)));
+        let mut consumed = false;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Copy],
+                ..Default::default()
+            },
+            |ctx| {
+                consumed = app.thumbnail_shortcuts(ctx);
+            },
+        );
+        assert!(consumed);
+        until_thumbnail(&mut app, &ctx, |app| app.organizer.clipboard.is_some());
+        assert_eq!(app.organizer.clipboard.as_ref().unwrap().pages, 1);
+        assert!(!app.tabs[0].session.as_ref().unwrap().editable);
+        assert!(app.editor.mode == editing::Mode::Read);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::PointerButton {
+                        pos: pos2(500., 400.),
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::Copy,
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                consumed = app.thumbnail_shortcuts(ctx);
+            },
+        );
+        assert!(
+            !consumed,
+            "a canvas click returns Copy to text or annotation selection"
+        );
+        assert!(app.organizer.thumbnail_focus.is_none());
+    }
+    #[test]
+    fn thumbnail_duplicate_cut_and_paste_before_are_undoable_and_preserve_clipboard() {
+        let (mut app, ctx) = thumbnail_fixture();
+        app.organizer.selected = BTreeSet::from([1, 2]);
+        app.thumbnail_action(&ctx, ThumbnailAction::Copy);
+        until_thumbnail(&mut app, &ctx, |app| app.organizer.clipboard.is_some());
+        let original_clip = app.organizer.clipboard.clone().unwrap();
+        app.thumbnail_action(&ctx, ThumbnailAction::Duplicate);
+        until_thumbnail(&mut app, &ctx, |app| {
+            app.tabs[0].pages.len() == 6 && app.tabs[0].session.as_ref().is_some_and(|s| s.editable)
+        });
+        assert!(Arc::ptr_eq(
+            &original_clip,
+            app.organizer.clipboard.as_ref().unwrap()
+        ));
+        assert_eq!(app.organizer.selected, BTreeSet::from([3, 4]));
+        let original_widths: Vec<_> = app.tabs[0].pages.iter().map(|p| p.width).collect();
+        assert_eq!(&original_widths[1..3], &original_widths[3..5]);
+        app.thumbnail_action(&ctx, ThumbnailAction::Cut);
+        until_thumbnail(&mut app, &ctx, |app| {
+            app.tabs[0].pages.len() == 4 && app.tabs[0].session.as_ref().is_some_and(|s| s.editable)
+        });
+        assert_eq!(app.organizer.clipboard.as_ref().unwrap().pages, 2);
+        app.organizer.selected = BTreeSet::from([0]);
+        app.thumbnail_action(&ctx, ThumbnailAction::PasteBefore);
+        until_thumbnail(&mut app, &ctx, |app| {
+            app.tabs[0].pages.len() == 6 && app.tabs[0].session.as_ref().is_some_and(|s| s.editable)
+        });
+        assert_eq!(app.organizer.selected, BTreeSet::from([0, 1]));
+        app.editor_undo(false);
+        until_thumbnail(&mut app, &ctx, |app| {
+            app.tabs[0].pages.len() == 4 && app.tabs[0].session.as_ref().is_some_and(|s| s.editable)
+        });
+        assert!(app.editor.mode == editing::Mode::Read);
+        app.organizer.selected = (0..4).collect();
+        let tab = &app.tabs[0];
+        assert!(
+            !app.organizer
+                .action_enabled(tab, ThumbnailAction::Delete, false)
+        );
+        assert!(
+            !app.organizer
+                .action_enabled(tab, ThumbnailAction::Cut, false)
+        );
+    }
+
+    #[test]
+    fn sidebar_copies_multiple_pages_between_open_documents_at_the_selected_insertion_point() {
+        let (mut app, ctx) = thumbnail_fixture();
+        app.organizer.selected = BTreeSet::from([0, 2]);
+        let source_widths: Vec<_> = app.tabs[0].pages.iter().map(|p| p.width).collect();
+        app.thumbnail_action(&ctx, ThumbnailAction::Copy);
+        until_thumbnail(&mut app, &ctx, |app| app.organizer.clipboard.is_some());
+        let clip = app.organizer.clipboard.clone().unwrap();
+        assert_eq!(clip.pages, 2);
+        app.open_memory(
+            PathBuf::from("Target memo.pdf"),
+            mypdf_milestone0::convert::blank(600., 700.).unwrap(),
+            &ctx,
+        );
+        until_thumbnail(&mut app, &ctx, |app| {
+            app.tabs.len() == 2
+                && app.tabs[1].session.as_ref().is_some_and(|s| s.editable)
+                && app.tabs[1].pages.len() == 1
+        });
+        app.active = 1;
+        app.organizer.use_tab(&app.tabs[1]);
+        assert!(Arc::ptr_eq(
+            &clip,
+            app.organizer.clipboard.as_ref().unwrap()
+        ));
+        app.thumbnail_action(&ctx, ThumbnailAction::PasteBefore);
+        until_thumbnail(&mut app, &ctx, |app| {
+            app.tabs[1].pages.len() == 3 && app.tabs[1].session.as_ref().is_some_and(|s| s.editable)
+        });
+        assert_eq!(
+            app.tabs[0].pages.len(),
+            4,
+            "Copy never deletes source pages"
+        );
+        assert_eq!(
+            app.tabs[1]
+                .pages
+                .iter()
+                .map(|p| p.width)
+                .collect::<Vec<_>>(),
+            vec![source_widths[0], source_widths[2], 600.]
+        );
+        assert_eq!(app.organizer.selected, BTreeSet::from([0, 1]));
+        assert!(app.editor.mode == editing::Mode::Read);
+    }
+
+    #[test]
+    fn thumbnail_page_actions_preserve_unfinished_pdf_text_and_async_followups() {
+        let (mut app, ctx) = thumbnail_fixture();
+        let id = app.tabs[0].id;
+        let size = app.tabs[0].pages[0];
+        let source = app.tabs[0].session.as_ref().unwrap().source.clone();
+        let revision = app.tabs[0].session.as_ref().unwrap().revision();
+        app.content
+            .paste_new_text(id, 0, size, "Keep this unfinished text".into());
+        app.editor.mode = editing::Mode::Edit;
+        app.organizer.selected = BTreeSet::from([0]);
+        for action in [
+            ThumbnailAction::Copy,
+            ThumbnailAction::Extract,
+            ThumbnailAction::Cut,
+            ThumbnailAction::Duplicate,
+            ThumbnailAction::RotateRight,
+            ThumbnailAction::Delete,
+        ] {
+            app.thumbnail_action(&ctx, action);
+            assert!(!app.organizer.busy);
+            assert_eq!(app.content.pending_text(), Some(id));
+            assert!(app.content.has_pending_text_change(id));
+            assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), revision);
+            assert!(Arc::ptr_eq(
+                &app.tabs[0].session.as_ref().unwrap().source,
+                &source
+            ));
+            assert!(app.status.as_ref().unwrap().0.contains(
+                if matches!(action, ThumbnailAction::Copy | ThumbnailAction::Extract) {
+                    "before copying pages"
+                } else {
+                    "before changing pages"
+                }
+            ));
+            assert!(app.organizer.clipboard.is_none());
+        }
+        // A draft can be opened while the original immutable snapshot is being
+        // extracted. Its later Cut/Duplicate completion must check the same guard.
+        for operation in [ClipOperation::Cut, ClipOperation::Duplicate] {
+            app.organizer
+                .clip_tx
+                .send(Ok(PageClip {
+                    bytes: pages::extract(&source, &[0]).unwrap(),
+                    pages: 1,
+                    from: "Snapshot before text edit".into(),
+                    followup: Some(ClipFollowup {
+                        tab: id,
+                        revision,
+                        operation,
+                        selected: vec![0],
+                    }),
+                }))
+                .unwrap();
+            app.page_events(&ctx);
+            assert!(!app.organizer.busy);
+            assert_eq!(app.content.pending_text(), Some(id));
+            assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), revision);
+            assert_eq!(app.tabs[0].pages.len(), 4);
+            assert!(Arc::ptr_eq(
+                &app.tabs[0].session.as_ref().unwrap().source,
+                &source
+            ));
+        }
+    }
+
+    #[test]
+    fn global_shortcuts_prioritize_sidebar_pages_over_selected_annotations_for_keys_and_clipboard_events()
+     {
+        let (mut app, ctx) = thumbnail_fixture();
+        thumbnail_frame(&mut app, &ctx, vec![]);
+        app.editor.mode = editing::Mode::Annotate;
+        let mark = Annotation::new(0, [30., 30., 100., 80.], Kind::Rectangle, Style::default());
+        app.tabs[0].selected_annotation = Some(mark.id.clone());
+        app.tabs[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .commit(vec![mark])
+            .unwrap();
+        app.organizer.selected = BTreeSet::from([0, 2]);
+        app.organizer.thumbnail_focus = Some(app.tabs[0].id);
+        app.organizer.thumbnail_area(
+            app.tabs[0].id,
+            Rect::from_min_max(pos2(0., 0.), pos2(220., 900.)),
+        );
+        let command_key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        for event in [command_key(egui::Key::C), egui::Event::Copy] {
+            app.organizer.clipboard = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![event],
+                    ..Default::default()
+                },
+                |ctx| app.shortcuts(ctx),
+            );
+            until_thumbnail(&mut app, &ctx, |app| app.organizer.clipboard.is_some());
+            assert_eq!(app.organizer.clipboard.as_ref().unwrap().pages, 2);
+            assert!(
+                app.editor.marks_clip.is_none(),
+                "Copy belongs to focused thumbnails, not the selected rectangle"
+            );
+            assert!(app.editor.mode == editing::Mode::Annotate);
+        }
+        for (event, count) in [
+            (
+                egui::Event::Paste("2 pages from another document".into()),
+                6,
+            ),
+            (command_key(egui::Key::V), 8),
+        ] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![event],
+                    ..Default::default()
+                },
+                |ctx| app.shortcuts(ctx),
+            );
+            until_thumbnail(&mut app, &ctx, |app| {
+                app.tabs[0].pages.len() == count
+                    && app.tabs[0].session.as_ref().is_some_and(|s| s.editable)
+            });
+            assert!(app.editor.mode == editing::Mode::Annotate);
+            assert_eq!(app.organizer.selected.len(), 2);
+        }
+    }
+
+    #[test]
+    fn sidebar_selection_initializes_after_a_new_document_finishes_loading() {
+        let (mut app, _ctx) = thumbnail_fixture();
+        let tab = &mut app.tabs[0];
+        let pages = std::mem::take(&mut tab.pages);
+        let mut organizer = Organizer::new();
+        organizer.use_tab(tab);
+        assert!(
+            organizer.selected.is_empty(),
+            "no target exists while pages load"
+        );
+        tab.pages = pages;
+        tab.page = 2;
+        organizer.use_tab(tab);
+        assert_eq!(organizer.selected, BTreeSet::from([2]));
+        assert!(organizer.action_enabled(tab, ThumbnailAction::Copy, false));
+        // The same repair applies when a page transaction invalidates the old
+        // selection, without replacing a still-valid multiselection.
+        organizer.selected = BTreeSet::from([100]);
+        organizer.use_tab(tab);
+        assert_eq!(organizer.selected, BTreeSet::from([2]));
+        organizer.selected = BTreeSet::from([0, 3]);
+        organizer.use_tab(tab);
+        assert_eq!(organizer.selected, BTreeSet::from([0, 3]));
     }
 }

@@ -2923,6 +2923,37 @@ mod tests {
         assert!(app.table.editor.is_some());
         assert!(app.status.as_ref().unwrap().0.contains("Reopen"));
     }
+
+    #[test]
+    fn thumbnail_page_copy_and_mutations_leave_dirty_table_cells_intact() {
+        for layer in [false, true] {
+            let (mut app, ctx) = open_table_fixture(layer);
+            app.table.editor.as_mut().unwrap().text = "Keep my unfinished table cell".into();
+            let source = app.tabs[0].session.as_ref().unwrap().source.clone();
+            let revision = app.tabs[0].session.as_ref().unwrap().revision();
+            app.organizer.use_tab(&app.tabs[0]);
+            for action in [
+                organize::ThumbnailAction::Copy,
+                organize::ThumbnailAction::Duplicate,
+                organize::ThumbnailAction::RotateRight,
+            ] {
+                app.thumbnail_action(&ctx, action);
+                assert!(!app.organizer.busy && !app.content.busy);
+                assert_eq!(
+                    app.table.editor.as_ref().unwrap().text,
+                    "Keep my unfinished table cell"
+                );
+                assert!(app.table.editor.as_ref().unwrap().dirty());
+                assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), revision);
+                assert!(Arc::ptr_eq(
+                    &app.tabs[0].session.as_ref().unwrap().source,
+                    &source
+                ));
+                assert!(app.organizer.clipboard.is_none());
+                assert!(app.status.as_ref().unwrap().0.contains("before "));
+            }
+        }
+    }
     #[test]
     fn an_annotation_commit_does_not_turn_a_failed_table_write_into_success() {
         let (mut app, ctx) = open_table_fixture(false);

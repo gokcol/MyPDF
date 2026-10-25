@@ -109,6 +109,126 @@ fn inline_id(app: &Viewer) -> Id {
 }
 
 #[test]
+fn active_text_keeps_document_layout_and_typing_when_zoomed_out() {
+    for density in [1., 2.] {
+        let (mut app, ctx) = fixture(editing::Mode::Annotate, false);
+        ctx.set_pixels_per_point(density);
+        let a = Annotation::new(
+            0,
+            [40., 130., 340., 230.],
+            Kind::Text {
+                text: "Review this document carefully before signing the approval.".into(),
+            },
+            Style {
+                font_size: 14.,
+                ..Default::default()
+            },
+        );
+        app.tabs[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .commit(vec![a.clone()])
+            .unwrap();
+        app.tabs[0].selected_annotation = Some(a.id.clone());
+        super::start(&mut app.editor, app.tabs[0].id, &a, false);
+        settle(&mut app, &ctx);
+        app.inspector = false;
+        let mut expected: Option<Vec<(String, egui::Vec2)>> = None;
+        for scale in [1., 0.5, 0.25, 0.15] {
+            app.tabs[0].zoom = crate::desktop::Zoom::Scale(scale);
+            settle(&mut app, &ctx);
+            let output = frame(&mut app, &ctx, vec![]);
+            assert!(ctx.memory(|m| m.has_focus(inline_id(&app))));
+            let shape = output
+                .shapes
+                .iter()
+                .find_map(|p| match &p.shape {
+                    egui::Shape::Text(t)
+                        if t.galley.job.text.starts_with("Review this")
+                            && page(&app, &ctx).contains(t.pos) =>
+                    {
+                        Some(t)
+                    }
+                    _ => None,
+                })
+                .expect("The on-page text editor must remain painted");
+            let rows: Vec<_> = shape
+                .galley
+                .rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.glyphs.iter().map(|g| g.chr).collect::<String>(),
+                        r.size / scale,
+                    )
+                })
+                .collect();
+            if let Some(expected) = &expected {
+                assert_eq!(rows.len(), expected.len());
+                for ((text, size), (e_text, e_size)) in rows.iter().zip(expected) {
+                    assert_eq!(text, e_text);
+                    assert!(
+                        (*size - *e_size).length() < 0.001,
+                        "density={density}, scale={scale}: {size:?} != {e_size:?}"
+                    );
+                }
+            } else {
+                expected = Some(rows);
+            }
+        }
+        frame(&mut app, &ctx, vec![egui::Event::Text(" İmza".into())]);
+        assert!(text(&app).ends_with(" İmza"));
+        assert!(app.editor.mode == editing::Mode::Annotate);
+        assert!(!app.inspector);
+    }
+}
+
+#[test]
+fn reduced_inline_editor_does_not_enlarge_the_page_scroll_extent() {
+    let (mut app, ctx) = fixture(editing::Mode::Annotate, false);
+    let a = Annotation::new(
+        0,
+        [390., 600., 570., 780.],
+        Kind::Text {
+            text: "Bottom of page".into(),
+        },
+        Style::default(),
+    );
+    app.tabs[0]
+        .session
+        .as_mut()
+        .unwrap()
+        .commit(vec![a.clone()])
+        .unwrap();
+    app.tabs[0].selected_annotation = Some(a.id.clone());
+    super::start(&mut app.editor, app.tabs[0].id, &a, false);
+    for scale in [0.15, 0.5, 1., 2.] {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let (page_rect, _) =
+                    ui.allocate_exact_size(vec2(595., 842.) * scale, egui::Sense::hover());
+                let before = ui.min_rect();
+                super::overlay(
+                    &mut app.editor,
+                    &mut app.tabs[0],
+                    ui,
+                    0,
+                    page_rect,
+                    scale,
+                    &mut app.status,
+                );
+                assert_eq!(
+                    ui.min_rect(),
+                    before,
+                    "The text overlay must not allocate document-space coordinates in the parent"
+                );
+            });
+        });
+    }
+}
+
+#[test]
 fn click_placed_annotation_text_types_immediately_with_or_without_inspector() {
     for mode in [editing::Mode::Annotate, editing::Mode::Draw] {
         for inspector in [false, true] {

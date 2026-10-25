@@ -659,8 +659,8 @@ pub(super) fn update(
                         Err(e) => *status = Some((format!("{e:#}"), true)),
                     }
                 }
-            } else if g.preview != g.originals {
-                commit(tab, &g.preview, None, status);
+            } else if g.preview != g.originals && commit(tab, &g.preview, None, status).is_some() {
+                editor.remember_asset_resizes(&g.originals, &g.preview);
             }
         } else {
             editor.group_gesture = Some(g);

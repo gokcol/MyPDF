@@ -1,3 +1,6 @@
+mod annotation_geometry;
+mod annotation_image;
+mod annotation_render;
 mod annotation_text;
 mod clipboard;
 mod comparison;
@@ -707,6 +710,9 @@ impl Viewer {
         if self.productivity_action(action, ctx) {
             return;
         }
+        if self.thumbnail_command(action, ctx) {
+            return;
+        }
         if action == "settings" {
             self.digital.save_if_dirty();
             self.digital.open = true;
@@ -1177,6 +1183,9 @@ impl Viewer {
             self.paste_image_over_text(ctx, clip);
             return;
         }
+        if self.thumbnail_shortcuts(ctx) {
+            return;
+        }
         self.table_keys(ctx);
         self.selection_keys(ctx);
         if self.context_shortcuts(ctx) {
@@ -1581,12 +1590,6 @@ impl Viewer {
                         {
                             action = Some("translation");
                         }
-                        if ui
-                            .add(ActionButton::new(Icon::Search, "Find").compact())
-                            .clicked()
-                        {
-                            action = Some("find");
-                        }
                     });
                 });
             });
@@ -1818,6 +1821,8 @@ impl Viewer {
                 });
             return;
         }
+        let mut thumbnail_action = None;
+        let thumbnail_blocked = self.organizer.busy || self.content.busy;
         let tab = &mut self.tabs[self.active];
         let tick = self.tick;
         egui::SidePanel::left("sidebar").resizable(true).default_width(220.0).width_range(190.0..=360.0).frame(egui::Frame::new().fill(theme::paper()).inner_margin(12.0)).show(ctx, |ui| {
@@ -1866,13 +1871,15 @@ impl Viewer {
                 if ui.add(ActionButton::new(Icon::Outline,"Edit bookmarks & labels…")).clicked(){self.workbench.request=Some("edit_navigation".into());}
                     navigate::outline_list(tab, ui, ctx);
             } else {
-                ui.label(RichText::new(pages_label(tab.pages.len())).color(theme::muted()).size(11.5));
+                self.organizer.use_tab(tab);
+                ui.label(RichText::new(pages_label(tab.pages.len())).color(theme::muted()).size(11.5)).on_hover_text("⌘/Ctrl-click to select pages · Shift-click for a range · right-click for page actions");
+                self.organizer.thumbnail_area(tab.id, ui.available_rect_before_wrap().intersect(ui.clip_rect()));
                 egui::ScrollArea::vertical().id_salt((tab.id, "thumbnails")).show_rows(ui, 176.0, tab.pages.len(), |ui, range| {
                     for page in range { let size = tab.pages[page]; let factor = (132.0 / size.width).min(146.0 / size.height); let display = vec2(size.width * factor, size.height * factor); let key = viewer::raster_key(page, size, factor * ctx.pixels_per_point(), true); tab.request(key);
                         let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 176.0), egui::Sense::click());
-                        response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, page == tab.page, format!("Go to page {}", page + 1)));
+                        response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, self.organizer.selected.contains(&page), format!("Go to page {}", page + 1)));
                         let image = Rect::from_center_size(pos2(rect.center().x, rect.top() + 77.0), display);
-                        let current = page == tab.page;
+                        let current = self.organizer.selected.contains(&page);
                         ui::shadow(ui.painter(), image, 2, 1);
                         if current {
                             ui.painter().rect_stroke(image.expand(4.0), 6, Stroke::new(2.5, theme::accent()), egui::StrokeKind::Middle);
@@ -1891,11 +1898,15 @@ impl Viewer {
                             ui.painter().rect_filled(Rect::from_center_size(number, vec2(26. + 6. * (page + 1).to_string().len() as f32, 18.)), 9, theme::accent());
                         }
                         ui.painter().text(number, egui::Align2::CENTER_CENTER, (page + 1).to_string(), ui::strong(ui, 11.5), if current { theme::on_accent() } else { theme::muted() });
-                        if response.on_hover_text(format!("Go to page {}", page + 1)).clicked() { tab.jump(page); }
+                        if let Some(action) = organize::thumbnail_context_menu(ui, &response, &mut self.organizer, tab, page, thumbnail_blocked) { thumbnail_action = Some(action); }
+                        if response.on_hover_text(format!("Page {} · right-click for page actions", page + 1)).clicked() { tab.jump(page); }
                     }
                 });
             }
         });
+        if let Some(action) = thumbnail_action {
+            self.thumbnail_action(ctx, action);
+        }
     }
     fn document(&mut self, ctx: &egui::Context) {
         let preview = self.live_signature_preview(ctx);
@@ -3913,6 +3924,7 @@ mod tests {
                 "Save As… · ⇧⌘S",
                 "Save As… · Ctrl+Shift+S",
                 "Compare Documents…",
+                "Find",
             ] {
                 assert!(
                     !nodes.iter().any(|(_, node)| node.label() == Some(label)
@@ -3920,7 +3932,7 @@ mod tests {
                     "{label} is absent from the toolbar"
                 );
             }
-            for label in ["Toggle right panel", "Find", "Translate"] {
+            for label in ["Toggle right panel", "Translate"] {
                 let r = nodes
                     .iter()
                     .find(|(_, n)| n.label() == Some(label))

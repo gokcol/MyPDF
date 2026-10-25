@@ -438,16 +438,7 @@ pub(super) fn paint_head(
         return;
     }
     if fill {
-        let polygon: Vec<_> = points.iter().map(|point| [point.x, point.y]).collect();
-        let mut mesh = egui::Mesh::default();
-        for triangle in ann::triangulate(&polygon) {
-            let start = mesh.vertices.len() as u32;
-            for point in triangle {
-                mesh.colored_vertex(pos2(point[0], point[1]), ink);
-            }
-            mesh.add_triangle(start, start + 1, start + 2);
-        }
-        painter.add(egui::Shape::mesh(mesh));
+        annotation_geometry::paint_fill(painter, &points, ink);
     } else {
         if closed {
             points.push(points[0]);
@@ -765,6 +756,69 @@ mod tests {
             .unwrap();
     }
 
+    fn filled_head_centers(rect: Rect, kind: &Kind, style: &Style) -> Vec<egui::Pos2> {
+        let annotation = Annotation::new(
+            0,
+            [rect.left(), rect.top(), rect.right(), rect.bottom()],
+            kind.clone(),
+            style.clone(),
+        );
+        let bounds = annotation.bounds();
+        let scale = (rect.width() / (bounds[2] - bounds[0]).max(1.))
+            .min(rect.height() / (bounds[3] - bounds[1]).max(1.))
+            .min(1.);
+        let offset = rect.center().to_vec2()
+            - vec2((bounds[0] + bounds[2]) / 2., (bounds[1] + bounds[3]) / 2.) * scale;
+        ann::primitives(&annotation)
+            .into_iter()
+            .filter_map(|primitive| match primitive {
+                Primitive::Head {
+                    points, fill: true, ..
+                } => {
+                    let center = points.iter().fold(egui::Vec2::ZERO, |sum, point| {
+                        sum + vec2(point[0], point[1])
+                    }) / points.len() as f32;
+                    Some((center * scale + offset).to_pos2())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn painted_with_ink_at(
+        primitives: &[egui::ClippedPrimitive],
+        point: egui::Pos2,
+        ink: Color32,
+    ) -> bool {
+        primitives.iter().any(|primitive| {
+            if !primitive.clip_rect.contains(point) {
+                return false;
+            }
+            let egui::epaint::Primitive::Mesh(mesh) = &primitive.primitive else {
+                return false;
+            };
+            mesh.indices.chunks_exact(3).any(|triangle| {
+                let vertices = [
+                    mesh.vertices[triangle[0] as usize],
+                    mesh.vertices[triangle[1] as usize],
+                    mesh.vertices[triangle[2] as usize],
+                ];
+                if !vertices.iter().all(|vertex| vertex.color == ink) {
+                    return false;
+                }
+                let [a, b, c] = vertices.map(|vertex| vertex.pos);
+                let cross = |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| {
+                    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+                };
+                let area = cross(a, b, c);
+                area.abs() > 0.0001
+                    && [cross(a, b, point), cross(b, c, point), cross(c, a, point)]
+                        .iter()
+                        .all(|side| *side * area.signum() >= -0.0001)
+            })
+        })
+    }
+
     #[test]
     fn head_controls_change_live_and_filled_heads_use_stroke_color() {
         let ctx = egui::Context::default();
@@ -785,23 +839,22 @@ mod tests {
         assert_eq!(endings.start, ann::LineEnd::Circle);
         assert_eq!(endings.end, ann::LineEnd::FilledArrow);
         let ink = color(style.color, style.opacity);
-        let meshes: Vec<_> = output
-            .shapes
-            .iter()
-            .filter_map(|shape| {
-                if let egui::Shape::Mesh(mesh) = &shape.shape {
-                    Some(mesh)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let preview = ctx
+            .data(|data| data.get_temp::<Rect>(egui::Id::new("drawing_live_preview")))
+            .unwrap()
+            .shrink2(vec2(18., 12.));
+        let heads = filled_head_centers(preview, &kind, &style);
+        assert_eq!(heads.len(), 1);
+        let rendered = ctx.tessellate(output.shapes, output.pixels_per_point);
         assert!(
-            !meshes.is_empty(),
-            "The same frame must contain the filled head preview"
+            painted_with_ink_at(&rendered, heads[0], ink),
+            "The same frame must visibly fill the arrow head with the stroke color"
         );
-        assert!(meshes.iter().any(|mesh| !mesh.vertices.is_empty()
-            && mesh.vertices.iter().all(|vertex| vertex.color == ink)));
+        assert!(!painted_with_ink_at(
+            &rendered,
+            heads[0],
+            color(style.fill.unwrap(), style.opacity)
+        ));
         let at = ctx
             .data(|data| data.get_temp::<Rect>(egui::Id::new("drawing_head_size")))
             .unwrap()
@@ -845,33 +898,30 @@ mod tests {
             }),
             ..Default::default()
         };
+        let before = style.clone();
+        let kind = tool_kind(Tool::DoubleCurvedArrow).unwrap();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
             let painter = ctx.layer_painter(egui::LayerId::background());
-            paint(
-                &painter,
-                rect,
-                tool_kind(Tool::DoubleCurvedArrow).unwrap(),
-                style.clone(),
-            );
+            paint(&painter, rect, kind.clone(), style.clone());
         });
-        let meshes: Vec<_> = output
-            .shapes
-            .iter()
-            .filter_map(|shape| {
-                if let egui::Shape::Mesh(mesh) = &shape.shape {
-                    Some(mesh)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert_eq!(meshes.len(), 2);
-        assert!(meshes.iter().all(|mesh| {
+        let fringe = 1. / output.pixels_per_point;
+        let rendered = ctx.tessellate(output.shapes, output.pixels_per_point);
+        let heads = filled_head_centers(rect, &kind, &style);
+        assert_eq!(heads.len(), 2);
+        assert!(heads.iter().all(|point| painted_with_ink_at(
+            &rendered,
+            *point,
+            color(style.color, style.opacity)
+        )));
+        assert!(rendered.iter().all(|primitive| {
+            let egui::epaint::Primitive::Mesh(mesh) = &primitive.primitive else {
+                return false;
+            };
             mesh.vertices
                 .iter()
-                .all(|vertex| rect.expand(0.01).contains(vertex.pos))
+                .all(|vertex| rect.expand(fringe + 0.01).contains(vertex.pos))
         }));
-        assert_eq!(style.line_endings.unwrap().size, 144.);
+        assert_eq!(style, before);
     }
 
     #[test]

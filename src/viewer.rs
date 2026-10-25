@@ -452,7 +452,7 @@ fn run_worker(
                 let rendering = if caps.rewritable() {
                     crate::annotations::clean_render_copy(&bytes, &mut doc)?
                 } else {
-                    bytes.to_vec()
+                    image_render_copy(&bytes, &mut doc)
                 };
                 (annotations, caps, rendering, None)
             }
@@ -469,8 +469,7 @@ fn run_worker(
                 Some(format!("Editing is unavailable for this PDF: {e}")),
             ),
         };
-    let pdf =
-        Pdf::new(rendering).map_err(|e| anyhow::anyhow!("Could not read this PDF ({e:?})."))?;
+    let pdf = open_render_pdf(rendering, &bytes)?;
     if pdf.pages().is_empty() || pdf.pages().len() > 10_000 {
         bail!("The PDF must contain between 1 and 10,000 pages.");
     }
@@ -587,8 +586,10 @@ pub fn raster_key(page: usize, size: PageSize, desired: f32, thumbnail: bool) ->
 
 /// Render one displayed page to premultiplied RGBA, outside any worker.
 pub fn render_page(bytes: &[u8], page: usize, scale: f32) -> Result<([usize; 2], Vec<u8>)> {
-    let pdf =
-        Pdf::new(bytes.to_vec()).map_err(|e| anyhow::anyhow!("Could not read this PDF ({e:?})"))?;
+    let rendering = lopdf::Document::load_mem(bytes)
+        .map(|mut doc| image_render_copy(bytes, &mut doc))
+        .unwrap_or_else(|_| bytes.to_vec());
+    let pdf = open_render_pdf(rendering, bytes)?;
     let page = pdf.pages().get(page).context("Page not found")?;
     let (width, height) = page.render_dimensions();
     let scale = scale
@@ -612,7 +613,36 @@ pub fn render_page(bytes: &[u8], page: usize, scale: f32) -> Result<([usize; 2],
     ))
 }
 
+fn image_render_copy(bytes: &[u8], doc: &mut lopdf::Document) -> Vec<u8> {
+    // Display preparation must never prevent a PDF from opening. Preserve the
+    // source on malformed/unsupported appearance metadata or serialization errors.
+    crate::annotations::interpolated_image_render_copy(bytes, doc)
+        .unwrap_or_else(|_| bytes.to_vec())
+}
+
+fn open_render_pdf(rendering: Vec<u8>, original: &[u8]) -> Result<Pdf> {
+    Pdf::new(rendering)
+        .or_else(|_| Pdf::new(original.to_vec()))
+        .map_err(|error| anyhow::anyhow!("Could not read this PDF ({error:?})"))
+}
+
 /// Exact original bytes, atomically published to a fresh path. Existing files are never replaced.
 pub fn save_copy(destination: &Path, bytes: &[u8]) -> Result<()> {
     crate::write_new(destination, bytes)
+}
+
+#[cfg(test)]
+mod render_copy_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_derived_pdf_falls_back_to_original_without_changing_it() {
+        let source = crate::convert::blank(200., 100.).unwrap();
+        let original = source.clone();
+        let parsed = open_render_pdf(b"invalid viewing copy".to_vec(), &source).unwrap();
+        assert_eq!(parsed.pages().len(), 1);
+        assert_eq!(parsed.pages()[0].render_dimensions(), (200., 100.));
+        assert_eq!(source, original);
+        assert!(open_render_pdf(b"invalid viewing copy".to_vec(), b"invalid original").is_err());
+    }
 }

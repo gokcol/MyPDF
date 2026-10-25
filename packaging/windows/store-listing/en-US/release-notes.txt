@@ -1,6 +1,8 @@
-New in MyPDF 2.1.3:
+New in MyPDF 2.1.4:
 
-- Improved PDFs with nonembedded fonts: available installed substitutes restore Turkish and other supported characters.
-- Corrected wrong letters caused by duplicate glyph names in substitute fonts.
-- Viewing, thumbnails, text geometry and exports now share the same font fallback. Embedded PDF fonts and text positions remain unchanged.
-- Includes the on-page text-box typing and background-color improvements from 2.1.2.
+- Clearer annotation text, shapes and image artwork at reduced zoom.
+- Stamps, checkmarks and saved ink signatures remember their chosen placement sizes.
+- Improved page-thumbnail multi-selection and context actions, with page copy/paste between open PDFs.
+- Thumbnail navigation preserves reading history; page exports protect unfinished edits.
+- Removed the duplicate Find toolbar icon. Search remains in the sidebar and on Ctrl+F.
+- Existing settings, saved artwork and font compatibility fixes are retained.

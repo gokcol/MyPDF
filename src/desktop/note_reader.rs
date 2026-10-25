@@ -605,6 +605,7 @@ mod tests {
             &mut app.editor,
             &mut app.tabs[0],
             note.clone(),
+            false,
             &mut app.status,
         );
         let output = frame(&mut app, &ctx, vec![]);

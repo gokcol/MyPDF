@@ -124,7 +124,13 @@ pub(super) fn overlay(
         page_rect.min + vec2(bounds[2], bounds[3]) * scale,
     );
     // Match the saved text's four-point inset and preserve the corner handles.
-    let text_rect = rect.shrink(4. * scale);
+    let resolution = annotation_render::text_resolution(scale);
+    let to_global = egui::emath::TSTransform::from_translation(page_rect.min.to_vec2())
+        * egui::emath::TSTransform::from_scaling(scale / resolution);
+    let text_rect = Rect::from_min_max(
+        pos2(bounds[0] + 4., bounds[1] + 4.) * resolution,
+        pos2(bounds[2] - 4., bounds[3] - 4.) * resolution,
+    );
     let id = egui::Id::new((tab.id, &a.id, "inline_annotation_text"));
     let finish = ui.ctx().memory(|m| m.has_focus(id))
         && ui.input_mut(|i| {
@@ -140,13 +146,24 @@ pub(super) fn overlay(
         return;
     };
     let state = editor.annotation_text.as_mut().unwrap();
-    let mut changed = false;
-    ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
-        ui.set_clip_rect(rect.intersect(page_rect).intersect(ui.clip_rect()));
+    // Lay out the editor at the same document resolution as static text.
+    // A transformed sublayer scales both painting and pointer/caret geometry;
+    // tiny font hinting must not rewrap the selected box when zooming out.
+    let layer = egui::LayerId::new(ui.layer_id().order, id.with("document_text_layer"));
+    ui.ctx().set_sublayer(ui.layer_id(), layer);
+    ui.ctx().set_transform_layer(layer, to_global);
+    let clip = to_global.inverse() * rect.intersect(page_rect).intersect(ui.clip_rect());
+    let changed = {
+        // The page is already allocated. Reserving this child in its parent's
+        // flow would add unscaled document coordinates to the scroll extent.
+        let mut inline_ui =
+            ui.new_child(egui::UiBuilder::new().layer_id(layer).max_rect(text_rect));
+        let ui = &mut inline_ui;
+        ui.set_clip_rect(clip);
         let mut output = egui::TextEdit::multiline(text)
             .id(id)
             .font(FontId::new(
-                a.style.font_size * scale,
+                a.style.font_size * resolution,
                 egui::FontFamily::Name("annotation".into()),
             ))
             .text_color(editing::color(a.style.color, a.style.opacity))
@@ -175,8 +192,8 @@ pub(super) fn overlay(
             state.focus = false;
         }
         editor.text_editing |= output.response.has_focus();
-        changed = output.response.changed();
-    });
+        output.response.changed()
+    };
     if changed && let Some(session) = &mut tab.session {
         let mut entries = session.annotations.clone();
         if let Some(target) = entries.iter_mut().find(|item| item.id == a.id) {

@@ -1394,6 +1394,209 @@ pub fn clean_render_copy(bytes: &[u8], doc: &mut Document) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+/// Smooth our saved image appearances when a viewer renders their PDF appearance
+/// instead of the live annotation overlay. This is a disposable viewing copy: original
+/// bytes, signature evidence, and explicit image interpolation choices remain
+/// unchanged. Foreign images and appearances are never adjusted.
+pub fn interpolated_image_render_copy(bytes: &[u8], doc: &mut Document) -> Result<Vec<u8>> {
+    // Verify every candidate against the original graph before adding objects.
+    let mut budget = RenderImageBudget::default();
+    let mut changes = vec![];
+    for page in doc.get_pages().into_values() {
+        let values = doc
+            .get_dictionary(page)
+            .ok()
+            .and_then(|page| page.get(b"Annots").ok())
+            .and_then(|value| doc.dereference(value).ok())
+            .and_then(|(_, value)| value.as_array().ok());
+        let Some(values) = values else { continue };
+        let mut replacements = vec![];
+        for (index, value) in values.iter().enumerate() {
+            if let Some(image) = RenderImageAppearance::prepare(doc, value, &mut budget)? {
+                replacements.push((index, image));
+            }
+        }
+        if !replacements.is_empty() {
+            for value in values {
+                budget.reserve_bytes(render_object_clone_bytes(value, 0)?)?;
+            }
+            changes.push((page, values.clone(), replacements));
+        }
+    }
+    if changes.is_empty() {
+        return Ok(bytes.to_vec());
+    }
+    for (page, mut values, replacements) in changes {
+        for (index, appearance) in replacements {
+            values[index] = Object::Reference(appearance.install(doc));
+        }
+        doc.get_dictionary_mut(page)?.set("Annots", values);
+    }
+    let mut output = vec![];
+    doc.save_to(&mut output)?;
+    Ok(output)
+}
+
+const MAX_RENDER_IMAGE_COPIES: usize = 256;
+const MAX_RENDER_IMAGE_CLONE_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct RenderImageBudget {
+    copies: usize,
+    bytes: usize,
+}
+impl RenderImageBudget {
+    fn reserve_bytes(&mut self, bytes: usize) -> Result<()> {
+        self.bytes = self.bytes.saturating_add(bytes);
+        ensure!(
+            self.bytes <= MAX_RENDER_IMAGE_CLONE_BYTES,
+            "Image viewing copy exceeds its memory budget"
+        );
+        Ok(())
+    }
+}
+
+// Cloning follows direct containers, not indirect references. Include generous
+// per-entry overhead as well as stream/string bytes; reject unusual nesting.
+fn render_object_clone_bytes(object: &Object, depth: usize) -> Result<usize> {
+    ensure!(depth <= 32, "Image viewing metadata is nested too deeply");
+    let mut bytes = 128_usize;
+    match object {
+        Object::String(value, _) | Object::Name(value) => {
+            bytes = bytes.saturating_add(value.len());
+        }
+        Object::Array(values) => {
+            for value in values {
+                bytes = bytes.saturating_add(render_object_clone_bytes(value, depth + 1)?);
+            }
+        }
+        Object::Dictionary(dictionary) => {
+            bytes = bytes.saturating_add(render_dictionary_clone_bytes(dictionary, depth + 1)?);
+        }
+        Object::Stream(stream) => {
+            bytes = bytes.saturating_add(render_dictionary_clone_bytes(&stream.dict, depth + 1)?);
+            bytes = bytes.saturating_add(stream.content.len());
+        }
+        _ => {}
+    }
+    Ok(bytes)
+}
+fn render_dictionary_clone_bytes(dictionary: &lopdf::Dictionary, depth: usize) -> Result<usize> {
+    ensure!(depth <= 32, "Image viewing metadata is nested too deeply");
+    let mut bytes = 128_usize;
+    for (key, value) in dictionary.iter() {
+        bytes = bytes.saturating_add(key.len());
+        bytes = bytes.saturating_add(render_object_clone_bytes(value, depth + 1)?);
+    }
+    Ok(bytes)
+}
+
+struct RenderImageAppearance {
+    annotation: lopdf::Dictionary,
+    appearance: lopdf::Dictionary,
+    form: Stream,
+    resources: lopdf::Dictionary,
+    xobjects: lopdf::Dictionary,
+    image: Stream,
+    mask: Option<Stream>,
+}
+
+impl RenderImageAppearance {
+    fn prepare(
+        doc: &Document,
+        value: &Object,
+        budget: &mut RenderImageBudget,
+    ) -> Result<Option<Self>> {
+        let candidate = (|| {
+            if !matches!(decoded(doc, value)?.kind, Kind::Image { .. }) {
+                return None;
+            }
+            let dictionary = |object| doc.dereference(object).ok()?.1.as_dict().ok();
+            let stream = |object| doc.dereference(object).ok()?.1.as_stream().ok();
+            let annotation = dictionary(value)?;
+            let appearance = dictionary(annotation.get(b"AP").ok()?)?;
+            let form = stream(appearance.get(b"N").ok()?)?;
+            let resources = dictionary(form.dict.get(b"Resources").ok()?)?;
+            let xobjects = dictionary(resources.get(b"XObject").ok()?)?;
+            // This resource name belongs to our integrity-checked image appearance.
+            let image = stream(xobjects.get(b"Im").ok()?)?;
+            if image.dict.get(b"Subtype").ok()?.as_name().ok()? != b"Image"
+                || image.dict.has(b"Interpolate")
+            {
+                return None;
+            }
+            let mask = match image.dict.get(b"SMask") {
+                Ok(value) => {
+                    let mask = stream(value)?;
+                    match mask.dict.get(b"Interpolate") {
+                        Ok(Object::Boolean(true)) => None,
+                        Ok(_) => return None, // Preserve explicit false or an unknown choice.
+                        Err(_) => Some(mask),
+                    }
+                }
+                Err(_) => None,
+            };
+            Some((
+                annotation, appearance, form, resources, xobjects, image, mask,
+            ))
+        })();
+        let Some((annotation, appearance, form, resources, xobjects, image, mask)) = candidate
+        else {
+            return Ok(None);
+        };
+        budget.copies = budget.copies.saturating_add(1);
+        ensure!(
+            budget.copies <= MAX_RENDER_IMAGE_COPIES,
+            "Too many image viewing copies"
+        );
+        for dictionary in [
+            annotation,
+            appearance,
+            &form.dict,
+            resources,
+            xobjects,
+            &image.dict,
+        ] {
+            budget.reserve_bytes(render_dictionary_clone_bytes(dictionary, 0)?)?;
+        }
+        budget.reserve_bytes(form.content.len().saturating_add(image.content.len()))?;
+        if let Some(mask) = mask {
+            budget.reserve_bytes(render_dictionary_clone_bytes(&mask.dict, 0)?)?;
+            budget.reserve_bytes(mask.content.len())?;
+        }
+        let mut image = image.clone();
+        image.dict.set("Interpolate", true);
+        let mask = mask.map(|mask| {
+            let mut mask = mask.clone();
+            mask.dict.set("Interpolate", true);
+            mask
+        });
+        Ok(Some(Self {
+            annotation: annotation.clone(),
+            appearance: appearance.clone(),
+            form: form.clone(),
+            resources: resources.clone(),
+            xobjects: xobjects.clone(),
+            image,
+            mask,
+        }))
+    }
+
+    fn install(mut self, doc: &mut Document) -> ObjectId {
+        // Clone the whole affected chain: an AP, image, mask, or resources may
+        // also be referenced by a foreign annotation or the page's contents.
+        if let Some(mask) = self.mask {
+            self.image.dict.set("SMask", doc.add_object(mask));
+        }
+        self.xobjects.set("Im", doc.add_object(self.image));
+        self.resources.set("XObject", self.xobjects);
+        self.form.dict.set("Resources", self.resources);
+        self.appearance.set("N", doc.add_object(self.form));
+        self.annotation.set("AP", self.appearance);
+        doc.add_object(self.annotation)
+    }
+}
+
 pub enum Primitive {
     Dot {
         center: Point2,
