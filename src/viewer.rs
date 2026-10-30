@@ -577,12 +577,22 @@ impl<'a> Device<'a> for TextDevice {
             let basis = transform * hayro::kurbo::Point::new(0.0, 1000.0) - origin;
             let axis = transform * hayro::kurbo::Point::new(1000.0, 0.0) - origin;
             let size = basis.hypot() as f32;
+            let fallback_bounds = || {
+                (transform * Rect::new(0.0, -200.0, advance.max(200.0), 800.0).to_path(0.1))
+                    .bounding_box()
+            };
             let rect = match &**glyph {
-                Glyph::Outline(g) if !g.outline().is_empty() => {
-                    (transform * g.outline()).bounding_box()
+                Glyph::Outline(g) => {
+                    // Decoding an outline allocates and visits its curves. Reuse
+                    // it for the empty check and bounds on this indexing pass.
+                    let outline = g.outline();
+                    if outline.is_empty() {
+                        fallback_bounds()
+                    } else {
+                        (transform * outline).bounding_box()
+                    }
                 }
-                _ => (transform * Rect::new(0.0, -200.0, advance.max(200.0), 800.0).to_path(0.1))
-                    .bounding_box(),
+                _ => fallback_bounds(),
             };
             if !rect.is_finite()
                 || !origin.is_finite()

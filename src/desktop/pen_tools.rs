@@ -14,6 +14,8 @@ struct Gesture {
     page: usize,
     last: Point2,
     revision: Option<u64>,
+    // A stationary first touch may become a two-finger navigation gesture.
+    deferred_touch: Option<egui::Pos2>,
 }
 
 impl Default for State {
@@ -104,6 +106,15 @@ pub(super) fn overlay(
     };
     let visible = page_rect.intersect(ui.clip_rect());
     let events = ctx.input(|i| i.events.clone());
+    let touch_press = events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::Touch {
+                phase: egui::TouchPhase::Start,
+                ..
+            }
+        )
+    });
     for event in events {
         match event {
             egui::Event::PointerButton {
@@ -119,10 +130,13 @@ pub(super) fn overlay(
                     page,
                     last: normal(pos),
                     revision: None,
+                    deferred_touch: touch_press.then_some(pos),
                 });
                 tab.selected_annotation = None;
                 tab.group.clear();
-                state.advance(tab, normal(pos), status);
+                if !touch_press {
+                    state.advance(tab, normal(pos), status);
+                }
             }
             egui::Event::PointerMoved(pos)
                 if state
@@ -130,6 +144,14 @@ pub(super) fn overlay(
                     .as_ref()
                     .is_some_and(|g| g.tab == tab.id && g.page == page) =>
             {
+                let gesture = state.gesture.as_mut().unwrap();
+                if gesture
+                    .deferred_touch
+                    .is_some_and(|origin| origin.distance(pos) <= 6.)
+                {
+                    continue;
+                }
+                gesture.deferred_touch = None;
                 state.advance(tab, normal(pos), status);
             }
             egui::Event::PointerButton {

@@ -474,6 +474,75 @@ mod tests {
         assert_eq!(facing.page_at(facing.rects[1].center().to_vec2()), 1);
     }
     #[test]
+    fn scrolling_defers_disk_state_and_close_flushes_even_if_source_is_temporarily_unavailable() {
+        let (_dir, mut app, ctx) = loaded();
+        app.remember_reading(&ctx, true);
+        let path = app.tabs[0].path.clone();
+        let baseline = app.home.reading(&path);
+        for (page, scale) in [(1, 1.25), (2, 1.5)] {
+            app.tabs[0].zoom = Zoom::Scale(scale);
+            app.tabs[0].jump(page);
+            frame(&mut app, &ctx, vec2(1200., 820.), vec![]);
+        }
+        let latest = app.tabs[0].view_preferences.clone();
+        assert_ne!(Some(latest.clone()), baseline);
+        assert_eq!(app.home.reading(&path), baseline);
+        assert_eq!(app.reading_memory.pending[&path], latest);
+        let temporary = path.with_extension("temporarily-unavailable");
+        std::fs::rename(&path, &temporary).unwrap();
+        let id = app.tabs[0].id;
+        app.request_close(Some(id), &ctx);
+        assert_eq!(app.home.reading(&path), Some(latest.clone()));
+        assert!(app.reading_memory.pending.is_empty());
+        std::fs::rename(&temporary, &path).unwrap();
+        app.open(path, &ctx);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.tabs[0].pages.is_empty() {
+            assert!(std::time::Instant::now() < end);
+            frame(&mut app, &ctx, vec2(1200., 820.), vec![]);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        frame(&mut app, &ctx, vec2(1200., 820.), vec![]);
+        assert_eq!(app.tabs[0].page, latest.page);
+        assert!(app.tabs[0].zoom == Zoom::Scale(latest.scale.unwrap()));
+    }
+
+    #[test]
+    fn quiet_frame_saves_latest_reading_state_and_approved_exit_flushes_workspace() {
+        let (_dir, mut app, ctx) = loaded();
+        app.remember_reading(&ctx, true);
+        app.workspace.invalidate();
+        app.remember_workspace(&ctx);
+        let workspace_file = app.workspace.root.join("workspace.json");
+        let previous_workspace = std::fs::read(&workspace_file).unwrap();
+        let path = app.tabs[0].path.clone();
+        let previous_reading = app.home.reading(&path);
+        app.tabs[0].zoom = Zoom::Scale(1.75);
+        app.tabs[0].jump(1);
+        frame(&mut app, &ctx, vec2(1200., 820.), vec![]);
+        let latest = app.tabs[0].view_preferences.clone();
+        assert_ne!(Some(latest.clone()), previous_reading);
+        assert_eq!(app.home.reading(&path), previous_reading);
+        assert_eq!(std::fs::read(&workspace_file).unwrap(), previous_workspace);
+        let now = std::time::Instant::now();
+        app.reading_memory.changed = Some(now - READING_SAVE_QUIET);
+        app.reading_memory.written = Some(now - READING_SAVE_RETRY);
+        app.remember_reading(&ctx, false);
+        assert_eq!(app.home.reading(&path), Some(latest.clone()));
+        assert!(app.reading_memory.pending.is_empty());
+        // Approved exit must bypass both the workspace interval and navigation debounce.
+        app.reading_memory.changed = Some(std::time::Instant::now());
+        app.exit_approved = true;
+        app.remember_workspace(&ctx);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&workspace_file).unwrap()).unwrap();
+        assert_eq!(
+            saved["tabs"][0]["view"],
+            serde_json::to_value(latest).unwrap()
+        );
+    }
+
+    #[test]
     fn back_forward_and_saved_reading_position_return_to_the_same_place() {
         let (_dir, mut app, ctx) = loaded();
         let size = vec2(1200., 820.);
@@ -513,11 +582,60 @@ mod tests {
     }
 }
 
+const READING_SAVE_QUIET: std::time::Duration = std::time::Duration::from_millis(600);
+pub(super) const READING_SAVE_CHECKPOINT: std::time::Duration = std::time::Duration::from_secs(10);
+const READING_SAVE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 #[derive(Default)]
 pub(super) struct Memory {
     active: Option<u64>,
     pending: HashMap<PathBuf, mypdf_milestone0::home::ReadingState>,
+    pending_since: Option<std::time::Instant>,
+    changed: Option<std::time::Instant>,
     written: Option<std::time::Instant>,
+}
+impl Memory {
+    fn queue(
+        &mut self,
+        path: PathBuf,
+        state: mypdf_milestone0::home::ReadingState,
+        now: std::time::Instant,
+    ) {
+        if self.pending.is_empty() {
+            self.pending_since = Some(now);
+        }
+        self.changed = Some(now);
+        self.pending.insert(path, state);
+    }
+    pub(super) fn settling(&self, now: std::time::Instant) -> bool {
+        self.changed
+            .is_some_and(|at| now.saturating_duration_since(at) < READING_SAVE_QUIET)
+    }
+    fn save_delay(&self, now: std::time::Instant) -> std::time::Duration {
+        let remaining = |at: Option<std::time::Instant>, interval: std::time::Duration| {
+            interval.saturating_sub(at.map_or(interval, |at| now.saturating_duration_since(at)))
+        };
+        remaining(self.changed, READING_SAVE_QUIET)
+            .min(remaining(self.pending_since, READING_SAVE_CHECKPOINT))
+            .max(remaining(self.written, READING_SAVE_RETRY))
+    }
+    fn persist(
+        &mut self,
+        now: std::time::Instant,
+        save: impl FnOnce(&[(PathBuf, mypdf_milestone0::home::ReadingState)]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let states: Vec<_> = self
+            .pending
+            .iter()
+            .map(|(p, s)| (p.clone(), s.clone()))
+            .collect();
+        self.written = Some(now);
+        // Keep the latest positions available for retry if an atomic write fails.
+        save(&states)?;
+        self.pending.clear();
+        self.pending_since = None;
+        Ok(())
+    }
 }
 impl Tab {
     fn reading_position(&self) -> (usize, f32) {
@@ -574,6 +692,7 @@ impl Viewer {
         }
     }
     pub(super) fn remember_reading(&mut self, ctx: &egui::Context, flush: bool) {
+        let now = std::time::Instant::now();
         if !self.home.visible
             && self.comparison.is_none()
             && let Some(tab) = self.tabs.get_mut(self.active)
@@ -601,26 +720,31 @@ impl Viewer {
             };
             if tab.view_preferences != state {
                 tab.view_preferences = state.clone();
-                // Untitled/in-memory documents have no persistent file identity yet.
-                if tab.path.is_absolute() && tab.path.is_file() {
-                    self.reading_memory.pending.insert(tab.path.clone(), state);
+                self.reading_memory.changed = Some(now);
+                // Queue in memory while scrolling; filesystem checks and fsync wait
+                // for a quiet frame. Untitled documents have no saved identity.
+                if tab.has_destination && tab.path.is_absolute() {
+                    self.reading_memory.queue(tab.path.clone(), state, now);
                 }
             }
         }
         if self.reading_memory.pending.is_empty() {
             return;
         }
-        if flush
-            || self
-                .reading_memory
-                .written
-                .is_none_or(|t| t.elapsed().as_secs() >= 1)
+        let delay = self.reading_memory.save_delay(now);
+        if !flush && !delay.is_zero() {
+            ctx.request_repaint_after(delay);
+            return;
+        }
+        // These are identities of opened, saved documents. A temporary cloud or
+        // network metadata failure must not discard their queued reading state.
+        let home = &mut self.home;
+        if self
+            .reading_memory
+            .persist(now, |states| home.save_reading(states))
+            .is_err()
         {
-            let states: Vec<_> = self.reading_memory.pending.drain().collect();
-            self.home.save_reading(&states);
-            self.reading_memory.written = Some(std::time::Instant::now());
-        } else {
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            ctx.request_repaint_after(READING_SAVE_RETRY);
         }
     }
 }
@@ -643,5 +767,92 @@ impl Tab {
             (actual.1.y - expected.1.y).abs() < 1.,
             "Viewport jumped: {expected:?} -> {actual:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use mypdf_milestone0::home::ReadingState;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn moving_positions_wait_for_quiet_but_long_scrolls_checkpoint() {
+        let start = Instant::now();
+        let mut memory = Memory::default();
+        let path = PathBuf::from("reading.pdf");
+        for step in 0..100 {
+            let now = start + Duration::from_millis(step * 100);
+            memory.queue(
+                path.clone(),
+                ReadingState {
+                    top: step as f32,
+                    ..Default::default()
+                },
+                now,
+            );
+            assert!(!memory.save_delay(now).is_zero());
+        }
+        assert!(memory.save_delay(start + READING_SAVE_CHECKPOINT).is_zero());
+        let mut saved = vec![];
+        memory
+            .persist(start + READING_SAVE_CHECKPOINT, |states| {
+                saved = states.to_vec();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].1.top, 99.);
+        assert!(memory.pending.is_empty());
+        let next = start + Duration::from_secs(12);
+        memory.queue(
+            path,
+            ReadingState {
+                top: 120.,
+                ..Default::default()
+            },
+            next,
+        );
+        assert_eq!(memory.save_delay(next), READING_SAVE_QUIET);
+        assert!(memory.save_delay(next + READING_SAVE_QUIET).is_zero());
+    }
+
+    #[test]
+    fn failed_checkpoint_retains_latest_positions_for_retry_and_close_flush() {
+        let now = Instant::now();
+        let mut memory = Memory::default();
+        let path = PathBuf::from("reading.pdf");
+        memory.queue(
+            path.clone(),
+            ReadingState {
+                top: 20.,
+                ..Default::default()
+            },
+            now,
+        );
+        assert!(
+            memory
+                .persist(now, |_| anyhow::bail!("disk temporarily unavailable"))
+                .is_err()
+        );
+        assert_eq!(memory.pending[&path].top, 20.);
+        memory.queue(
+            path.clone(),
+            ReadingState {
+                top: 30.,
+                ..Default::default()
+            },
+            now,
+        );
+        assert_eq!(memory.save_delay(now), READING_SAVE_RETRY);
+        // A close flush bypasses the delay and persists the newest state.
+        memory
+            .persist(now, |states| {
+                assert_eq!(states[0].1.top, 30.);
+                Ok(())
+            })
+            .unwrap();
+        assert!(memory.pending.is_empty());
+        assert!(memory.pending_since.is_none());
     }
 }

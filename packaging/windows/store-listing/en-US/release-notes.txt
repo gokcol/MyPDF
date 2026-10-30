@@ -1,8 +1,7 @@
-New in MyPDF 2.1.6:
+New in MyPDF 2.1.7:
 
-- Copy PDF text with its font, size, bold/italic style and color into compatible apps.
-- Avoid duplicate copied lines when PDFs draw the same text repeatedly to simulate bold.
-- Recover damaged Latin ligature mappings when the matching font is available locally.
-- Extend a text selection with Shift-click after releasing the mouse.
-- Keep copied PDF images available for pasting into other apps.
-- Existing settings and saved artwork are retained.
+- Scroll PDFs with one finger on a touchscreen in Read mode.
+- Pan and zoom with two fingers while using document tools.
+- Reduce work during scrolling and text indexing.
+- Retain reading positions, settings, and saved artwork.
+- Keep the rich text and image clipboard improvements from 2.1.6.

@@ -174,3 +174,26 @@ fn unicode_extraction_retains_valid_ranges_and_embedded_font_metadata() {
     assert_ne!(unicode.family, "sans-serif");
     assert!(unicode.size > 0.);
 }
+
+#[test]
+fn empty_outline_spaces_keep_selectable_bounds_when_text_is_rotated() {
+    let horizontal = text_page("BT /F1 14 Tf 1 0 0 1 50 700 Tm (A A) Tj ET");
+    let vertical = text_page("BT /F1 14 Tf 0 1 -1 0 50 700 Tm (A A) Tj ET");
+    for text in [&horizontal, &vertical] {
+        assert_eq!(text.text, "A A");
+        assert_eq!(text.glyphs.len(), 3);
+        assert_eq!(&text.text[text.glyphs[1].range.clone()], " ");
+        for glyph in &text.glyphs {
+            assert!(glyph.rect.iter().all(|coordinate| coordinate.is_finite()));
+            assert!(glyph.rect[2] > glyph.rect[0]);
+            assert!(glyph.rect[3] > glyph.rect[1]);
+        }
+    }
+    let h = horizontal.glyphs[1].rect;
+    let v = vertical.glyphs[1].rect;
+    let horizontal_size = [h[2] - h[0], h[3] - h[1]];
+    let vertical_size = [v[2] - v[0], v[3] - v[1]];
+    assert!(horizontal_size[0] < horizontal_size[1]);
+    assert!((horizontal_size[0] - vertical_size[1]).abs() < 0.001);
+    assert!((horizontal_size[1] - vertical_size[0]).abs() < 0.001);
+}

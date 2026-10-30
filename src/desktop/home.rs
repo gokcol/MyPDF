@@ -86,8 +86,14 @@ impl Home {
     pub(super) fn save_reading(
         &mut self,
         states: &[(PathBuf, mypdf_milestone0::home::ReadingState)],
-    ) {
-        self.change(|h| h.save_reading(states));
+    ) -> anyhow::Result<()> {
+        let result = self
+            .history
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Home history is unavailable"))
+            .and_then(|history| history.save_reading(states));
+        self.error = result.as_ref().err().map(|error| format!("{error:#}"));
+        result
     }
     pub fn remember(&mut self, path: &Path) {
         self.change(|h| h.record(path));

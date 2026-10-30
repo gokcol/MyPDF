@@ -184,6 +184,19 @@ impl Viewer {
         }
     }
     pub(super) fn remember_workspace(&mut self, ctx: &egui::Context) {
+        // Atomic preference writes can stall a scrolling frame, especially on
+        // Windows. Defer them while the view moves, retaining a bounded checkpoint
+        // and the synchronous flush on approved exit.
+        let now = std::time::Instant::now();
+        if !self.exit_approved
+            && self.reading_memory.settling(now)
+            && self.workspace.last.is_some_and(|last| {
+                now.saturating_duration_since(last) < reading::READING_SAVE_CHECKPOINT
+            })
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(600));
+            return;
+        }
         if !self.exit_approved
             && self
                 .workspace

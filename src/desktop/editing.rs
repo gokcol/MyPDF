@@ -1412,6 +1412,47 @@ pub(super) fn page_interaction(
     let ctx = ui.ctx();
     annotation_text::sync(editor, tab);
     let editable = tab.session.as_ref().is_some_and(|s| s.editable);
+    if touch_navigation::navigating(ctx, tab.id) {
+        editor.gesture = None;
+        editor.pressed = None;
+        editor.marquee = None;
+        editor.group_gesture = None;
+        editor.eraser.finish();
+        editor.touch_navigation = false;
+        let painter = ui
+            .painter()
+            .with_clip_rect(page_rect.intersect(ui.clip_rect()));
+        if let Some(session) = &tab.session
+            && session.editable
+        {
+            for a in session.annotations.iter().filter(|a| a.page == page) {
+                // The inline editor is suspended while panning. Paint its
+                // current draft normally so the text remains visible.
+                let draft = editor
+                    .draft
+                    .as_ref()
+                    .filter(|d| d.id == a.id && tab.selected_annotation.as_ref() == Some(&d.id))
+                    .cloned();
+                paint_annotation(
+                    editor,
+                    ctx,
+                    &painter,
+                    page_rect,
+                    scale,
+                    draft.as_ref().unwrap_or(a),
+                );
+            }
+        }
+        text_selection::paint(
+            &editor.text_selection,
+            tab,
+            &painter,
+            page,
+            page_rect,
+            scale,
+        );
+        return;
+    }
     if matches!(editor.mode, Mode::Edit | Mode::Forms | Mode::Convert) {
         let painter = ui
             .painter()

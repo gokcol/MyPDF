@@ -47,6 +47,7 @@ mod table_tools;
 mod tabs;
 mod text_selection;
 mod theme;
+mod touch_navigation;
 mod translation;
 mod translation_note;
 mod ui;
@@ -1997,15 +1998,25 @@ impl Viewer {
                 // canvas was wider than the viewport even in Fit Width.
                 let available = ui.available_size() - vec2(ui.spacing().scroll.allocated_width(), 0.);
                 let mut layout = reading::Layout::arrange(&tab.pages, tab.zoom, available, tab.page_layout, tab.page);
+                let touch = touch_navigation::update(
+                    ctx, tab.id, self.editor.mode,
+                    tab.document_view.map_or(ui.available_rect_before_wrap(), |(view, _, _)| view), ui.layer_id(), tab.jump.is_some(),
+                );
                 let mut anchor_offset = None;
-                let delta = ctx.input(|i| i.zoom_delta());
+                let delta = ctx.input(|i| {
+                    // A finger over the sidebar or toolbar must not become
+                    // part of a document pinch through global touch state.
+                    if !touch.apply_motion || i.any_touches() && !i.multi_touch().is_some_and(|multi| touch.contacts >= 2 && multi.num_touches == touch.contacts) {
+                        1.
+                    } else { i.zoom_delta() }
+                });
                 if delta.is_finite() && (delta - 1.).abs() > 0.0001
                     && let Some((view, offset, _)) = tab.document_view
                     && let Some(old) = &tab.document_layout
-                    && let Some(pointer) = ctx.pointer_hover_pos()
+                    && let Some(pointer) = touch.center.or_else(|| ctx.pointer_hover_pos())
                     && view.contains(pointer) && ctx.layer_id_at(pointer) == Some(ui.layer_id())
                 {
-                    let pointer = pointer - view.min;
+                    let pointer = pointer - view.min - touch.delta;
                     let next = (old.scale * delta).clamp(0.1, 6.);
                     tab.zoom = Zoom::Scale(next);
                     layout = reading::Layout::arrange(&tab.pages, tab.zoom, available, tab.page_layout, tab.page);
@@ -2025,10 +2036,14 @@ impl Viewer {
                     anchor_offset = Some(next);
                 }
                 tab.restore_scroll = false;
+                if touch.delta != egui::Vec2::ZERO && let Some((_, offset, _)) = tab.document_view {
+                    anchor_offset = Some((anchor_offset.unwrap_or(offset) - touch.delta).max(egui::Vec2::ZERO));
+                    tab.jump = None;
+                }
                 let max_width = layout.size.x;
                 let mut scroll = egui::ScrollArea::both()
                     .scroll_source(egui::scroll_area::ScrollSource {
-                        drag: self.editor.mode == editing::Mode::Read,
+                        drag: self.editor.mode == editing::Mode::Read && !touch.tracking,
                         ..Default::default()
                     })
                     .id_salt((tab.id, "document"))
@@ -2156,6 +2171,12 @@ impl Viewer {
                                 }
                             }
                         }
+                        if touch.navigating {
+                            // Panning must not trigger page links, selection,
+                            // annotation handles or other overlaid tools.
+                            editing::page_interaction(&mut self.editor, tab, ui, page, page_rect, scale, &mut self.status);
+                            continue;
+                        }
                         if matches!(self.editor.mode, editing::Mode::Edit|editing::Mode::Annotate) && self.table.owns_page(tab.id, page) && let Some(session) = &tab.session {
                             for a in session.annotations.iter().filter(|a| a.page == page && !a.object.hidden && Some(a.id.as_str()) != self.table.editing_layer()) {
                                 editing::paint_annotation(&mut self.editor,ctx,ui.painter(),page_rect,scale,a);
@@ -2263,32 +2284,34 @@ impl Viewer {
             .flat_map(|t| t.rasters.values().chain(t.stale.values()))
             .map(|r| r.bytes)
             .sum();
-        let mut candidates: Vec<_> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .flat_map(|(i, t)| {
-                t.rasters
-                    .iter()
-                    .map(move |(k, r)| (r.used, i, Some(*k), k.page, r.bytes))
-                    .chain(
-                        t.stale
-                            .iter()
-                            .map(move |(page, r)| (r.used, i, None, *page, r.bytes)),
-                    )
-            })
-            .collect();
-        candidates.sort_by_key(|r| r.0);
-        for (_, tab, key, page, bytes) in candidates {
-            if total <= CACHE_BUDGET {
-                break;
+        if total > CACHE_BUDGET {
+            let mut candidates: Vec<_> = self
+                .tabs
+                .iter()
+                .enumerate()
+                .flat_map(|(i, t)| {
+                    t.rasters
+                        .iter()
+                        .map(move |(k, r)| (r.used, i, Some(*k), k.page, r.bytes))
+                        .chain(
+                            t.stale
+                                .iter()
+                                .map(move |(page, r)| (r.used, i, None, *page, r.bytes)),
+                        )
+                })
+                .collect();
+            candidates.sort_by_key(|r| r.0);
+            for (_, tab, key, page, bytes) in candidates {
+                if total <= CACHE_BUDGET {
+                    break;
+                }
+                if let Some(key) = key {
+                    self.tabs[tab].rasters.remove(&key);
+                } else {
+                    self.tabs[tab].stale.remove(&page);
+                }
+                total -= bytes;
             }
-            if let Some(key) = key {
-                self.tabs[tab].rasters.remove(&key);
-            } else {
-                self.tabs[tab].stale.remove(&page);
-            }
-            total -= bytes;
         }
         let mut retained: usize = self
             .tabs

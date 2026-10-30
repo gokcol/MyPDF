@@ -1,8 +1,18 @@
 # MyPDF — current handover
 
-Updated 30 October 2026 at 20:03 (Europe/Istanbul). Project root: `/Users/gokcol/SWPROJECTS/Utility/MyPDF/`.
+Updated 31 October 2026 at 00:23 (Europe/Istanbul). Project root: `/Users/gokcol/SWPROJECTS/Utility/MyPDF/`.
 
-## MyPDF 2.1.6 / build 194
+## MyPDF 2.1.7 / build 195 — release in progress
+
+The Windows 11 touchscreen report is being addressed with one-finger Read-mode scrolling, two-finger navigation, deferred navigation persistence, conditional cache trimming and single-pass glyph-outline decoding. The reported laptop has an Intel i7 and 16 GB RAM. Physical Windows touchscreen/pen behavior and end-to-end scrolling performance still require confirmation on that device.
+
+Local validation: `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked --no-fail-fast` passed: 700 passes, 0 failures, 7 ignored. Fifteen touch regressions include link taps versus scrolling, pinch anchoring, cancellation, outside contacts, repeated layout passes, protected/draft annotation painting and staggered two-finger eraser navigation. Existing Shift-click and mouse eraser tests pass. Reading-state tests cover idle saving, retry/checkpoint timing, temporary source unavailability and normal-close flush. Independent code review found no release blockers.
+
+Scrolling now defers reading-state writes until 600 ms of quiet with a ten-second checkpoint and retry on failed writes; workspace writes also wait during navigation, and approved close/exit bypasses debounce. Cache candidates are sorted only over budget. Text indexing decodes each glyph outline once. Synthetic optimized text-indexing benchmarks on the Mac host measured 25.13% and 30.12% lower median CPU time for two fonts with identical extracted text/style/geometry; these are not Windows UI speed measurements. Evidence: `artifacts/windows-touch-performance/extraction-benchmark.json` and `validation/final-validation.json`.
+
+Version metadata is 2.1.7, Mac build 195, Windows/Store 2.1.7.0. Source validation, release packaging and the authorized Mac update are in progress; 2.1.6/build 194 remains the installed/public baseline until the new reports verify completion. New evidence belongs in `artifacts/windows-touch-performance/`, `artifacts/release-2.1.7-build195/` and `artifacts/mac-install-2.1.7-build195/`. Do not mistake the previous release results below for validation of 2.1.7.
+
+## Previous completed release: MyPDF 2.1.6 / build 194
 
 **GitHub release:** Published and marked latest on 30 October 2026 at 20:01 Europe/Istanbul — [v2.1.6](https://github.com/gokcol/MyPDF/releases/tag/v2.1.6). **Installed Mac:** **2.1.6/build 194**, installed and running; launch verified at 19:55 Europe/Istanbul at `/Applications/MyPDF.app`.
 
@@ -67,7 +77,7 @@ All paths below are relative to `/Users/gokcol/SWPROJECTS/Utility/MyPDF/`. Later
 
 Store product **MyPDF (OG)**, `9MXR0WLW42XT`: [Partner Center](https://partner.microsoft.com/en-us/dashboard/products/9MXR0WLW42XT/overview). The last submitted package is **2.1.4.0**, submission `1152921505702158150`, last verified **In certification** on 25 October 2026. No present certification/publication status is claimed. Prior 2.1.3 certification was canceled; do not repeat or alter submissions without a new request. The 2.1.6.0 MSIX publication does not change this history.
 
-Preserve unrelated modified `vendor/underskrift/tests/fixtures/sample.pdf`, untracked `.mimosa/`, and `scripts/__pycache__/`. They were excluded from the release source. Keep private source PDFs, fonts, Word QA files, artifacts, backups and credentials out of Git. Final tracked working-tree/remote state: All requested source/release metadata and this completion handover are committed and pushed to `main`; only the unrelated modified fixture and untracked local folders listed above remain.
+Preserve unrelated modified `vendor/underskrift/tests/fixtures/sample.pdf`, untracked `.mimosa/`, and `scripts/__pycache__/`. They were excluded from the release source. Keep private source PDFs, fonts, Word QA files, artifacts, backups and credentials out of Git. At completion of 2.1.6, its source/release metadata and handover were pushed to `main`; current 2.1.7 work is described above.
 
 Older handover recovery: `artifacts/release-2.1.4-build190/session-history/HANDOVER-before-refresh.md` and `artifacts/session-handover-2026-10-24/`; old workspace paths there are historical. Do not apply old patches over the current checkout. Ignored local artifacts are absent from a fresh clone.
 
