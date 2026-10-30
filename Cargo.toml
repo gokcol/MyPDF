@@ -1,6 +1,6 @@
 [package]
 name = "mypdf-milestone0"
-version = "2.1.7"
+version = "2.1.8"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 default-run = "mypdf"

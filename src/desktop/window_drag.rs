@@ -19,10 +19,9 @@ pub(super) fn handle(
     let pressed_here = ctx
         .input(|i| i.pointer.primary_down() && i.pointer.press_origin().is_some_and(&eligible))
         && (response.is_pointer_button_down_on() || response.dragged_by(PointerButton::Primary));
-    if pressed_here {
-        ctx.set_cursor_icon(CursorIcon::Grabbing);
-    } else if response.hovered() && response.hover_pos().is_some_and(&eligible) {
-        ctx.set_cursor_icon(CursorIcon::Grab);
+    if pressed_here || response.hovered() && response.hover_pos().is_some_and(&eligible) {
+        // Window movement keeps the normal arrow, including over branding text.
+        ctx.set_cursor_icon(CursorIcon::Default);
     }
     pressed_here && response.drag_started_by(PointerButton::Primary)
 }
@@ -55,7 +54,7 @@ fn finish_native_drag(ctx: &eframe::egui::Context) {
             .pointer;
     });
     ctx.stop_dragging();
-    ctx.set_cursor_icon(CursorIcon::Grab);
+    ctx.set_cursor_icon(CursorIcon::Default);
     ctx.request_repaint();
 }
 
@@ -92,7 +91,7 @@ pub(super) fn begin(frame: &eframe::Frame, ctx: &eframe::egui::Context) {
                 if !event.is_null() {
                     // The native loop blocks eframe before it can apply this
                     // frame's cursor output. Set AppKit's cursor immediately.
-                    let cursor: *mut AnyObject = msg_send![class!(NSCursor), closedHandCursor];
+                    let cursor: *mut AnyObject = msg_send![class!(NSCursor), arrowCursor];
                     if !cursor.is_null() {
                         let _: () = msg_send![cursor, push];
                     }
@@ -101,6 +100,7 @@ pub(super) fn begin(frame: &eframe::Frame, ctx: &eframe::egui::Context) {
                     let _: () = msg_send![window, setMovable: Bool::NO];
                     if !cursor.is_null() {
                         let _: () = msg_send![class!(NSCursor), pop];
+                        let _: () = msg_send![cursor, set];
                     }
                     finish_native_drag(ctx);
                 }
@@ -207,7 +207,7 @@ mod tests {
                 toolbar_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(at)]);
             assert_eq!(
                 hover.platform_output.cursor_icon,
-                egui::CursorIcon::Grab,
+                egui::CursorIcon::Default,
                 "{region} hover"
             );
             assert!(!requested);
@@ -218,7 +218,7 @@ mod tests {
             );
             assert_eq!(
                 press.platform_output.cursor_icon,
-                egui::CursorIcon::Grabbing,
+                egui::CursorIcon::Default,
                 "{region} held press"
             );
             assert!(!requested, "{region} should wait for movement");
@@ -237,7 +237,7 @@ mod tests {
                 requested,
                 "{region} starts moving the window after the same threshold"
             );
-            assert_eq!(drag.platform_output.cursor_icon, egui::CursorIcon::Grabbing);
+            assert_eq!(drag.platform_output.cursor_icon, egui::CursorIcon::Default);
             let (outside, requested) = toolbar_frame(
                 &mut app,
                 &ctx,
@@ -246,7 +246,7 @@ mod tests {
             assert!(!requested, "native drag is requested only once");
             assert_eq!(
                 outside.platform_output.cursor_icon,
-                egui::CursorIcon::Grabbing,
+                egui::CursorIcon::Default,
                 "owned drag keeps feedback outside the handle"
             );
             let (release, requested) = toolbar_frame(
@@ -259,13 +259,13 @@ mod tests {
                 )],
             );
             assert!(!requested);
-            assert_ne!(
+            assert_eq!(
                 release.platform_output.cursor_icon,
-                egui::CursorIcon::Grabbing,
-                "release clears the held cursor"
+                egui::CursorIcon::Default,
+                "release keeps the normal arrow"
             );
             let (hover, _) = toolbar_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(at)]);
-            assert_eq!(hover.platform_output.cursor_icon, egui::CursorIcon::Grab);
+            assert_eq!(hover.platform_output.cursor_icon, egui::CursorIcon::Default);
         }
     }
 
@@ -395,17 +395,14 @@ mod tests {
         assert!(ctx.dragged_id().is_none());
         let (next, requested) = toolbar_frame(&mut app, &ctx, vec![]);
         assert!(!requested);
-        assert_eq!(next.platform_output.cursor_icon, egui::CursorIcon::Grab);
+        assert_eq!(next.platform_output.cursor_icon, egui::CursorIcon::Default);
         let (press, requested) = toolbar_frame(
             &mut app,
             &ctx,
             vec![button(point, egui::PointerButton::Primary, true)],
         );
         assert!(!requested);
-        assert_eq!(
-            press.platform_output.cursor_icon,
-            egui::CursorIcon::Grabbing
-        );
+        assert_eq!(press.platform_output.cursor_icon, egui::CursorIcon::Default);
         let (_, requested) = toolbar_frame(
             &mut app,
             &ctx,

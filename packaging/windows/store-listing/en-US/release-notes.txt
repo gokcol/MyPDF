@@ -1,8 +1,6 @@
-New in MyPDF 2.1.7:
+New in MyPDF 2.1.8:
 
-- Scroll PDFs with one finger on a touchscreen in Read mode.
-- Pan and zoom with two fingers while using document tools.
-- Reduce work during scrolling and text indexing.
-- Use consistent window dragging from the header, logo and MyPDF text.
-- Retain reading positions, settings, and saved artwork.
-- Keep the rich text and image clipboard improvements from 2.1.6.
+- Keep the normal arrow pointer when dragging the window from the header, logo or MyPDF text.
+- Retain consistent drag behavior without selecting the branding text.
+- Keep the touchscreen scrolling and reduced navigation work introduced in 2.1.7.
+- Preserve reading positions, settings and saved artwork.

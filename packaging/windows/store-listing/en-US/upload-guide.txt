@@ -1,4 +1,4 @@
-MyPDF (OG) 2.1.7 — Microsoft Store, English (United States)
+MyPDF (OG) 2.1.8 — Microsoft Store, English (United States)
 
 Description: paste description.txt as plain text.
 Release notes: paste release-notes.txt as plain text.

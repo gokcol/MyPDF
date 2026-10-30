@@ -2,6 +2,8 @@
 
 # MyPDF — native Rust desktop PDF editor
 
+Version **2.1.8**, build **197**, keeps the normal arrow pointer when moving the window from the header, logo or MyPDF text. The shared drag behavior, nonselectable branding text, and release cleanup remain, along with the touchscreen navigation and scrolling improvements from 2.1.7.
+
 Version **2.1.7**, build **196**, adds touchscreen scrolling in Read mode, with two-finger pan and pinch navigation across document tools. It reduces disk writes during scrolling, avoids unnecessary cache sorting and reuses decoded font outlines during text indexing. Window dragging from the header, logo and MyPDF text uses consistent behavior and contextual cursors. Settings and reading positions remain saved after navigation settles and on normal close. Available for Mac and Windows.
 
 Version **2.1.6**, build **194**, improves copying PDF text and images into other apps. Text copies with font, size, bold/italic and color formatting, and overlapping paint passes used to simulate bold no longer produce repeated lines. Damaged Latin ligature mappings can be recovered when an exact matching font is available locally. After dragging a text selection and releasing the mouse, Shift-click extends it from the original anchor within the page. Image copies retain their bitmap clipboard data. Available for Mac and Windows.
