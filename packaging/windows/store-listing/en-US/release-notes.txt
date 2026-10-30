@@ -1,8 +1,5 @@
-New in MyPDF 2.1.4:
+New in MyPDF 2.1.5:
 
-- Clearer annotation text, shapes and image artwork at reduced zoom.
-- Stamps, checkmarks and saved ink signatures remember their chosen placement sizes.
-- Improved page-thumbnail multi-selection and context actions, with page copy/paste between open PDFs.
-- Thumbnail navigation preserves reading history; page exports protect unfinished edits.
-- Removed the duplicate Find toolbar icon. Search remains in the sidebar and on Ctrl+F.
-- Existing settings, saved artwork and font compatibility fixes are retained.
+- Clear document searches in one click using the X at the right of the search box.
+- Clear matching highlights and keep the search field focused for the next query.
+- Match-case, whole-word preferences, existing settings and saved artwork are retained.

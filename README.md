@@ -2,6 +2,8 @@
 
 # MyPDF — native Rust desktop PDF editor
 
+Version **2.1.5**, build **192**, adds a one-click clear button inside the document search box. The X appears when text is entered, clears the query and matching highlights, and keeps the field focused for the next search. Match-case and whole-word settings are preserved. Available for Mac and Windows.
+
 Version **2.1.4**, build **190**, improves annotation clarity at reduced zoom, remembers each stamp/checkmark/ink-signature size, and expands thumbnail page selection and context actions, including copying pages between open PDFs. Thumbnail navigation preserves reading history, and page exports protect unfinished edits. The duplicate Find toolbar icon is removed; document search remains in the Search sidebar and on ⌘F/Ctrl+F. Existing settings and saved artwork are retained.
 
 Version **2.1.3**, build **187**, improves PDFs with nonembedded fonts: installed substitutes restore Turkish and other supported glyphs, with consistent font resolution across viewing, thumbnails, text geometry and exports. A font-engine correction prevents duplicate glyph names from displaying the wrong letter. Mac review bundles stay out of Finder’s Open With menu, and a targeted maintenance command tidies old MyPDF registrations without deleting apps or user data.

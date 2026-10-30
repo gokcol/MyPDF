@@ -39,7 +39,7 @@ This handover is a point-in-time record. Later status/verification reports take 
 | Published release source | `46e504cf0399241de1d0883d80c1b8bee090f362` — Release MyPDF 2.1.4 with clearer annotations and page workflows |
 | Release tag | `v2.1.4`, still points to published release source `46e504cf0399241de1d0883d80c1b8bee090f362` |
 | Clean release snapshot | `/Users/gokcol/SWPROJECTS/Utility/MyPDF/artifacts/release-2.1.4-build190/source`; all 439 tracked files matched the commit |
-| Repository versions | App 2.1.4; Mac build 191; Windows/Store package 2.1.4.0 |
+| Repository release-preparation versions | App 2.1.5; Mac build 192; Windows/Store package 2.1.5.0; installed Mac remains 2.1.4/build 191 |
 | GitHub 2.1.4 | [Published release](https://github.com/gokcol/MyPDF/releases/tag/v2.1.4), all ten assets verified; published 25 October at 23:28 Europe/Istanbul |
 | Previous public GitHub release | [v2.1.3](https://github.com/gokcol/MyPDF/releases/tag/v2.1.3), Mac build 187 |
 | Published Mac release (build 190) | Developer ID signed, app and DMG notarization **Accepted**, stapled and verified; published release assets complete |
