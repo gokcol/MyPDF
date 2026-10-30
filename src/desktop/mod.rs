@@ -1402,9 +1402,9 @@ impl Viewer {
                     #[cfg(target_os = "macos")]
                     ui.add_space(70.);
                     let (mark, move_handle) =
-                        ui.allocate_exact_size(vec2(22., 22.), egui::Sense::drag());
+                        ui.allocate_exact_size(vec2(22., 22.), egui::Sense::click_and_drag());
                     ui::logo(ui.painter(), mark);
-                    if move_handle.drag_started() {
+                    if window_drag::handle(&move_handle, |_| true) {
                         self.tab_controls.request_window_drag();
                     }
                     if ui.available_width() > 960. {
@@ -1414,9 +1414,10 @@ impl Viewer {
                                     .font(ui::bold(ui, 14.))
                                     .color(theme::ink()),
                             )
-                            .sense(egui::Sense::drag()),
+                            .selectable(false)
+                            .sense(egui::Sense::click_and_drag()),
                         );
-                        if move_handle.drag_started() {
+                        if window_drag::handle(&move_handle, |_| true) {
                             self.tab_controls.request_window_drag();
                         }
                     }

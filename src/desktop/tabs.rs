@@ -1337,16 +1337,10 @@ impl Viewer {
         // Decide ownership from the original press, never from the absence of
         // a tab drag after its release. Close buttons and clipped tabs also
         // belong to the tab strip and must never initiate window movement.
-        if area.drag_started()
-            && !egui::Popup::is_any_open(ctx)
-            && ctx.input(|i| {
-                i.pointer.primary_down()
-                    && i.pointer.press_origin().is_some_and(|origin| {
-                        strip_rect.contains(origin)
-                            && !targets.iter().any(|(_, rect)| rect.contains(origin))
-                    })
-            })
-        {
+        if window_drag::handle(&area, |position| {
+            strip_rect.contains(position)
+                && !targets.iter().any(|(_, rect)| rect.contains(position))
+        }) {
             self.tab_controls.request_window_drag();
         }
         if self.tab_controls.drag.is_some_and(|d| d.moved) {

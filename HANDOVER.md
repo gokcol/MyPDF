@@ -1,8 +1,18 @@
 # MyPDF — current handover
 
-Updated 31 October 2026 at 00:23 (Europe/Istanbul). Project root: `/Users/gokcol/SWPROJECTS/Utility/MyPDF/`.
+Updated 31 October 2026 at 00:53 (Europe/Istanbul). Project root: `/Users/gokcol/SWPROJECTS/Utility/MyPDF/`.
 
-## MyPDF 2.1.7 / build 195 — release in progress
+## MyPDF 2.1.7 / build 196 — release in progress
+
+The user added consistent window-drag cursors and dragging from the MyPDF logo text before publication. These changes are being folded into the still-unpublished v2.1.7 draft, with Mac build 196 and Windows version 2.1.7.0. Final release source and package checks will be recorded after this follow-up is committed. Local final checks passed: formatting, Clippy with warnings denied, and the full Rust suite (704 passes, 0 failures, 7 ignored). Four new window-drag regressions and twelve existing tab tests passed; independent review found no blockers. Receipt: `artifacts/release-2.1.7-build196/local-validation.json`. Build 195 packages are local/draft evidence only and must not be presented as the final release.
+
+The Mac currently runs **2.1.7/build 195**, signed/notarized/stapled and installed successfully. Its fresh shutdown baseline was one open document; one reopened with the same reading position, workspace, all eight critical settings files and macOS preferences. Receipt: `artifacts/mac-install-2.1.7-build195/installation-report.json`. Build 194 is retained intact in that installation's rollback directory. Build 196 must preserve this current state again.
+
+Build 195 source was `8247f33d278593811f56c4701ac1dd7ed94821b9`. Windows Rust checks and all three Windows package jobs passed. The first macOS CI attempt failed an unchanged recovery test during immediate lock reacquisition; the same-source macOS rerun passed, with Windows also passing. Isolated lock/process-spawn reproduction found temporary lock retention, and sixteen repetitions of the unchanged recovery suite passed. The exact original cause remains an inference; see `artifacts/windows-touch-performance/validation/recovery-ci-diagnosis.json` and `artifacts/release-2.1.7-build195/rust-checks-attempt1.json`. Final build 196 must pass its own checks.
+
+New release/install evidence belongs in `artifacts/release-2.1.7-build196/` and `artifacts/mac-install-2.1.7-build196/`. Public latest remains 2.1.6 until the final release is verified and published.
+
+## Earlier build 195 implementation and validation
 
 The Windows 11 touchscreen report is being addressed with one-finger Read-mode scrolling, two-finger navigation, deferred navigation persistence, conditional cache trimming and single-pass glyph-outline decoding. The reported laptop has an Intel i7 and 16 GB RAM. Physical Windows touchscreen/pen behavior and end-to-end scrolling performance still require confirmation on that device.
 
