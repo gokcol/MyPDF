@@ -1836,7 +1836,24 @@ impl Viewer {
             }
             ui.add_space(4.);
             if self.search {
-                let response = ui.add(egui::TextEdit::singleline(&mut tab.query).margin(ui::FIELD_MARGIN).hint_text("Find in document…").margin(vec2(10., 7.)).desired_width(f32::INFINITY));
+                let mut response = ui.add(egui::TextEdit::singleline(&mut tab.query).hint_text("Find in document…").margin(egui::Margin { left: 10, right: 34, top: 7, bottom: 7 }).desired_width(f32::INFINITY));
+                if !tab.query.is_empty() {
+                    let clear_rect = Rect::from_center_size(pos2(response.rect.right() - 17., response.rect.center().y), vec2(24., 24.));
+                    let clear = ui.interact(clear_rect, response.id.with("clear"), egui::Sense::click()).on_hover_text("Clear search").on_hover_cursor(egui::CursorIcon::PointingHand);
+                    clear.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Clear search"));
+                    if clear.hovered() || clear.has_focus() {
+                        ui.painter().rect_filled(clear_rect, 4., theme::hover());
+                    }
+                    if clear.has_focus() {
+                        ui.painter().rect_stroke(clear_rect, 4., Stroke::new(1., theme::accent()), egui::StrokeKind::Inside);
+                    }
+                    ui::draw_icon(ui.painter(), clear_rect.shrink(6.), Icon::Close, theme::muted());
+                    if clear.clicked() {
+                        tab.query.clear();
+                        response.mark_changed();
+                        response.request_focus();
+                    }
+                }
                 self.editor.text_editing |= response.has_focus();
                 if self.focus_search { response.request_focus(); self.focus_search = false; }
                 let mut options_changed = false;
