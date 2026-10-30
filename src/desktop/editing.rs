@@ -1454,6 +1454,14 @@ pub(super) fn page_interaction(
         }
         return;
     }
+    // Capture ownership before interact(): a Shift-click on another page may
+    // start a local anchor, but must not borrow an old page's selection or
+    // suppress that page's ordinary annotation actions.
+    let extending_text_selection = editor.mode == Mode::Read
+        && ctx.input(|i| i.modifiers.shift)
+        && editor.text_selection.is_some_and(|selection| {
+            selection.tab == tab.id && selection.page == page && selection.text(tab).is_some()
+        });
     if editor.mode == Mode::Read {
         text_selection::interact(
             &mut editor.text_selection,
@@ -1673,6 +1681,7 @@ pub(super) fn page_interaction(
     if response.clicked()
         && !inline_text_pointer
         && !vertex_tool
+        && !extending_text_selection
         && matches!(editor.mode, Mode::Read | Mode::Draw | Mode::Annotate)
         && let Some(pointer) = response.interact_pointer_pos()
     {

@@ -493,6 +493,10 @@ impl StandardKind {
         self.code_to_ps_name(code).and_then(glyph_name_to_unicode)
     }
 
+    pub(crate) fn postscript_name(&self) -> &'static str {
+        self.base_font.postscript_name()
+    }
+
     pub(crate) fn is_italic(&self) -> bool {
         self.base_font.is_italic()
     }

@@ -209,6 +209,69 @@ impl SystemFonts {
         None
     }
 }
+/// Resolve only an exact PostScript font identity for verifying embedded glyph
+/// outlines. A similar family or fallback font cannot justify a text correction.
+pub(crate) fn exact_font(name: &str) -> Option<Resolved> {
+    let name = strip_subset(name);
+    if name.is_empty() || name.len() > 256 {
+        return None;
+    }
+    fn find(fonts: &SystemFonts, name: &str) -> Option<Resolved> {
+        let id = fonts
+            .database
+            .faces()
+            .find(|face| face.post_script_name.eq_ignore_ascii_case(name))?
+            .id;
+        fonts.face(id, "")
+    }
+    if let Some(font) = find(system_fonts(), name) {
+        return Some(font);
+    }
+    // Office's private fonts are not necessarily registered with the OS. Read
+    // only its font resources when present, never its documents or preferences.
+    #[cfg(target_os = "macos")]
+    {
+        static OFFICE: OnceLock<SystemFonts> = OnceLock::new();
+        let fonts = OFFICE.get_or_init(|| {
+            let mut database = fontdb::Database::new();
+            let directory =
+                std::path::Path::new("/Applications/Microsoft Word.app/Contents/Resources/DFonts");
+            if let Ok(entries) = std::fs::read_dir(directory) {
+                let mut paths: Vec<_> = entries
+                    .take(2048)
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.extension().is_some_and(|extension| {
+                            extension.to_str().is_some_and(|extension| {
+                                ["ttf", "otf", "ttc"]
+                                    .iter()
+                                    .any(|wanted| extension.eq_ignore_ascii_case(wanted))
+                            })
+                        })
+                    })
+                    .collect();
+                paths.sort();
+                for path in paths {
+                    if std::fs::metadata(&path)
+                        .is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_FONT_BYTES)
+                    {
+                        let _ = database.load_font_file(path);
+                    }
+                }
+            }
+            SystemFonts {
+                database,
+                files: Mutex::default(),
+            }
+        });
+        if let Some(font) = find(fonts, name) {
+            return Some(font);
+        }
+    }
+    None
+}
+
 fn usable_face(bytes: &[u8], index: u32, required: &str) -> bool {
     bytes.len() as u64 <= MAX_FONT_BYTES
         && ttf_parser::Face::parse(bytes, index).is_ok_and(|font| {

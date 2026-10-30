@@ -1,5 +1,8 @@
-New in MyPDF 2.1.5:
+New in MyPDF 2.1.6:
 
-- Clear document searches in one click using the X at the right of the search box.
-- Clear matching highlights and keep the search field focused for the next query.
-- Match-case, whole-word preferences, existing settings and saved artwork are retained.
+- Copy PDF text with its font, size, bold/italic style and color into compatible apps.
+- Avoid duplicate copied lines when PDFs draw the same text repeatedly to simulate bold.
+- Recover damaged Latin ligature mappings when the matching font is available locally.
+- Extend a text selection with Shift-click after releasing the mouse.
+- Keep copied PDF images available for pasting into other apps.
+- Existing settings and saved artwork are retained.

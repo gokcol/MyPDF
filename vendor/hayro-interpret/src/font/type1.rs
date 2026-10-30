@@ -15,7 +15,7 @@ use skrifa::GlyphId;
 use std::sync::Arc;
 
 #[derive(Debug)]
-pub(crate) struct Type1Font(u128, Kind, Option<CMap>);
+pub(crate) struct Type1Font(u128, Kind, Option<CMap>, Option<String>);
 
 impl Type1Font {
     pub(crate) fn new(
@@ -26,6 +26,7 @@ impl Type1Font {
         let cache_key = dict.cache_key();
 
         let to_unicode = read_to_unicode(dict, cmap_resolver);
+        let postscript_name = FallbackFontQuery::new(dict).post_script_name;
 
         let fallback = || {
             // TODO: Actually use fallback fonts
@@ -49,23 +50,29 @@ impl Type1Font {
                     resolver,
                 )?),
                 to_unicode.clone(),
+                postscript_name.clone(),
             ))
         };
 
         let inner = if is_cff(dict) {
             if let Some(cff) = CffKind::new(dict) {
-                Self(cache_key, Kind::Cff(cff), to_unicode)
+                Self(cache_key, Kind::Cff(cff), to_unicode, postscript_name)
             } else {
                 return fallback();
             }
         } else if is_type1(dict) {
             if let Some(f) = Type1Kind::new(dict) {
-                Self(cache_key, Kind::Type1(f), to_unicode)
+                Self(cache_key, Kind::Type1(f), to_unicode, postscript_name)
             } else {
                 return fallback();
             }
         } else if let Some(standard) = StandardKind::new(dict, resolver) {
-            Self(cache_key, Kind::Standard(standard), to_unicode)
+            Self(
+                cache_key,
+                Kind::Standard(standard),
+                to_unicode,
+                postscript_name,
+            )
         } else {
             return fallback();
         };
@@ -77,7 +84,16 @@ impl Type1Font {
         let dict = Dict::default();
         let standard = StandardKind::new_with_standard(&dict, font, true, resolver)?;
 
-        Some(Self(0, Kind::Standard(standard), None))
+        Some(Self(
+            0,
+            Kind::Standard(standard),
+            None,
+            Some(font.postscript_name().to_owned()),
+        ))
+    }
+
+    pub(crate) fn postscript_name(&self) -> Option<&str> {
+        self.3.as_deref()
     }
 
     pub(crate) fn map_code(&self, code: u8) -> GlyphId {

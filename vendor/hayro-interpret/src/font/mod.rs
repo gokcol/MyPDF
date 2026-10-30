@@ -186,6 +186,12 @@ impl OutlineGlyph {
         self.font.char_code_to_unicode(self.char_code)
     }
 
+    /// Return the PDF font name even when no TrueType/OpenType font bytes are
+    /// available, as with the standard Type1 fonts.
+    pub fn font_name(&self) -> Option<&str> {
+        self.font.postscript_name()
+    }
+
     /// Get raw font bytes and metadata for downstream use.
     ///
     /// Returns `None` for Type1 fonts.

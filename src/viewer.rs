@@ -6,6 +6,8 @@ use hayro::kurbo::{BezPath, Rect, Shape};
 use interpret::{
     BlendMode, ClipPath, DrawMode, DrawProps, Image, ImageDrawProps, SoftMask, TransformExt,
 };
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -31,10 +33,57 @@ pub struct GlyphBox {
     pub rect: [f32; 4],
 }
 
+/// Portable text styling for copying editable text to another application.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextStyle {
+    pub family: String,
+    pub size: f32,
+    pub bold: bool,
+    pub italic: bool,
+    pub color: [u8; 3],
+}
+impl Default for TextStyle {
+    fn default() -> Self {
+        Self {
+            family: "sans-serif".into(),
+            size: 12.,
+            bold: false,
+            italic: false,
+            color: [0; 3],
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TextSpan {
+    pub range: Range<usize>,
+    pub style: TextStyle,
+}
+
+/// A visual text line in page coordinates (points, with the origin at top left).
+#[derive(Clone, Debug)]
+pub struct TextLine {
+    pub range: Range<usize>,
+    pub left: f32,
+    pub baseline: f32,
+}
+
+/// An independently verified glyph expansion and its original PDF mapping.
+/// Ranges refer to the corrected `PageText.text`, preserving safe correspondence
+/// with raw text objects that still use the PDF's original ToUnicode values.
+#[derive(Clone, Debug)]
+pub struct TextCorrection {
+    pub range: Range<usize>,
+    pub original: String,
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct PageText {
     pub text: String,
     pub glyphs: Vec<GlyphBox>,
+    pub spans: Vec<TextSpan>,
+    pub lines: Vec<TextLine>,
+    pub corrections: Vec<TextCorrection>,
     pub limited: bool,
 }
 
@@ -223,35 +272,301 @@ impl SearchWorker {
     }
 }
 
+#[derive(Clone)]
+struct FontStyle {
+    family: String,
+    bold: bool,
+    italic: bool,
+}
+
+impl FontStyle {
+    fn from_glyph(glyph: &interpret::font::OutlineGlyph) -> Self {
+        let data = glyph.font_data();
+        let face = data
+            .as_ref()
+            .and_then(|data| ttf_parser::Face::parse(data.data.as_ref().as_ref(), 0).ok());
+        let family = face.as_ref().and_then(|face| {
+            [
+                ttf_parser::name_id::TYPOGRAPHIC_FAMILY,
+                ttf_parser::name_id::FAMILY,
+            ]
+            .into_iter()
+            .find_map(|id| {
+                face.names()
+                    .into_iter()
+                    .filter(|name| name.name_id == id)
+                    .find_map(|name| name.to_string().filter(|s| !s.trim().is_empty()))
+            })
+        });
+        let name = glyph.font_name().unwrap_or("");
+        let name = name
+            .split_once('+')
+            .filter(|(prefix, _)| prefix.len() == 6)
+            .map_or(name, |(_, rest)| rest);
+        let lower = name.to_ascii_lowercase();
+        let family = family.unwrap_or_else(|| {
+            if name.starts_with('.') || name.is_empty() {
+                if data.as_ref().is_some_and(|data| data.is_monospace) {
+                    "monospace".into()
+                } else if data.as_ref().is_some_and(|data| data.is_serif) {
+                    "serif".into()
+                } else {
+                    "sans-serif".into()
+                }
+            } else if name.starts_with("TimesNewRoman") {
+                "Times New Roman".into()
+            } else if name.starts_with("Arial") {
+                "Arial".into()
+            } else {
+                name.split('-').next().unwrap_or(name).to_owned()
+            }
+        });
+        // A PDF font name is untrusted and is copied into each temporary glyph
+        // style; cap it once before caching to keep that staging memory bounded.
+        let family: String = family.chars().take(256).collect();
+        Self {
+            family,
+            bold: data
+                .as_ref()
+                .and_then(|data| data.weight)
+                .is_some_and(|weight| weight >= 600)
+                || face.as_ref().is_some_and(|face| face.is_bold())
+                || lower.contains("bold")
+                || lower.contains("demi"),
+            italic: data.as_ref().is_some_and(|data| data.is_italic)
+                || face.as_ref().is_some_and(|face| face.is_italic())
+                || lower.contains("italic")
+                || lower.contains("oblique"),
+        }
+    }
+}
+
+struct ExtractedGlyph {
+    text: String,
+    original: Option<String>,
+    rect: [f32; 4],
+    origin: hayro::kurbo::Point,
+    end: hayro::kurbo::Point,
+    direction: hayro::kurbo::Vec2,
+    font: Option<u128>,
+    style: TextStyle,
+}
+
+struct PaintedRun {
+    glyphs: Range<usize>,
+    positions: Vec<(hayro::kurbo::Point, hayro::kurbo::Point)>,
+}
+
+#[derive(Default)]
 struct TextDevice {
     result: PageText,
-    previous: Option<hayro::kurbo::Point>,
+    previous: Option<(hayro::kurbo::Point, hayro::kurbo::Vec2, f32)>,
+    glyph_styles: Vec<TextStyle>,
+    fonts: HashMap<u128, FontStyle>,
+    recoveries: HashMap<u128, crate::text_recovery::LigatureRecovery>,
+    painted: HashMap<(u64, i32, i32), Vec<PaintedRun>>,
+    last_fill: Option<Range<usize>>,
+    visited: usize,
 }
+
+impl TextDevice {
+    /// Quartz can synthesize bold by drawing the same text several times, each
+    /// shifted by a fraction of a point. Those paint passes are one logical run.
+    /// Compare both text/font and every glyph's placement; repeated words on
+    /// another line or in another column must remain separate selections.
+    fn duplicate_run(
+        &mut self,
+        glyphs: &[ExtractedGlyph],
+        hash: u64,
+        stroked: bool,
+    ) -> Option<Range<usize>> {
+        let first = &glyphs[0];
+        let cell = (
+            (first.origin.x / 2.).floor() as i32,
+            (first.origin.y / 2.).floor() as i32,
+        );
+        for x in cell.0.saturating_sub(1)..=cell.0.saturating_add(1) {
+            for y in cell.1.saturating_sub(1)..=cell.1.saturating_add(1) {
+                let Some(runs) = self.painted.get(&(hash, x, y)) else {
+                    continue;
+                };
+                for run in runs {
+                    if run.glyphs.len() != glyphs.len() {
+                        continue;
+                    }
+                    let mut offset = false;
+                    let same = glyphs
+                        .iter()
+                        .zip(run.glyphs.clone())
+                        .zip(&run.positions)
+                        .all(|((glyph, index), (origin, end))| {
+                            let old_style = &self.glyph_styles[index];
+                            let tolerance = (glyph.style.size as f64 * 0.075).clamp(0.05, 1.);
+                            let shift = (glyph.origin - *origin).hypot();
+                            offset |= shift > 0.02;
+                            self.result
+                                .text
+                                .get(self.result.glyphs[index].range.clone())
+                                == Some(glyph.text.as_str())
+                                && old_style.family == glyph.style.family
+                                && old_style.italic == glyph.style.italic
+                                && (old_style.color == glyph.style.color
+                                    // FillStroke emits consecutive callbacks for
+                                    // the same run even with different paint colors.
+                                    || (stroked
+                                        && self.last_fill.as_ref() == Some(&run.glyphs)
+                                        && shift <= 0.001
+                                        && (glyph.end - *end).hypot() <= 0.001))
+                                && (old_style.size - glyph.style.size).abs() < 0.01
+                                && shift <= tolerance
+                                && (glyph.end - *end).hypot() <= tolerance
+                        });
+                    if same {
+                        if offset || stroked {
+                            for index in run.glyphs.clone() {
+                                self.glyph_styles[index].bold = true;
+                            }
+                        }
+                        return Some(run.glyphs.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn append(&mut self, glyph: &ExtractedGlyph) {
+        let mut new_line = self.result.lines.is_empty();
+        if let Some((previous, direction, size)) = self.previous {
+            let delta = glyph.origin - previous;
+            let across = delta.x * direction.y - delta.y * direction.x;
+            new_line = across.abs() > f64::from(size.max(glyph.style.size)) * 0.35
+                || direction.dot(glyph.direction) < 0.9;
+            if new_line {
+                self.result.text.push('\n');
+            } else {
+                let along = delta.dot(direction);
+                if along > f64::from(glyph.style.size) * 0.25
+                    && !self.result.text.ends_with(char::is_whitespace)
+                    && !glyph.text.starts_with(char::is_whitespace)
+                {
+                    self.result.text.push(' ');
+                }
+            }
+        }
+        let start = self.result.text.len();
+        self.result.text.push_str(&glyph.text);
+        let end = self.result.text.len();
+        if let Some(original) = &glyph.original {
+            self.result.corrections.push(TextCorrection {
+                range: start..end,
+                original: original.clone(),
+            });
+        }
+        self.result.glyphs.push(GlyphBox {
+            range: start..end,
+            rect: glyph.rect,
+        });
+        self.glyph_styles.push(glyph.style.clone());
+        if new_line {
+            self.result.lines.push(TextLine {
+                range: start..end,
+                left: glyph.origin.x as f32,
+                baseline: glyph.origin.y as f32,
+            });
+        } else if let Some(line) = self.result.lines.last_mut() {
+            line.range.end = end;
+            line.left = line.left.min(glyph.origin.x as f32);
+        }
+        self.previous = Some((glyph.end, glyph.direction, glyph.style.size));
+    }
+
+    fn finish(mut self) -> PageText {
+        for (glyph, style) in self.result.glyphs.iter().zip(self.glyph_styles) {
+            match self.result.spans.last_mut() {
+                Some(span) if span.style == style => span.range.end = glyph.range.end,
+                _ => self.result.spans.push(TextSpan {
+                    range: glyph.range.clone(),
+                    style,
+                }),
+            }
+        }
+        self.result
+    }
+}
+
 impl<'a> Device<'a> for TextDevice {
-    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {}
-    fn push_clip_path(&mut self, _: &ClipPath) {}
-    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {}
-    fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {}
-    fn pop_clip(&mut self) {}
-    fn pop_transparency_group(&mut self) {}
+    fn draw_path(&mut self, _: &BezPath, _: DrawProps<'a>, _: &DrawMode) {
+        self.last_fill = None;
+    }
+    fn push_clip_path(&mut self, _: &ClipPath) {
+        self.last_fill = None;
+    }
+    fn push_transparency_group(&mut self, _: f32, _: Option<SoftMask<'a>>, _: BlendMode) {
+        self.last_fill = None;
+    }
+    fn draw_image(&mut self, _: Image<'a, '_>, _: ImageDrawProps<'a>) {
+        self.last_fill = None;
+    }
+    fn pop_clip(&mut self) {
+        self.last_fill = None;
+    }
+    fn pop_transparency_group(&mut self) {
+        self.last_fill = None;
+    }
     fn draw_glyph_run(
         &mut self,
         run: &interpret::font::GlyphRun<'_, 'a>,
         props: DrawProps<'a>,
-        _: &DrawMode,
+        mode: &DrawMode,
     ) {
+        let color = match props.paint {
+            interpret::Paint::Color(color) => {
+                let [r, g, b, _] = color.to_rgba().to_rgba8();
+                [r, g, b]
+            }
+            _ => [0; 3],
+        };
+        let mut glyphs = Vec::new();
+        let mut run_bytes = 0;
+        let mut signature = std::collections::hash_map::DefaultHasher::new();
         for glyph in run.glyphs() {
-            if self.result.glyphs.len() >= MAX_PAGE_GLYPHS || self.result.text.len() >= 2_000_000 {
+            self.visited += 1;
+            if self.visited > MAX_PAGE_GLYPHS * 8
+                || self.result.glyphs.len() + glyphs.len() >= MAX_PAGE_GLYPHS
+                || self.result.text.len() >= 2_000_000
+            {
                 self.result.limited = true;
                 break;
             }
             let Some(unicode) = glyph.as_unicode() else {
                 continue;
             };
-            let text = match unicode {
+            let mut text = match unicode {
                 interpret::hayro_cmap::BfString::Char(c) => c.to_string(),
                 interpret::hayro_cmap::BfString::String(s) => s,
             };
+            let original = if let Glyph::Outline(g) = &**glyph {
+                let recovery = self
+                    .recoveries
+                    .entry(g.font_cache_key())
+                    .or_insert_with(|| crate::text_recovery::LigatureRecovery::for_font(g));
+                recovery
+                    .recover(g)
+                    .filter(|recovered| *recovered != text)
+                    .map(|recovered| std::mem::replace(&mut text, recovered.to_owned()))
+            } else {
+                None
+            };
+            if text.is_empty() {
+                continue;
+            }
+            // Include reconstructed separators in the same byte budget.
+            run_bytes += text.len().saturating_add(1) + original.as_ref().map_or(0, String::len);
+            if self.result.text.len().saturating_add(run_bytes) > 2_000_000 {
+                self.result.limited = true;
+                break;
+            }
             let transform = props.transform * glyph.transform();
             let origin = transform * hayro::kurbo::Point::ZERO;
             let advance = match &**glyph {
@@ -260,19 +575,8 @@ impl<'a> Device<'a> for TextDevice {
             };
             let end = transform * hayro::kurbo::Point::new(advance, 0.0);
             let basis = transform * hayro::kurbo::Point::new(0.0, 1000.0) - origin;
-            if let Some(previous) = self.previous {
-                let distance = (origin - previous).hypot();
-                if distance > basis.hypot() * 1.4 {
-                    self.result.text.push('\n');
-                } else if distance > basis.hypot() * 0.25
-                    && !self.result.text.ends_with(char::is_whitespace)
-                    && !text.starts_with(char::is_whitespace)
-                {
-                    self.result.text.push(' ');
-                }
-            }
-            let start = self.result.text.len();
-            self.result.text.push_str(&text);
+            let axis = transform * hayro::kurbo::Point::new(1000.0, 0.0) - origin;
+            let size = basis.hypot() as f32;
             let rect = match &**glyph {
                 Glyph::Outline(g) if !g.outline().is_empty() => {
                     (transform * g.outline()).bounding_box()
@@ -280,18 +584,86 @@ impl<'a> Device<'a> for TextDevice {
                 _ => (transform * Rect::new(0.0, -200.0, advance.max(200.0), 800.0).to_path(0.1))
                     .bounding_box(),
             };
-            if rect.is_finite() {
-                self.result.glyphs.push(GlyphBox {
-                    range: start..self.result.text.len(),
-                    rect: [
-                        rect.x0 as f32,
-                        rect.y0 as f32,
-                        rect.x1 as f32,
-                        rect.y1 as f32,
-                    ],
-                });
+            if !rect.is_finite()
+                || !origin.is_finite()
+                || !end.is_finite()
+                || !size.is_finite()
+                || size <= 0.
+                || axis.hypot() <= 0.
+            {
+                continue;
             }
-            self.previous = Some(end);
+            let mut style = TextStyle {
+                size,
+                color,
+                ..TextStyle::default()
+            };
+            let font = if let Glyph::Outline(g) = &**glyph {
+                let key = g.font_cache_key();
+                let metadata = self
+                    .fonts
+                    .entry(key)
+                    .or_insert_with(|| FontStyle::from_glyph(g));
+                style.family.clone_from(&metadata.family);
+                style.bold = metadata.bold;
+                style.italic = metadata.italic;
+                Some(key)
+            } else {
+                None
+            };
+            text.hash(&mut signature);
+            font.hash(&mut signature);
+            glyphs.push(ExtractedGlyph {
+                text,
+                original,
+                rect: [
+                    rect.x0 as f32,
+                    rect.y0 as f32,
+                    rect.x1 as f32,
+                    rect.y1 as f32,
+                ],
+                origin,
+                end,
+                direction: axis / axis.hypot(),
+                font,
+                style,
+            });
+        }
+        if glyphs.is_empty() {
+            self.last_fill = None;
+            return;
+        }
+        let hash = signature.finish();
+        let can_deduplicate = glyphs.iter().all(|glyph| glyph.font.is_some());
+        if can_deduplicate
+            && let Some(original) =
+                self.duplicate_run(&glyphs, hash, matches!(mode, DrawMode::Stroke(_)))
+        {
+            self.last_fill = matches!(mode, DrawMode::Fill(_)).then_some(original);
+            return;
+        }
+        let first = &glyphs[0];
+        let cell = (
+            (first.origin.x / 2.).floor() as i32,
+            (first.origin.y / 2.).floor() as i32,
+        );
+        let start = self.result.glyphs.len();
+        for glyph in &glyphs {
+            self.append(glyph);
+        }
+        self.last_fill =
+            matches!(mode, DrawMode::Fill(_)).then_some(start..self.result.glyphs.len());
+        if can_deduplicate {
+            self.painted
+                .entry((hash, cell.0, cell.1))
+                .or_default()
+                .push(PaintedRun {
+                    glyphs: start..self.result.glyphs.len(),
+                    positions: glyphs
+                        .iter()
+                        .map(|glyph| (glyph.origin, glyph.end))
+                        .collect(),
+                });
         }
     }
 }
@@ -308,12 +680,9 @@ pub fn extract_page<'a>(
         page.xref(),
         crate::render_fonts::settings(),
     );
-    let mut device = TextDevice {
-        result: PageText::default(),
-        previous: None,
-    };
+    let mut device = TextDevice::default();
     interpret::interpret_page(page, &mut context, &mut device);
-    device.result
+    device.finish()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -559,7 +928,21 @@ fn run_worker(
             });
         } else if !index_finished {
             let text = extract_page(&pdf.pages()[indexed], &text_cache);
-            index_bytes += text.text.len() + text.glyphs.len() * std::mem::size_of::<GlyphBox>();
+            index_bytes += text.text.len()
+                + text.glyphs.len() * std::mem::size_of::<GlyphBox>()
+                + text.lines.len() * std::mem::size_of::<TextLine>()
+                + text
+                    .corrections
+                    .iter()
+                    .map(|correction| {
+                        std::mem::size_of::<TextCorrection>() + correction.original.len()
+                    })
+                    .sum::<usize>()
+                + text
+                    .spans
+                    .iter()
+                    .map(|span| std::mem::size_of::<TextSpan>() + span.style.family.len())
+                    .sum::<usize>();
             index_limited |= text.limited;
             send(Event::Indexed {
                 page: indexed,

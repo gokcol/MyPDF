@@ -5,3 +5,5 @@ Upstream: hayro-interpret 0.8.0, licensed under MIT or Apache-2.0 (original lice
 `StandardFontBlob::name_to_glyph` prefers a known glyph name's Unicode cmap mapping for OpenType substitute fonts, then falls back to the POST table for custom names. Some installed Times New Roman fonts repeat the POST name N or assign it to a different glyph; name-only lookup could render a dotted I instead of N. This also handles valid uniXXXX/uXXXXX glyph names through the interpreter's existing glyph-name decoder.
 
 Embedded font handling and CFF/Symbol/Dingbats lookup are unchanged. The regression is in `tests/render_font_fallback.rs`.
+
+`OutlineGlyph::font_name` also exposes the original PostScript font name through the existing font variants, including standard Type1/nonembedded fonts. MyPDF uses this metadata to retain clipboard font styling and to require an exact font identity before verifying a damaged ligature mapping against local glyph outlines. These accessors do not change rendering or the embedded font bytes. Clipboard extraction regressions are in `tests/viewer_copy.rs`.

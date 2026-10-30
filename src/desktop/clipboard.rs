@@ -43,6 +43,98 @@ pub(super) fn set_for_test(clip: Clip) {
     TEST_CLIP.with(|c| *c.borrow_mut() = Some(clip));
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextCopy {
+    Formatted,
+    Plain,
+}
+
+#[cfg(not(test))]
+fn write_formatted_text(
+    text: &mypdf_milestone0::clipboard_text::ClipboardText,
+) -> anyhow::Result<TextCopy> {
+    let mut clipboard = arboard::Clipboard::new()?;
+    match clipboard.set_html(text.html.as_str(), Some(text.text.as_str())) {
+        Ok(()) => Ok(TextCopy::Formatted),
+        Err(_) => {
+            // Keep Copy useful in apps/platform sessions without a rich format.
+            // Report plain text only after its write has actually succeeded.
+            clipboard.set_text(text.text.as_str())?;
+            Ok(TextCopy::Plain)
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_RICH_TEXT: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
+    static FAIL_TEXT_WRITE: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) };
+}
+
+#[cfg(test)]
+pub(super) fn rich_text_for_test() -> Option<(String, String)> {
+    TEST_RICH_TEXT.with(|text| text.borrow_mut().take())
+}
+
+#[cfg(test)]
+fn write_formatted_text(
+    text: &mypdf_milestone0::clipboard_text::ClipboardText,
+) -> anyhow::Result<TextCopy> {
+    let (rich_fails, plain_fails) = FAIL_TEXT_WRITE.with(|fail| fail.replace((false, false)));
+    TEST_RICH_TEXT.with(|captured| *captured.borrow_mut() = None);
+    if rich_fails {
+        anyhow::ensure!(!plain_fails, "Clipboard unavailable");
+        set_for_test(Clip::Text(text.text.clone()));
+        return Ok(TextCopy::Plain);
+    }
+    TEST_RICH_TEXT.with(|captured| {
+        *captured.borrow_mut() = Some((text.text.clone(), text.html.clone()));
+    });
+    set_for_test(Clip::Text(text.text.clone()));
+    Ok(TextCopy::Formatted)
+}
+
+impl Viewer {
+    pub(super) fn copy_formatted_text(
+        &mut self,
+        ctx: &egui::Context,
+        text: mypdf_milestone0::clipboard_text::ClipboardText,
+    ) {
+        let count = text.text.chars().count();
+        let characters = if count == 1 {
+            "character"
+        } else {
+            "characters"
+        };
+        match write_formatted_text(&text) {
+            Ok(kind) => {
+                // eframe applies queued CopyText commands after update(), which
+                // would clear the HTML flavor we just wrote. This action owns
+                // Copy; remove earlier text-copy output rather than queueing it.
+                ctx.output_mut(|output| {
+                    output
+                        .commands
+                        .retain(|command| !matches!(command, egui::OutputCommand::CopyText(_)));
+                });
+                self.status = Some((
+                    match kind {
+                        TextCopy::Formatted => {
+                            format!("Copied {count} {characters} with formatting")
+                        }
+                        TextCopy::Plain => format!(
+                            "Copied {count} {characters} as plain text; formatting was unavailable."
+                        ),
+                    },
+                    false,
+                ));
+            }
+            Err(error) => {
+                self.status = Some((format!("Could not copy the selected text: {error}"), true))
+            }
+        }
+    }
+}
+
 pub(super) fn png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
     if width == 0 || height == 0 || width > 8192 || height > 8192 {
         return None;
@@ -340,7 +432,17 @@ impl Viewer {
                 })
             });
             match copied {
-                Ok(image) => Some(image),
+                Ok(image) => {
+                    // The image was written directly to the native clipboard.
+                    // eframe must not replace it with an earlier queued text
+                    // copy when this frame finishes.
+                    ctx.output_mut(|output| {
+                        output
+                            .commands
+                            .retain(|command| !matches!(command, egui::OutputCommand::CopyText(_)));
+                    });
+                    Some(image)
+                }
                 Err(e) => {
                     self.status = Some((
                         format!("Could not copy image: {e:#}. The document was not changed."),
@@ -548,6 +650,69 @@ mod tests {
     use super::*;
     use eframe::App;
 
+    fn text_fixture() -> (Viewer, egui::Context) {
+        let ctx = egui::Context::default();
+        let app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        (app, ctx)
+    }
+
+    fn sample_rich_text() -> mypdf_milestone0::clipboard_text::ClipboardText {
+        mypdf_milestone0::clipboard_text::ClipboardText {
+            text: "café & Ω".into(),
+            html: "<p><strong>café &amp; Ω</strong></p>".into(),
+        }
+    }
+
+    #[test]
+    fn formatted_copy_keeps_plain_alternative_without_eframe_overwrite() {
+        let (mut app, ctx) = text_fixture();
+        let copied = sample_rich_text();
+        let output = ctx.run(Default::default(), |ctx| {
+            ctx.copy_text("Earlier copy command".into());
+            app.copy_formatted_text(ctx, copied.clone());
+        });
+        assert_eq!(
+            rich_text_for_test(),
+            Some((copied.text.clone(), copied.html))
+        );
+        assert!(matches!(read(), Clip::Text(text) if text == copied.text));
+        assert!(
+            !output
+                .platform_output
+                .commands
+                .iter()
+                .any(|command| { matches!(command, egui::OutputCommand::CopyText(_)) })
+        );
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|(text, error)| { !error && text.contains("with formatting") })
+        );
+    }
+
+    #[test]
+    fn formatted_copy_falls_back_to_plain_text_with_truthful_status() {
+        let (mut app, ctx) = text_fixture();
+        FAIL_TEXT_WRITE.with(|fail| fail.set((true, false)));
+        app.copy_formatted_text(&ctx, sample_rich_text());
+        assert!(rich_text_for_test().is_none());
+        assert!(matches!(read(), Clip::Text(text) if text == "café & Ω"));
+        assert!(app.status.as_ref().is_some_and(|(text, error)| {
+            !error && text.contains("as plain text") && text.contains("formatting was unavailable")
+        }));
+    }
+
+    #[test]
+    fn copy_failure_is_reported_instead_of_claiming_success() {
+        let (mut app, ctx) = text_fixture();
+        FAIL_TEXT_WRITE.with(|fail| fail.set((true, true)));
+        app.copy_formatted_text(&ctx, sample_rich_text());
+        assert!(rich_text_for_test().is_none());
+        assert!(app.status.as_ref().is_some_and(|(text, error)| {
+            *error && text.starts_with("Could not copy") && !text.contains("Copied")
+        }));
+    }
+
     fn image_fixture() -> (Viewer, egui::Context, Annotation) {
         let ctx = egui::Context::default();
         let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
@@ -648,7 +813,10 @@ mod tests {
     #[test]
     fn image_copy_exports_pixels_and_internal_paste_keeps_editable_original() {
         let (mut app, ctx, original) = image_fixture();
-        assert!(app.copy_marks(&ctx, false));
+        let output = ctx.run(Default::default(), |ctx| {
+            ctx.copy_text("Earlier copied text".into());
+            assert!(app.copy_marks(ctx, false));
+        });
         let Clip::Image(bytes, size) = read() else {
             panic!("Copy must publish an image, not a marker")
         };
@@ -659,11 +827,14 @@ mod tests {
                 .as_raw(),
             &[240, 20, 10, 128, 10, 20, 240, 255]
         );
-        assert!(!ctx.output(|o| {
-            o.commands
+        assert!(
+            !output
+                .platform_output
+                .commands
                 .iter()
-                .any(|c| matches!(c, egui::OutputCommand::CopyText(_)))
-        }));
+                .any(|c| matches!(c, egui::OutputCommand::CopyText(_))),
+            "Queued text must not replace native image data at the end of the frame"
+        );
         set_for_test(Clip::Image(bytes, size));
         app.paste(&ctx);
         let draft = &app.workbench.paste.as_ref().unwrap()[0];
@@ -691,6 +862,10 @@ mod tests {
         assert_eq!(
             app.tabs[0].session.as_ref().unwrap().annotations,
             vec![original.clone()]
+        );
+        assert_eq!(
+            selection::selected_ids(&app.tabs[0]),
+            vec![original.id.clone()]
         );
         assert!(app.status.as_ref().unwrap().1);
         assert!(app.copy_marks(&ctx, true));

@@ -106,7 +106,7 @@ impl TrueTypeFont {
     pub(crate) fn postscript_name(&self) -> Option<&str> {
         match &self.kind {
             Kind::Embedded(e) => e.postscript_name.as_deref(),
-            Kind::Standard(_) => None,
+            Kind::Standard(s) => Some(s.postscript_name()),
         }
     }
 

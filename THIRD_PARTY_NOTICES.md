@@ -28,7 +28,7 @@ The application bypasses the upstream legacy PKCS#12 loader and ECDSA software s
 - Declared license: MIT OR Apache-2.0; original license and bundled-asset notices retained
 - Local source: `vendor/hayro-interpret`
 
-The OpenType substitute-font lookup prefers a known glyph name's Unicode cmap mapping before using legacy POST names. This avoids incorrect glyphs when installed fonts contain duplicate or misleading POST names. Embedded-font and CFF/Symbol/Dingbats lookup is unchanged. `vendor/hayro-interpret/MYPDF-PATCH.md` documents the patch; no operating-system fonts are distributed.
+The OpenType substitute-font lookup prefers a known glyph name's Unicode cmap mapping before using legacy POST names. This avoids incorrect glyphs when installed fonts contain duplicate or misleading POST names. Embedded-font and CFF/Symbol/Dingbats lookup is unchanged. The local API also exposes original PostScript font names for clipboard style metadata and exact-font ligature verification. `vendor/hayro-interpret/MYPDF-PATCH.md` documents these patches; no operating-system or Office fonts are distributed.
 
 ## Desktop viewer dependencies
 

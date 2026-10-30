@@ -28,6 +28,16 @@ impl TextSelection {
             .map(str::to_owned)
             .filter(|t| !t.trim().is_empty())
     }
+    pub(super) fn clipboard_text(
+        &self,
+        tab: &Tab,
+    ) -> Option<mypdf_milestone0::clipboard_text::ClipboardText> {
+        let text = tab.text.get(self.page)?.as_ref()?;
+        let (lo, hi) = self.span();
+        let start = text.glyphs.get(lo)?.range.start;
+        let end = text.glyphs.get(hi)?.range.end;
+        mypdf_milestone0::clipboard_text::from_page(text, start.min(end)..start.max(end))
+    }
     pub(super) fn contains(&self, tab: &Tab, p: [f32; 2]) -> bool {
         self.rects(tab).iter().any(|r| {
             p[0] >= r[0] - 2. && p[0] <= r[2] + 2. && p[1] >= r[1] - 2. && p[1] <= r[3] + 2.
@@ -123,7 +133,27 @@ fn over_text(text: &PageText, p: [f32; 2]) -> bool {
     })
 }
 
-/// Select by dragging, clear by clicking, and show the text cursor over text.
+fn focus_at(
+    selection: &mut Option<TextSelection>,
+    tab: u64,
+    page: usize,
+    focus: usize,
+    extend: bool,
+    glyph_count: usize,
+) {
+    let anchor = selection
+        .filter(|s| extend && s.tab == tab && s.page == page && s.anchor < glyph_count)
+        .map_or(focus, |s| s.anchor);
+    *selection = Some(TextSelection {
+        tab,
+        page,
+        anchor,
+        focus,
+    });
+}
+
+/// Drag to select, Shift-click after release to extend from the original anchor,
+/// and click without Shift to clear. Selection never crosses tabs or pages.
 pub(super) fn interact(
     selection: &mut Option<TextSelection>,
     tab: &Tab,
@@ -148,18 +178,14 @@ pub(super) fn interact(
     {
         ctx.set_cursor_icon(egui::CursorIcon::Text);
     }
+    let shift = ctx.input(|i| i.modifiers.shift);
     if response.drag_started()
         && let Some(origin) = ctx.input(|i| i.pointer.press_origin())
-        && let Some(anchor) = nearest(text, normal(origin))
+        && let Some(focus) = nearest(text, normal(origin))
     {
-        *selection = Some(TextSelection {
-            tab: tab.id,
-            page,
-            anchor,
-            focus: anchor,
-        });
+        focus_at(selection, tab.id, page, focus, shift, text.glyphs.len());
     }
-    if response.dragged()
+    if (response.dragged() || response.drag_stopped())
         && let Some(s) = selection
             .as_mut()
             .filter(|s| s.tab == tab.id && s.page == page)
@@ -170,7 +196,14 @@ pub(super) fn interact(
         ctx.set_cursor_icon(egui::CursorIcon::Text);
     }
     if response.clicked() {
-        *selection = None;
+        if shift
+            && let Some(pos) = response.interact_pointer_pos()
+            && let Some(focus) = nearest(text, normal(pos))
+        {
+            focus_at(selection, tab.id, page, focus, true, text.glyphs.len());
+        } else {
+            *selection = None;
+        }
     }
 }
 
@@ -226,16 +259,17 @@ impl Viewer {
         s.text(tab)
     }
     pub(super) fn copy_page_text(&mut self, ctx: &egui::Context) {
-        if let Some(text) = self.page_text_selection(ctx) {
-            let count = text.chars().count();
-            ctx.copy_text(text);
-            self.status = Some((
-                format!(
-                    "Copied {count} character{}",
-                    if count == 1 { "" } else { "s" }
-                ),
-                false,
-            ));
+        if self.page_text_selection(ctx).is_none() {
+            return;
+        }
+        let selection = self.editor.text_selection.unwrap();
+        if let Some(text) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == selection.tab)
+            .and_then(|tab| selection.clipboard_text(tab))
+        {
+            self.copy_formatted_text(ctx, text);
         }
     }
 }
@@ -244,6 +278,268 @@ impl Viewer {
 mod tests {
     use super::*;
     use mypdf_milestone0::viewer::GlyphBox;
+
+    fn pointer_fixture() -> (Viewer, egui::Context) {
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.open_memory(
+            PathBuf::from("Text selection pointer test.pdf"),
+            mypdf_milestone0::convert::blank(300., 300.).unwrap(),
+            &ctx,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let text = "abcd\nefgh\nijkl";
+        app.tabs[0].text[0] = Some(Arc::new(PageText {
+            text: text.into(),
+            glyphs: text
+                .char_indices()
+                .filter(|(_, c)| *c != '\n')
+                .map(|(start, _)| {
+                    let x = 40. + (start % 5) as f32 * 20.;
+                    let y = 50. + (start / 5) as f32 * 30.;
+                    GlyphBox {
+                        range: start..start + 1,
+                        rect: [x, y, x + 10., y + 12.],
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        }));
+        app.editor.mode = editing::Mode::Read;
+        pointer_frame(&mut app, &ctx, 0, egui::Modifiers::NONE, vec![]);
+        (app, ctx)
+    }
+
+    fn pointer_frame(
+        app: &mut Viewer,
+        ctx: &egui::Context,
+        page: usize,
+        modifiers: egui::Modifiers,
+        events: Vec<egui::Event>,
+    ) {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(400., 400.))),
+                modifiers,
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    editing::page_interaction(
+                        &mut app.editor,
+                        &mut app.tabs[0],
+                        ui,
+                        page,
+                        Rect::from_min_size(pos2(20., 20.), vec2(300., 300.)),
+                        1.,
+                        &mut app.status,
+                    );
+                });
+            },
+        );
+    }
+
+    fn glyph_point(index: usize) -> egui::Pos2 {
+        pos2(
+            65. + (index % 4) as f32 * 20.,
+            76. + (index / 4) as f32 * 30.,
+        )
+    }
+
+    fn pointer_button(pos: egui::Pos2, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers,
+        }
+    }
+
+    fn drag_text(
+        app: &mut Viewer,
+        ctx: &egui::Context,
+        from: usize,
+        to: usize,
+        modifiers: egui::Modifiers,
+    ) {
+        let from = glyph_point(from);
+        let to = glyph_point(to);
+        pointer_frame(
+            app,
+            ctx,
+            0,
+            modifiers,
+            vec![
+                egui::Event::PointerMoved(from),
+                pointer_button(from, true, modifiers),
+            ],
+        );
+        pointer_frame(app, ctx, 0, modifiers, vec![egui::Event::PointerMoved(to)]);
+        pointer_frame(
+            app,
+            ctx,
+            0,
+            modifiers,
+            vec![pointer_button(to, false, modifiers)],
+        );
+        assert!(!ctx.input(|i| i.pointer.primary_down()));
+    }
+
+    fn click_text(
+        app: &mut Viewer,
+        ctx: &egui::Context,
+        page: usize,
+        index: usize,
+        modifiers: egui::Modifiers,
+    ) {
+        let at = glyph_point(index);
+        pointer_frame(
+            app,
+            ctx,
+            page,
+            modifiers,
+            vec![
+                egui::Event::PointerMoved(at),
+                pointer_button(at, true, modifiers),
+            ],
+        );
+        pointer_frame(
+            app,
+            ctx,
+            page,
+            modifiers,
+            vec![pointer_button(at, false, modifiers)],
+        );
+    }
+
+    #[test]
+    fn shift_click_after_mouse_release_extends_forward_backward_and_copies_lines() {
+        let (mut app, ctx) = pointer_fixture();
+        drag_text(&mut app, &ctx, 1, 5, egui::Modifiers::NONE);
+        assert_eq!(app.page_text_selection(&ctx).as_deref(), Some("bcd\nef"));
+        let anchor = app.editor.text_selection.unwrap().anchor;
+        // Shift is pressed only for a new click, after the selection drag and
+        // its mouse release have finished.
+        click_text(&mut app, &ctx, 0, 10, egui::Modifiers::SHIFT);
+        let selected = app.editor.text_selection.unwrap();
+        assert_eq!((selected.anchor, selected.focus), (anchor, 10));
+        assert_eq!(
+            selected.text(&app.tabs[0]).as_deref(),
+            Some("bcd\nefgh\nijk")
+        );
+        app.copy_page_text(&ctx);
+        assert_eq!(clipboard::rich_text_for_test().unwrap().0, "bcd\nefgh\nijk");
+        click_text(&mut app, &ctx, 0, 0, egui::Modifiers::SHIFT);
+        let selected = app.editor.text_selection.unwrap();
+        assert_eq!((selected.anchor, selected.focus), (anchor, 0));
+        assert_eq!(selected.text(&app.tabs[0]).as_deref(), Some("ab"));
+        click_text(&mut app, &ctx, 0, 3, egui::Modifiers::NONE);
+        assert!(app.editor.text_selection.is_none());
+    }
+
+    #[test]
+    fn shift_click_keeps_reversed_drag_anchor_and_shift_drag_uses_it_too() {
+        let (mut app, ctx) = pointer_fixture();
+        drag_text(&mut app, &ctx, 6, 4, egui::Modifiers::NONE);
+        assert_eq!(app.page_text_selection(&ctx).as_deref(), Some("efg"));
+        click_text(&mut app, &ctx, 0, 11, egui::Modifiers::SHIFT);
+        let selected = app.editor.text_selection.unwrap();
+        assert_eq!((selected.anchor, selected.focus), (6, 11));
+        assert_eq!(selected.text(&app.tabs[0]).as_deref(), Some("gh\nijkl"));
+        drag_text(&mut app, &ctx, 11, 2, egui::Modifiers::SHIFT);
+        let selected = app.editor.text_selection.unwrap();
+        assert_eq!((selected.anchor, selected.focus), (6, 2));
+        assert_eq!(selected.text(&app.tabs[0]).as_deref(), Some("cd\nefg"));
+    }
+
+    #[test]
+    fn shift_click_starts_local_anchor_without_reusing_another_page_or_tab() {
+        let (mut app, ctx) = pointer_fixture();
+        click_text(&mut app, &ctx, 0, 5, egui::Modifiers::SHIFT);
+        let selected = app.editor.text_selection.unwrap();
+        assert_eq!((selected.anchor, selected.focus), (5, 5));
+        let page = app.tabs[0].pages[0];
+        let text = app.tabs[0].text[0].clone();
+        app.tabs[0].pages.push(page);
+        app.tabs[0].text.push(text);
+        pointer_frame(&mut app, &ctx, 1, egui::Modifiers::NONE, vec![]);
+        click_text(&mut app, &ctx, 1, 10, egui::Modifiers::SHIFT);
+        let selected = app.editor.text_selection.unwrap();
+        assert_eq!(
+            (selected.page, selected.anchor, selected.focus),
+            (1, 10, 10)
+        );
+        app.editor.text_selection = Some(TextSelection {
+            tab: app.tabs[0].id + 1,
+            page: 1,
+            anchor: 2,
+            focus: 3,
+        });
+        click_text(&mut app, &ctx, 1, 6, egui::Modifiers::SHIFT);
+        let selected = app.editor.text_selection.unwrap();
+        assert_eq!(
+            (selected.tab, selected.anchor, selected.focus),
+            (app.tabs[0].id, 6, 6)
+        );
+    }
+
+    #[test]
+    fn shift_click_over_highlight_extends_text_while_normal_click_selects_annotation() {
+        use mypdf_milestone0::annotations::{Annotation, Kind, Markup};
+        let (mut app, ctx) = pointer_fixture();
+        let mark = Annotation::new(
+            0,
+            [40., 110., 120., 122.],
+            Kind::Markup {
+                kind: Markup::Highlight,
+                quads: vec![[0., 0., 1., 1.]],
+            },
+            Default::default(),
+        );
+        app.tabs[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .commit(vec![mark.clone()])
+            .unwrap();
+        drag_text(&mut app, &ctx, 1, 5, egui::Modifiers::NONE);
+        click_text(&mut app, &ctx, 0, 10, egui::Modifiers::SHIFT);
+        assert_eq!(
+            app.page_text_selection(&ctx).as_deref(),
+            Some("bcd\nefgh\nijk")
+        );
+        assert!(app.tabs[0].selected_annotation.is_none());
+        click_text(&mut app, &ctx, 0, 10, egui::Modifiers::NONE);
+        assert!(app.editor.text_selection.is_none());
+        assert_eq!(
+            app.tabs[0].selected_annotation.as_deref(),
+            Some(mark.id.as_str())
+        );
+        // A selection on a different page cannot suppress this annotation's
+        // normal action merely because Shift is held during the click.
+        let page = app.tabs[0].pages[0];
+        let text = app.tabs[0].text[0].clone();
+        app.tabs[0].pages.push(page);
+        app.tabs[0].text.push(text);
+        app.editor.text_selection = Some(TextSelection {
+            tab: app.tabs[0].id,
+            page: 1,
+            anchor: 1,
+            focus: 5,
+        });
+        click_text(&mut app, &ctx, 0, 10, egui::Modifiers::SHIFT);
+        assert!(app.editor.text_selection.is_none());
+        assert_eq!(
+            app.tabs[0].selected_annotation.as_deref(),
+            Some(mark.id.as_str())
+        );
+    }
 
     #[test]
     fn dragging_over_page_text_selects_it_for_copying() {
@@ -361,7 +657,7 @@ mod tests {
                     rect: [20., 30., 30., 40.],
                 },
             ],
-            limited: false,
+            ..Default::default()
         };
         assert_eq!(nearest(&text, [25., 15.]), Some(1));
         assert_eq!(nearest(&text, [90., 16.]), Some(1), "past the line end");

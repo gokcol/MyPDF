@@ -487,6 +487,258 @@ fn selection_note(
 fn contains(r: [f32; 4], p: [f32; 2]) -> bool {
     p[0] >= r[0] - 2. && p[0] <= r[2] + 2. && p[1] >= r[1] - 2. && p[1] <= r[3] + 2.
 }
+/// PDF BaseFont values are face names; CSS needs the family separately from
+/// weight/slant. Keep common PostScript names usable in Word's font matching.
+fn clipboard_font_face(name: &str) -> (String, bool, bool) {
+    if let Some(face) = text_style::fonts()
+        .iter()
+        .find(|face| face.ui_name() == name || face.path.to_str() == Some(name))
+    {
+        return (face.family.clone(), face.bold, face.italic);
+    }
+    let name = name
+        .split_once('+')
+        .filter(|(prefix, _)| {
+            prefix.len() == 6 && prefix.bytes().all(|byte| byte.is_ascii_uppercase())
+        })
+        .map_or(name, |(_, name)| name);
+    let lower = name.to_ascii_lowercase();
+    let compact = lower.replace([' ', '-'], "");
+    let bold = ["bold", "black", "heavy", "demi"]
+        .iter()
+        .any(|part| lower.contains(part));
+    let italic = lower.contains("italic") || lower.contains("oblique");
+    let known = [
+        ("timesnewroman", "Times New Roman"),
+        ("timesroman", "Times New Roman"),
+        ("arialnarrow", "Arial Narrow"),
+        ("arialblack", "Arial Black"),
+        ("arial", "Arial"),
+        ("helveticaneue", "Helvetica Neue"),
+        ("helvetica", "Helvetica"),
+        ("couriernew", "Courier New"),
+        ("courier", "Courier"),
+    ]
+    .into_iter()
+    .find_map(|(prefix, family)| compact.starts_with(prefix).then_some(family));
+    let family = if let Some(family) = known {
+        family
+    } else {
+        let suffixes = [
+            "bolditalicmt",
+            "boldobliquemt",
+            "boldmt",
+            "italicmt",
+            "obliquemt",
+            "semibolditalic",
+            "semiboldoblique",
+            "bolditalic",
+            "boldoblique",
+            "semibold",
+            "demibold",
+            "regular",
+            "italic",
+            "oblique",
+            "bold",
+        ];
+        let suffix = suffixes.into_iter().find(|suffix| lower.ends_with(suffix));
+        suffix.map_or(name, |suffix| {
+            name[..name.len() - suffix.len()].trim_end_matches([' ', '-', ','])
+        })
+    };
+    let family = if family.is_empty() || family == "Text box" {
+        "sans-serif"
+    } else {
+        family
+    };
+    (family.into(), bold, italic)
+}
+
+/// Match the PDF edit model's original decoded text against the viewer without
+/// guessing replacements. Only proven glyph corrections are inverted, and a
+/// selection boundary inside an original replacement is deliberately refused.
+fn corrected_copy_ranges(
+    page: &mypdf_milestone0::viewer::PageText,
+    needle: &str,
+) -> Vec<std::ops::Range<usize>> {
+    if needle.is_empty() || page.corrections.is_empty() {
+        return vec![];
+    }
+    let mut original = String::with_capacity(page.text.len());
+    let mut mapping = Vec::with_capacity(page.corrections.len());
+    let mut cursor = 0;
+    for correction in &page.corrections {
+        let Some(before) = page.text.get(cursor..correction.range.start) else {
+            return vec![];
+        };
+        if correction.range.is_empty()
+            || correction.original.is_empty()
+            || page.text.get(correction.range.clone()).is_none()
+        {
+            return vec![];
+        }
+        original.push_str(before);
+        let start = original.len();
+        original.push_str(&correction.original);
+        mapping.push((start..original.len(), correction.range.clone()));
+        cursor = correction.range.end;
+    }
+    let Some(after) = page.text.get(cursor..) else {
+        return vec![];
+    };
+    original.push_str(after);
+    let boundary = |offset: usize| {
+        let (mut old_cursor, mut new_cursor) = (0, 0);
+        for (old, new) in &mapping {
+            if offset <= old.start {
+                return Some(new_cursor + offset - old_cursor);
+            }
+            if offset < old.end {
+                return None;
+            }
+            if offset == old.end {
+                return Some(new.end);
+            }
+            old_cursor = old.end;
+            new_cursor = new.end;
+        }
+        Some(new_cursor + offset - old_cursor)
+    };
+    original
+        .match_indices(needle)
+        .filter_map(|(start, _)| {
+            let range = boundary(start)?..boundary(start + needle.len())?;
+            page.text
+                .get(range.clone())
+                .filter(|text| !text.is_empty())
+                .map(|_| range)
+        })
+        .collect()
+}
+
+fn indexed_copy_range(
+    page: &mypdf_milestone0::viewer::PageText,
+    text: &str,
+    rect: [f32; 4],
+) -> Option<std::ops::Range<usize>> {
+    if text.is_empty() {
+        return None;
+    }
+    let mut candidates = page
+        .text
+        .match_indices(text)
+        .map(|(start, _)| start..start + text.len())
+        .collect::<Vec<_>>();
+    candidates.extend(corrected_copy_ranges(page, text));
+    candidates.sort_unstable_by_key(|range| (range.start, range.end));
+    candidates.dedup();
+    let mut matches = candidates.into_iter().filter(|range| {
+        let mut glyphs = page
+            .glyphs
+            .iter()
+            .filter(|glyph| glyph.range.start < range.end && glyph.range.end > range.start)
+            .peekable();
+        glyphs.peek().is_some()
+            && glyphs.all(|glyph| {
+                let glyph = glyph.rect;
+                contains(
+                    rect,
+                    [(glyph[0] + glyph[2]) * 0.5, (glyph[1] + glyph[3]) * 0.5],
+                )
+            })
+    });
+    let selected = matches.next()?;
+    matches.next().is_none().then_some(selected)
+}
+
+/// Each source run must independently identify indexed text at its own position.
+/// Repeated paint passes collapse only when they map to the exact same canonical
+/// glyph range; repeated wording at a different position keeps its own range.
+fn block_copy_range(
+    page: &mypdf_milestone0::viewer::PageText,
+    block: &BlockDraft,
+    runs: &[document::TextRun],
+) -> Option<std::ops::Range<usize>> {
+    if !block.selection.annotations.is_empty() || block.selection.runs.is_empty() {
+        return None;
+    }
+    let mut ranges = block
+        .selection
+        .runs
+        .iter()
+        .map(|(ordinal, original)| {
+            let run = runs.get(*ordinal)?;
+            if run.text != *original {
+                return None;
+            }
+            indexed_copy_range(page, &run.layout.as_ref()?.text, run.rect?)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    ranges.sort_unstable_by_key(|range| (range.start, range.end));
+    ranges.dedup();
+    let start = ranges.first()?.start;
+    let mut end = ranges.first()?.end;
+    for range in &ranges[1..] {
+        // No partial overlaps or unselected words may be pulled into Copy.
+        let gap = page.text.get(end..range.start)?;
+        if !gap.chars().all(char::is_whitespace) {
+            return None;
+        }
+        end = range.end;
+    }
+    Some(start..end)
+}
+
+/// Use indexed styles only when the text and its page position identify the
+/// clicked block. Repeated wording elsewhere must not donate its formatting.
+fn formatted_inline_text(
+    tab: &Tab,
+    draft: &InlineText,
+    runs: Option<&[document::TextRun]>,
+) -> Option<mypdf_milestone0::clipboard_text::ClipboardText> {
+    let shown = if draft.text == draft.original {
+        draft
+            .geometry
+            .as_ref()
+            .map_or(draft.text.as_str(), |layout| layout.text.as_str())
+    } else {
+        draft.text.as_str()
+    };
+    if !shown.is_empty()
+        && draft.text == draft.original
+        && let Some(page) = tab.text.get(draft.key.2).and_then(Option::as_ref)
+    {
+        let range = indexed_copy_range(page, shown, draft.rect).or_else(|| {
+            let InlineTarget::Block(block) = &draft.target else {
+                return None;
+            };
+            block_copy_range(page, block, runs?)
+        });
+        if let Some(range) = range
+            && let Some(text) = mypdf_milestone0::clipboard_text::from_page(page, range)
+        {
+            return Some(text);
+        }
+    }
+    let (family, bold, italic) = match &draft.target {
+        InlineTarget::Block(block) => text_style::fonts()
+            .get(block.font)
+            .map(|face| (face.family.clone(), face.bold, face.italic))
+            .unwrap_or_else(|| clipboard_font_face(&draft.font)),
+        _ => clipboard_font_face(&draft.font),
+    };
+    let style = mypdf_milestone0::viewer::TextStyle {
+        family,
+        size: draft.size,
+        bold,
+        italic,
+        color: draft
+            .color
+            .map(|channel| (channel.clamp(0., 1.) * 255.).round() as u8),
+    };
+    mypdf_milestone0::clipboard_text::from_styled_text(shown, &style)
+}
+
 fn candidates(state: &ContentState, tab: &Tab, page: usize) -> Vec<InlineText> {
     let Some(s) = &tab.session else { return vec![] };
     let key = (tab.id, s.revision(), page);
@@ -1549,14 +1801,26 @@ impl Viewer {
                 }
             }
             "copy_text" | "copy_artwork_text" => {
-                let text = match &menu.target {
-                    Target::SelectedText(s) => s.text(&self.tabs[index]),
-                    Target::Text(d) => Some(d.text.clone()),
-                    Target::Artwork(m) => m.first().and_then(|a| a.kind.text().map(str::to_owned)),
+                let formatted = match &menu.target {
+                    Target::SelectedText(selection) => selection.clipboard_text(&self.tabs[index]),
+                    Target::Text(draft) => {
+                        let runs = self
+                            .content
+                            .inspection
+                            .as_ref()
+                            .filter(|inspection| inspection.key == draft.key)
+                            .and_then(|inspection| inspection.text.as_ref().ok())
+                            .map(Vec::as_slice);
+                        formatted_inline_text(&self.tabs[index], draft, runs)
+                    }
                     _ => None,
                 };
-                if let Some(text) = text {
-                    ctx.copy_text(text);
+                if let Some(text) = formatted {
+                    self.copy_formatted_text(ctx, text);
+                } else if let Target::Artwork(marks) = &menu.target
+                    && let Some(text) = marks.first().and_then(|mark| mark.kind.text())
+                {
+                    ctx.copy_text(text.to_owned());
                 }
             }
             "all_text" => {
@@ -1883,19 +2147,379 @@ mod tests {
     }
 
     #[test]
+    fn selected_text_context_copy_keeps_formatting_and_unicode() {
+        use mypdf_milestone0::viewer::{GlyphBox, PageText, TextSpan, TextStyle};
+        let (mut app, ctx) = fixture();
+        let text = "café Ω";
+        app.tabs[0].text[0] = Some(Arc::new(PageText {
+            text: text.into(),
+            glyphs: text
+                .char_indices()
+                .enumerate()
+                .map(|(column, (start, c))| GlyphBox {
+                    range: start..start + c.len_utf8(),
+                    rect: [20. + column as f32 * 8., 50., 28. + column as f32 * 8., 62.],
+                })
+                .collect(),
+            spans: vec![TextSpan {
+                range: 0..text.len(),
+                style: TextStyle {
+                    bold: true,
+                    size: 18.,
+                    color: [30, 60, 90],
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        }));
+        let selection = text_selection::TextSelection::all(&app.tabs[0], 0).unwrap();
+        run_command(&mut app, &ctx, Target::SelectedText(selection), "copy_text");
+        let (plain, html) = clipboard::rich_text_for_test().unwrap();
+        assert_eq!(plain, text);
+        assert!(html.contains("font-weight:700") && html.contains("18.00pt"));
+        assert!(html.contains("#1e3c5a"));
+        assert!(!ctx.output(|output| {
+            output
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::OutputCommand::CopyText(_)))
+        }));
+    }
+
+    #[test]
+    fn inline_copy_normalizes_postscript_face_names_for_word() {
+        for (name, family, bold, italic) in [
+            ("ABCDEF+Helvetica-BoldOblique", "Helvetica", true, true),
+            ("TimesNewRomanPS-BoldMT", "Times New Roman", true, false),
+            ("Arial-ItalicMT", "Arial", false, true),
+            ("Georgia-BoldItalic", "Georgia", true, true),
+            ("Aptos-Regular", "Aptos", false, false),
+        ] {
+            assert_eq!(clipboard_font_face(name), (family.into(), bold, italic));
+        }
+        if let Some(face) = text_style::fonts().first() {
+            assert_eq!(
+                clipboard_font_face(&face.ui_name()),
+                (face.family.clone(), face.bold, face.italic)
+            );
+            assert_eq!(
+                clipboard_font_face(face.path.to_str().unwrap()),
+                (face.family.clone(), face.bold, face.italic)
+            );
+        }
+    }
+
+    #[test]
+    fn inline_copy_uses_verified_corrections_at_the_clicked_occurrence_only() {
+        use mypdf_milestone0::viewer::{GlyphBox, PageText, TextCorrection, TextSpan, TextStyle};
+        let (mut app, _) = fixture();
+        let text = "efforts\nefforts\ne[orts";
+        let mut page = PageText {
+            text: text.into(),
+            corrections: vec![
+                TextCorrection {
+                    range: 1..3,
+                    original: "[".into(),
+                },
+                TextCorrection {
+                    range: 9..11,
+                    original: "[".into(),
+                },
+            ],
+            spans: vec![
+                TextSpan {
+                    range: 0..7,
+                    style: TextStyle {
+                        bold: true,
+                        ..Default::default()
+                    },
+                },
+                TextSpan {
+                    range: 8..15,
+                    style: TextStyle {
+                        italic: true,
+                        color: [200, 0, 0],
+                        ..Default::default()
+                    },
+                },
+                TextSpan {
+                    range: 16..22,
+                    style: TextStyle::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        for (row, ranges) in [
+            vec![0..1, 1..3, 3..4, 4..5, 5..6, 6..7],
+            vec![8..9, 9..11, 11..12, 12..13, 13..14, 14..15],
+            (16..22).map(|start| start..start + 1).collect(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (column, range) in ranges.into_iter().enumerate() {
+                let x = 20. + column as f32 * 8.;
+                let y = 50. + row as f32 * 40.;
+                page.glyphs.push(GlyphBox {
+                    range,
+                    rect: [x, y, x + 8., y + 12.],
+                });
+            }
+        }
+        app.tabs[0].text[0] = Some(Arc::new(page.clone()));
+        let mut draft = InlineText {
+            key: (
+                app.tabs[0].id,
+                app.tabs[0].session.as_ref().unwrap().revision(),
+                0,
+            ),
+            target: InlineTarget::Run(1),
+            geometry: None,
+            original: "e[orts".into(),
+            text: "e[orts".into(),
+            rect: [20., 90., 68., 102.],
+            font: "Helvetica-Bold".into(),
+            size: 20.,
+            color: [0., 0., 1.],
+            focus: false,
+        };
+        let copied = formatted_inline_text(&app.tabs[0], &draft, None).unwrap();
+        assert_eq!(copied.text, "efforts");
+        assert!(copied.html.contains("font-style:italic") && copied.html.contains("#c80000"));
+        assert!(!copied.html.contains("font-weight:700"));
+        assert_eq!(
+            draft.text, "e[orts",
+            "Copy must not change PDF edit validation text"
+        );
+        // A genuine bracket on another line has no correction provenance.
+        draft.rect = [20., 130., 68., 142.];
+        assert_eq!(
+            formatted_inline_text(&app.tabs[0], &draft, None)
+                .unwrap()
+                .text,
+            "e[orts"
+        );
+        // Even a visually plausible replacement is never guessed without proof.
+        page.corrections.clear();
+        app.tabs[0].text[0] = Some(Arc::new(page));
+        draft.rect = [20., 90., 68., 102.];
+        assert_eq!(
+            formatted_inline_text(&app.tabs[0], &draft, None)
+                .unwrap()
+                .text,
+            "e[orts"
+        );
+    }
+
+    #[test]
+    fn corrected_copy_ranges_respect_unicode_and_replacement_boundaries() {
+        use mypdf_milestone0::viewer::{PageText, TextCorrection};
+        let page = PageText {
+            text: "éff Ω".into(),
+            corrections: vec![TextCorrection {
+                range: 2..4,
+                original: "ab".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(corrected_copy_ranges(&page, "éab"), vec![0..4]);
+        assert_eq!(corrected_copy_ranges(&page, "ab Ω"), vec![2..7]);
+        assert_eq!(corrected_copy_ranges(&page, " Ω"), vec![4..7]);
+        assert!(corrected_copy_ranges(&page, "a").is_empty());
+        assert!(corrected_copy_ranges(&page, "b").is_empty());
+        let page = PageText {
+            text: "éff Ω".into(),
+            corrections: vec![TextCorrection {
+                range: 2..4,
+                original: "ﬀ".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(corrected_copy_ranges(&page, "éﬀ Ω"), vec![0..7]);
+    }
+
+    #[test]
+    fn block_copy_collapses_only_source_runs_matching_the_same_indexed_glyphs() {
+        use mypdf_milestone0::viewer::{GlyphBox, PageText, TextCorrection};
+        let mut page = PageText {
+            text: "efforts\nefforts".into(),
+            corrections: vec![
+                TextCorrection {
+                    range: 1..3,
+                    original: "[".into(),
+                },
+                TextCorrection {
+                    range: 9..11,
+                    original: "[".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        for row in 0..2 {
+            for (column, range) in [0..1, 1..3, 3..4, 4..5, 5..6, 6..7].into_iter().enumerate() {
+                let x = 20. + column as f32 * 8.;
+                let y = 50. + row as f32 * 40.;
+                page.glyphs.push(GlyphBox {
+                    range: range.start + row * 8..range.end + row * 8,
+                    rect: [x, y, x + 8., y + 12.],
+                });
+            }
+        }
+        let runs = [(20., 50.), (20.3, 50.), (20., 90.)]
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, (x, y))| document::TextRun {
+                operator_index: ordinal,
+                operator: "Tj".into(),
+                font: "F1".into(),
+                base_font: "Helvetica".into(),
+                text: "e[orts".into(),
+                rect: Some([x, y, x + 48., y + 12.]),
+                size: 12.,
+                color: [0.; 3],
+                layout: Some(document::RunLayout {
+                    text: "e[orts".into(),
+                    origin: [x, y + 10.],
+                    end: [x + 48., y + 10.],
+                    direction: [1., 0.],
+                    space_width: 3.,
+                }),
+            })
+            .collect::<Vec<_>>();
+        let items = runs
+            .iter()
+            .enumerate()
+            .map(|(ordinal, run)| InlineText {
+                key: (1, 0, 0),
+                target: InlineTarget::Run(ordinal),
+                geometry: run.layout.clone(),
+                original: run.text.clone(),
+                text: run.text.clone(),
+                rect: run.rect.unwrap(),
+                size: run.size,
+                color: run.color,
+                font: run.base_font.clone(),
+                focus: false,
+            })
+            .collect();
+        let draft = selected_block(
+            items,
+            [20., 50., 68., 102.],
+            PageSize {
+                width: 300.,
+                height: 300.,
+            },
+        )
+        .unwrap();
+        assert_eq!(draft.text.matches("e[orts").count(), 3);
+        let InlineTarget::Block(block) = &draft.target else {
+            panic!("text block")
+        };
+        let range = block_copy_range(&page, block, &runs).unwrap();
+        let copied = mypdf_milestone0::clipboard_text::from_page(&page, range).unwrap();
+        assert_eq!(copied.text, "efforts\nefforts");
+        assert_eq!(
+            block.selection.runs.len(),
+            3,
+            "source edit validation must retain every run"
+        );
+        assert_eq!(draft.text.matches("e[orts").count(), 3);
+        let mut stale = runs.clone();
+        stale[1].text = "changed".into();
+        assert!(block_copy_range(&page, block, &stale).is_none());
+        // Distinct indexed words between the selected source runs must not be
+        // copied just because their surrounding ranges have been identified.
+        page.text = "efforts\nMIDDLE\nefforts".into();
+        for glyph in &mut page.glyphs[6..] {
+            glyph.range.start += 7;
+            glyph.range.end += 7;
+        }
+        page.corrections[1].range = 16..18;
+        assert!(block_copy_range(&page, block, &runs).is_none());
+    }
+
+    #[test]
+    fn inline_copy_matches_repeated_text_by_geometry_and_has_styled_fallback() {
+        use mypdf_milestone0::viewer::{GlyphBox, PageText, TextSpan, TextStyle};
+        let (mut app, _) = fixture();
+        let repeated = "Same\nSame";
+        app.tabs[0].text[0] = Some(Arc::new(PageText {
+            text: repeated.into(),
+            glyphs: repeated
+                .char_indices()
+                .filter(|(_, c)| *c != '\n')
+                .map(|(start, c)| {
+                    let line = start / 5;
+                    let x = 20. + (start % 5) as f32 * 8.;
+                    let y = 50. + line as f32 * 40.;
+                    GlyphBox {
+                        range: start..start + c.len_utf8(),
+                        rect: [x, y, x + 8., y + 12.],
+                    }
+                })
+                .collect(),
+            spans: vec![
+                TextSpan {
+                    range: 0..4,
+                    style: TextStyle {
+                        bold: true,
+                        ..Default::default()
+                    },
+                },
+                TextSpan {
+                    range: 5..9,
+                    style: TextStyle {
+                        italic: true,
+                        color: [200, 0, 0],
+                        ..Default::default()
+                    },
+                },
+            ],
+            ..Default::default()
+        }));
+        let mut draft = InlineText {
+            key: (
+                app.tabs[0].id,
+                app.tabs[0].session.as_ref().unwrap().revision(),
+                0,
+            ),
+            target: InlineTarget::Run(1),
+            geometry: None,
+            original: "Same".into(),
+            text: "Same".into(),
+            rect: [20., 90., 52., 102.],
+            font: "Helvetica-Bold".into(),
+            size: 20.,
+            color: [0., 0., 1.],
+            focus: false,
+        };
+        let copied = formatted_inline_text(&app.tabs[0], &draft, None).unwrap();
+        assert_eq!(copied.text, "Same");
+        assert!(copied.html.contains("font-style:italic") && copied.html.contains("#c80000"));
+        assert!(!copied.html.contains("font-weight:700"));
+        // A draft with changed text must not use stale indexed styles or text.
+        draft.text = "Edited Ω".into();
+        let copied = formatted_inline_text(&app.tabs[0], &draft, None).unwrap();
+        assert_eq!(copied.text, "Edited Ω");
+        assert!(copied.html.contains("font-weight:700") && copied.html.contains("20.00pt"));
+        assert!(copied.html.contains("#0000ff"));
+        assert!(copied.html.contains("Helvetica") && !copied.html.contains("Helvetica-Bold"));
+    }
+
+    #[test]
     fn shortcuts_copy_select_all_and_mark_up_page_text() {
         use mypdf_milestone0::viewer::{GlyphBox, PageText};
         let (mut app, ctx) = fixture();
         app.editor.mode = editing::Mode::Read;
         app.tabs[0].text[0] = Some(Arc::new(PageText {
             text: "One two".into(),
-            limited: false,
             glyphs: (0..7)
                 .map(|i| GlyphBox {
                     range: i..i + 1,
                     rect: [20. + i as f32 * 8., 50., 28. + i as f32 * 8., 62.],
                 })
                 .collect(),
+            ..Default::default()
         }));
         press_shortcut(&mut app, &ctx, "all_text", false);
         assert_eq!(
@@ -1907,11 +2531,15 @@ mod tests {
             Some("One two")
         );
         let out = press_shortcut(&mut app, &ctx, "copy_text", true);
+        let (plain, html) = clipboard::rich_text_for_test().expect("formatted page text");
+        assert_eq!(plain, "One two");
+        assert!(html.contains("One two"));
         assert!(
-            out.platform_output
+            !out.platform_output
                 .commands
                 .iter()
-                .any(|c| matches!(c, egui::OutputCommand::CopyText(t) if t=="One two"))
+                .any(|command| { matches!(command, egui::OutputCommand::CopyText(_)) }),
+            "eframe must not replace rich clipboard content with plain text"
         );
         for (action, expected) in [
             ("highlight", Markup::Highlight),
@@ -2781,7 +3409,14 @@ mod tests {
             [0.; 3],
         )
         .unwrap();
-        let png = clipboard::png(2, 2, &[0, 90, 240, 255].repeat(4)).unwrap();
+        let png = clipboard::png(
+            2,
+            2,
+            &[
+                0, 90, 240, 255, 10, 200, 30, 128, 50, 60, 70, 0, 220, 30, 10, 255,
+            ],
+        )
+        .unwrap();
         let source = content::add_image(&source, 1, [100., 200., 200., 300.], &png).unwrap();
         let mut pdf = lopdf::Document::load_mem(&source).unwrap();
         for object in pdf.objects.values_mut() {
@@ -2793,9 +3428,19 @@ mod tests {
                     .ok()
                     == Some(b"Image")
             {
+                let gray = stream
+                    .dict
+                    .get(b"ColorSpace")
+                    .and_then(lopdf::Object::as_name)
+                    .ok()
+                    == Some(b"DeviceGray");
                 stream.dict.set(
                     "Decode",
-                    vec![0.into(), 1.into(), 0.into(), 1.into(), 0.into(), 1.into()],
+                    if gray {
+                        vec![0.into(), 1.into()]
+                    } else {
+                        vec![0.into(), 1.into(), 0.into(), 1.into(), 0.into(), 1.into()]
+                    },
                 );
             }
         }
@@ -2853,10 +3498,17 @@ mod tests {
             panic!("Copy image did not publish pixels")
         };
         assert_eq!(size, [2, 2]);
+        let pixels = content::decode_image(&copied).unwrap();
+        assert_eq!(pixels.get_pixel(0, 0).0, [0, 90, 240, 255]);
+        for (actual, expected) in pixels.get_pixel(1, 0).0.into_iter().zip([10, 200, 30, 128]) {
+            assert!((i16::from(actual) - expected).abs() <= 1);
+        }
         assert_eq!(
-            content::decode_image(&copied).unwrap().get_pixel(0, 0).0,
-            [0, 90, 240, 255]
+            pixels.get_pixel(0, 1)[3],
+            0,
+            "Soft-mask transparency survives Copy"
         );
+        assert_eq!(pixels.get_pixel(1, 1).0, [220, 30, 10, 255]);
         assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
         assert!(!commands(&Target::Image(images[0].clone()), false).contains(&"cut_image"));
         run_command(
@@ -2883,7 +3535,6 @@ mod tests {
         let text = "First line\nSecond line";
         app.tabs[0].text[0] = Some(Arc::new(PageText {
             text: text.into(),
-            limited: false,
             glyphs: text
                 .char_indices()
                 .filter(|(_, c)| *c != '\n')
@@ -2896,6 +3547,7 @@ mod tests {
                     }
                 })
                 .collect(),
+            ..Default::default()
         }));
         text_selection::TextSelection::all(&app.tabs[0], 0).unwrap()
     }
@@ -3063,13 +3715,13 @@ mod tests {
         let (mut app, _) = fixture();
         app.tabs[0].text[0] = Some(Arc::new(PageText {
             text: "Hello".into(),
-            limited: false,
             glyphs: (0..5)
                 .map(|i| GlyphBox {
                     range: i..i + 1,
                     rect: [20. + i as f32 * 8., 50., 28. + i as f32 * 8., 62.],
                 })
                 .collect(),
+            ..Default::default()
         }));
         let selection = text_selection::TextSelection::all(&app.tabs[0], 0).unwrap();
         let selected = commands(&Target::SelectedText(selection), false);
@@ -3227,6 +3879,7 @@ mod tests {
                 })
                 .collect(),
             limited: false,
+            ..Default::default()
         }));
         let selected = text_selection::TextSelection::word_at(&app.tabs[0], 0, [25., 55.]).unwrap();
         assert_eq!(selected.text(&app.tabs[0]).as_deref(), Some("One"));

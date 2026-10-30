@@ -1,5 +1,6 @@
 pub mod annotations;
 pub mod assets;
+pub mod clipboard_text;
 pub mod compare;
 pub mod compress;
 pub mod content;
@@ -42,6 +43,7 @@ pub mod svg;
 pub mod tables;
 pub mod text_block;
 pub mod text_geometry;
+mod text_recovery;
 pub mod text_style;
 pub mod translation;
 pub mod trust;

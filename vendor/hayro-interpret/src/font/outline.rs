@@ -117,6 +117,14 @@ impl OutlineFont {
         }
     }
 
+    pub(crate) fn postscript_name(&self) -> Option<&str> {
+        match self {
+            Self::Type1(t) => t.postscript_name(),
+            Self::TrueType(t) => t.postscript_name(),
+            Self::Type0(t) => t.postscript_name(),
+        }
+    }
+
     /// Get raw font bytes and metadata.
     ///
     /// Returns None for Type1 fonts and non-embedded TrueType fonts.

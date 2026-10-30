@@ -2,39 +2,56 @@
 
 Updated 30 October 2026 (Europe/Istanbul). Workspace: `/Users/gokcol/SWPROJECTS/Utility/MyPDF/`.
 
+## GitHub release in progress — 30 October 2026
+
+The user authorized committing/pushing the clipboard and selection fixes, publishing the next GitHub release, and updating the local Mac installation. This source prepares **2.1.6, Mac build 194, Windows/Store version 2.1.6.0**. Publication and the build 194 installation are not yet complete. The existing installed build 193 and current public v2.1.5/build 192 records below remain authoritative until superseded by verified release/install reports.
+
+Release work is under `artifacts/release-2.1.6-build194/`. Package only the committed source snapshot; exclude private PDF/Word test material, fonts, user-data backups, the unrelated modified fixture and untracked local folders. No new Microsoft Store submission is authorized by this GitHub release request.
+
+## Current local build — 30 October 2026
+
+**MyPDF 2.1.5/build 193 is installed and running at `/Applications/MyPDF.app`.** It fixes rich text copying to Word, repeated faux-bold text, verified recovery of damaged `ff` ligature mappings, standard Shift-click text selection after releasing the mouse, and image clipboard preservation. The app is Developer ID signed by the existing team `HXDYTBC6ZT`, signature/hash verified, and **not notarized**. Its binary SHA256 is `cbe00d473ad71ae22aca52ad2adf4905cee14be9ef66aaad28c2fd2362853edc`.
+
+Launch was verified at 18:01 Europe/Istanbul. All **seven open documents**, their order and reading positions were restored. Workspace state, eight critical settings/artwork/signature/style files, and macOS preferences were verified unchanged. Normal shutdown and a complete verified private backup preceded replacement.
+
+The build 193 fixes and this handover are included in the 2.1.6 release preparation, based on `01261168d996319b73e9e8ae30d8e81f11e98c31`. Build 193 remains installed while the 2.1.6/build 194 packages are prepared. Public v2.1.5/build 192 remains the latest verified release until publication completes.
+
+Current local evidence is `artifacts/mac-install-2.1.5-build193/`: `candidate-report.json`, `source-state.json`, `installation-report.json`, and `validation/`. The original installed **2.1.4/build 191** is retained at `previous-installed.retired/` with its original `Contents` intact; the private data backup is `user-data-at-install/`.
+
 ## Published GitHub release — 30 October 2026
 
 **[MyPDF v2.1.5](https://github.com/gokcol/MyPDF/releases/tag/v2.1.5) is published and marked latest**, verified at 10:57 Europe/Istanbul. The tag points to release-preparation commit [`88499a4effec96785a5d2a26b95294a99abe6d9b`](https://github.com/gokcol/MyPDF/commit/88499a4effec96785a5d2a26b95294a99abe6d9b). It includes the search-clear button on Mac and Windows. Mac release build **192** is Developer ID signed, notarized and stapled. Windows installer, portable ZIP and Store-format MSIX **2.1.5.0** are available. All ten public assets were verified by filename, size and GitHub SHA-256 digest against the local release manifest.
 
 The initial updated handover was committed and pushed as [`189195f`](https://github.com/gokcol/MyPDF/commit/189195f), followed by the release-preparation commit above. This handover now records the completed publication; documentation commits after the release source do not change the pinned release tag.
 
-Authoritative release records are under `artifacts/release-2.1.5-build192/`: `release-status.json`, `github-release.json` and `public-release-verification.json`. The installed Mac remains **2.1.4/build 191**, with settings and open documents preserved. The new MSIX was published to GitHub only; no new Microsoft Partner Center submission, local installation or recurring monitor was performed.
+Authoritative public release records are under `artifacts/release-2.1.5-build192/`: `release-status.json`, `github-release.json` and `public-release-verification.json`. Those records describe the published build 192 artifacts; the later local build 193 installation is recorded separately above. The 2.1.5.0 MSIX was published to GitHub only; no new Microsoft Partner Center submission or recurring monitor was performed.
 
-## Installed build and completed source update — 30 October 2026
+## Historical build 191 installation and source push — 30 October 2026
 
-At the user's request, the app was rebuilt and installed locally as **2.1.4 build 191** with the one-click X inside the document search field. It appears when the query contains text, clears the query and matches, and restores field focus. Nine existing search tests and formatting passed; the optimized app was rebuilt and Developer ID signed with the existing identity. The installed build 191 package is **not notarized and was not uploaded as a GitHub release asset**. The historical 2.1.4/build 190 release and recorded Store submission are unchanged; the newer GitHub release is 2.1.5/build 192 as described above.
+Build **2.1.4/191** introduced the one-click X inside the search field. Nine search tests and formatting passed, and the optimized app was Developer ID signed and installed locally without notarization. Its source and Mac build number were committed and pushed to GitHub `main` as [`597a7fe641b54fab9cd3d1ea5c33d47c3bdd8e4d`](https://github.com/gokcol/MyPDF/commit/597a7fe641b54fab9cd3d1ea5c33d47c3bdd8e4d) — `Add one-click search clearing and bump Mac build to 191`. That commit changed `src/desktop/mod.rs` and `packaging/Info.plist`; later handover and release-preparation commits followed.
 
-The search-clear control and Mac build number were **committed and pushed to GitHub `main`** as [`597a7fe641b54fab9cd3d1ea5c33d47c3bdd8e4d`](https://github.com/gokcol/MyPDF/commit/597a7fe641b54fab9cd3d1ea5c33d47c3bdd8e4d) — `Add one-click search clearing and bump Mac build to 191`. The commit contains exactly `src/desktop/mod.rs` and `packaging/Info.plist`; it is the implementation commit, followed by handover and release-preparation commits. No release tag, release assets or Store submission were changed by that push.
+Historical installation evidence remains at `artifacts/mac-install-2.1.4-build191/installation-report.json`. Its signed binary SHA256 is `9c22a4150b027f7d3ae717859ce7ddfe3bdeace3111bc10b2488fc452bf020a7`. That earlier restart restored six documents and their reading positions; additional documents opened afterward were retained. Eight critical settings files and macOS preferences were verified unchanged. **Build 193 now replaces this installation.**
 
-Current installation evidence: `artifacts/mac-install-2.1.4-build191/installation-report.json`. `/Applications/MyPDF.app` is installed as build 191 and launch was verified; its signed binary SHA256 is `9c22a4150b027f7d3ae717859ce7ddfe3bdeace3111bc10b2488fc452bf020a7`. All six documents present at normal shutdown were restored with their reading positions. Additional documents opened after restart were left in place. Eight critical settings/artwork/signature/style files and macOS preference bytes were verified unchanged.
+The older private backup remains at `artifacts/mac-install-2.1.4-build191/user-data-at-install/`. The signed/notarized build 190 original remains at `artifacts/mac-install-2.1.4-build191/previous-installed.retired/`, with `Contents` intact; macOS prevented changing its internals. `installation-attempt1.json` records the unsuccessful initial archive attempt, and that directory's `installation-report.json` records recovery and the successful build 191 installation. These are historical recovery records, not build 193's current rollback instructions.
 
-The full verified data backup is private at `artifacts/mac-install-2.1.4-build191/user-data-at-install/`; do not display, commit or upload its contents. The original signed/notarized build 190 is preserved with all bytes and metadata at `artifacts/mac-install-2.1.4-build191/previous-installed.retired/`. **Its original `Contents` directory is intact**: macOS prevented changing the old app's internals. It was explicitly unregistered; only the installed replacement was registered. Follow the current installation report's rollback steps without overwriting current user data. The first unsuccessful archive attempt is recorded in `installation-attempt1.json`; the current `installation-report.json` records successful recovery and installation.
-
-The project move required regenerating the release Swift compiler cache. Its old cache is retained at `target/release/mypdf-swift-module-cache-before-root-move-20261030/`. The search-clear control and build 191 metadata have no remaining uncommitted changes. Preserve the unrelated modified PDF fixture and other local files listed below. The new GitHub release is published; the installed build 191 remains in place.
+The project move required regenerating the host release Swift compiler cache. Its old cache is retained at `target/release/mypdf-swift-module-cache-before-root-move-20261030/`. Build 193 used the native host packaging path (`sh scripts/bundle-macos.sh --output ...`) rather than the separate explicit-target cache. Preserve unrelated modified fixtures and local files listed below.
 
 ## Current task and authority
 
-The user requested the search-clear button, rebuilding/installing the updated Mac app with settings and open documents preserved, and committing/pushing the source and build 191 changes to GitHub. The build 191 implementation, local installation and source push are complete. The user subsequently authorized committing/pushing `HANDOVER.md` and the next GitHub release, including Windows. The handover is tracked and its initial update was pushed as `189195f`; GitHub release v2.1.5 is complete.
+The current request is to fix PDF text copying/format preservation, image copying, and standard Shift-click selection: drag-select text, release the mouse, then hold Shift and click another point. These fixes are implemented, tested and installed locally as build 193 while preserving settings and open documents. The user subsequently authorized their commit, push, GitHub release and a new local Mac installation; see release preparation above.
 
-The earlier public MyPDF 2.1.4 release remains build 190: GitHub publication and Microsoft Store submission were completed on 25 October. Both published Mac app and DMG were signed, notarized and stapled. Store submission `1152921505702158150` was **In certification** at the last verification on 25 October; its present certification/publication state has not been rechecked. GitHub v2.1.5 is now published; no monitoring automation, further Store submission or local installation was requested.
+Earlier requests for the search-clear button, build 191 installation, source/handover pushes and the next GitHub release including Windows are complete. The original handover update was pushed as `189195f`; public GitHub release v2.1.5 remains the completed build 192 release.
+
+The earlier public MyPDF 2.1.4 release remains build 190: GitHub publication and Microsoft Store submission were completed on 25 October. Both published Mac app and DMG were signed, notarized and stapled. Store submission `1152921505702158150` was **In certification** at the last verification on 25 October; its present certification/publication state has not been rechecked. GitHub v2.1.5 is published. No monitoring automation or further Store submission was requested; the subsequent local build 193 update is separate from that public release.
 
 Use these records for their respective scopes:
 
 - **Current published release:** `/Users/gokcol/SWPROJECTS/Utility/MyPDF/artifacts/release-2.1.5-build192/release-status.json`.
-- **Current Mac installation:** `/Users/gokcol/SWPROJECTS/Utility/MyPDF/artifacts/mac-install-2.1.4-build191/installation-report.json`.
-- **Published build 190 release:** `/Users/gokcol/SWPROJECTS/Utility/MyPDF/artifacts/release-2.1.4-build190/release-status.json`. Its installed-build fields describe the earlier build 190 installation and are superseded by the build 191 report.
+- **Current Mac installation:** `/Users/gokcol/SWPROJECTS/Utility/MyPDF/artifacts/mac-install-2.1.5-build193/installation-report.json`.
+- **Previous Mac installation:** `/Users/gokcol/SWPROJECTS/Utility/MyPDF/artifacts/mac-install-2.1.4-build191/installation-report.json` (historical).
+- **Published build 190 release:** `/Users/gokcol/SWPROJECTS/Utility/MyPDF/artifacts/release-2.1.4-build190/release-status.json`. Its installed-build fields describe the earlier build 190 installation; current installed state is recorded in the build 193 report.
 
-This handover is a point-in-time record. Later status/verification reports take precedence. Historical reports may retain earlier values: for example, build 190's `mac-build-report.json` says `notarized: false` because it predates the accepted app/DMG notarization reports. Build 191 is a separate local package and is not notarized.
+This handover is a point-in-time record. Later status/verification reports take precedence. Historical reports may retain earlier values: for example, build 190's `mac-build-report.json` says `notarized: false` because it predates the accepted app/DMG notarization reports. Local builds 191 and 193 are separate from the public packages and are not notarized.
 
 ## Versions and distribution
 
@@ -44,12 +61,12 @@ This handover is a point-in-time record. Later status/verification reports take 
 | Current published release source | `88499a4effec96785a5d2a26b95294a99abe6d9b` — Prepare MyPDF 2.1.5 release for Mac and Windows |
 | Current release tag | `v2.1.5`, verified to point to `88499a4effec96785a5d2a26b95294a99abe6d9b` |
 | Current clean release snapshot | `/Users/gokcol/SWPROJECTS/Utility/MyPDF/artifacts/release-2.1.5-build192/source`; all 440 tracked files matched the commit |
-| Repository/release versions | App 2.1.5; Mac build 192; Windows/Store package 2.1.5.0; installed Mac remains 2.1.4/build 191 |
+| Repository/local versions | Repository prepares app 2.1.6/Mac 194/Windows 2.1.6.0; installed Mac is 2.1.5/193; latest verified public release is 2.1.5/Mac 192 |
 | GitHub 2.1.5 | [Published release](https://github.com/gokcol/MyPDF/releases/tag/v2.1.5), latest; all ten assets verified; published 30 October at 10:57 Europe/Istanbul |
 | Previous GitHub 2.1.4 | [Published release](https://github.com/gokcol/MyPDF/releases/tag/v2.1.4), all ten assets verified; published 25 October at 23:28 Europe/Istanbul |
 | Earlier GitHub release | [v2.1.3](https://github.com/gokcol/MyPDF/releases/tag/v2.1.3), Mac build 187 |
 | Current published Mac release (build 192) | Developer ID signed, app and DMG notarization **Accepted**, stapled; signature, Gatekeeper and DMG integrity verified |
-| Installed Mac | `/Applications/MyPDF.app`, **2.1.4 build 191**, Developer ID signed, signature/hash verified and launched; not notarized; original build 190 retained for rollback |
+| Installed Mac | `/Applications/MyPDF.app`, **2.1.5 build 193**, Developer ID signed, signature/hash and running executable verified; not notarized; original build 191 retained intact for rollback |
 | New GitHub Store-format asset | `MyPDF-2.1.5.0-store-x64.msix`, x64, unchanged Store identity/publisher; verified and published on GitHub, not submitted to Partner Center |
 | Previously submitted Store package | `MyPDF-2.1.4.0-store-x64.msix`, verified x64, unchanged Store identity/publisher; uploaded, validated, saved as the only package and submitted |
 | Store product | MyPDF (OG), `9MXR0WLW42XT` |
@@ -59,9 +76,9 @@ The Store MSIX is intentionally unsigned for Store ingestion/Microsoft signing; 
 
 ## Completion and external review
 
-The requested build 191 implementation/installation and v2.1.5 GitHub release are complete. Microsoft certification for 2.1.4.0 was pending at the last recorded check on 25 October; no current status is claimed. At that check, the 2.1.3 certification had been canceled, 2.1.4.0 was the only submitted package, and final Submit for certification had succeeded. Do not repeat or change that submission without a new request. No monitor has been requested.
+The local build 193 fixes, installation and preservation checks are complete; the authorized 2.1.6 release and build 194 installation are in progress. Earlier build 191 work and the public v2.1.5/build 192 release are complete. Microsoft certification for 2.1.4.0 was pending at the last recorded check on 25 October; no current status is claimed. At that check, the 2.1.3 certification had been canceled, 2.1.4.0 was the only submitted package, and final Submit for certification had succeeded. Do not repeat or change that submission without a new request. No monitor has been requested.
 
-For the historical 2.1.4.0 Store submission, the What's New text and reviewer notes were saved, reopened and verified; existing restricted-capability explanations and automatic-publication settings were preserved. The generated build 192 app was archived and unregistered after packaging; its retained original has `ArchivedContents`, and a verified ZIP is also available. Use `artifacts/release-2.1.5-build192/source-app-archive.json` for recovery. This is separate from the installed build 191 rollback directory, whose build 190 `Contents` must remain intact.
+For the historical 2.1.4.0 Store submission, the What's New text and reviewer notes were saved, reopened and verified; existing restricted-capability explanations and automatic-publication settings were preserved. The generated build 192 app was archived and unregistered after packaging; its retained original has `ArchivedContents`, and a verified ZIP is also available. Use `artifacts/release-2.1.5-build192/source-app-archive.json` for recovery. This is separate from both local installation rollback directories: build 193 retains build 191, and build 191 retains build 190. Both of those original `Contents` directories must remain intact.
 
 Partner Center: [product overview](https://partner.microsoft.com/en-us/dashboard/products/9MXR0WLW42XT/overview).
 
@@ -69,7 +86,15 @@ Do not inspect unrelated browser pages, conversations or user data. If another p
 
 ## Included improvements
 
-Committed on GitHub `main`, installed locally in build 191 and included in published v2.1.5: a clear X inside the right edge of the document search field when text is present. One click clears the query and matches, cancels stale search results through the existing invalidation path, and returns keyboard focus to the field. Match-case and whole-word settings remain unchanged.
+Local build 193 adds:
+
+- Editable rich text plus a plain-text clipboard alternative, retaining the PDF's font family, size, bold/italic style, color, relative indentation and line spacing. Page selections and inline text copying use the same corrected text/style metadata.
+- Duplicate paint-pass detection: overlapping faux-bold/fill-and-stroke glyphs copy once, while genuinely repeated text remains. Font metadata is bounded before per-glyph storage, and clipboard markup is escaped.
+- Damaged ligature recovery only when the embedded glyph's exact outline and advance match a shaped ligature in a locally available font with the same exact identity. The supplied two-page PDF recovered ten malformed `ff` mappings; ordinary brackets remain unchanged. This depends on the matching font being available. No private PDF or newly bundled font was added, and the source PDF was not modified.
+- Shift-click after releasing a drag selection extends from its original anchor, forward or backward, including clicks over a highlight annotation. Shift-drag uses the same anchor. Selection remains within one page and tab.
+- Native image clipboard output for embedded images and copied regions. Successful image copy removes stale queued text writes that would replace the bitmap at frame end. Image alpha/pixels and editable internal paste are covered by regression tests; a failed image cut preserves the selection and original artwork.
+
+The search-clear feature was committed on GitHub `main`, introduced in local build 191, included in published v2.1.5/build 192, and retained in build 193: a clear X inside the right edge of the document search field when text is present. One click clears the query and matches, cancels stale search results through the existing invalidation path, and returns keyboard focus to the field. Match-case and whole-word settings remain unchanged.
 
 The earlier refinements included in the published 2.1.4/build 190 release remain:
 
@@ -84,7 +109,15 @@ Existing Turkish/nonembedded-font fixes and durable Finder Open With cleanup are
 
 ## Evidence and validation
 
-Build 191 evidence is under `artifacts/mac-install-2.1.4-build191/`: `candidate-report.json` pins its signed binary, and `installation-report.json` confirms installation, launch, preservation checks and rollback. Nine existing search tests passed, formatting and diff checks passed, and the optimized bundle built successfully. These are the build 191 local checks; the separate release-source GitHub checks are recorded below.
+Current **local build 193** evidence is under `artifacts/mac-install-2.1.5-build193/`:
+
+- `source-state.json` records the base commit and SHA256 of each changed source/build file. `candidate-report.json` pins the signed arm64 binary and records Word text/image paste and Shift-click checks. `installation-report.json` confirms the installed/running build, original bundle preservation, private data backup, seven restored documents and settings checks.
+- `validation/tests.log`: full test run **675 passed, 0 failed, 7 ignored** before the final ligature/context refinements. Final affected tests passed afterward: ligature recovery 2, `viewer_copy` 7, viewer 10, pointer interaction 4, clipboard 9, selection 6, context 41 and image-region 3. The four clipboard HTML tests also passed. The focused clipboard/selection/context/image logs are retained in `validation/`.
+- `validation/clippy.log`: final `cargo clippy --locked --all-targets -- -D warnings` passed. Formatting and diff checks passed. The optimized native arm64 bundle built successfully. Five synthetic installer success/failure scenarios verified data preservation and intact bundle rollback; see `preparation-report.json`.
+- `validation/word-text-verification.json`, `extraction-verification.json` and `ligature-verification.json`: normal paste into a scratch Microsoft Word document produced five nonblank paragraphs without duplicates, Aptos at Word's 13-point rounding of the 12.80195-point PDF size, and two bold lines. Both selected occurrences of “efforts” were correct; no malformed `e[orts` remained. Recovery used matching font/glyph evidence rather than spelling guesses.
+- `validation/word-image-verification.json` and `image-extraction-verification.json`: the embedded table image pasted into Word at **798 × 350 pixels**, with RGBA pixels exactly matching the extracted image. The original clipboard was restored; existing Word documents were untouched.
+
+These are local Mac checks for build 193. No new Windows build/CI run or public release was performed for these fixes. Historical build 191 evidence remains under `artifacts/mac-install-2.1.4-build191/`; its nine search tests and earlier installation checks do not describe build 193. The separate public release-source checks are recorded below.
 
 Current **v2.1.5/build 192 release** evidence is under `/Users/gokcol/SWPROJECTS/Utility/MyPDF/artifacts/release-2.1.5-build192/`:
 
@@ -127,11 +160,13 @@ Published build 190 Mac binary SHA256: `edd634ce986b3901534bf869e9fa0f40240a6c05
 
 ## Installed build and preservation
 
-Current installation evidence is `artifacts/mac-install-2.1.4-build191/installation-report.json`. Installed build 191's binary SHA256 is `9c22a4150b027f7d3ae717859ce7ddfe3bdeace3111bc10b2488fc452bf020a7`. Its app identifier remains `dev.mypdf.desktop`, signed by the existing Developer ID team `HXDYTBC6ZT`.
+Current installation evidence is `artifacts/mac-install-2.1.5-build193/installation-report.json`. Installed **2.1.5/build 193** has binary SHA256 `cbe00d473ad71ae22aca52ad2adf4905cee14be9ef66aaad28c2fd2362853edc`, app identifier `dev.mypdf.desktop`, and the existing Developer ID team `HXDYTBC6ZT`. It is signed but not notarized.
 
-MyPDF was quit normally and confirmed stopped before replacement. The complete user-data/preferences backup was verified and user data was unchanged during replacement. All six documents open at shutdown and their reading positions were restored. Verification found a seventh document subsequently opened; it was left in place. Eight critical settings/artwork/signature/style files and macOS preference bytes remained identical. The installed executable and running app path were verified; the clear-search feature marker is present. Native About/UI verification from build 190 must not be represented as a new build 191 check.
+MyPDF was quit normally and confirmed stopped before replacement. The complete user-data/preferences backup was verified, and exact data/metadata snapshots were unchanged during replacement. After launch, the running installed executable was verified; all seven documents, their order and reading positions were restored. Workspace state, eight critical settings/artwork/signature/style files and macOS preferences remained unchanged. The build 193 private backup is `artifacts/mac-install-2.1.5-build193/user-data-at-install/`.
 
-**Current rollback is build 190:** `artifacts/mac-install-2.1.4-build191/previous-installed.retired/`, with its original `Contents` directory intact and all bytes/metadata verified. Its binary SHA256 is `edd634ce986b3901534bf869e9fa0f40240a6c05dae135eb472cbf68ab2fb8fa`. After normal shutdown and preserving the current app, move this retained directory directly to `/Applications/MyPDF.app`; follow the current report for signature/hash and registration checks. Do not apply an `ArchivedContents` rename to this build 190 backup, and do not overwrite current user data from the data backup.
+**Current rollback is 2.1.4/build 191:** `artifacts/mac-install-2.1.5-build193/previous-installed.retired/`, with its original `Contents` directory intact and all bytes/metadata verified. Its binary SHA256 is `9c22a4150b027f7d3ae717859ce7ddfe3bdeace3111bc10b2488fc452bf020a7`. After normal shutdown and preserving the current app, move this retained directory directly to `/Applications/MyPDF.app`; follow the build 193 report's signature/hash and registration checks. Do not rename `Contents` internally or overwrite current user data from the backup.
+
+The earlier build 191 installation retains build 190 at `artifacts/mac-install-2.1.4-build191/previous-installed.retired/`, also with `Contents` intact, binary SHA256 `edd634ce986b3901534bf869e9fa0f40240a6c05dae135eb472cbf68ab2fb8fa`. That is historical recovery material, not the current rollback target.
 
 The build 190 installation report under `artifacts/mac-install-2.1.4-build190/` is historical evidence. Its earlier build 189 rollback remains available as `previous-installed.zip` and an inert `previous-installed.retired` with `ArchivedContents`; build 189 binary SHA256 is `50152687e0be89525f75c00a620059e26c2ea8b330606e69589aa00195ff1596`. Use that older report only when deliberately recovering the older build.
 
@@ -141,12 +176,14 @@ Keep Finder cleanup targeted. Build 189's `open-with-after-install.json` verifie
 
 ## Working tree and historical recovery
 
-The search-clear update and Mac build 191 are committed and pushed as `597a7fe641b54fab9cd3d1ea5c33d47c3bdd8e4d`. The initial handover update was pushed as `189195f`; release preparation was pushed as `88499a4effec96785a5d2a26b95294a99abe6d9b`, which is pinned by published tag `v2.1.5`. Later documentation commits record completion without changing the release source. Remaining unrelated checkout state must be preserved:
+The clipboard/selection implementation being committed for 2.1.6 includes `packaging/Info.plist`, clipboard/selection/context/viewer/font changes, new `src/clipboard_text.rs`, new `src/text_recovery.rs`, new `tests/viewer_copy.rs`, the necessary vendored hayro font APIs, and this handover. `artifacts/mac-install-2.1.5-build193/source-state.json` pins the source used for the installed binary against base commit `01261168d996319b73e9e8ae30d8e81f11e98c31`. Local artifacts and private QA documents stay out of Git.
+
+The earlier search-clear update and Mac build 191 were pushed as `597a7fe641b54fab9cd3d1ea5c33d47c3bdd8e4d`; the initial handover as `189195f`; and release preparation as `88499a4effec96785a5d2a26b95294a99abe6d9b`, still pinned by public tag `v2.1.5`. Later documentation commits do not change that release source. Preserve unrelated checkout state:
 
 - `vendor/underskrift/tests/fixtures/sample.pdf` is a pre-existing modified fixture; excluded from the release commit/snapshot. Do not reset or include it in release work.
 - `.mimosa/` is unrelated and untracked; leave it alone.
 - `scripts/__pycache__/` is generated/untracked; do not stage it.
-- `HANDOVER.md` is now explicitly authorized for commit and publication. Keep the actual private artifacts, user-data backups and credentials out of Git.
+- The user authorized committing and publishing this updated handover with the fixes and 2.1.6 release. Keep actual private artifacts, user-data backups, source documents, QA Word files and credentials out of Git.
 
 The previous handover is preserved at:
 
@@ -154,4 +191,4 @@ The previous handover is preserved at:
 
 The older checkpoint is under `artifacts/session-handover-2026-10-24/`. Its `/Users/gokcol/Works/MyPDF` paths describe the old workspace. Treat it as historical recovery evidence; do not apply its patch over the current release checkout. Ignored artifacts are local and will not appear in a fresh clone.
 
-User preferences: keep the UI compact, preserve modes/settings, avoid unsolicited layout changes and competitor comparisons, and avoid repeated permission questions for work already authorized. No new chat or recurring monitor is requested. The v2.1.5 GitHub release is complete as described above.
+User preferences: keep the UI compact, preserve modes/settings, avoid unsolicited layout changes and competitor comparisons, and avoid repeated permission questions for work already authorized. No new chat or recurring monitor is requested. The user has now authorized the 2.1.6 GitHub release and local build 194 installation. Build 193 is still installed while that work proceeds.
