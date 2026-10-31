@@ -1,8 +1,6 @@
-New in MyPDF 2.2.0:
+New in MyPDF 2.2.1:
 
-- A compact Home screen brings recent documents closer, with resume-page labels and more readable filenames.
-- Annotation tools show labels when space allows; search results highlight matching words and the full row is clickable.
-- Theme accents are consistent, repeated filenames have folder hints, and shortcut labels match your platform.
-- Choose optional Comfortable spacing for larger controls; Compact remains the default.
-- Thumbnails follow Up/Down and other page navigation while preserving manual browsing and page-action selections.
-- Preserve the normal window-drag pointer, touchscreen scrolling, rich copying, settings and reading positions.
+- Area Highlight creates a translucent rectangle without snapping to text. Find it at the end of Annotate → More.
+- Underline, Squiggly, Strikeout and Table now live in the More menu for a simpler annotation toolbar.
+- Area highlights preserve their appearance when saved and reopened, with undo and redo support.
+- Retains optional Comfortable spacing, the compact Home screen, highlighted search results and thumbnails that follow page navigation from 2.2.

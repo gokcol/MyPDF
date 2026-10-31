@@ -2,7 +2,7 @@
 
 # MyPDF — native Rust desktop PDF editor
 
-Version **2.2.0**, Mac build **198**, brings a more compact Home screen with reading-resume labels, clearer annotation tools and highlighted search results, consistent theme accents, duplicate-filename folder hints and platform-correct shortcuts. **Comfortable spacing is optional; Compact remains the default.** The thumbnail sidebar follows page navigation while preserving manual browsing and page-action multiselections. Normal window dragging and touchscreen navigation remain.
+Version **2.2.1**, Mac build **200**, adds **Area Highlight** at the end of Annotate → More: drag a translucent rectangle without snapping to text. Underline, Squiggly, Strikeout and Table are now grouped in More. It retains the compact Home screen, reading-resume labels, highlighted search results and thumbnail following from 2.2. **Comfortable spacing is optional; Compact remains the default.**
 
 Version **2.1.7**, build **196**, adds touchscreen scrolling in Read mode, with two-finger pan and pinch navigation across document tools. It reduces disk writes during scrolling, avoids unnecessary cache sorting and reuses decoded font outlines during text indexing. Window dragging from the header, logo and MyPDF text uses consistent behavior and contextual cursors. Settings and reading positions remain saved after navigation settles and on normal close. Available for Mac and Windows.
 
