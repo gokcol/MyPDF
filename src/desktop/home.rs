@@ -1095,79 +1095,145 @@ mod tests {
     }
     #[test]
     fn home_recents_show_resume_before_tools_with_readable_names_and_optional_touch_targets() {
-        for density in theme::Density::ALL {
-            for width in [720., 1200.] {
-                let ctx = egui::Context::default();
-                ctx.enable_accesskit();
-                let mut app =
-                    Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
-                theme::set_density(density);
-                let name = "Annual audit findings and corrective action plan";
-                let path = app.home.root.join(format!("{name}.pdf"));
-                app.home.history.as_mut().unwrap().entries = vec![Entry {
-                    path: path.clone(),
-                    opened: 1_797_000_000_000,
-                    favorite: false,
-                    reading: Some(mypdf_milestone0::home::ReadingState {
-                        page: 11,
-                        ..Default::default()
-                    }),
-                }];
-                app.home.previews.insert(
-                    path,
-                    Thumbnail {
-                        image: None,
-                        error: None,
-                        used: 0,
-                    },
-                );
-                for _ in 0..3 {
-                    frame(&mut app, &ctx, width, vec![]);
-                }
-                let output = frame(&mut app, &ctx, width, vec![]);
-                let nodes = output.platform_output.accesskit_update.unwrap().nodes;
-                let bounds = |label: &str| {
-                    nodes
-                        .iter()
-                        .find(|(_, n)| {
-                            n.label() == Some(label)
-                                || n.role() == egui::accesskit::Role::Label
-                                    && n.value() == Some(label)
-                        })
-                        .unwrap_or_else(|| panic!("Missing Home label: {label}"))
-                        .1
-                        .bounds()
-                        .unwrap()
-                };
-                let search = bounds("Search recents and favorites");
-                let banner = bounds("Open Files");
-                let recent = bounds(&format!("Open {name}"));
-                let resume = bounds("Resume · page 12");
-                let tools = bounds("Edit PDF");
-                let filename = bounds(name);
-                let favorite = bounds(&format!("Add to Favorites: {name}"));
-                assert_eq!(banner.y1 - banner.y0, 104.);
-                assert!(
-                    recent.y0 > banner.y1 && recent.y1 < tools.y0,
-                    "Recents should be visible before quick tools"
-                );
-                assert!(resume.y0 >= recent.y1 && resume.y1 < tools.y0);
-                assert!(
-                    filename.y1 - filename.y0 >= 24.,
-                    "Long filenames need two lines"
-                );
-                for rect in [search, banner, recent, resume, filename, favorite, tools] {
-                    assert!(
-                        rect.x0 >= 0. && rect.x1 <= width as f64,
-                        "Home item clipped: {rect:?}"
+        use egui::accesskit::{NodeId, Role};
+
+        for preview_portable_menu in [false, true] {
+            for density in theme::Density::ALL {
+                for width in [720., 1200.] {
+                    let ctx = egui::Context::default();
+                    ctx.enable_accesskit();
+                    ctx.data_mut(|d| {
+                        d.insert_temp(
+                            egui::Id::new("preview_portable_menu"),
+                            preview_portable_menu,
+                        );
+                    });
+                    let portable_menu = !cfg!(target_os = "macos") || preview_portable_menu;
+                    let case = format!(
+                        "width={width}, density={density:?}, portable_menu={portable_menu}"
                     );
-                }
-                if density == theme::Density::Comfortable {
-                    assert!(search.y1 - search.y0 >= 44.);
-                    assert!(favorite.x1 - favorite.x0 >= 44. && favorite.y1 - favorite.y0 >= 44.);
-                } else {
-                    assert_eq!(favorite.x1 - favorite.x0, 22.);
-                    assert_eq!(favorite.y1 - favorite.y0, 24.);
+                    let mut app =
+                        Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+                    theme::set_density(density);
+                    let name = "Annual audit findings and corrective action plan";
+                    let path = app.home.root.join(format!("{name}.pdf"));
+                    app.home.history.as_mut().unwrap().entries = vec![Entry {
+                        path: path.clone(),
+                        opened: 1_797_000_000_000,
+                        favorite: false,
+                        reading: Some(mypdf_milestone0::home::ReadingState {
+                            page: 11,
+                            ..Default::default()
+                        }),
+                    }];
+                    app.home.previews.insert(
+                        path,
+                        Thumbnail {
+                            image: None,
+                            error: None,
+                            used: 0,
+                        },
+                    );
+                    for _ in 0..3 {
+                        frame(&mut app, &ctx, width, vec![]);
+                    }
+                    let output = frame(&mut app, &ctx, width, vec![]);
+                    let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+                    // CentralPanel's actual accessibility subtree distinguishes Home cards
+                    // from same-named application menus without assuming their position.
+                    let home_root: NodeId = egui::Id::new((ctx.viewport_id(), "central_panel"))
+                        .value()
+                        .into();
+                    assert!(
+                        nodes.iter().any(|(id, _)| *id == home_root),
+                        "Missing Home central panel: {case}"
+                    );
+                    let mut home_nodes = std::collections::HashSet::new();
+                    let mut pending = vec![home_root];
+                    while let Some(id) = pending.pop() {
+                        if home_nodes.insert(id)
+                            && let Some((_, node)) =
+                                nodes.iter().find(|(node_id, _)| *node_id == id)
+                        {
+                            pending.extend_from_slice(node.children());
+                        }
+                    }
+                    let bounds = |label: &str, role: Role| {
+                        let matches: Vec<_> = nodes
+                            .iter()
+                            .filter(|(id, n)| {
+                                home_nodes.contains(id)
+                                    && n.role() == role
+                                    && (n.label() == Some(label)
+                                        || role == Role::Label && n.value() == Some(label))
+                            })
+                            .collect();
+                        assert_eq!(
+                            matches.len(),
+                            1,
+                            "Expected one Home {role:?} named {label:?}: {case}"
+                        );
+                        matches[0]
+                            .1
+                            .bounds()
+                            .unwrap_or_else(|| panic!("Missing bounds for Home {label:?}: {case}"))
+                    };
+                    assert_eq!(
+                        nodes
+                            .iter()
+                            .filter(|(id, n)| {
+                                !home_nodes.contains(id)
+                                    && n.role() == Role::Button
+                                    && n.label() == Some("Edit PDF")
+                            })
+                            .count(),
+                        usize::from(portable_menu),
+                        "The application menu must be distinct from the Home tool: {case}"
+                    );
+                    let search = bounds("Search recents and favorites", Role::TextInput);
+                    let banner = bounds("Open Files", Role::Button);
+                    let recent = bounds(&format!("Open {name}"), Role::Button);
+                    let resume = bounds("Resume · page 12", Role::Label);
+                    let tools = bounds("Edit PDF", Role::Button);
+                    let filename = bounds(name, Role::Label);
+                    let favorite = bounds(&format!("Add to Favorites: {name}"), Role::Button);
+                    assert_eq!(banner.y1 - banner.y0, 104., "Banner {banner:?}: {case}");
+                    assert!(
+                        recent.y0 > banner.y1 && recent.y1 < tools.y0,
+                        "Recents should be visible before quick tools: {case}; banner={banner:?}, recent={recent:?}, tools={tools:?}"
+                    );
+                    assert!(
+                        resume.y0 >= recent.y1 && resume.y1 < tools.y0,
+                        "Resume label must follow its card before tools: {case}; recent={recent:?}, resume={resume:?}, tools={tools:?}"
+                    );
+                    assert!(
+                        filename.y1 - filename.y0 >= 24.,
+                        "Long filenames need two lines: {case}; filename={filename:?}"
+                    );
+                    for rect in [search, banner, recent, resume, filename, favorite, tools] {
+                        assert!(
+                            rect.x0 >= 0. && rect.x1 <= width as f64,
+                            "Home item clipped: {case}; rect={rect:?}"
+                        );
+                    }
+                    if density == theme::Density::Comfortable {
+                        assert!(search.y1 - search.y0 >= 44., "Search {search:?}: {case}");
+                        assert!(
+                            favorite.x1 - favorite.x0 >= 44. && favorite.y1 - favorite.y0 >= 44.,
+                            "Favorite {favorite:?}: {case}"
+                        );
+                    } else {
+                        assert_eq!(
+                            favorite.x1 - favorite.x0,
+                            22.,
+                            "Favorite {favorite:?}: {case}"
+                        );
+                        assert_eq!(
+                            favorite.y1 - favorite.y0,
+                            24.,
+                            "Favorite {favorite:?}: {case}"
+                        );
+                    }
                 }
             }
         }
