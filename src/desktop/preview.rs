@@ -254,6 +254,7 @@ const SCENES: &[&str] = &[
     "Arrows",
     "Symbols",
     "Stamps",
+    "AnnotationMore",
     "Pages",
     "Crop",
     "Edit",
@@ -1330,6 +1331,39 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
             preview.settle(&mut app, &ctx);
         }
     }
+    if collection == "AnnotationMore" {
+        ctx.enable_accesskit();
+        preview.settle(&mut app, &ctx);
+        let output = preview.capture(&mut app, &ctx);
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let rect = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("More") && node.has_popup().is_some())
+            .expect("Annotate More menu trigger")
+            .1
+            .bounds()
+            .unwrap();
+        let at = pos2(
+            ((rect.x0 + rect.x1) / 2.) as f32,
+            ((rect.y0 + rect.y1) / 2.) as f32,
+        );
+        for pressed in [true, false] {
+            preview.capture_with(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        preview.settle(&mut app, &ctx);
+    }
     if collection.starts_with("ReusableColorPicker") {
         ctx.enable_accesskit();
         for label in if collection == "ReusableColorPickerMore" {
@@ -1434,6 +1468,21 @@ fn assert_scene(scene: &str, app: &Viewer, output: &egui::FullOutput) {
         "{scene}: Home visibility"
     );
     let text = rendered_text(output);
+    if scene == "AnnotationMore" {
+        for label in [
+            "More",
+            "Underline",
+            "Squiggly",
+            "Strikeout",
+            "Table",
+            "Area Highlight",
+        ] {
+            assert!(
+                text.iter().any(|value| value == label),
+                "More menu must show {label}"
+            );
+        }
+    }
     if scene == "Home" {
         assert!(
             text.iter().any(|value| value == "Resume · page 2"),

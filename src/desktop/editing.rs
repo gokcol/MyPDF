@@ -34,6 +34,7 @@ pub(super) enum Tool {
     Pen,
     Eraser,
     Highlight,
+    AreaHighlight,
     Underline,
     Squiggly,
     Strikeout,
@@ -75,6 +76,7 @@ impl Tool {
             Self::Pen => "Pen",
             Self::Eraser => "Eraser",
             Self::Highlight => "Highlight",
+            Self::AreaHighlight => "Area Highlight",
             Self::Underline => "Underline",
             Self::Squiggly => "Squiggly underline",
             Self::Strikeout => "Strikeout",
@@ -198,7 +200,7 @@ impl Tool {
             Self::Lasso => Icon::Lasso,
             Self::Pen => Icon::Pen,
             Self::Eraser => Icon::Eraser,
-            Self::Highlight => Icon::Highlight,
+            Self::Highlight | Self::AreaHighlight => Icon::Highlight,
             Self::Underline => Icon::Underline,
             Self::Squiggly => Icon::Squiggly,
             Self::Strikeout => Icon::Strikeout,
@@ -833,7 +835,7 @@ impl EditorState {
         self.vertices = None;
         self.gesture = None;
         self.pressed = None;
-        if tool == Tool::Highlight {
+        if matches!(tool, Tool::Highlight | Tool::AreaHighlight) {
             self.style.color = HIGHLIGHT;
             self.style.opacity = 0.35;
             self.style.fill = None;
@@ -917,6 +919,10 @@ impl EditorState {
         let kind = match self.tool {
             Tool::Pen => Kind::Ink {
                 strokes: vec![points.iter().map(|p| local(*p)).collect()],
+            },
+            Tool::AreaHighlight => Kind::Markup {
+                kind: Markup::Highlight,
+                quads: vec![[0., 0., 1., 1.]],
             },
             Tool::Highlight | Tool::Underline | Tool::Squiggly | Tool::Strikeout => {
                 let quads: Vec<_> = tab
@@ -1029,18 +1035,17 @@ impl EditorState {
 const HIGHLIGHT: [f32; 3] = [1.0, 0.8, 0.05];
 const DEFAULT_INK: [f32; 3] = [0.11, 0.43, 0.35];
 
-const ANNOTATION_TOOLS: [Tool; 10] = [
+const ANNOTATION_TOOLS: [Tool; 7] = [
     Tool::Select,
     Tool::Lasso,
     Tool::Highlight,
-    Tool::Underline,
-    Tool::Squiggly,
-    Tool::Strikeout,
     Tool::Pen,
     Tool::Text,
     Tool::Note,
     Tool::Callout,
 ];
+
+const ANNOTATION_MORE_TOOLS: [Tool; 3] = [Tool::Underline, Tool::Squiggly, Tool::Strikeout];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AnnotationLabels {
@@ -1052,7 +1057,7 @@ impl AnnotationLabels {
     fn expanded(self, tool: Tool) -> bool {
         match self {
             Self::Full => !matches!(tool, Tool::Select | Tool::Lasso),
-            Self::Essential => matches!(tool, Tool::Highlight | Tool::Underline | Tool::Note),
+            Self::Essential => matches!(tool, Tool::Highlight | Tool::Note),
             Self::Icons => false,
         }
     }
@@ -1081,11 +1086,11 @@ fn annotation_ribbon_layout(ui: &egui::Ui, available: f32) -> (AnnotationLabels,
             .iter()
             .map(|&tool| annotation_button(tool, labels).width(ui))
             .sum();
-        let table = ribbon_action(Icon::Table, "Table", labels == AnnotationLabels::Full).width(ui);
+        let more = ActionButton::new(Icon::More, "More").dropdown().width(ui);
         let stamps =
             ribbon_action(Icon::Stamp, "Stamps", labels != AnnotationLabels::Icons).width(ui);
-        // Twelve controls and three separators, with one gap between each item.
-        tools + table + stamps + 3. * 6. + 14. * gap
+        // Nine controls and three separators, with one gap between each item.
+        tools + more + stamps + 3. * 6. + 11. * gap
     };
     for labels in [AnnotationLabels::Full, AnnotationLabels::Essential] {
         let measured = width(labels);
@@ -2721,6 +2726,73 @@ impl Viewer {
         }
     }
 
+    fn annotation_more_menu(&mut self, ui: &mut egui::Ui) {
+        let table_selected = self.table.chooser
+            || self.table.placing
+            || self
+                .table
+                .has_editor(self.tabs.get(self.active).map_or(0, |tab| tab.id));
+        let selected = ((ANNOTATION_MORE_TOOLS.contains(&self.editor.tool)
+            || self.editor.tool == Tool::AreaHighlight)
+            && !self.editor.library_open)
+            || table_selected;
+        let enabled = ui.is_enabled();
+        let response = ui
+            .add(
+                ActionButton::new(Icon::More, "More")
+                    .dropdown()
+                    .selected(selected),
+            )
+            .on_hover_text("Underline, squiggly, strikeout, tables and area highlighting");
+        let ctx = ui.ctx().clone();
+        egui::Popup::menu(&response).show(|ui| {
+            // Popups have their own UI: preserve the ribbon's document-editability guard.
+            ui.add_enabled_ui(enabled, |ui| {
+                for tool in ANNOTATION_MORE_TOOLS {
+                    let button = annotation_button(tool, AnnotationLabels::Full)
+                        .selected(self.editor.tool == tool && !self.editor.library_open);
+                    if ui.add(button).clicked() {
+                        self.toggle_editor_tool(&ctx, tool);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(
+                        !self.content.busy,
+                        ActionButton::new(Icon::Table, "Table").selected(table_selected),
+                    )
+                    .on_hover_text("Place a movable table layer")
+                    .clicked()
+                {
+                    if table_selected {
+                        self.finish_table_selection(&ctx);
+                    } else if self.apply_pending_annotation() {
+                        self.choose_table();
+                    }
+                    ui.close();
+                }
+                if ui
+                    .add(
+                        annotation_button(Tool::AreaHighlight, AnnotationLabels::Full).selected(
+                            self.editor.tool == Tool::AreaHighlight && !self.editor.library_open,
+                        ),
+                    )
+                    .on_hover_text("Highlight a rectangular area without snapping to text")
+                    .clicked()
+                {
+                    self.toggle_editor_tool(&ctx, Tool::AreaHighlight);
+                    ui.close();
+                }
+            });
+        });
+        let expanded = egui::Popup::is_id_open(&ctx, egui::Popup::default_response_id(&response));
+        ctx.accesskit_node_builder(response.id, |node| {
+            node.set_has_popup(egui::accesskit::HasPopup::Menu);
+            node.set_expanded(expanded);
+        });
+    }
+
     pub(super) fn editor_tools(&mut self, ctx: &egui::Context) {
         if matches!(
             self.editor.mode,
@@ -2793,16 +2865,6 @@ impl Viewer {
                                     self.drawing_tool_group(ui, ToolFamily::Line);
                                     self.drawing_tool_group(ui, ToolFamily::Arrow);
                                 } else {
-                                    if ui.add_enabled(!self.content.busy,
-                                        ribbon_action(Icon::Table, "Table", labels == AnnotationLabels::Full)
-                                            .selected(self.table.chooser || self.table.placing || self.table.has_editor(self.tabs.get(self.active).map_or(0, |tab| tab.id))))
-                                        .on_hover_text("Place a movable table layer").clicked() {
-                                        if self.table.chooser || self.table.placing || self.table.has_editor(self.tabs.get(self.active).map_or(0, |tab| tab.id)) {
-                                            self.finish_table_selection(ctx);
-                                        } else if self.apply_pending_annotation() {
-                                            self.choose_table();
-                                        }
-                                    }
                                     ui.separator();
                                     let selected = self.editor.library_open;
                                     let button = ribbon_action(Icon::Stamp, "Stamps", labels != AnnotationLabels::Icons).selected(selected);
@@ -2817,6 +2879,7 @@ impl Viewer {
                                             self.editor.library_open = true;
                                         }
                                     }
+                                    self.annotation_more_menu(ui);
                                 }
                             });
                         } else if self.editor.mode == Mode::Sign {
@@ -3127,6 +3190,7 @@ impl Viewer {
                             if drawing { "Drawings" } else { "Annotations" }
                         } else { self.editor.tool.label() };
                         let hint = match self.editor.tool {
+                            Tool::AreaHighlight => "Drag a rectangle to highlight any area without snapping to text. Click an existing highlight to edit its appearance.",
                             Tool::Highlight | Tool::Underline | Tool::Squiggly | Tool::Strikeout => "Drag across PDF text to mark it. Click an existing annotation to edit its appearance.",
                             Tool::Note => "Click the page to add a note. Click an existing note to edit it.",
                             Tool::Text => "Click or drag on the page to add a text box.",
@@ -5730,6 +5794,7 @@ mod tests {
         for (tool, title) in [
             (Tool::Select, "Annotations"),
             (Tool::Highlight, "Highlight"),
+            (Tool::AreaHighlight, "Area Highlight"),
         ] {
             app.editor.tool = tool;
             let mut labels = Vec::new();
@@ -6142,6 +6207,163 @@ mod tests {
         assert!((ratio(c) - ratio(a.rect)).abs() < 0.01);
     }
     #[test]
+    fn area_highlight_drag_stays_rectangular_and_translucent_after_save_reopen() {
+        use mypdf_milestone0::viewer::{GlyphBox, PageText};
+
+        for reverse in [false, true] {
+            let (ctx, mut app) = ready_ribbon();
+            app.editor.mode = Mode::Annotate;
+            // Deliberately cross two glyph boxes at their edges, with empty space
+            // between them: normal text highlighting expands to these boxes.
+            app.tabs[0].text[0] = Some(std::sync::Arc::new(PageText {
+                text: "A B".into(),
+                glyphs: vec![
+                    GlyphBox {
+                        range: 0..1,
+                        rect: [90., 90., 125., 115.],
+                    },
+                    GlyphBox {
+                        range: 2..3,
+                        rect: [175., 135., 210., 160.],
+                    },
+                ],
+                ..Default::default()
+            }));
+            let initial_revision = app.tabs[0].session.as_ref().unwrap().revision();
+            let initial_history = app.tabs[0].session.as_ref().unwrap().history().0;
+            let at = ribbon_button(&mut app, &ctx, "Area Highlight");
+            let output = ribbon_frame(&mut app, &ctx, vec![], 900.);
+            let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+            let table = nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.role() == egui::accesskit::Role::Button && node.label() == Some("Table")
+                })
+                .unwrap()
+                .1
+                .bounds()
+                .unwrap();
+            assert!(
+                f64::from(at.y) > table.y1,
+                "Area Highlight follows Table in More"
+            );
+            ribbon_click(&mut app, &ctx, at);
+            assert!(app.editor.tool == Tool::AreaHighlight);
+            assert!(!egui::Popup::is_any_open(&ctx));
+            input(&mut app, &ctx, vec![]);
+
+            let (start, end) = if reverse {
+                ([200., 150.], [100., 100.])
+            } else {
+                ([100., 100.], [200., 150.])
+            };
+            pointer(&mut app, &ctx, start, Some(true));
+            pointer(&mut app, &ctx, [150., 125.], None);
+            pointer(&mut app, &ctx, end, None);
+            pointer(&mut app, &ctx, end, Some(false));
+            assert!(app.status.as_ref().is_none_or(|(_, error)| !error));
+            let (mark, bytes) = {
+                let session = app.tabs[0].session.as_mut().unwrap();
+                assert_eq!(session.annotations.len(), 1);
+                let mark = session.annotations[0].clone();
+                assert_eq!(
+                    mark.rect,
+                    [100., 100., 200., 150.],
+                    "reverse={reverse}: no glyph snapping"
+                );
+                assert!(matches!(&mark.kind,
+                    Kind::Markup { kind: Markup::Highlight, quads }
+                        if quads.as_slice() == [[0., 0., 1., 1.]]));
+                assert_eq!(mark.style.opacity, 0.35);
+                assert_eq!(
+                    session.history().0,
+                    initial_history + 1,
+                    "one drag is one undo step"
+                );
+                session.undo();
+                assert!(session.annotations.is_empty());
+                assert_eq!(session.revision(), initial_revision);
+                session.redo();
+                assert_eq!(session.annotations, vec![mark.clone()]);
+                (mark, session.snapshot_bytes().unwrap())
+            };
+
+            // Round-trip actual saved PDF bytes, then render its native appearance.
+            // Metadata alone could pass while a missing/opaque appearance stays wrong.
+            let saved = lopdf::Document::load_mem(&bytes).unwrap();
+            assert_eq!(ann::load(&saved), vec![mark]);
+            let native = saved
+                .objects
+                .values()
+                .filter_map(|o| o.as_dict().ok())
+                .find(|d| {
+                    d.get(b"Subtype").and_then(lopdf::Object::as_name).ok() == Some(b"Highlight")
+                })
+                .expect("native PDF highlight");
+            assert_eq!(
+                native.get(b"QuadPoints").unwrap().as_array().unwrap().len(),
+                8
+            );
+            assert!(
+                native
+                    .get(b"AP")
+                    .unwrap()
+                    .as_dict()
+                    .unwrap()
+                    .get(b"N")
+                    .is_ok()
+            );
+            let (size, pixels) = mypdf_milestone0::viewer::render_page(&bytes, 0, 1.).unwrap();
+            let pixel = |x: usize, y: usize| &pixels[(y * size[0] + x) * 4..][..4];
+            // Blank space between glyphs and both corners must all be covered;
+            // blue remains well above zero because the yellow fill is translucent.
+            for (x, y) in [(102, 102), (150, 125), (198, 148)] {
+                let p = pixel(x, y);
+                assert!(
+                    p[0] > 245 && p[1] > 210 && (150..210).contains(&p[2]),
+                    "reverse={reverse}: translucent full-area fill at ({x},{y}), got {p:?}"
+                );
+            }
+            for (x, y) in [(95, 125), (205, 125), (150, 95), (150, 155)] {
+                assert_eq!(
+                    pixel(x, y),
+                    &[255, 255, 255, 255],
+                    "outside the dragged area"
+                );
+            }
+
+            app.tabs[0].session.as_mut().unwrap().undo();
+            selection::set(&mut app.tabs[0], &mut app.editor, vec![]);
+            app.editor.select_tool(Tool::Highlight);
+            pointer(&mut app, &ctx, start, Some(true));
+            pointer(&mut app, &ctx, end, None);
+            pointer(&mut app, &ctx, end, Some(false));
+            let normal = &app.tabs[0].session.as_ref().unwrap().annotations[0];
+            assert_eq!(
+                normal.rect,
+                [90., 90., 210., 160.],
+                "text Highlight still snaps to glyphs"
+            );
+            assert!(matches!(&normal.kind, Kind::Markup { quads, .. } if quads.len() == 2));
+
+            app.tabs[0].session.as_mut().unwrap().undo();
+            selection::set(&mut app.tabs[0], &mut app.editor, vec![]);
+            app.editor.select_tool(Tool::AreaHighlight);
+            app.tabs[0].session.as_mut().unwrap().editable = false;
+            let revision = app.tabs[0].session.as_ref().unwrap().revision();
+            pointer(&mut app, &ctx, start, Some(true));
+            pointer(&mut app, &ctx, end, None);
+            pointer(&mut app, &ctx, end, Some(false));
+            let session = app.tabs[0].session.as_ref().unwrap();
+            assert!(
+                session.annotations.is_empty(),
+                "read-only PDFs cannot gain area highlights"
+            );
+            assert_eq!(session.revision(), revision);
+        }
+    }
+
+    #[test]
     fn vertex_tools_commit_once_cancel_and_survive_save() {
         let ctx = egui::Context::default();
         let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
@@ -6467,6 +6689,15 @@ mod tests {
             "Squiggly underline" => "Squiggly",
             other => other,
         };
+        if app.editor.mode == Mode::Annotate
+            && matches!(
+                label,
+                "Underline" | "Squiggly" | "Strikeout" | "Table" | "Area Highlight"
+            )
+        {
+            let more = ribbon_button(app, ctx, "More");
+            ribbon_click(app, ctx, more);
+        }
         for _ in 0..3 {
             ribbon_frame(app, ctx, vec![], 900.);
         }
@@ -6515,7 +6746,7 @@ mod tests {
         let revision = app.tabs[0].session.as_ref().unwrap().revision();
         for density in theme::Density::ALL {
             theme::set_density(density);
-            for (width, expanded) in [(1400., true), (720., false), (1400., true)] {
+            for width in [1400., 720., 1400.] {
                 for _ in 0..3 {
                     ribbon_frame(&mut app, &ctx, vec![], width);
                 }
@@ -6531,12 +6762,23 @@ mod tests {
                         }
                     })
                     .collect();
-                for label in ["Highlight", "Underline", "Comment", "Stamps"] {
-                    assert_eq!(
-                        painted.contains(&label),
-                        expanded,
-                        "{density:?}, width {width}: visible {label}"
-                    );
+                assert!(
+                    painted.contains(&"More"),
+                    "More must always have a visible label"
+                );
+                if width == 1400. {
+                    for label in ["Highlight", "Comment", "Stamps"] {
+                        assert!(painted.contains(&label), "{density:?}: visible {label}");
+                    }
+                }
+                for label in [
+                    "Underline",
+                    "Squiggly",
+                    "Strikeout",
+                    "Table",
+                    "Area Highlight",
+                ] {
+                    assert!(!painted.contains(&label), "{label} belongs inside More");
                 }
                 let nodes = output.platform_output.accesskit_update.unwrap().nodes;
                 let buttons: Vec<_> = nodes
@@ -6546,8 +6788,8 @@ mod tests {
                     .collect();
                 assert_eq!(
                     buttons.len(),
-                    12,
-                    "Every annotation action remains available"
+                    9,
+                    "The main annotation actions and More remain available"
                 );
                 let top = buttons[0].y0;
                 for rect in buttons {
@@ -6638,6 +6880,7 @@ mod tests {
                     Tool::Underline,
                     Tool::Squiggly,
                     Tool::Strikeout,
+                    Tool::AreaHighlight,
                     Tool::Pen,
                     Tool::Text,
                     Tool::Note,
@@ -6662,6 +6905,7 @@ mod tests {
                 let at = ribbon_button(&mut app, &ctx, tool.label());
                 ribbon_click(&mut app, &ctx, at);
                 assert!(app.editor.tool == tool, "{} should arm", tool.label());
+                let at = ribbon_button(&mut app, &ctx, tool.label());
                 ribbon_click(&mut app, &ctx, at);
                 assert!(
                     app.editor.tool == Tool::Select,

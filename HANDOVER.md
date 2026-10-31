@@ -2,7 +2,15 @@
 
 Updated 31 October 2026 (Europe/Istanbul). Project root: `/Users/gokcol/SWPROJECTS/Utility/MyPDF/`.
 
-## MyPDF 2.2.0 / build 199
+## Release in preparation — v2.2 / Mac build 200
+
+The user requested moving **Underline, Squiggly, Strikeout and Table** into an Annotate **More** menu, then approved adding **Area Highlight at the end of that menu, after Table**. Implemented in `src/desktop/editing.rs`, with an ellipsis icon in `src/desktop/ui.rs` and Area Highlight guidance in `src/desktop/interface.rs`. More stays labeled at the end of the toolbar and indicates an active nested tool; menu entries retain tool toggling, pending-edit handling, document editability and Table busy guards. Native/menu commands elsewhere remain available.
+
+Area Highlight creates a translucent yellow rectangle with the exact dragged bounds, without snapping to text. It uses the existing native PDF Highlight annotation and appearance format, retaining undo/redo, editing, save/reopen and read-only protection. Ordinary text Highlight still snaps to glyphs. Replace Text and Insert Text remain suggestions only.
+
+Validation: all **30 desktop editing tests** passed, including forward/reverse area drags over controlled glyph boxes, undo/redo, saved PDF roundtrip, native appearance rendering/transparency, unchanged text highlighting and read-only protection. Clippy with warnings denied passed. Native More-menu previews passed and were visually inspected at Compact 1200px and Comfortable 720px (`artifacts/annotation-more/area-compact/annotationmore.png` and `artifacts/annotation-more/area-comfortable/annotationmore.png`); Area Highlight is visibly last. The user authorized committing, pushing and releasing both desktop versions as GitHub tag `v2.2`, and updating the local Mac installation with settings and documents preserved. App version stays **2.2.0**, Mac build becomes **200**, and the internal Store MSIX version becomes **2.2.1.0**; Windows installer/PE version remains **2.2.0.0**. The existing `v2.2.0` release remains intact. Build, CI, notarization, publication and installation are pending; current installed baseline is build199. New evidence belongs in `artifacts/release-2.2.0-build200/` and `artifacts/mac-install-2.2.0-build200/`.
+
+## Previous release — MyPDF 2.2.0 / build 199
 
 **MyPDF 2.2.0 is published as the latest GitHub release, and Mac build199 is installed and running at `/Applications/MyPDF.app`.** Mac/Windows packages, exact-source CI, notarization, local preservation and generated source-app archival are verified. Final versions are **2.2.0**, Mac **199**, Windows/Store **2.2.0.0**. The existing MyPDF Keychain profile was used successfully; no new private key was needed.
 

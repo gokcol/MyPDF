@@ -351,6 +351,7 @@ pub(super) enum Icon {
     Stamp,
     Star,
     Sparkle,
+    More,
     Plus,
     Minus,
     Left,
@@ -1383,6 +1384,11 @@ fn draw_icon_impl(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             };
             star([0.42, 0.56], 0.34);
             star([0.78, 0.2], 0.14);
+        }
+        Icon::More => {
+            for x in [0.2, 0.5, 0.8] {
+                painter.circle_filled(p(x, 0.5), width, color);
+            }
         }
         Icon::Plus | Icon::Minus => {
             line(&[[0.2, 0.5], [0.8, 0.5]]);

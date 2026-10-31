@@ -110,6 +110,7 @@ impl Viewer {
                     "Click to add corners · Double-click or Return finishes · Esc cancels"
                 }
                 Tool::Asset => "Click or drag to place artwork · Select it to move or resize",
+                Tool::AreaHighlight => "Drag a rectangle to highlight an area",
                 Tool::Highlight | Tool::Underline | Tool::Squiggly | Tool::Strikeout => {
                     "Drag across text to mark it"
                 }
