@@ -102,6 +102,61 @@ mod tests {
     }
 
     #[test]
+    fn folder_hints_distinguish_duplicate_names_without_cluttering_unique_tabs() {
+        use std::path::Path;
+        let paths = [
+            Path::new("/work/2026/report.pdf"),
+            Path::new("/archive/2026/report.pdf"),
+            Path::new("/work/notes.pdf"),
+        ];
+        assert_eq!(
+            duplicate_folder_hints(&paths),
+            vec![
+                Some(["work", "2026"].join(std::path::MAIN_SEPARATOR_STR)),
+                Some(["archive", "2026"].join(std::path::MAIN_SEPARATOR_STR)),
+                None
+            ]
+        );
+        assert_eq!(
+            duplicate_folder_hints(&[Path::new("/a/report.pdf"), Path::new("/b/report.pdf")]),
+            vec![Some("a".into()), Some("b".into())]
+        );
+    }
+
+    #[test]
+    fn comfortable_tab_close_has_a_full_target_and_never_starts_a_drag() {
+        struct Restore(theme::Density);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                theme::set_density(self.0);
+            }
+        }
+        let _restore = Restore(theme::density());
+        let (mut app, ctx) = fixture(3);
+        ui::set_density(&ctx, theme::Density::Comfortable).unwrap();
+        let rect = bounds(&mut app, &ctx, "document-0.pdf");
+        let closing_id = app.tabs[0].id;
+        let close = close_target(rect);
+        assert_eq!(close.size(), vec2(44., 44.));
+        assert!(rect.contains_rect(close));
+        // The outer corner used to lie outside the small close target.
+        let point = close.min + vec2(2., 2.);
+        pointer(&mut app, &ctx, point, egui::PointerButton::Primary, true);
+        assert!(app.tab_controls.drag.is_none());
+        pointer(&mut app, &ctx, point, egui::PointerButton::Primary, false);
+        assert_eq!(
+            app.close_intent,
+            Some(Some(closing_id)),
+            "The full close target must reach the unsaved-document guard"
+        );
+        assert_eq!(
+            app.tabs.len(),
+            3,
+            "An unsaved in-memory PDF must await the close decision"
+        );
+    }
+
+    #[test]
     fn adaptive_tabs_fit_when_possible_and_keep_active_readable() {
         let result = widths(&[260., 260., 260.], Some(1), 440.);
         assert!(result.iter().sum::<f32>() + 8. <= 440.1);
@@ -440,6 +495,7 @@ struct TabContext<'a> {
     groups: &'a [Group],
     current_group: u64,
     dragging: Option<u64>,
+    folder_hint: Option<&'a str>,
 }
 
 impl State {
@@ -476,11 +532,7 @@ impl State {
                         .find(|(_, rect)| {
                             strip.contains(pos)
                                 && rect.contains(pos)
-                                && !Rect::from_center_size(
-                                    pos2(rect.right() - 14., rect.center().y),
-                                    vec2(20., 20.),
-                                )
-                                .contains(pos)
+                                && !close_target(*rect).contains(pos)
                         })
                         .map(|(source, _)| TabDrag {
                             source: *source,
@@ -549,6 +601,69 @@ enum Action {
     },
 }
 
+/// Show only the shortest folder suffix needed to distinguish equal filenames.
+fn duplicate_folder_hints(paths: &[&std::path::Path]) -> Vec<Option<String>> {
+    let names: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase()
+        })
+        .collect();
+    let tails = |path: &std::path::Path, depth: usize| {
+        let mut parts: Vec<_> = path
+            .parent()
+            .into_iter()
+            .flat_map(|parent| parent.components().rev())
+            .take(depth)
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        parts.reverse();
+        parts.join(std::path::MAIN_SEPARATOR_STR)
+    };
+    paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let peers: Vec<_> = paths
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index && names[*other] == names[index])
+                .collect();
+            if peers.is_empty() {
+                return None;
+            }
+            let depth = path
+                .parent()
+                .map_or(0, |parent| parent.components().count());
+            for count in 1..=depth {
+                let hint = tails(path, count);
+                if !hint.is_empty() && peers.iter().all(|(_, other)| tails(other, count) != hint) {
+                    return Some(hint);
+                }
+            }
+            Some(if depth == 0 {
+                "Unsaved".into()
+            } else {
+                tails(path, depth)
+            })
+        })
+        .collect()
+}
+
+fn close_target(rect: Rect) -> Rect {
+    let size = ui::target_size(20.);
+    Rect::from_center_size(
+        pos2(
+            rect.right() - size / 2. - if theme::comfortable() { 0. } else { 4. },
+            rect.center().y,
+        ),
+        vec2(size, size),
+    )
+}
+
 /// Shrink evenly, with extra room reserved for the active filename.
 fn widths(natural: &[f32], active: Option<usize>, available: f32) -> Vec<f32> {
     let minimum: Vec<_> = (0..natural.len())
@@ -597,9 +712,16 @@ fn tab_chip(
 ) -> Option<Action> {
     let mut action = None;
     let name = tab.name();
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 30.), egui::Sense::click_and_drag());
-    response
-        .widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, active, &name));
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(width, ui::target_size(30.)),
+        egui::Sense::click_and_drag(),
+    );
+    let accessible_name = context
+        .folder_hint
+        .map_or_else(|| name.clone(), |folder| format!("{name} · {folder}"));
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, true, active, &accessible_name)
+    });
     if reveal {
         response.scroll_to_me(Some(egui::Align::Center));
     }
@@ -607,8 +729,7 @@ fn tab_chip(
     let after = pointer.is_some_and(|p| p.x > rect.center().x);
     let insertion_marker = context.dragging.is_some_and(|source| source != tab.id)
         && pointer.is_some_and(|p| rect.intersect(ui.clip_rect()).contains(p));
-    let close_rect =
-        Rect::from_center_size(pos2(rect.right() - 14., rect.center().y), vec2(20., 20.));
+    let close_rect = close_target(rect);
     let close = ui.interact(close_rect, ui.id().with("close"), egui::Sense::click());
     close.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Close tab"));
     let painter = ui.painter();
@@ -637,8 +758,30 @@ fn tab_chip(
         FontId::proportional(13.),
         color,
     );
-    job.wrap = egui::text::TextWrapping::truncate_at_width((width - 48.).max(10.));
+    let text_width = (close_rect.left() - rect.left() - 20.).max(10.);
+    let folder = context.folder_hint.map(|hint| {
+        let mut job = egui::text::LayoutJob::simple_singleline(
+            format!(" · {hint}"),
+            FontId::proportional(11.),
+            theme::muted(),
+        );
+        job.wrap = egui::text::TextWrapping::truncate_at_width((text_width * 0.45).max(10.));
+        ui.fonts_mut(|f| f.layout_job(job))
+    });
+    job.wrap = egui::text::TextWrapping::truncate_at_width(
+        (text_width - folder.as_ref().map_or(0., |g| g.size().x)).max(10.),
+    );
     let text = ui.fonts_mut(|f| f.layout_job(job));
+    if let Some(folder) = folder {
+        painter.galley(
+            pos2(
+                close_rect.left() - 10. - folder.size().x,
+                rect.center().y - folder.size().y / 2.,
+            ),
+            folder,
+            theme::muted(),
+        );
+    }
     painter.galley(
         pos2(rect.left() + 10., rect.center().y - text.size().y / 2.),
         text,
@@ -651,11 +794,16 @@ fn tab_chip(
             theme::accent(),
         );
     }
-    if active || response.hovered() || close.hovered() {
+    if theme::comfortable() || active || response.hovered() || close.hovered() {
         if close.hovered() {
             painter.rect_filled(close_rect, 4, theme::pressed());
         }
-        ui::draw_icon(painter, close_rect.shrink(5.), Icon::Close, theme::muted());
+        ui::draw_icon(
+            painter,
+            Rect::from_center_size(close_rect.center(), vec2(12., 12.)),
+            Icon::Close,
+            theme::muted(),
+        );
     }
     if close.on_hover_text("Close tab").clicked() {
         action = Some(Action::Close(tab.id));
@@ -1019,7 +1167,10 @@ impl Viewer {
         let area = ui.interact(
             Rect::from_min_size(
                 ui.next_widget_position(),
-                vec2((ui.available_width() - 124.).max(1.), 32.),
+                vec2(
+                    (ui.available_width() - 4. * ui::control_height()).max(1.),
+                    ui::target_size(32.),
+                ),
             ),
             ui.id().with("tab_area"),
             egui::Sense::click_and_drag(),
@@ -1037,31 +1188,45 @@ impl Viewer {
             .collect();
         let label = format!("Open documents ({})", visible.len());
         let group_font = ui::bold(ui, 10.);
-        let chooser_width = group_name.map_or(30., |name| {
+        let chooser_width = group_name.map_or(ui::target_size(30.), |name| {
             ui.fonts_mut(|f| {
                 f.layout_no_wrap(name.into(), group_font.clone(), theme::ink())
                     .size()
                     .x
                     + 12.
             })
-            .clamp(30., 96.)
+            .clamp(ui::target_size(30.), 96.)
         });
         // The caller renders Open, Settings and Appearance after this area.
-        let available = (ui.available_width() - chooser_width - 124.).max(36.);
+        let available = (ui.available_width() - chooser_width - 4. * ui::control_height()).max(36.);
         let selected = (!self.home.visible)
             .then(|| self.tabs.get(self.active).map(|t| t.id))
             .flatten();
+        let folder_hints = duplicate_folder_hints(
+            &visible
+                .iter()
+                .map(|tab| tab.path.as_path())
+                .collect::<Vec<_>>(),
+        );
         let natural: Vec<_> = visible
             .iter()
-            .map(|tab| {
+            .enumerate()
+            .map(|(index, tab)| {
                 ui.fonts_mut(|f| {
                     f.layout_no_wrap(
-                        tab_caption(&tab.name()),
+                        format!(
+                            "{}{}",
+                            tab_caption(&tab.name()),
+                            folder_hints[index]
+                                .as_ref()
+                                .map_or(String::new(), |folder| format!(" · {folder}"))
+                        ),
                         FontId::proportional(13.),
                         theme::ink(),
                     )
                     .size()
                     .x + 48.
+                        + if theme::comfortable() { 24. } else { 0. }
                 })
             })
             .collect();
@@ -1074,7 +1239,7 @@ impl Viewer {
             tab_widths.iter().sum::<f32>() + 4. * visible.len().saturating_sub(1) as f32;
         let overflow = content_width > available + 0.5;
         let viewport = if overflow {
-            (available - 72.).max(24.)
+            (available - 2. * (ui::control_height() + 4.)).max(24.)
         } else {
             available
         };
@@ -1095,7 +1260,7 @@ impl Viewer {
             self.tab_controls.offset = (self.tab_controls.offset - viewport * 0.75).max(0.);
         }
         ui.allocate_ui_with_layout(
-            vec2(viewport, 32.),
+            vec2(viewport, ui::target_size(32.)),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 let output = egui::ScrollArea::horizontal()
@@ -1123,6 +1288,7 @@ impl Viewer {
                                             !self.workspace.closed.is_empty(),
                                         ),
                                         TabContext {
+                                            folder_hint: folder_hints[i].as_deref(),
                                             groups: &self.tab_controls.groups,
                                             current_group: self.tab_controls.current_group,
                                             dragging: self
@@ -1139,7 +1305,7 @@ impl Viewer {
                                 }
                             }
                             ui.allocate_response(
-                                vec2(ui.available_width().max(1.), 30.),
+                                vec2(ui.available_width().max(1.), ui::target_size(30.)),
                                 egui::Sense::hover(),
                             );
                         });
@@ -1177,15 +1343,21 @@ impl Viewer {
             self.tab_controls.offset = (self.tab_controls.offset + viewport * 0.75)
                 .min((content_width - viewport).max(0.));
         }
-        let (rect, response) =
-            ui.allocate_exact_size(vec2(chooser_width, 30.), egui::Sense::click());
+        let (rect, response) = ui.allocate_exact_size(
+            vec2(chooser_width, ui::target_size(30.)),
+            egui::Sense::click(),
+        );
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
         if response.hovered() || response.has_focus() {
             ui.painter().rect_filled(rect, 5., theme::hover());
         }
         let center = pos2(
             rect.center().x,
-            rect.top() + if group_name.is_some() { 8. } else { 15. },
+            if group_name.is_some() {
+                rect.top() + 8.
+            } else {
+                rect.center().y
+            },
         );
         ui.painter().add(egui::Shape::line(
             vec![
@@ -1259,12 +1431,13 @@ impl Viewer {
                                         if dirty(tab) { "● " } else { "" },
                                         tab.name()
                                     );
-                                    let w =
-                                        (ui.available_width() - 32. - ui.spacing().item_spacing.x)
-                                            .max(40.);
+                                    let w = (ui.available_width()
+                                        - ui::control_height()
+                                        - ui.spacing().item_spacing.x)
+                                        .max(40.);
                                     if ui
                                         .add_sized(
-                                            [w, 26.],
+                                            [w, ui::target_size(26.)],
                                             egui::Button::new((caption, egui::Atom::grow()))
                                                 .selected(selected == Some(tab.id))
                                                 .truncate(),

@@ -1029,10 +1029,77 @@ impl EditorState {
 const HIGHLIGHT: [f32; 3] = [1.0, 0.8, 0.05];
 const DEFAULT_INK: [f32; 3] = [0.11, 0.43, 0.35];
 
+const ANNOTATION_TOOLS: [Tool; 10] = [
+    Tool::Select,
+    Tool::Lasso,
+    Tool::Highlight,
+    Tool::Underline,
+    Tool::Squiggly,
+    Tool::Strikeout,
+    Tool::Pen,
+    Tool::Text,
+    Tool::Note,
+    Tool::Callout,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnnotationLabels {
+    Full,
+    Essential,
+    Icons,
+}
+impl AnnotationLabels {
+    fn expanded(self, tool: Tool) -> bool {
+        match self {
+            Self::Full => !matches!(tool, Tool::Select | Tool::Lasso),
+            Self::Essential => matches!(tool, Tool::Highlight | Tool::Underline | Tool::Note),
+            Self::Icons => false,
+        }
+    }
+}
+
+fn ribbon_action(icon: Icon, label: &'static str, expanded: bool) -> ActionButton<'static> {
+    let button = ActionButton::new(icon, label);
+    if expanded { button } else { button.compact() }
+}
+
+fn annotation_button(tool: Tool, labels: AnnotationLabels) -> ActionButton<'static> {
+    let label = match tool {
+        Tool::Note => "Comment",
+        Tool::Squiggly => "Squiggly",
+        _ => tool.label(),
+    };
+    ribbon_action(tool.icon(), label, labels.expanded(tool))
+}
+
+/// Choose labels from the real font metrics and density before laying out the
+/// row. Icon-only controls remain available when the window is too narrow.
+fn annotation_ribbon_layout(ui: &egui::Ui, available: f32) -> (AnnotationLabels, f32) {
+    let gap = ui::control_gap(ui.spacing().item_spacing.x);
+    let width = |labels| {
+        let tools: f32 = ANNOTATION_TOOLS
+            .iter()
+            .map(|&tool| annotation_button(tool, labels).width(ui))
+            .sum();
+        let table = ribbon_action(Icon::Table, "Table", labels == AnnotationLabels::Full).width(ui);
+        let stamps =
+            ribbon_action(Icon::Stamp, "Stamps", labels != AnnotationLabels::Icons).width(ui);
+        // Twelve controls and three separators, with one gap between each item.
+        tools + table + stamps + 3. * 6. + 14. * gap
+    };
+    for labels in [AnnotationLabels::Full, AnnotationLabels::Essential] {
+        let measured = width(labels);
+        if measured <= available {
+            return (labels, measured);
+        }
+    }
+    (AnnotationLabels::Icons, width(AnnotationLabels::Icons))
+}
+
 pub(super) fn color_palette(ui: &mut egui::Ui, current: &mut [f32; 3]) -> bool {
     let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 7.;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = ui::control_gap(7.);
         for (name, rgb) in [
             ("Ink", [0.15, 0.17, 0.21]),
             ("Blue", [0.15, 0.49, 0.85]),
@@ -1040,7 +1107,10 @@ pub(super) fn color_palette(ui: &mut egui::Ui, current: &mut [f32; 3]) -> bool {
             ("Coral", [0.9, 0.29, 0.29]),
             ("Gold", [0.95, 0.68, 0.15]),
         ] {
-            let (r, response) = ui.allocate_exact_size(vec2(24., 28.), egui::Sense::click());
+            let (r, response) = ui.allocate_exact_size(
+                vec2(ui::target_size(24.), ui::target_size(28.)),
+                egui::Sense::click(),
+            );
             #[cfg(test)]
             ui.ctx()
                 .data_mut(|d| d.insert_temp(egui::Id::new(("color_swatch", name)), r));
@@ -2666,12 +2736,18 @@ impl Viewer {
                     .inner_margin(egui::Margin::symmetric(16, 6)),
             )
             .show(ctx, |ui| {
+                let available = ui.available_width();
+                ui.spacing_mut().item_spacing.x = ui::control_gap(ui.spacing().item_spacing.x);
+                let annotation_layout = (self.editor.mode == Mode::Annotate)
+                    .then(|| annotation_ribbon_layout(ui, available));
                 egui::ScrollArea::horizontal().show(ui, |ui| {
-                    // Centered on the width this mode's tools took last frame.
-                    let measured = egui::Id::new(("ribbon_width", format!("{:?}", self.editor.mode)));
-                    let width = ctx.data(|d| d.get_temp::<f32>(measured)).unwrap_or(790.);
-                    let inset = ((ui.available_width() - width) / 2.).max(0.);
-                    let compact = ui.available_width() < 930.;
+                    // Annotation labels fit this viewport immediately. Other
+                    // modes retain their measured centered ribbon layout.
+                    let measured = egui::Id::new(("ribbon_width", format!("{:?}", self.editor.mode), theme::comfortable()));
+                    let width = annotation_layout.map(|(_, width)| width)
+                        .unwrap_or_else(|| ctx.data(|d| d.get_temp::<f32>(measured)).unwrap_or(790.));
+                    let inset = ((available - width) / 2.).max(0.);
+                    let labels = annotation_layout.map_or(AnnotationLabels::Icons, |(labels, _)| labels);
                     let row = ui.horizontal(|ui| {
                         ui.add_space(inset);
                         if matches!(self.editor.mode, Mode::Annotate | Mode::Draw) {
@@ -2687,11 +2763,7 @@ impl Viewer {
                                         Tool::Polyline, Tool::Polygon,
                                     ]
                                 } else {
-                                    &[
-                                        Tool::Select, Tool::Lasso, Tool::Highlight, Tool::Underline,
-                                        Tool::Squiggly, Tool::Strikeout, Tool::Pen,
-                                        Tool::Text, Tool::Note, Tool::Callout,
-                                    ]
+                                    &ANNOTATION_TOOLS
                                 };
                                 let ink = if self.editor.style.color == HIGHLIGHT {
                                     DEFAULT_INK
@@ -2700,9 +2772,11 @@ impl Viewer {
                                     if matches!(tool, Tool::Highlight | Tool::Pen | Tool::Rectangle) {
                                         ui.separator();
                                     }
-                                    let mut button = ActionButton::new(tool.icon(), tool.label())
-                                        .compact()
-                                        .selected(self.editor.tool == tool && !self.editor.library_open);
+                                    let mut button = if self.editor.mode == Mode::Annotate {
+                                        annotation_button(tool, labels)
+                                    } else {
+                                        ActionButton::new(tool.icon(), tool.label()).compact()
+                                    }.selected(self.editor.tool == tool && !self.editor.library_open);
                                     let tinted = self.editor.mode == Mode::Annotate
                                         || tool == Tool::Pen || self.editor.tool == tool;
                                     if !matches!(tool, Tool::Select | Tool::Lasso | Tool::Eraser) && tinted {
@@ -2720,7 +2794,7 @@ impl Viewer {
                                     self.drawing_tool_group(ui, ToolFamily::Arrow);
                                 } else {
                                     if ui.add_enabled(!self.content.busy,
-                                        ActionButton::new(Icon::Table,"Table").compact()
+                                        ribbon_action(Icon::Table, "Table", labels == AnnotationLabels::Full)
                                             .selected(self.table.chooser || self.table.placing || self.table.has_editor(self.tabs.get(self.active).map_or(0, |tab| tab.id))))
                                         .on_hover_text("Place a movable table layer").clicked() {
                                         if self.table.chooser || self.table.placing || self.table.has_editor(self.tabs.get(self.active).map_or(0, |tab| tab.id)) {
@@ -2731,8 +2805,8 @@ impl Viewer {
                                     }
                                     ui.separator();
                                     let selected = self.editor.library_open;
-                                    let button = ActionButton::new(Icon::Stamp, "Stamps").selected(selected);
-                                    if ui.add(if compact { button.compact() } else { button })
+                                    let button = ribbon_action(Icon::Stamp, "Stamps", labels != AnnotationLabels::Icons).selected(selected);
+                                    if ui.add(button)
                                         .on_hover_text("Stamps, arrows, symbols and saved artwork").clicked() {
                                         if selected {
                                             self.editor.library_open = false;
@@ -2756,7 +2830,7 @@ impl Viewer {
                         }
                     });
                     let used = row.response.rect.width() - inset;
-                    if (used - width).abs() > 0.5 {
+                    if annotation_layout.is_none() && (used - width).abs() > 0.5 {
                         ctx.data_mut(|d| d.insert_temp(measured, used));
                         ctx.request_repaint();
                     }
@@ -6388,6 +6462,11 @@ mod tests {
         )
     }
     fn ribbon_button(app: &mut Viewer, ctx: &egui::Context, label: &str) -> egui::Pos2 {
+        let label = match label {
+            "Note" => "Comment",
+            "Squiggly underline" => "Squiggly",
+            other => other,
+        };
         for _ in 0..3 {
             ribbon_frame(app, ctx, vec![], 900.);
         }
@@ -6421,6 +6500,133 @@ mod tests {
             );
         }
     }
+    struct RestoreDensity(theme::Density);
+    impl Drop for RestoreDensity {
+        fn drop(&mut self) {
+            theme::set_density(self.0);
+        }
+    }
+
+    #[test]
+    fn annotation_ribbon_labels_adapt_to_width_and_density_without_wrapping() {
+        let (ctx, mut app) = ready_ribbon();
+        let _restore = RestoreDensity(theme::density());
+        app.editor.mode = Mode::Annotate;
+        let revision = app.tabs[0].session.as_ref().unwrap().revision();
+        for density in theme::Density::ALL {
+            theme::set_density(density);
+            for (width, expanded) in [(1400., true), (720., false), (1400., true)] {
+                for _ in 0..3 {
+                    ribbon_frame(&mut app, &ctx, vec![], width);
+                }
+                let output = ribbon_frame(&mut app, &ctx, vec![], width);
+                let painted: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| {
+                        if let egui::Shape::Text(text) = &shape.shape {
+                            Some(text.galley.job.text.as_str())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                for label in ["Highlight", "Underline", "Comment", "Stamps"] {
+                    assert_eq!(
+                        painted.contains(&label),
+                        expanded,
+                        "{density:?}, width {width}: visible {label}"
+                    );
+                }
+                let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+                let buttons: Vec<_> = nodes
+                    .iter()
+                    .filter(|(_, node)| node.role() == egui::accesskit::Role::Button)
+                    .filter_map(|(_, node)| node.bounds())
+                    .collect();
+                assert_eq!(
+                    buttons.len(),
+                    12,
+                    "Every annotation action remains available"
+                );
+                let top = buttons[0].y0;
+                for rect in buttons {
+                    assert!(
+                        rect.x0 >= 0. && rect.x1 <= width as f64 + 0.1,
+                        "{density:?}, width {width}: ribbon overflow {rect:?}"
+                    );
+                    assert!(
+                        (rect.y0 - top).abs() <= 0.1,
+                        "Ribbon wrapped to another row"
+                    );
+                    assert!(rect.height() >= ui::control_height() as f64 - 0.1);
+                    if density == theme::Density::Comfortable {
+                        assert!(rect.width() >= 44. - 0.1);
+                    }
+                }
+            }
+        }
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), revision);
+        assert!(app.editor.tool == Tool::Select);
+    }
+
+    #[test]
+    fn comfortable_color_palette_wraps_without_small_or_overlapping_targets() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let _restore = RestoreDensity(theme::density());
+        theme::set_density(theme::Density::Comfortable);
+        let mut current = DEFAULT_INK;
+        let mut frame = || {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(220., 260.))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        assert!(!color_palette(ui, &mut current));
+                    });
+                },
+            )
+        };
+        frame();
+        let output = frame();
+        let names = [
+            "Ink color",
+            "Blue color",
+            "Green color",
+            "Coral color",
+            "Gold color",
+            "Custom color",
+        ];
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let targets: Vec<_> = nodes
+            .iter()
+            .filter(|(_, node)| node.label().is_some_and(|label| names.contains(&label)))
+            .filter_map(|(_, node)| node.bounds())
+            .collect();
+        assert_eq!(targets.len(), 6);
+        for (i, rect) in targets.iter().enumerate() {
+            assert!(rect.width() >= 44. && rect.height() >= 44.);
+            assert!(rect.x0 >= 0. && rect.x1 <= 220. && rect.y1 <= 260.);
+            for other in &targets[i + 1..] {
+                assert!(
+                    rect.x1 <= other.x0
+                        || other.x1 <= rect.x0
+                        || rect.y1 <= other.y0
+                        || other.y1 <= rect.y0,
+                    "Comfortable color targets overlap"
+                );
+            }
+        }
+        assert!(
+            targets.iter().any(|rect| rect.y0 > targets[0].y0),
+            "Comfortable swatches should wrap within a narrow inspector"
+        );
+        assert_eq!(current, DEFAULT_INK);
+    }
+
     #[test]
     fn compact_ribbons_hide_duplicate_controls_and_creation_tools_toggle_off() {
         let (ctx, mut app) = ready_ribbon();

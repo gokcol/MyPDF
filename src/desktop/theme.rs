@@ -139,6 +139,35 @@ impl Style {
     }
 }
 
+/// Control spacing is independent of the palette and light/dark appearance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum Density {
+    #[default]
+    Compact,
+    Comfortable,
+}
+impl Density {
+    pub const ALL: [Self; 2] = [Self::Compact, Self::Comfortable];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Compact => "Compact",
+            Self::Comfortable => "Comfortable",
+        }
+    }
+    fn key(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Comfortable => "comfortable",
+        }
+    }
+    fn from_key(value: &str) -> Self {
+        match value {
+            "comfortable" => Self::Comfortable,
+            _ => Self::Compact,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum IconStyle {
     #[default]
@@ -319,6 +348,7 @@ const CALICO_DARK: Palette = Palette {
 thread_local! {
     static STYLE: Cell<Style> = const { Cell::new(Style::Graphite) };
     static ICON_STYLE: Cell<IconStyle> = const { Cell::new(IconStyle::Selective) };
+    static DENSITY: Cell<Density> = const { Cell::new(Density::Compact) };
     static DARK_MODE: Cell<bool> = const { Cell::new(false) };
 }
 /// Follow the theme egui resolved for this frame (including Match System).
@@ -339,6 +369,15 @@ pub(super) fn icon_style() -> IconStyle {
 }
 pub(super) fn set_icon_style(style: IconStyle) {
     ICON_STYLE.with(|s| s.set(style));
+}
+pub(super) fn density() -> Density {
+    DENSITY.with(Cell::get)
+}
+pub(super) fn comfortable() -> bool {
+    density() == Density::Comfortable
+}
+pub(super) fn set_density(density: Density) {
+    DENSITY.with(|value| value.set(density));
 }
 pub(super) fn palette_for(dark: bool) -> &'static Palette {
     palette_for_style(style(), dark)
@@ -434,6 +473,24 @@ pub(super) fn load_icon_style() -> IconStyle {
     }
     decode_icon_style(&serde_json::Value::Null)
 }
+fn decode_density(value: &serde_json::Value) -> Density {
+    Density::from_key(
+        value
+            .get("density")
+            .and_then(|v| v.as_str())
+            .unwrap_or("compact"),
+    )
+}
+pub(super) fn load_density() -> Density {
+    #[cfg(not(test))]
+    if let Ok(value) = super::preferences::load::<serde_json::Value>(
+        &mypdf_milestone0::assets::data_directory(),
+        "interface.json",
+    ) {
+        return decode_density(&value);
+    }
+    decode_density(&serde_json::Value::Null)
+}
 fn save_field(root: &std::path::Path, key: &str, value: &str) -> anyhow::Result<()> {
     let mut stored = super::preferences::load::<serde_json::Value>(root, "interface.json")?;
     if stored.is_null() {
@@ -457,6 +514,9 @@ pub(super) fn save_style(style: Style) -> anyhow::Result<()> {
 pub(super) fn save_icon_style(style: IconStyle) -> anyhow::Result<()> {
     save_current("icons", style.key())
 }
+pub(super) fn save_density(density: Density) -> anyhow::Result<()> {
+    save_current("density", density.key())
+}
 fn save_current(key: &str, value: &str) -> anyhow::Result<()> {
     #[cfg(not(test))]
     {
@@ -472,6 +532,48 @@ fn save_current(key: &str, value: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn density_defaults_and_roundtrips_preserve_every_other_preference() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"density":"future"}),
+            serde_json::json!({"density":true}),
+        ] {
+            assert_eq!(decode_density(&value), Density::Compact);
+        }
+        let root = tempfile::tempdir().unwrap();
+        let initial = serde_json::json!({"theme":"dark", "style":"calico", "icons":"duotone", "future_option":{"enabled":true}});
+        super::super::preferences::save(root.path(), "interface.json", &initial).unwrap();
+        for density in Density::ALL {
+            save_field(root.path(), "density", density.key()).unwrap();
+            let saved =
+                super::super::preferences::load::<serde_json::Value>(root.path(), "interface.json")
+                    .unwrap();
+            assert_eq!(decode_density(&saved), density);
+            let mut without_density = saved.clone();
+            without_density.as_object_mut().unwrap().remove("density");
+            assert_eq!(without_density, initial);
+            save_field(root.path(), "theme", "light").unwrap();
+            save_field(root.path(), "style", "glacier").unwrap();
+            save_field(root.path(), "icons", "families").unwrap();
+            let saved =
+                super::super::preferences::load::<serde_json::Value>(root.path(), "interface.json")
+                    .unwrap();
+            assert_eq!(decode_density(&saved), density);
+            assert_eq!(saved["future_option"], initial["future_option"]);
+            super::super::preferences::save(root.path(), "interface.json", &initial).unwrap();
+        }
+        let invalid = serde_json::json!(["preserve invalid data"]);
+        super::super::preferences::save(root.path(), "interface.json", &invalid).unwrap();
+        assert!(save_field(root.path(), "density", "comfortable").is_err());
+        assert_eq!(
+            super::super::preferences::load::<serde_json::Value>(root.path(), "interface.json")
+                .unwrap(),
+            invalid
+        );
+    }
+
     #[test]
     fn all_styles_keep_text_and_selected_controls_readable() {
         fn luminance(c: Color32) -> f32 {

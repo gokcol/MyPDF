@@ -2,7 +2,15 @@
 
 Updated 31 October 2026 (Europe/Istanbul). Project root: `/Users/gokcol/SWPROJECTS/Utility/MyPDF/`.
 
-## MyPDF 2.1.8 / build 197
+## MyPDF 2.2.0 / build 198 — in preparation
+
+The user approved the complete usability polish, requested version **2.2**, GitHub commit/push and Mac/Windows release, and a local Mac update preserving settings and open documents. Release versions are **2.2.0**, Mac **198**, Windows/Store **2.2.0.0**. **Publication and installation are not yet complete.** The verified previous release/install below remains the baseline until new completion receipts are recorded.
+
+Changes: compact Home with Recents above tools, two-line document names and saved resume-page labels; consistent theme accents; annotation labels when space permits; matching words highlighted in fully clickable search rows; duplicate-filename folder hints; platform-specific shortcut labels. **Comfortable control spacing is optional and persisted separately; Compact remains the default.** Comfortable controls use larger targets and responsive layout without changing text sizes. The thumbnail sidebar now follows keyboard/other page navigation, distinguishes the current page from page-operation selections, and preserves independent manual thumbnail scrolling.
+
+Evidence/work directories: `artifacts/release-2.2.0-build198/` and `artifacts/mac-install-2.2.0-build198/`. Package only a verified clean source snapshot; keep the unrelated fixture and private artifacts excluded. Wait for final source tests, visual checks, exact-source CI and signed/notarized package verification before publication. Install the final notarized/stapled Mac candidate with a complete backup and intact build197 rollback. The earlier local-only build198 preparation under `2.1.8-build198` is obsolete; local-only helpers under the new directory are not publication receipts. No Partner Center submission is authorized by GitHub release publication.
+
+## Previous verified MyPDF 2.1.8 / build 197
 
 **GitHub release (latest):** [v2.1.8](https://github.com/gokcol/MyPDF/releases/tag/v2.1.8), publication time **31 October 2026 at 01:33:12 (Europe/Istanbul)**. **Installed Mac:** **2.1.8/build 197**, running at `/Applications/MyPDF.app`; launch verified 31 October 2026 at 01:26 (Europe/Istanbul). The app is Developer ID signed, Apple notarized and Gatekeeper accepted. Its local offline ticket is not stapled; the published DMG and bundled app are stapled and verified, as is the local recovery ZIP. See the installation distinction below.
 

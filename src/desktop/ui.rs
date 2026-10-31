@@ -10,6 +10,29 @@ use std::sync::OnceLock;
 /// Inner padding for text fields, so they match the height of buttons and menus.
 pub(super) const FIELD_MARGIN: egui::Vec2 = egui::vec2(8., 6.);
 
+/// Keep compact geometry by default; Comfortable reserves a full touch target.
+pub(super) fn target_size(compact: f32) -> f32 {
+    if theme::comfortable() {
+        compact.max(44.)
+    } else {
+        compact
+    }
+}
+pub(super) fn control_height() -> f32 {
+    target_size(32.)
+}
+pub(super) fn control_gap(compact: f32) -> f32 {
+    if theme::comfortable() {
+        compact.max(4.)
+    } else {
+        compact
+    }
+}
+fn target_spacing(ui: &mut egui::Ui) {
+    ui.spacing_mut().item_spacing.x = control_gap(ui.spacing().item_spacing.x);
+    ui.spacing_mut().item_spacing.y = control_gap(ui.spacing().item_spacing.y);
+}
+
 pub(super) const SANS: &str = "ui-sans";
 pub(super) const STRONG: &str = "ui-strong";
 pub(super) const BOLD: &str = "ui-bold";
@@ -1516,7 +1539,7 @@ impl<'a> MenuItem<'a> {
     }
 }
 
-fn shortcut_label(key: egui::KeyboardShortcut) -> String {
+pub(super) fn shortcut_label(key: egui::KeyboardShortcut) -> String {
     if cfg!(target_os = "macos") && key.modifiers == egui::Modifiers::NONE {
         match key.logical_key {
             egui::Key::Backspace => return "⌫".into(),
@@ -1602,7 +1625,9 @@ impl egui::Widget for MenuItem<'_> {
             galley = ui.painter().layout_job(job);
         }
         let elided = galley.elided;
-        let (rect, response) = ui.allocate_exact_size(vec2(width, 27.), egui::Sense::click());
+        target_spacing(ui);
+        let (rect, response) =
+            ui.allocate_exact_size(vec2(width, target_size(27.)), egui::Sense::click());
         response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), self.label)
         });
@@ -1704,7 +1729,7 @@ impl<'a> ActionButton<'a> {
                     .x
             }) + 44.0
         };
-        (if self.compact { 32.0 } else { text }) + if self.dropdown { 12. } else { 0. }
+        target_size(if self.compact { 32.0 } else { text }) + if self.dropdown { 12. } else { 0. }
     }
 }
 impl egui::Widget for ActionButton<'_> {
@@ -1714,7 +1739,15 @@ impl egui::Widget for ActionButton<'_> {
         let galley = ui
             .painter()
             .layout_no_wrap(self.label.into(), font, base_color);
-        let size = vec2(self.width(ui), if self.tab { 30.0 } else { 32.0 });
+        target_spacing(ui);
+        let size = vec2(
+            self.width(ui),
+            if self.tab {
+                target_size(30.)
+            } else {
+                control_height()
+            },
+        );
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
         response.widget_info(|| {
             if self.selectable {
@@ -1858,7 +1891,7 @@ pub(super) fn segment_track<R>(
         .corner_radius(theme::style().radius() + 3)
         .inner_margin(egui::Margin::same(3))
         .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 2.;
+            ui.spacing_mut().item_spacing.x = control_gap(2.);
             ui.horizontal(add_contents).inner
         })
         .inner
@@ -1878,14 +1911,34 @@ pub(super) fn segmented_icons(
     segments(ui, &names, &icons, selected)
 }
 fn segments(ui: &mut egui::Ui, options: &[&str], icons: &[Icon], selected: usize) -> Option<usize> {
-    let (track, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.), egui::Sense::hover());
+    target_spacing(ui);
+    let count = options.len().max(1);
+    let gap = if theme::comfortable() { 4. } else { 0. };
+    let columns = if theme::comfortable() {
+        (((ui.available_width() - 6. + gap) / (44. + gap)).floor() as usize).clamp(1, count)
+    } else {
+        count
+    };
+    let rows = count.div_ceil(columns);
+    let height = target_size(24.);
+    let (track, _) = ui.allocate_exact_size(
+        vec2(
+            ui.available_width(),
+            height * rows as f32 + gap * rows.saturating_sub(1) as f32 + 6.,
+        ),
+        egui::Sense::hover(),
+    );
     ui.painter().rect_filled(track, 9, theme::track());
-    let width = (track.width() - 6.) / options.len().max(1) as f32;
+    let width = (track.width() - 6. - gap * columns.saturating_sub(1) as f32) / columns as f32;
     let mut choice = None;
     for (i, label) in options.iter().enumerate() {
         let r = Rect::from_min_size(
-            track.min + vec2(3. + i as f32 * width, 3.),
-            vec2(width, track.height() - 6.),
+            track.min
+                + vec2(
+                    3. + (i % columns) as f32 * (width + gap),
+                    3. + (i / columns) as f32 * (height + gap),
+                ),
+            vec2(width, height),
         );
         // Several controls can share a panel; their labels tell them apart.
         let response = ui.interact(
@@ -1936,16 +1989,39 @@ fn segments(ui: &mut egui::Ui, options: &[&str], icons: &[Icon], selected: usize
 
 /// Secondary navigation uses an underline rather than the primary tabs' filled track.
 pub(super) fn sub_tabs(ui: &mut egui::Ui, options: &[&str], selected: usize) -> Option<usize> {
-    let (track, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.), egui::Sense::hover());
+    target_spacing(ui);
+    let count = options.len().max(1);
+    let gap = if theme::comfortable() { 4. } else { 0. };
+    let columns = if theme::comfortable() {
+        (((ui.available_width() + gap) / (44. + gap)).floor() as usize).clamp(1, count)
+    } else {
+        count
+    };
+    let rows = count.div_ceil(columns);
+    let height = target_size(28.);
+    let (track, _) = ui.allocate_exact_size(
+        vec2(
+            ui.available_width(),
+            height * rows as f32 + gap * rows.saturating_sub(1) as f32,
+        ),
+        egui::Sense::hover(),
+    );
     ui.painter().hline(
         track.x_range(),
         track.bottom(),
         Stroke::new(1., theme::line()),
     );
-    let width = track.width() / options.len().max(1) as f32;
+    let width = (track.width() - gap * columns.saturating_sub(1) as f32) / columns as f32;
     let mut choice = None;
     for (i, label) in options.iter().enumerate() {
-        let rect = Rect::from_min_size(track.min + vec2(i as f32 * width, 0.), vec2(width, 28.));
+        let rect = Rect::from_min_size(
+            track.min
+                + vec2(
+                    (i % columns) as f32 * (width + gap),
+                    (i / columns) as f32 * (height + gap),
+                ),
+            vec2(width, height),
+        );
         let response = ui.interact(
             rect,
             ui.id().with(("sub_tab", options, i)),
@@ -2042,6 +2118,8 @@ fn color_picker_button(
     label: &str,
     size: egui::Vec2,
 ) -> bool {
+    target_spacing(ui);
+    let size = vec2(target_size(size.x), target_size(size.y));
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::ColorButton, ui.is_enabled(), label)
@@ -2111,10 +2189,10 @@ pub(super) fn reset_color_picker(ui: &mut egui::Ui, id: egui::Id) {
 
 fn picker_row_label(ui: &mut egui::Ui, label: &str) {
     ui.allocate_ui_with_layout(
-        vec2(36., 28.),
+        vec2(target_size(36.), target_size(28.)),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            ui.set_min_size(vec2(36., 28.));
+            ui.set_min_size(vec2(target_size(36.), target_size(28.)));
             ui.label(label);
         },
     );
@@ -2129,9 +2207,11 @@ pub(super) fn color_picker_contents(
     hex_id: egui::Id,
 ) -> bool {
     let before = *color;
-    ui.set_width(222.);
+    let picker_width = 6. * target_size(32.) + 5. * 6.;
+    let picker_height = 4. * target_size(28.) + 3. * 4.;
+    ui.set_width(picker_width);
     ui.spacing_mut().item_spacing = vec2(6., 6.);
-    ui.spacing_mut().interact_size.y = 26.;
+    ui.spacing_mut().interact_size.y = target_size(26.);
     ui.spacing_mut().button_padding = vec2(8., 4.);
     let advanced_id = hex_id.with("advanced");
     let mut advanced = ui
@@ -2162,10 +2242,10 @@ pub(super) fn color_picker_contents(
         });
     });
     ui.allocate_ui_with_layout(
-        vec2(222., 124.),
+        vec2(picker_width, picker_height),
         egui::Layout::top_down(egui::Align::Min),
         |ui| {
-            ui.set_min_size(vec2(222., 124.));
+            ui.set_min_size(vec2(picker_width, picker_height));
             ui.spacing_mut().item_spacing.y = 4.;
             if advanced {
                 let mut rgb = [color.r(), color.g(), color.b()];
@@ -2178,8 +2258,9 @@ pub(super) fn color_picker_contents(
                         ui.horizontal(|ui| {
                             picker_row_label(ui, name);
                             ui.scope(|ui| {
-                                ui.spacing_mut().slider_width = 126.;
-                                ui.spacing_mut().interact_size.y = 16.;
+                                ui.spacing_mut().slider_width =
+                                    picker_width - target_size(36.) - 48. - 12.;
+                                ui.spacing_mut().interact_size.y = target_size(16.);
                                 ui.visuals_mut().selection.bg_fill = tint;
                                 numeric_slider(
                                     ui,
@@ -2193,7 +2274,7 @@ pub(super) fn color_picker_contents(
                                     )
                                 });
                             });
-                            ui.add_sized(vec2(48., 26.), |ui: &mut egui::Ui| {
+                            ui.add_sized(vec2(48., target_size(26.)), |ui: &mut egui::Ui| {
                                 numeric_value(ui, egui::DragValue::new(channel).range(0..=255))
                             })
                             .widget_info(|| {
@@ -2219,7 +2300,7 @@ pub(super) fn color_picker_contents(
                 ui.horizontal(|ui| {
                     picker_row_label(ui, "Hex");
                     let entry = ui.add_sized(
-                        vec2(180., 26.),
+                        vec2(picker_width - target_size(36.) - 6., target_size(26.)),
                         egui::TextEdit::singleline(&mut hex)
                             .char_limit(7)
                             .margin(vec2(8., 5.)),
@@ -2244,8 +2325,10 @@ pub(super) fn color_picker_contents(
                     ui.horizontal(|ui| {
                         for &(name, [r, g, b]) in row {
                             let picked = Color32::from_rgb(r, g, b);
-                            let (rect, response) =
-                                ui.allocate_exact_size(vec2(32., 28.), egui::Sense::click());
+                            let (rect, response) = ui.allocate_exact_size(
+                                vec2(target_size(32.), target_size(28.)),
+                                egui::Sense::click(),
+                            );
                             let selected = *color == picked;
                             ui.painter().rect(
                                 rect.shrink(2.),
@@ -2298,7 +2381,7 @@ pub(super) fn color_picker_contents(
     );
     if ui
         .add_sized(
-            vec2(222., 26.),
+            vec2(picker_width, target_size(26.)),
             egui::Button::new(if advanced {
                 "Standard colors"
             } else {
@@ -2357,6 +2440,8 @@ pub(super) fn numeric_slider(ui: &mut egui::Ui, slider: egui::Slider<'_>) -> egu
         ui.visuals().selection.bg_fill
     };
     ui.scope(|ui| {
+        target_spacing(ui);
+        ui.spacing_mut().interact_size.y = target_size(ui.spacing().interact_size.y);
         ui.spacing_mut().slider_rail_height = 3.;
         let visuals = ui.visuals_mut();
         visuals.selection.bg_fill = accent;
@@ -2388,6 +2473,8 @@ pub(super) fn numeric_slider(ui: &mut egui::Ui, slider: egui::Slider<'_>) -> egu
 /// sizing, numeric ranges, text entry, or the appearance of adjacent buttons.
 pub(super) fn numeric_value(ui: &mut egui::Ui, value: egui::DragValue<'_>) -> egui::Response {
     ui.scope(|ui| {
+        target_spacing(ui);
+        ui.spacing_mut().interact_size.y = target_size(ui.spacing().interact_size.y);
         let visuals = ui.visuals_mut();
         visuals.text_edit_bg_color = Some(theme::surface());
         visuals.selection.stroke = Stroke::new(1.5, theme::accent());
@@ -2463,7 +2550,7 @@ pub(super) fn dialog_body<R>(
         .max_height(height)
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            ui.spacing_mut().interact_size.y = 28.;
+            ui.spacing_mut().interact_size.y = target_size(28.);
             ui.spacing_mut().button_padding.y = 5.;
             content(ui)
         })
@@ -2489,8 +2576,10 @@ pub(super) enum DialogTone {
 }
 
 pub(super) fn dialog_button(ui: &mut egui::Ui, label: &str, tone: DialogTone) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(vec2(ui.available_width(), 32.), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), control_height()),
+        egui::Sense::click(),
+    );
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
@@ -2604,7 +2693,7 @@ pub(super) fn confirmation(
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.;
                     for index in [1, 0] {
-                        ui.allocate_ui(vec2(half, 32.), |ui| add(ui, index));
+                        ui.allocate_ui(vec2(half, control_height()), |ui| add(ui, index));
                     }
                 });
             } else {
@@ -2776,6 +2865,7 @@ pub(super) fn install_theme(ctx: &egui::Context) {
     let (preference, style) = theme::load_preferences();
     theme::set_style(style);
     theme::set_icon_style(theme::load_icon_style());
+    theme::set_density(theme::load_density());
     apply_style(ctx);
     // Light when the platform does not report its appearance.
     ctx.options_mut(|o| o.fallback_theme = egui::Theme::Light);
@@ -2837,6 +2927,13 @@ pub(super) fn set_icon_style(ctx: &egui::Context, style: theme::IconStyle) -> an
     Ok(())
 }
 
+pub(super) fn set_density(ctx: &egui::Context, density: theme::Density) -> anyhow::Result<()> {
+    theme::save_density(density)?;
+    theme::set_density(density);
+    apply_style(ctx);
+    Ok(())
+}
+
 pub(super) fn appearance_settings(ui: &mut egui::Ui) {
     ui.label(RichText::new("Visual style").family(semibold()));
     let mut selected = theme::style();
@@ -2877,6 +2974,26 @@ pub(super) fn appearance_settings(ui: &mut egui::Ui) {
             "Blue editing, teal signing and saving, amber document tools."
         }
         theme::IconStyle::Duotone => "The same color families with softly filled icon details.",
+    });
+    ui.add_space(8.);
+    ui.label(RichText::new("Control spacing").family(semibold()));
+    let mut density = theme::density();
+    ui.horizontal_wrapped(|ui| {
+        for choice in theme::Density::ALL {
+            ui.selectable_value(&mut density, choice, choice.name());
+        }
+    });
+    if density != theme::density() {
+        let error = set_density(ui.ctx(), density)
+            .err()
+            .map(|e| format!("Could not save control spacing: {e}"));
+        ui.ctx().data_mut(|d| d.insert_temp(error_id, error));
+    }
+    ui.weak(match theme::density() {
+        theme::Density::Compact => "Compact controls leave more room for your document.",
+        theme::Density::Comfortable => {
+            "Larger controls and more space for touch, with the same text size."
+        }
     });
     ui.add_space(8.);
     ui.label(RichText::new("Appearance").family(semibold()));
@@ -2972,7 +3089,7 @@ fn style_for(style: &mut egui::Style, p: &theme::Palette, dark: bool) {
     v.widgets.open.bg_stroke = Stroke::new(1.0, p.line);
     style.spacing.button_padding = vec2(12.0, 6.0);
     style.spacing.item_spacing = vec2(8.0, 8.0);
-    style.spacing.interact_size = vec2(36.0, 30.0);
+    style.spacing.interact_size = vec2(target_size(36.), target_size(30.));
     style.spacing.window_margin = egui::Margin::same(18);
     style.spacing.menu_margin = egui::Margin::same(6);
     style.spacing.slider_rail_height = 4.0;
@@ -2993,6 +3110,191 @@ fn style_for(style: &mut egui::Style, p: &theme::Palette, dark: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn comfortable_controls_expand_targets_wrap_segments_and_keep_text_sizes() {
+        struct RestoreDensity(theme::Density);
+        impl Drop for RestoreDensity {
+            fn drop(&mut self) {
+                theme::set_density(self.0);
+            }
+        }
+        let _restore = RestoreDensity(theme::density());
+        let ctx = egui::Context::default();
+        install_theme(&ctx);
+        ctx.enable_accesskit();
+        let fonts = ctx.style().text_styles.clone();
+        for density in theme::Density::ALL {
+            set_density(&ctx, density).unwrap();
+            assert_eq!(ctx.style().text_styles, fonts);
+            let mut action = Rect::NOTHING;
+            let mut color = [0.2, 0.4, 0.6];
+            let mut output = None;
+            for _ in 0..2 {
+                output = Some(ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(800., 700.))),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.spacing_mut().item_spacing = vec2(2., 2.);
+                            ui.horizontal(|ui| {
+                                action = ui
+                                    .add(
+                                        ActionButton::new(Icon::Search, "Density action").compact(),
+                                    )
+                                    .rect;
+                                color_swatch_sized(ui, &mut color, "Density color", vec2(24., 28.));
+                            });
+                            ui.allocate_ui(vec2(166., 0.), |ui| {
+                                segmented_icons(
+                                    ui,
+                                    &[
+                                        (Icon::Library, "Density pages"),
+                                        (Icon::Outline, "Density outline"),
+                                        (Icon::Search, "Density search"),
+                                        (Icon::Note, "Density marks"),
+                                    ],
+                                    0,
+                                );
+                                sub_tabs(
+                                    ui,
+                                    &[
+                                        "Density first",
+                                        "Density second",
+                                        "Density third",
+                                        "Density fourth",
+                                    ],
+                                    0,
+                                );
+                            });
+                        });
+                    },
+                ));
+            }
+            let output = output.unwrap();
+            let bounds = |label: &str| {
+                let node = output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| node.label() == Some(label))
+                    .unwrap()
+                    .1
+                    .bounds()
+                    .unwrap();
+                Rect::from_min_max(
+                    pos2(node.x0 as f32, node.y0 as f32),
+                    pos2(node.x1 as f32, node.y1 as f32),
+                )
+            };
+            let labels = [
+                "Density pages",
+                "Density outline",
+                "Density search",
+                "Density marks",
+            ];
+            let segments: Vec<_> = labels.iter().map(|label| bounds(label)).collect();
+            if density == theme::Density::Comfortable {
+                assert_eq!(action.size(), vec2(44., 44.));
+                assert!(bounds("Density color").left() - action.right() >= 4.);
+                for label in labels.into_iter().chain([
+                    "Density color",
+                    "Density first",
+                    "Density second",
+                    "Density third",
+                    "Density fourth",
+                ]) {
+                    let rect = bounds(label);
+                    assert!(
+                        rect.width() >= 44. && rect.height() >= 44.,
+                        "{label}: {rect:?}"
+                    );
+                }
+                assert!(
+                    segments[3].top() >= segments[0].bottom() + 4.,
+                    "narrow segments wrap with spacing"
+                );
+                assert!(segments[1].left() - segments[0].right() >= 3.99);
+            } else {
+                assert_eq!(action.size(), vec2(32., 32.));
+                assert_eq!(bounds("Density color").size(), vec2(24., 28.));
+                assert_eq!(segments[0].height(), 24.);
+                assert_eq!(segments[3].top(), segments[0].top());
+            }
+            assert_eq!(
+                color,
+                [0.2, 0.4, 0.6],
+                "layout alone never changes the color"
+            );
+        }
+    }
+
+    #[test]
+    fn comfortable_color_presets_have_separate_touch_targets() {
+        struct RestoreDensity(theme::Density);
+        impl Drop for RestoreDensity {
+            fn drop(&mut self) {
+                theme::set_density(self.0);
+            }
+        }
+        let _restore = RestoreDensity(theme::density());
+        let ctx = egui::Context::default();
+        install_theme(&ctx);
+        set_density(&ctx, theme::Density::Comfortable).unwrap();
+        ctx.enable_accesskit();
+        let mut color = Color32::from_rgb(22, 101, 52);
+        let original = color;
+        let mut output = None;
+        for _ in 0..2 {
+            output = Some(ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(400., 500.))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        assert!(!color_picker_contents(
+                            ui,
+                            &mut color,
+                            "Touch colors",
+                            egui::Id::new("touch_colors")
+                        ));
+                    });
+                },
+            ));
+        }
+        let output = output.unwrap();
+        let nodes = &output.platform_output.accesskit_update.unwrap().nodes;
+        let rects: Vec<_> = PICKER_COLORS
+            .iter()
+            .map(|(name, _)| {
+                let label = format!("{name} preset");
+                let node = nodes
+                    .iter()
+                    .find(|(_, n)| n.label() == Some(label.as_str()))
+                    .unwrap()
+                    .1
+                    .bounds()
+                    .unwrap();
+                Rect::from_min_max(
+                    pos2(node.x0 as f32, node.y0 as f32),
+                    pos2(node.x1 as f32, node.y1 as f32),
+                )
+            })
+            .collect();
+        assert_eq!(rects.len(), 24);
+        for rect in &rects {
+            assert_eq!(rect.size(), vec2(44., 44.));
+        }
+        assert!(rects[1].left() - rects[0].right() >= 4.);
+        assert!(rects[6].top() - rects[0].bottom() >= 4.);
+        assert_eq!(color, original);
+    }
+
     #[test]
     fn numeric_controls_keep_native_geometry_input_and_channel_tints() {
         let ctx = egui::Context::default();

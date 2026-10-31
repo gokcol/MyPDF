@@ -92,7 +92,11 @@ impl Viewer {
                 "Mark areas to redact · Nothing is removed until you apply"
             }
             Mode::Edit if self.content.add_target.is_some() => {
-                "Click a page and type · ⌘Return finishes · Esc cancels"
+                if cfg!(target_os = "macos") {
+                    "Click a page and type · ⌘Return finishes · Esc cancels"
+                } else {
+                    "Click a page and type · Ctrl+Enter finishes · Esc cancels"
+                }
             }
             Mode::Edit if self.content.area_mode => {
                 "Drag around text to edit several lines together"

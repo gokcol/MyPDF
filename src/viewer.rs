@@ -139,15 +139,14 @@ impl PageText {
             }
         }
         let chars: Vec<_> = self.text.char_indices().collect();
+        let word =
+            |c: char| c.is_alphanumeric() || c == '_' || ('\u{300}'..='\u{36f}').contains(&c);
         folded
             .match_indices(&needle)
             .filter(|(start, matched)| {
                 if !options.whole_word {
                     return true;
                 }
-                let word = |c: char| {
-                    c.is_alphanumeric() || c == '_' || ('\u{300}'..='\u{36f}').contains(&c)
-                };
                 let a = mapping[*start].start;
                 let b = mapping[*start + matched.len() - 1].end;
                 !self.text[..a].chars().next_back().is_some_and(word)
@@ -162,10 +161,22 @@ impl PageText {
                     .take_while(|g| g.range.start < range.end)
                     .map(|g| g.rect)
                     .collect();
-                let first = chars
-                    .partition_point(|(i, _)| *i < range.start)
-                    .saturating_sub(24);
-                let end = (chars.partition_point(|(i, _)| *i < range.end) + 50).min(chars.len());
+                let match_start = chars.partition_point(|(i, _)| *i < range.start);
+                let match_end = chars.partition_point(|(i, _)| *i < range.end);
+                let mut first = match_start.saturating_sub(24);
+                let mut end = (match_end + 50).min(chars.len());
+                if options.whole_word {
+                    // Truncated context must not create false whole-word matches
+                    // when the UI highlights the snippet. Keep the same adjacent-
+                    // character rule as search, including punctuation query edges,
+                    // and never trim any part of the genuine match.
+                    while first < match_start && first > 0 && word(chars[first - 1].1) {
+                        first += 1;
+                    }
+                    while end > match_end && end < chars.len() && word(chars[end].1) {
+                        end -= 1;
+                    }
+                }
                 let snippet: String = chars[first..end]
                     .iter()
                     .map(|(_, c)| *c)

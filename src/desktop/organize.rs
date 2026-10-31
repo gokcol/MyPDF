@@ -245,6 +245,17 @@ impl Organizer {
             self.pending_select = None;
         }
     }
+    /// Keep the default single-page action target with reading navigation, while
+    /// retaining explicit selections made for copy, reorder and other page actions.
+    pub(super) fn follow_reading_page(&mut self, tab: &Tab, previous: Option<usize>) {
+        if previous != Some(tab.page)
+            && self.selected.len() == 1
+            && previous.is_some_and(|page| self.selected.contains(&page))
+        {
+            self.selected = BTreeSet::from([tab.page]);
+            self.range = (tab.page + 1).to_string();
+        }
+    }
     pub(super) fn thumbnail_area(&mut self, tab: u64, bounds: Rect) {
         if self.thumbnail_focus.is_some_and(|id| id != tab) {
             self.thumbnail_focus = None;

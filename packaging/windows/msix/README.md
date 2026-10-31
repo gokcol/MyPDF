@@ -37,7 +37,7 @@ On GitHub, run **Actions → Microsoft Store MSIX → Run workflow**:
 - `ref`: the release tag or full commit SHA to package.
 - `mode`: `store` after configuring the three variables; `test` otherwise.
 - `package_version`: usually blank, which uses `version.txt` in this directory.
-  For MyPDF **2.1.8**, the internal MSIX version is **2.1.8.0**, which
+  For MyPDF **2.2.0**, the internal MSIX version is **2.2.0.0**, which
   sorts above the previous 2.1.5 package **2.1.5.0** and preserves ordinary
   upgrades. Public app versions and MSIX package versions are maintained
   separately. Increase `version.txt` for each Store release.

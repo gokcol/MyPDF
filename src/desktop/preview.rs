@@ -250,6 +250,7 @@ const SCENES: &[&str] = &[
     "Home",
     "HomeEmpty",
     "Viewer",
+    "DocumentSearch",
     "Arrows",
     "Symbols",
     "Stamps",
@@ -444,6 +445,8 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
         } else {
             bytes
         }
+    } else if collection == "DocumentSearch" {
+        mypdf_milestone0::convert::text_to_pdf(PREVIEW_AGREEMENT, true).unwrap()
     } else if collection == "RepeatArtwork" {
         let source = mypdf_milestone0::convert::text_to_pdf(PREVIEW_AGREEMENT, true).unwrap();
         let mut doc = lopdf::Document::load_mem(&source).unwrap();
@@ -475,6 +478,9 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
         vec![pdf.clone()],
     );
     ctx.set_theme(theme);
+    if std::env::var("MYPDF_PREVIEW_DENSITY").as_deref() == Ok("comfortable") {
+        ui::set_density(&ctx, theme::Density::Comfortable).unwrap();
+    }
     if let Ok(style) = std::env::var("MYPDF_PREVIEW_STYLE") {
         ui::set_visual_style(&ctx, theme::Style::from_key(&style)).unwrap();
     }
@@ -505,15 +511,39 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
             "Research paper",
             "Design review",
             "Meeting minutes",
-            "Reading list",
+            "Reading list — reference notes and follow-up reading",
         ]
         .iter()
         .enumerate()
         {
             let path = fixture.path().join(format!("{name}.pdf"));
-            let bytes = mypdf_milestone0::convert::text_to_pdf(&format!("# {name}\n\nMyPDF workspace\n\nA place for your documents and ideas.\n\n## Notes\n\nOpen a PDF to read, annotate, edit, or sign.\n\nKeep your important files in Favorites."), true).unwrap();
+            let mut text = format!(
+                "# {name}\n\nMyPDF workspace\n\nA place for your documents and ideas.\n\n## Notes\n\nOpen a PDF to read, annotate, edit, or sign.\n\nKeep your important files in Favorites."
+            );
+            if i == 5 {
+                for note in 1..=40 {
+                    text.push_str(&format!("\n\nReading note {note}. Review the references and record the next steps for this document."));
+                }
+            }
+            let bytes = mypdf_milestone0::convert::text_to_pdf(&text, true).unwrap();
+            if i == 5 {
+                assert!(lopdf::Document::load_mem(&bytes).unwrap().get_pages().len() >= 2);
+            }
             std::fs::write(&path, bytes).unwrap();
             app.home.remember(&path);
+            if i == 5 {
+                let canonical = path.canonicalize().unwrap();
+                app.home
+                    .save_reading(&[(
+                        canonical.clone(),
+                        mypdf_milestone0::home::ReadingState {
+                            page: 1,
+                            ..Default::default()
+                        },
+                    )])
+                    .unwrap();
+                assert_eq!(app.home.reading(&canonical).unwrap().page, 1);
+            }
             if i == 0 || i == 2 {
                 app.home.preview_favorite(&path);
             }
@@ -539,6 +569,31 @@ fn capture_scene(collection: &str, theme: egui::Theme, root: Option<&std::path::
     }
     if collection == "Viewer" {
         app.editor.mode = editing::Mode::Read;
+    }
+    if collection == "DocumentSearch" {
+        app.editor.mode = editing::Mode::Read;
+        app.editor.annotation_sidebar = false;
+        app.sidebar = true;
+        app.search = true;
+        app.outline = false;
+        app.inspector = false;
+        app.tabs[0].query = "agreement".into();
+        app.tabs[0].search_dirty = true;
+        app.tabs[0].search_at = None;
+        app.tabs[0].search(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while app.tabs[0].search_dirty || app.tabs[0].searching {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "DocumentSearch indexing timed out"
+            );
+            preview.capture(&mut app, &ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            !app.tabs[0].hits.is_empty(),
+            "DocumentSearch needs real search hits"
+        );
     }
     if collection == "Convert" {
         app.editor.mode = editing::Mode::Convert;
@@ -1379,6 +1434,38 @@ fn assert_scene(scene: &str, app: &Viewer, output: &egui::FullOutput) {
         "{scene}: Home visibility"
     );
     let text = rendered_text(output);
+    if scene == "Home" {
+        assert!(
+            text.iter().any(|value| value == "Resume · page 2"),
+            "Home must show the saved position of its fictional multi-page reading list"
+        );
+    }
+    if scene == "DocumentSearch" {
+        let tab = &app.tabs[app.active];
+        assert!(app.search && app.sidebar && !tab.hits.is_empty());
+        assert_eq!(tab.query, "agreement");
+        fn has_highlight(shape: &egui::Shape, query: &str) -> bool {
+            match shape {
+                egui::Shape::Text(shape) => {
+                    let job = &shape.galley.job;
+                    job.text.starts_with("Page ")
+                        && job.sections.iter().any(|section| {
+                            section.format.underline.width > 0.
+                                && job.text[section.byte_range.clone()].eq_ignore_ascii_case(query)
+                        })
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().any(|s| has_highlight(s, query)),
+                _ => false,
+            }
+        }
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|s| has_highlight(&s.shape, &tab.query)),
+            "DocumentSearch must show a highlighted matching word in a result row"
+        );
+    }
     if scene == "WindowsMenus" {
         for label in [
             "File",

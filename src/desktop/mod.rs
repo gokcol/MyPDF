@@ -8,6 +8,8 @@ mod content;
 mod details;
 mod digital;
 mod editing;
+#[cfg(test)]
+mod footer_tests;
 mod form_tools;
 mod header_footer;
 mod home;
@@ -36,6 +38,7 @@ mod recovery;
 mod redaction;
 mod review;
 mod save;
+mod search_results;
 mod selection;
 mod selection_keys;
 mod shell_menu;
@@ -47,6 +50,9 @@ mod table_tools;
 mod tabs;
 mod text_selection;
 mod theme;
+#[cfg(test)]
+mod thumbnail_tests;
+mod thumbnails;
 mod touch_navigation;
 mod translation;
 mod translation_note;
@@ -107,6 +113,8 @@ struct Tab {
     error: Option<String>,
     page: usize,
     page_input: String,
+    /// Last page presented by the thumbnail sidebar, independent of its manual scroll position.
+    thumbnail_page: Option<usize>,
     zoom: Zoom,
     scale: f32,
     jump: Option<(usize, Option<f32>)>,
@@ -444,6 +452,7 @@ impl Viewer {
             error: None,
             page: 0,
             page_input: "1".into(),
+            thumbnail_page: None,
             document_view: None,
             document_layout: None,
             last_pinch: None,
@@ -1427,7 +1436,17 @@ impl Viewer {
                     if ui.available_width() < 850. {
                         home = home.compact();
                     }
-                    if ui.add(home).on_hover_text("Home · ⇧⌘H").clicked() {
+                    if ui
+                        .add(home)
+                        .on_hover_text(format!(
+                            "Home · {}",
+                            ui::shortcut_label(egui::KeyboardShortcut::new(
+                                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                                egui::Key::H
+                            ))
+                        ))
+                        .clicked()
+                    {
                         action = Some("home");
                     }
                     self.document_tabs(ui, ctx);
@@ -1488,17 +1507,57 @@ impl Viewer {
                             b.width(ui)
                         })
                         .sum::<f32>()
-                        + 2. * (MODES.len() - 1) as f32
+                        + ui::control_gap(2.) * (MODES.len() - 1) as f32
                         + 6.
                 };
                 let full = ui.available_width();
-                // Three file/navigation controls on the left, four view controls
-                // on the right. Mode tabs remain centered whenever both groups fit.
-                const LEFT_WIDTH: f32 = 3. * 32. + 2. * 4.;
-                const RIGHT_WIDTH: f32 = 4. * 32. + 3. * 4.;
+                // Measure both groups at the selected density. Comfortable
+                // mode keeps readable mode labels on a separate row when needed.
+                let control = ui::target_size(32.);
+                let gap = ui::control_gap(4.);
+                let left_width = 3. * control + 2. * gap;
+                let right_width = 3. * control + 2. * gap;
                 const GROUP_GAP: f32 = 8.;
-                let compact =
-                    full < track_width(ui, false) + LEFT_WIDTH + RIGHT_WIDTH + GROUP_GAP * 2.;
+                let labeled_track = track_width(ui, false);
+                let stacked = theme::comfortable()
+                    && full < labeled_track + left_width + right_width + GROUP_GAP * 2.;
+                let compact = if stacked {
+                    full < labeled_track
+                } else {
+                    full < labeled_track + left_width + right_width + GROUP_GAP * 2.
+                };
+                let mode_controls = |viewer: &mut Self, ui: &mut egui::Ui, compact: bool| {
+                    ui::segment_track(ui, |ui| {
+                        for (mode, icon, label) in MODES {
+                            let button = ActionButton::new(icon, label)
+                                .tab()
+                                .selected(viewer.editor.mode == mode);
+                            if ui
+                                .add(if compact { button.compact() } else { button })
+                                .clicked()
+                                && viewer.apply_pending_annotation()
+                            {
+                                if mode != editing::Mode::Edit
+                                    && viewer.content.pending_text().is_some()
+                                {
+                                    viewer.content.new_commit = true;
+                                    viewer.content.exit_text_tool = true;
+                                }
+                                if viewer.editor.mode != mode {
+                                    viewer.editor.eraser.finish();
+                                }
+                                viewer.editor.mode = mode;
+                                if mode == editing::Mode::Edit {
+                                    viewer.automatic_edit();
+                                }
+                                viewer.editor.library_open = false;
+                                if let Some(tab) = viewer.tabs.get_mut(viewer.active) {
+                                    tab.signatures.panel = false;
+                                }
+                            }
+                        }
+                    });
+                };
                 ui.horizontal(|ui| {
                     if ui
                         .add(ActionButton::new(Icon::Blank, "New blank PDF").compact())
@@ -1529,44 +1588,29 @@ impl Viewer {
                     {
                         action = Some("sidebar");
                     }
-                    let used = ui.min_rect().width();
-                    let track = track_width(ui, compact);
-                    let centered = (full - track) / 2. - used;
-                    let room = full - track - used - RIGHT_WIDTH - GROUP_GAP;
-                    ui.add_space(centered.min(room).max(8.));
-                    ui::segment_track(ui, |ui| {
-                        for (mode, icon, label) in MODES {
-                            let button = ActionButton::new(icon, label)
-                                .tab()
-                                .selected(self.editor.mode == mode);
-                            if ui
-                                .add(if compact { button.compact() } else { button })
-                                .clicked()
-                                && self.apply_pending_annotation()
-                            {
-                                if mode != editing::Mode::Edit
-                                    && self.content.pending_text().is_some()
-                                {
-                                    self.content.new_commit = true;
-                                    self.content.exit_text_tool = true;
-                                }
-                                if self.editor.mode != mode {
-                                    self.editor.eraser.finish();
-                                }
-                                self.editor.mode = mode;
-                                if mode == editing::Mode::Edit {
-                                    self.automatic_edit();
-                                }
-                                self.editor.library_open = false;
-                                if let Some(tab) = self.tabs.get_mut(self.active) {
-                                    tab.signatures.panel = false;
-                                }
-                            }
-                        }
-                    });
+                    if !stacked {
+                        let used = ui.min_rect().width();
+                        let track = track_width(ui, compact);
+                        let centered = (full - track) / 2. - used;
+                        let room = full - track - used - right_width - GROUP_GAP;
+                        ui.add_space(centered.min(room).max(GROUP_GAP));
+                        mode_controls(self, ui, compact);
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add(ActionButton::new(Icon::Zen, "Zen mode · ⇧⌘F").compact())
+                            .add(
+                                ActionButton::new(
+                                    Icon::Zen,
+                                    &format!(
+                                        "Zen mode · {}",
+                                        ui::shortcut_label(egui::KeyboardShortcut::new(
+                                            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                                            egui::Key::F
+                                        ))
+                                    ),
+                                )
+                                .compact(),
+                            )
                             .clicked()
                         {
                             action = Some("zen");
@@ -1594,6 +1638,12 @@ impl Viewer {
                         }
                     });
                 });
+                if stacked {
+                    ui.horizontal(|ui| {
+                        ui.add_space(((full - track_width(ui, compact)) / 2.).max(0.));
+                        mode_controls(self, ui, compact);
+                    });
+                }
             });
         if let Some(choice) = file_action.take() {
             self.recent_menu_action(choice, ctx);
@@ -1605,7 +1655,15 @@ impl Viewer {
                     .inner_margin(egui::Margin::symmetric(12, 4)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                // Keep reading navigation together in narrow windows, then expose
+                // editing tools and save status below it. Comfortable needs more
+                // room for its touch targets; long labels can wrap at any width.
+                let stacked = ui.available_width() < if theme::comfortable() { 960. } else { 760. };
+                ui.allocate_ui_with_layout(
+                    vec2(ui.available_width(), ui.spacing().interact_size.y),
+                    egui::Layout::left_to_right(egui::Align::Center)
+                        .with_main_wrap(true),
+                    |ui| {
                     ui.spacing_mut().item_spacing.x = 5.;
                     if let Some(tab) = self.tabs.get_mut(self.active).filter(|t| !t.pages.is_empty() && t.error.is_none()) {
                         if ui
@@ -1666,6 +1724,8 @@ impl Viewer {
                         }
                         let r = ui.add(
                             egui::TextEdit::singleline(&mut tab.page_input).margin(ui::FIELD_MARGIN)
+                                .min_size(vec2(0., ui::target_size(28.)))
+                                .vertical_align(egui::Align::Center)
                                 .desired_width(30.0)
                                 .horizontal_align(egui::Align::Center),
                         );
@@ -1696,7 +1756,11 @@ impl Viewer {
                         }
                     }
 
-                    ui.separator();
+                    if stacked {
+                        ui.end_row();
+                    } else {
+                        ui.separator();
+                    }
                     let session = self.tabs.get(self.active).and_then(|t| t.session.as_ref());
                     let pending_text = self.tabs.get(self.active).is_some_and(|tab| self.content.has_pending_text_change(tab.id));
                     if ui
@@ -1717,7 +1781,7 @@ impl Viewer {
                     {
                         action = Some("redo");
                     }
-                    if ui.add(ActionButton::new(Icon::Search, "Find a tool (⌘K)").compact()).clicked() { action = Some("tool_search"); }
+                    if ui.add(ActionButton::new(Icon::Search, &format!("Find a tool ({})", ui::shortcut_label(egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::K)))).compact()).clicked() { action = Some("tool_search"); }
                     if ui.add(ActionButton::new(Icon::History, "Document history").compact()).clicked() { action = Some("history"); }
                     if ui.add(ActionButton::new(Icon::Guides, if self.editor.hide_guides { "Show editing guides" } else { "Hide editing guides" }).compact().selected(!self.editor.hide_guides)).clicked() { action = Some("guides"); }
                     if let Some(tab) = self.tabs.get(self.active)
@@ -1838,9 +1902,9 @@ impl Viewer {
             }
             ui.add_space(4.);
             if self.search {
-                let mut response = ui.add(egui::TextEdit::singleline(&mut tab.query).hint_text("Find in document…").margin(egui::Margin { left: 10, right: 34, top: 7, bottom: 7 }).desired_width(f32::INFINITY));
+                let mut response = ui.add(egui::TextEdit::singleline(&mut tab.query).hint_text("Find in document…").margin(egui::Margin { left: 10, right: if theme::comfortable() { 54 } else { 34 }, top: 7, bottom: 7 }).min_size(vec2(0., ui::target_size(28.))).vertical_align(egui::Align::Center).desired_width(f32::INFINITY));
                 if !tab.query.is_empty() {
-                    let clear_rect = Rect::from_center_size(pos2(response.rect.right() - 17., response.rect.center().y), vec2(24., 24.));
+                    let clear_rect = Rect::from_center_size(pos2(response.rect.right() - ui::target_size(24.) / 2. - 5., response.rect.center().y), vec2(ui::target_size(24.), ui::target_size(24.)));
                     let clear = ui.interact(clear_rect, response.id.with("clear"), egui::Sense::click()).on_hover_text("Clear search").on_hover_cursor(egui::CursorIcon::PointingHand);
                     clear.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Clear search"));
                     if clear.hovered() || clear.has_focus() {
@@ -1849,7 +1913,7 @@ impl Viewer {
                     if clear.has_focus() {
                         ui.painter().rect_stroke(clear_rect, 4., Stroke::new(1., theme::accent()), egui::StrokeKind::Inside);
                     }
-                    ui::draw_icon(ui.painter(), clear_rect.shrink(6.), Icon::Close, theme::muted());
+                    ui::draw_icon(ui.painter(), Rect::from_center_size(clear_rect.center(), vec2(12., 12.)), Icon::Close, theme::muted());
                     if clear.clicked() {
                         tab.query.clear();
                         response.mark_changed();
@@ -1880,10 +1944,9 @@ impl Viewer {
                 }
                 let mut chosen = None;
                 egui::ScrollArea::vertical().id_salt((tab.id, "search_results")).show(ui, |ui| {
-                    for (i, hit) in tab.hits.iter().enumerate().take(1000) { let selected = i == tab.hit; egui::Frame::new().fill(if selected { theme::accent_soft() } else { Color32::TRANSPARENT }).stroke(Stroke::new(1., if selected { theme::accent_line() } else { Color32::TRANSPARENT })).corner_radius(8.0).inner_margin(8.0).show(ui, |ui| {
-                        ui.label(RichText::new(format!("Page {}", hit.page + 1)).size(11.0).family(ui::semibold()).color(theme::accent()));
-                        if ui.add(egui::Button::new(&hit.snippet).wrap().frame(false)).clicked() { chosen = Some(i); }
-                    }); }
+                    for (i, hit) in tab.hits.iter().enumerate().take(1000) {
+                        if search_results::row(ui, hit, &tab.query, tab.search_options, i == tab.hit).clicked() { chosen = Some(i); }
+                    }
                 });
                 if let Some(index) = chosen { tab.select_hit(index); }
             } else if self.outline {
@@ -1893,14 +1956,18 @@ impl Viewer {
                 self.organizer.use_tab(tab);
                 ui.label(RichText::new(pages_label(tab.pages.len())).color(theme::muted()).size(11.5)).on_hover_text("⌘/Ctrl-click to select pages · Shift-click for a range · right-click for page actions");
                 self.organizer.thumbnail_area(tab.id, ui.available_rect_before_wrap().intersect(ui.clip_rect()));
-                egui::ScrollArea::vertical().id_salt((tab.id, "thumbnails")).show_rows(ui, 176.0, tab.pages.len(), |ui, range| {
+                thumbnails::scroll_area(ui, tab, &mut self.organizer).show_rows(ui, thumbnails::ROW_HEIGHT, tab.pages.len(), |ui, range| {
                     for page in range { let size = tab.pages[page]; let factor = (132.0 / size.width).min(146.0 / size.height); let display = vec2(size.width * factor, size.height * factor); let key = viewer::raster_key(page, size, factor * ctx.pixels_per_point(), true); tab.request(key);
-                        let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 176.0), egui::Sense::click());
+                        let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), thumbnails::ROW_HEIGHT), egui::Sense::click());
                         response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, self.organizer.selected.contains(&page), format!("Go to page {}", page + 1)));
                         let image = Rect::from_center_size(pos2(rect.center().x, rect.top() + 77.0), display);
-                        let current = self.organizer.selected.contains(&page);
+                        let selected = self.organizer.selected.contains(&page);
+                        let current = tab.page == page;
+                        ui.ctx().accesskit_node_builder(response.id, |node| {
+                            if current { node.set_aria_current(egui::accesskit::AriaCurrent::Page); }
+                        });
                         ui::shadow(ui.painter(), image, 2, 1);
-                        if current {
+                        if selected {
                             ui.painter().rect_stroke(image.expand(4.0), 6, Stroke::new(2.5, theme::accent()), egui::StrokeKind::Middle);
                         } else if response.hovered() {
                             ui.painter().rect_stroke(image.expand(4.0), 6, Stroke::new(2.0, theme::accent_line()), egui::StrokeKind::Middle);
@@ -3902,96 +3969,175 @@ mod tests {
 
     #[test]
     fn responsive_mode_controls_have_accessible_labels_and_stay_in_bounds() {
-        for width in [720., 1200.] {
-            let ctx = egui::Context::default();
-            ctx.enable_accesskit();
-            ctx.data_mut(|d| d.insert_temp(egui::Id::new("preview_portable_menu"), true));
-            let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
-            app.home.visible = false;
-            let output = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(width, 820.))),
-                    ..Default::default()
-                },
-                |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
-            );
-            let nodes = output.platform_output.accesskit_update.unwrap().nodes;
-            let ribbon_y = nodes
-                .iter()
-                .find(|(_, n)| n.label() == Some("Read"))
-                .and_then(|(_, n)| n.bounds())
-                .unwrap()
-                .y0;
-            let mut previous = 0.;
-            for label in [
-                "Read", "Annotate", "Edit", "Draw", "Forms", "Sign", "Pages", "Export",
-            ] {
-                let node = &nodes
+        struct RestoreDensity(theme::Density);
+        impl Drop for RestoreDensity {
+            fn drop(&mut self) {
+                theme::set_density(self.0);
+            }
+        }
+        let _restore = RestoreDensity(theme::density());
+        for density in theme::Density::ALL {
+            for width in [720., 900., 1200.] {
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new("preview_portable_menu"), true));
+                let mut app =
+                    Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+                theme::set_density(density);
+                app.new_blank(&ctx);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while app.tabs[0].session.is_none() {
+                    app.events(&ctx);
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                app.home.visible = false;
+                app.editor.mode = editing::Mode::Read;
+                let revision = app.tabs[0].session.as_ref().unwrap().revision();
+                let mut run = || {
+                    ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(width, 820.))),
+                            ..Default::default()
+                        },
+                        |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+                    )
+                };
+                run();
+                run();
+                let output = run();
+                let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+                let toolbar_rect =
+                    egui::containers::panel::PanelState::load(&ctx, egui::Id::new("main_toolbar"))
+                        .expect("Main toolbar was laid out")
+                        .rect;
+                let in_toolbar = |node: &egui::accesskit::Node| {
+                    node.role() == egui::accesskit::Role::Button
+                        && node.bounds().is_some_and(|rect| {
+                            toolbar_rect.contains(pos2(
+                                ((rect.x0 + rect.x1) / 2.) as f32,
+                                ((rect.y0 + rect.y1) / 2.) as f32,
+                            ))
+                        })
+                };
+                let bounds = |label: &str| {
+                    nodes
+                        .iter()
+                        .find(|(_, node)| node.label() == Some(label) && in_toolbar(node))
+                        .unwrap_or_else(|| panic!("Missing {label} at {width}, {density:?}"))
+                        .1
+                        .bounds()
+                        .unwrap()
+                };
+                let modes = [
+                    "Read", "Annotate", "Edit", "Draw", "Forms", "Sign", "Pages", "Export",
+                ];
+                let mut actions: Vec<_> =
+                    modes.iter().map(|label| (*label, bounds(label))).collect();
+                let first_mode = bounds("Read");
+                let mut previous = 0.;
+                for (label, rect) in &actions {
+                    assert!(
+                        rect.x0 >= previous && rect.x1 <= width as f64,
+                        "{label} is clipped or overlaps at {width}, {density:?}: {rect:?}"
+                    );
+                    assert!(
+                        (rect.y0 - first_mode.y0).abs() < 0.1,
+                        "Mode row wrapped unexpectedly"
+                    );
+                    previous = rect.x1;
+                }
+                for label in [
+                    "New blank PDF",
+                    "Open…",
+                    "Toggle left panel",
+                    "Toggle right panel",
+                    "Translate",
+                ] {
+                    actions.push((label, bounds(label)));
+                }
+                let zen = nodes
                     .iter()
-                    .find(|(_, n)| {
-                        n.label() == Some(label) && n.bounds().is_some_and(|r| r.y0 == ribbon_y)
+                    .find(|(_, node)| {
+                        node.label()
+                            .is_some_and(|label| label.starts_with("Zen mode ·"))
+                            && in_toolbar(node)
                     })
-                    .unwrap()
-                    .1;
-                let r = node.bounds().unwrap();
-                assert!(
-                    r.x0 >= previous && r.x1 <= width as f64,
-                    "{label} is clipped or overlaps at width {width}: {r:?}"
+                    .expect("Zen remains available");
+                actions.push(("Zen", zen.1.bounds().unwrap()));
+                assert_eq!(actions.len(), 14);
+                for (i, (label, rect)) in actions.iter().enumerate() {
+                    assert!(
+                        toolbar_rect.contains(pos2(rect.x0 as f32, rect.y0 as f32))
+                            && toolbar_rect.contains(pos2(rect.x1 as f32, rect.y1 as f32)),
+                        "{label} extends beyond the actual main toolbar"
+                    );
+                    assert!(
+                        rect.x0 >= 0.
+                            && rect.x1 <= width as f64
+                            && rect.y0 >= 0.
+                            && rect.y1 <= 820.,
+                        "{label} is outside the window at {width}, {density:?}: {rect:?}"
+                    );
+                    if density == theme::Density::Comfortable {
+                        assert!(
+                            rect.width() >= 44. && rect.height() >= 44.,
+                            "{label} lost its touch target"
+                        );
+                    }
+                    for (other_label, other) in &actions[i + 1..] {
+                        assert!(
+                            rect.x1 <= other.x0
+                                || other.x1 <= rect.x0
+                                || rect.y1 <= other.y0
+                                || other.y1 <= rect.y0,
+                            "{label} overlaps {other_label} at {width}, {density:?}"
+                        );
+                    }
+                }
+                let sidebar = bounds("Toggle left panel");
+                let stacked = density == theme::Density::Comfortable && width <= 900.;
+                if stacked {
+                    assert!(
+                        first_mode.y0 > sidebar.y1,
+                        "Comfortable modes get their own row"
+                    );
+                } else {
+                    assert!(
+                        sidebar.x1 < first_mode.x0,
+                        "Compact/wide layout retains the left group"
+                    );
+                    assert!(sidebar.y0 < first_mode.y1 && first_mode.y0 < sidebar.y1);
+                }
+                assert_eq!(
+                    nodes
+                        .iter()
+                        .filter(|(_, node)| node.label() == Some("Toggle left panel"))
+                        .count(),
+                    1
                 );
-                previous = r.x1;
+                for label in [
+                    "Save · ⌘S",
+                    "Save · Ctrl+S",
+                    "Save As… · ⇧⌘S",
+                    "Save As… · Ctrl+Shift+S",
+                    "Compare Documents…",
+                    "Find",
+                ] {
+                    assert!(
+                        !nodes.iter().any(|(_, node)| node.label() == Some(label)
+                            && node.bounds().is_some_and(|rect| rect.y0 == first_mode.y0)),
+                        "{label} should not add duplicate toolbar controls"
+                    );
+                }
+                assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), revision);
+                app.action("sidebar", &ctx);
+                assert!(!app.sidebar && app.inspector);
+                app.action("inspector", &ctx);
+                assert!(!app.sidebar && !app.inspector);
+                app.action("sidebar", &ctx);
+                assert!(app.sidebar && !app.inspector);
             }
-            let left = nodes
-                .iter()
-                .filter(|(_, node)| node.label() == Some("Toggle left panel"))
-                .collect::<Vec<_>>();
-            assert_eq!(left.len(), 1, "The sidebar button is shown once");
-            let sidebar = left[0].1.bounds().unwrap();
-            let first_mode = nodes
-                .iter()
-                .find(|(_, node)| {
-                    node.label() == Some("Read") && node.bounds().is_some_and(|r| r.y0 == ribbon_y)
-                })
-                .unwrap()
-                .1
-                .bounds()
-                .unwrap();
-            assert!(
-                sidebar.x0 >= 0. && sidebar.x1 < first_mode.x0,
-                "Sidebar belongs to the left group"
-            );
-            for label in [
-                "Save · ⌘S",
-                "Save · Ctrl+S",
-                "Save As… · ⇧⌘S",
-                "Save As… · Ctrl+Shift+S",
-                "Compare Documents…",
-                "Find",
-            ] {
-                assert!(
-                    !nodes.iter().any(|(_, node)| node.label() == Some(label)
-                        && node.bounds().is_some_and(|r| r.y0 == ribbon_y)),
-                    "{label} is absent from the toolbar"
-                );
-            }
-            for label in ["Toggle right panel", "Translate"] {
-                let r = nodes
-                    .iter()
-                    .find(|(_, n)| n.label() == Some(label))
-                    .unwrap()
-                    .1
-                    .bounds()
-                    .unwrap();
-                assert!(
-                    r.x0 >= previous && r.x1 <= width as f64,
-                    "{label} is clipped"
-                );
-            }
-            app.action("sidebar", &ctx);
-            assert!(!app.sidebar && app.inspector);
-            app.action("inspector", &ctx);
-            assert!(!app.sidebar && !app.inspector);
-            app.action("sidebar", &ctx);
-            assert!(app.sidebar && !app.inspector);
         }
     }
 }
