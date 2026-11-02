@@ -1,6 +1,23 @@
 # MyPDF — current handover
 
-Updated 1 November 2026 (Europe/Istanbul). Project root: `/Users/gokcol/SWPROJECTS/Utility/MyPDF/`.
+Updated 2 November 2026 (Europe/Istanbul). Project root: `/Users/gokcol/SWPROJECTS/Utility/MyPDF/` (Windows: `C:\Utilities\MyPDF`).
+
+## MyPDF 2.2.2 — Windows only
+
+The user asked for a Windows-only release because no Mac is available for at least two weeks. The app/installer version is **2.2.2** and the GitHub tag is **v2.2.2**, with Windows installer and portable ZIP only. The Mac version, `packaging/Info.plist`, and the Microsoft Store listing and MSIX notes stay at **2.2.1**; no DMG or MSIX was produced.
+
+Changes:
+
+- **Window size:** the first window shrinks and moves only as far as needed to fit the monitor work area (taskbar and DPI included), in `src/desktop/window_fit.rs`.
+- **Installer:** adds the App Path, Default apps capabilities (`RegisteredApplications`) and application metadata to the "Open with" registration.
+- **Scrolling:** Windows wheel and touchpad input is converted from lines to points in `src/desktop/wheel.rs`. That is 100 points per notch at the default three lines, with touchpad movement applied in the same frame. Installed fonts are scanned on a background thread at startup (`render_fonts::warm_up`).
+
+Known and pending:
+
+- One frame (22–27 ms) is still missed after each page change while AccessKit is active, because Windows UI Automation clients turn it on. The page-number field and thumbnail selection updates cause it; measurement tools are in `artifacts/scroll-timing/`.
+- MyPDF still does not appear in Windows' Default apps or Open with lists on this PC. Probe apps registered the same way, including signed Program Files exes, were also ignored, so this is not MyPDF-specific. Open with → Choose an app on your PC works.
+- The organisation's Trend Micro Apex One prompts on every new unsigned MyPDF build: no file reputation, "Newly Encountered Program". Code signing or the Store build would avoid this.
+- Commands run from the Codex desktop app had HKCU registry writes redirected to its MSIX private hive, so install and registry work must be done from an unpackaged shell.
 
 ## MyPDF 2.2.1 / Mac build 200
 

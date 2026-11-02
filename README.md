@@ -2,6 +2,8 @@
 
 # MyPDF — native Rust desktop PDF editor
 
+Version **2.2.2** is a Windows-only update. Mouse wheel and touchpad scrolling follow the Windows scroll setting and move with your fingers; the first page that needs a substitute font no longer pauses while scrolling. The first window fits the screen above the taskbar at any display scaling, and the installer registers MyPDF for Settings → Default apps. The Mac version remains 2.2.1, build 200.
+
 Version **2.2.1**, Mac build **200**, adds **Area Highlight** at the end of Annotate → More: drag a translucent rectangle without snapping to text. Underline, Squiggly, Strikeout and Table are now grouped in More. It retains the compact Home screen, reading-resume labels, highlighted search results and thumbnail following from 2.2. **Comfortable spacing is optional; Compact remains the default.**
 
 Version **2.1.7**, build **196**, adds touchscreen scrolling in Read mode, with two-finger pan and pinch navigation across document tools. It reduces disk writes during scrolling, avoids unnecessary cache sorting and reuses decoded font outlines during text indexing. Window dragging from the header, logo and MyPDF text uses consistent behavior and contextual cursors. Settings and reading positions remain saved after navigation settles and on normal close. Available for Mac and Windows.
