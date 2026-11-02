@@ -12,11 +12,17 @@ fn comfortable_footer_keeps_tools_visible_and_clickable_in_narrow_windows() {
         }
     }
     let _restore = Restore(theme::density());
-    for (density, width) in [
-        (theme::Density::Compact, 720.),
-        (theme::Density::Compact, 1200.),
-        (theme::Density::Comfortable, 720.),
-        (theme::Density::Comfortable, 1200.),
+    for (density, width, height) in [
+        (theme::Density::Compact, 720., 480.),
+        (theme::Density::Compact, 720., 700.),
+        (theme::Density::Compact, 1024., 600.),
+        (theme::Density::Compact, 1200., 700.),
+        (theme::Density::Compact, 1200., 820.),
+        (theme::Density::Comfortable, 720., 480.),
+        (theme::Density::Comfortable, 720., 700.),
+        (theme::Density::Comfortable, 1024., 600.),
+        (theme::Density::Comfortable, 1200., 700.),
+        (theme::Density::Comfortable, 1200., 820.),
     ] {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
@@ -34,7 +40,7 @@ fn comfortable_footer_keeps_tools_visible_and_clickable_in_narrow_windows() {
         let frame = |app: &mut Viewer, events| {
             ctx.run(
                 egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(width, 820.))),
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(width, height))),
                     events,
                     ..Default::default()
                 },
@@ -52,6 +58,15 @@ fn comfortable_footer_keeps_tools_visible_and_clickable_in_narrow_windows() {
             egui::containers::panel::PanelState::load(&ctx, egui::Id::new("document_navigation"))
                 .unwrap()
                 .rect;
+        let document = app.tabs[0]
+            .document_view
+            .expect("Document canvas is visible")
+            .0;
+        assert!(document.is_positive(), "Document canvas has usable space");
+        assert!(
+            document.bottom() <= footer.top() + 0.1,
+            "Document canvas overlaps its navigation footer at {width}x{height}, {density:?}"
+        );
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;
         let bounds = |label: &str| {
             nodes
@@ -105,8 +120,8 @@ fn comfortable_footer_keeps_tools_visible_and_clickable_in_narrow_windows() {
         actions.push(("Page number", page_number));
         for (index, (label, rect)) in actions.iter().enumerate() {
             assert!(
-                rect.x0 >= 0. && rect.x1 <= width as f64 && rect.y1 <= 820.,
-                "{label} is offscreen at {width}, {density:?}: {rect:?}"
+                rect.x0 >= 0. && rect.x1 <= width as f64 && rect.y1 <= height as f64,
+                "{label} is offscreen at {width}x{height}, {density:?}: {rect:?}"
             );
             assert!(
                 footer.contains(pos2(rect.x0 as f32, rect.y0 as f32))
@@ -140,7 +155,7 @@ fn comfortable_footer_keeps_tools_visible_and_clickable_in_narrow_windows() {
             .bounds()
             .unwrap();
         assert!(
-            status.x1 <= width as f64 && status.y1 <= 820.,
+            status.x1 <= width as f64 && status.y1 <= height as f64,
             "Save status is clipped"
         );
         if width == 720. {

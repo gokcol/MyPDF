@@ -59,6 +59,8 @@ mod translation_note;
 mod ui;
 mod watermark;
 mod window_drag;
+#[cfg(any(target_os = "windows", test))]
+mod window_fit;
 mod workbench;
 mod workspace;
 mod zen;
@@ -324,6 +326,8 @@ pub struct Viewer {
 }
 impl Viewer {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> Self {
+        #[cfg(target_os = "windows")]
+        window_fit::configure(cc);
         #[cfg(target_os = "macos")]
         window_drag::configure(cc);
         editing::install_annotation_font(&cc.egui_ctx);

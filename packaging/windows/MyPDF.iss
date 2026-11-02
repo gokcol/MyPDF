@@ -73,15 +73,30 @@ Name: "{autoprograms}\MyPDF"; Filename: "{app}\MyPDF.exe"
 Name: "{autodesktop}\MyPDF"; Filename: "{app}\MyPDF.exe"; Tasks: desktopicon
 
 [Registry]
+; Let ShellExecute locate this per-user or all-users installation by name.
+Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\MyPDF.exe"; ValueType: string; ValueName: ""; ValueData: "{app}\MyPDF.exe"; Flags: uninsdeletekey
 ; "Open with" for PDF files. The default PDF app stays as it is, and
 ; uninstalling removes these entries again.
 Root: HKA; Subkey: "Software\Classes\Applications\MyPDF.exe"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "MyPDF"; Flags: uninsdeletekey; Tasks: openwith
+Root: HKA; Subkey: "Software\Classes\Applications\MyPDF.exe\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\MyPDF.exe,0"; Tasks: openwith
 Root: HKA; Subkey: "Software\Classes\Applications\MyPDF.exe\SupportedTypes"; ValueType: string; ValueName: ".pdf"; ValueData: ""; Tasks: openwith
 Root: HKA; Subkey: "Software\Classes\Applications\MyPDF.exe\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\MyPDF.exe"" ""%1"""; Tasks: openwith
 Root: HKA; Subkey: "Software\Classes\MyPDF.Document"; ValueType: string; ValueName: ""; ValueData: "PDF Document"; Flags: uninsdeletekey; Tasks: openwith
+Root: HKA; Subkey: "Software\Classes\MyPDF.Document\Application"; ValueType: string; ValueName: "ApplicationName"; ValueData: "MyPDF"; Tasks: openwith
+Root: HKA; Subkey: "Software\Classes\MyPDF.Document\Application"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "Read, edit, annotate and sign PDF files on your computer."; Tasks: openwith
+Root: HKA; Subkey: "Software\Classes\MyPDF.Document\Application"; ValueType: string; ValueName: "ApplicationCompany"; ValueData: "MyPDF contributors"; Tasks: openwith
+Root: HKA; Subkey: "Software\Classes\MyPDF.Document\Application"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: "{app}\MyPDF.exe,0"; Tasks: openwith
 Root: HKA; Subkey: "Software\Classes\MyPDF.Document\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\MyPDF.exe,0"; Tasks: openwith
 Root: HKA; Subkey: "Software\Classes\MyPDF.Document\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\MyPDF.exe"" ""%1"""; Tasks: openwith
 Root: HKA; Subkey: "Software\Classes\.pdf\OpenWithProgids"; ValueType: string; ValueName: "MyPDF.Document"; ValueData: ""; Flags: uninsdeletevalue; Tasks: openwith
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.pdf\OpenWithProgids"; ValueType: string; ValueName: "MyPDF.Document"; ValueData: ""; Flags: uninsdeletevalue; Tasks: openwith
+; Windows Settings discovers desktop default-app candidates through these
+; capabilities, in addition to the Shell's OpenWithProgids registration above.
+Root: HKA; Subkey: "Software\MyPDF\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "MyPDF"; Flags: uninsdeletekey; Tasks: openwith
+Root: HKA; Subkey: "Software\MyPDF\Capabilities"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "Read, edit, annotate and sign PDF files on your computer."; Tasks: openwith
+Root: HKA; Subkey: "Software\MyPDF\Capabilities"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: "{app}\MyPDF.exe,0"; Tasks: openwith
+Root: HKA; Subkey: "Software\MyPDF\Capabilities\FileAssociations"; ValueType: string; ValueName: ".pdf"; ValueData: "MyPDF.Document"; Tasks: openwith
+Root: HKA; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "MyPDF"; ValueData: "Software\MyPDF\Capabilities"; Flags: uninsdeletevalue; Tasks: openwith
 
 [Run]
 Filename: "{app}\MyPDF.exe"; Description: "{cm:LaunchProgram,MyPDF}"; Flags: nowait postinstall skipifsilent
