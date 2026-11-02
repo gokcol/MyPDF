@@ -69,6 +69,14 @@ pub fn settings() -> InterpreterSettings {
     }
 }
 
+/// Scan the installed fonts ahead of time. Otherwise the first page that needs
+/// a substitute for a font a PDF does not embed waits for the scan: about half
+/// a second to a second on Windows, long enough to show while scrolling.
+pub fn warm_up() {
+    let _ = settings();
+    let _ = system_fonts();
+}
+
 struct SystemFonts {
     database: fontdb::Database,
     /// Faces in a TTC share one owned byte buffer, including regular/bold pairs.

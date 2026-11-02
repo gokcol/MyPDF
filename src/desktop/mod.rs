@@ -58,6 +58,8 @@ mod translation;
 mod translation_note;
 mod ui;
 mod watermark;
+#[cfg(any(target_os = "windows", test))]
+mod wheel;
 mod window_drag;
 #[cfg(any(target_os = "windows", test))]
 mod window_fit;
@@ -330,6 +332,8 @@ impl Viewer {
         window_fit::configure(cc);
         #[cfg(target_os = "macos")]
         window_drag::configure(cc);
+        // Scan installed fonts now rather than on the first page that needs one.
+        std::thread::spawn(mypdf_milestone0::render_fonts::warm_up);
         editing::install_annotation_font(&cc.egui_ctx);
         ui::install_theme(&cc.egui_ctx);
         let (native_menu, menu_events) = menu::install(cc.egui_ctx.clone());
@@ -2688,6 +2692,10 @@ impl eframe::App for Viewer {
                 theme::muted(),
             );
         }
+    }
+    #[cfg(target_os = "windows")]
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        wheel::adapt_input(ctx, raw_input);
     }
 }
 
