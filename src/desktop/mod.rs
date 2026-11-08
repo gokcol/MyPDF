@@ -284,6 +284,8 @@ pub struct Viewer {
     focus_search: bool,
     status: Option<(String, bool)>,
     saving: bool,
+    #[cfg(target_os = "windows")]
+    printing: print::State,
     about_open: bool,
     /// The file name the next Save suggests.
     save_name: Option<String>,
@@ -376,6 +378,8 @@ impl Viewer {
             focus_search: false,
             status: None,
             saving: false,
+            #[cfg(target_os = "windows")]
+            printing: print::State::new(cc),
             about_open: false,
             save_events,
             save_tx,
@@ -1011,6 +1015,10 @@ impl Viewer {
         }
     }
     fn events(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        if let Some(status) = self.printing.poll() {
+            self.status = Some(status);
+        }
         for tab in &mut self.tabs {
             for event in tab.worker.events.try_iter().take(16).collect::<Vec<_>>() {
                 match event {

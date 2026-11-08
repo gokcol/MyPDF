@@ -168,8 +168,20 @@ pub(super) fn thumbnail_context_menu(
     });
     action
 }
+struct PageMarquee {
+    /// Content coordinates keep the anchor fixed while the grid scrolls.
+    origin: egui::Pos2,
+    previous: BTreeSet<usize>,
+    extend: bool,
+    active: bool,
+}
+
+const PAGE_CELL_HEIGHT: f32 = 208.0;
+const PAGE_COLUMN_GAP: f32 = 24.0;
+
 pub(super) struct Organizer {
     tab: u64,
+    page_count: usize,
     pub selected: BTreeSet<usize>,
     range: String,
     before: usize,
@@ -178,6 +190,7 @@ pub(super) struct Organizer {
     margins: [f32; 4],
     dragged: Option<usize>,
     pressed: Option<(usize, egui::Pos2)>,
+    marquee: Option<PageMarquee>,
     pub busy: bool,
     change_name: &'static str,
     tx: mpsc::Sender<Change>,
@@ -199,6 +212,7 @@ impl Organizer {
         let (clip_tx, clip_rx) = mpsc::channel();
         Self {
             tab: 0,
+            page_count: 0,
             selected: BTreeSet::new(),
             range: "1".into(),
             before: 1,
@@ -207,6 +221,7 @@ impl Organizer {
             margins: [18.0; 4],
             dragged: None,
             pressed: None,
+            marquee: None,
             busy: false,
             change_name: "Edit pages",
             tx,
@@ -226,17 +241,24 @@ impl Organizer {
             self.tab = tab.id;
             self.pressed = None;
             self.dragged = None;
+            self.marquee = None;
             self.selected = BTreeSet::from([tab.page]);
             self.range = (tab.page + 1).to_string();
             self.crop = false;
         }
+        let had_selection = !self.selected.is_empty();
         self.selected.retain(|page| *page < tab.pages.len());
         // A new document may first be shown before Loaded supplies its pages.
         // Restore the current page once ready, and after deleting/rotating pages,
         // so sidebar actions have the same valid default target as Pages mode.
-        if self.selected.is_empty() && !tab.pages.is_empty() {
+        // An intentionally empty drag selection remains empty until pages change.
+        if self.selected.is_empty()
+            && !tab.pages.is_empty()
+            && (had_selection || self.page_count != tab.pages.len())
+        {
             self.selected.insert(tab.page.min(tab.pages.len() - 1));
         }
+        self.page_count = tab.pages.len();
         if let Some((id, count, pages)) = &self.pending_select
             && *id == tab.id
             && *count == tab.pages.len()
@@ -287,12 +309,21 @@ impl Organizer {
         }
         // The caller owns navigation: the sidebar must call Tab::jump while
         // the previous reading position is still available for Back history.
+        self.sync_range();
+    }
+    fn sync_range(&mut self) {
         self.range = self
             .selected
             .iter()
             .map(|p| (p + 1).to_string())
             .collect::<Vec<_>>()
             .join(", ");
+    }
+    fn cancel_marquee(&mut self) {
+        if let Some(marquee) = self.marquee.take() {
+            self.selected = marquee.previous;
+            self.sync_range();
+        }
     }
     fn action_enabled(&self, tab: &Tab, action: ThumbnailAction, blocked: bool) -> bool {
         let selected = self.tab == tab.id && !self.selected.is_empty();
@@ -615,6 +646,9 @@ impl Viewer {
     }
     pub(super) fn page_tools(&mut self, ctx: &egui::Context) {
         if self.editor.mode != editing::Mode::Pages {
+            self.organizer.cancel_marquee();
+            self.organizer.pressed = None;
+            self.organizer.dragged = None;
             return;
         }
         let Some(tab) = self.tabs.get(self.active) else {
@@ -627,12 +661,6 @@ impl Viewer {
         {
             self.organizer.selected = pages.clone();
             self.organizer.pending_select = None;
-        }
-        self.organizer.selected.retain(|i| *i < tab.pages.len());
-        if self.organizer.selected.is_empty() && !tab.pages.is_empty() {
-            self.organizer
-                .selected
-                .insert(tab.page.min(tab.pages.len() - 1));
         }
         let count = tab.pages.len();
         let editable = tab.session.as_ref().is_some_and(|s| s.editable)
@@ -746,7 +774,7 @@ impl Viewer {
                     }
                     ui.label(
                         RichText::new(
-                            "Drag to reorder · ⌘/Ctrl-click to select · double-click to read",
+                            "Drag empty space to select · Drag pages to reorder · ⌘/Ctrl or Shift adds to selection",
                         )
                         .small()
                         .color(theme::muted()),
@@ -1254,13 +1282,23 @@ impl Viewer {
                     pos,
                     button: egui::PointerButton::Primary,
                     pressed: true,
-                    ..
-                } => Some(*pos),
+                    modifiers,
+                } => Some((*pos, *modifiers)),
                 _ => None,
             })
         });
         let pointer = ctx.input(|i| i.pointer.interact_pos());
-        let released = ctx.input(|i| i.pointer.any_released());
+        let released = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
+        if blocked || ctx.input(|i| !i.focused || i.key_pressed(egui::Key::Escape)) {
+            self.organizer.cancel_marquee();
+            self.organizer.pressed = None;
+            self.organizer.dragged = None;
+        }
+        if first_press.is_some() {
+            self.organizer.cancel_marquee();
+            self.organizer.pressed = None;
+            self.organizer.dragged = None;
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::canvas()).inner_margin(24.0))
             .show(ctx, |ui| {
@@ -1271,25 +1309,31 @@ impl Viewer {
                 self.organizer.use_tab(tab);
                 self.organizer
                     .thumbnail_area(tab.id, ui.max_rect().intersect(ui.clip_rect()));
-                let columns = ((ui.available_width() + 24.0) / 174.0).floor().max(1.0) as usize;
-                let cell = (ui.available_width() - (columns - 1) as f32 * 24.0) / columns as f32;
+                let columns = ((ui.available_width() + PAGE_COLUMN_GAP) / 174.0)
+                    .floor()
+                    .max(1.0) as usize;
+                let cell = (ui.available_width() - (columns - 1) as f32 * PAGE_COLUMN_GAP)
+                    / columns as f32;
+                let row_stride = PAGE_CELL_HEIGHT + ui.spacing().item_spacing.y;
+                let mut grid_origin = ui.cursor().min;
                 let count = tab.pages.len();
-                egui::ScrollArea::vertical()
+                let scroll = egui::ScrollArea::vertical()
                     .scroll_source(egui::scroll_area::ScrollSource {
                         drag: false,
                         ..Default::default()
                     })
                     .id_salt(("organize", tab.id))
-                    .show_rows(ui, 224.0, count.div_ceil(columns), |ui, rows| {
+                    .show_rows(ui, PAGE_CELL_HEIGHT, count.div_ceil(columns), |ui, rows| {
+                        grid_origin = ui.max_rect().min - vec2(0.0, rows.start as f32 * row_stride);
                         for row in rows {
                             ui.horizontal_top(|ui| {
-                                ui.spacing_mut().item_spacing.x = 24.0;
+                                ui.spacing_mut().item_spacing.x = PAGE_COLUMN_GAP;
                                 for i in row * columns..((row + 1) * columns).min(count) {
                                     let size = tab.pages[i];
                                     let scale =
                                         ((cell - 16.0) / size.width).min(174.0 / size.height);
                                     let (area, _) = ui.allocate_exact_size(
-                                        vec2(cell, 208.0),
+                                        vec2(cell, PAGE_CELL_HEIGHT),
                                         egui::Sense::hover(),
                                     );
                                     let response = ui.interact(
@@ -1427,8 +1471,9 @@ impl Viewer {
                                         self.editor.mode = editing::Mode::Read;
                                         tab.jump(i);
                                     }
-                                    if let Some(p) = first_press.filter(|p| {
-                                        area.contains(*p)
+                                    if let Some((p, _)) = first_press.filter(|(p, _)| {
+                                        !blocked
+                                            && area.contains(*p)
                                             && ui.clip_rect().contains(*p)
                                             && ctx.layer_id_at(*p) == Some(ui.layer_id())
                                     }) {
@@ -1457,6 +1502,89 @@ impl Viewer {
                             });
                         }
                     });
+                let viewport = scroll.inner_rect.intersect(ui.clip_rect());
+                let canvas = ui.max_rect().expand(24.0).intersect(ui.clip_rect());
+                // The canvas margins are useful places to start a selection;
+                // leave the right-hand scrollbar to ScrollArea.
+                let background =
+                    Rect::from_min_max(canvas.min, pos2(viewport.right(), canvas.bottom()));
+                let page_rect = |page: usize| {
+                    Rect::from_min_size(
+                        pos2(
+                            (page % columns) as f32 * (cell + PAGE_COLUMN_GAP),
+                            (page / columns) as f32 * row_stride,
+                        ),
+                        vec2(cell, PAGE_CELL_HEIGHT),
+                    )
+                };
+                if let Some((press, modifiers)) = first_press
+                    && !blocked
+                    && count > 0
+                    && background.contains(press)
+                    && ctx.layer_id_at(press) == Some(ui.layer_id())
+                    && self.organizer.pressed.is_none()
+                {
+                    self.organizer.marquee = Some(PageMarquee {
+                        origin: press - grid_origin.to_vec2(),
+                        previous: self.organizer.selected.clone(),
+                        extend: modifiers.command || modifiers.ctrl || modifiers.shift,
+                        active: false,
+                    });
+                    self.organizer.thumbnail_focus = Some(tab.id);
+                    if let Some(focus) = ctx.memory(|m| m.focused()) {
+                        ctx.memory_mut(|m| m.surrender_focus(focus));
+                    }
+                }
+                if let Some(marquee) = &mut self.organizer.marquee
+                    && let Some(pointer) = pointer
+                {
+                    let end = viewport.clamp(pointer) - grid_origin.to_vec2();
+                    marquee.active |= end.distance(marquee.origin) > 4.0;
+                    if marquee.active {
+                        let selection = Rect::from_two_pos(marquee.origin, end);
+                        let mut selected = if marquee.extend {
+                            marquee.previous.clone()
+                        } else {
+                            BTreeSet::new()
+                        };
+                        selected.extend(
+                            (0..count).filter(|page| selection.intersects(page_rect(*page))),
+                        );
+                        self.organizer.selected = selected;
+                        let painter = ui.painter().with_clip_rect(canvas);
+                        let outline = selection.translate(grid_origin.to_vec2());
+                        painter.rect_filled(outline, 0.0, theme::accent().gamma_multiply(0.12));
+                        painter.rect_stroke(
+                            outline,
+                            0.0,
+                            Stroke::new(1.0_f32, theme::accent()),
+                            egui::StrokeKind::Inside,
+                        );
+                        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                        self.organizer.sync_range();
+                        ctx.request_repaint();
+
+                        // Continue selecting beyond the visible, virtualized rows.
+                        if !released && ctx.input(|i| i.pointer.primary_down()) {
+                            let edge = 32.0;
+                            let speed = if pointer.y < viewport.top() + edge {
+                                -((viewport.top() + edge - pointer.y) / edge).min(1.0)
+                            } else if pointer.y > viewport.bottom() - edge {
+                                ((pointer.y - viewport.bottom() + edge) / edge).min(1.0)
+                            } else {
+                                0.0
+                            };
+                            let mut state = scroll.state;
+                            state.offset.y = (state.offset.y
+                                + speed * 600.0 * ctx.input(|i| i.stable_dt.min(0.05)))
+                            .clamp(0.0, (scroll.content_size.y - viewport.height()).max(0.0));
+                            state.store(ctx, scroll.id);
+                        }
+                    }
+                }
+                if released || !ctx.input(|i| i.pointer.primary_down()) {
+                    self.organizer.marquee = None;
+                }
             });
         if let Some(action) = context_action {
             self.thumbnail_action(ctx, action);
@@ -1720,6 +1848,9 @@ mod tests {
     }
 
     fn thumbnail_fixture() -> (Viewer, egui::Context) {
+        thumbnail_fixture_with_count(4)
+    }
+    fn thumbnail_fixture_with_count(count: usize) -> (Viewer, egui::Context) {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
@@ -1730,6 +1861,17 @@ mod tests {
                 &Operation::InsertBlank {
                     at: 0,
                     width,
+                    height: 500.,
+                },
+            )
+            .unwrap();
+        }
+        for at in 4..count {
+            bytes = pages::apply(
+                &bytes,
+                &Operation::InsertBlank {
+                    at,
+                    width: 500.,
                     height: 500.,
                 },
             )
@@ -1747,6 +1889,219 @@ mod tests {
         app.sidebar = true;
         app.organizer.use_tab(&app.tabs[0]);
         (app, ctx)
+    }
+    fn overview_frame(app: &mut Viewer, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let time = ctx.input(|i| i.time) + 1.0 / 60.0;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1200., 900.))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+        );
+    }
+    fn overview_page(app: &Viewer, ctx: &egui::Context, page: usize) -> Rect {
+        ctx.read_response(egui::Id::new((app.tabs[0].id, page, "organizer_page")))
+            .expect("visible page tile")
+            .rect
+    }
+    fn overview_button(pos: egui::Pos2, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn pages_background_drag_selects_in_both_directions_and_extends_with_modifiers() {
+        let (mut app, ctx) = thumbnail_fixture();
+        app.editor.mode = editing::Mode::Pages;
+        overview_frame(&mut app, &ctx, vec![]);
+        overview_frame(&mut app, &ctx, vec![]);
+        let first = overview_page(&app, &ctx, 0);
+        let second = overview_page(&app, &ctx, 1);
+        let third = overview_page(&app, &ctx, 2);
+        let fourth = overview_page(&app, &ctx, 3);
+        let start = pos2((first.right() + second.left()) / 2., first.top() + 10.);
+        let end = third.center();
+        let source = app.tabs[0].session.as_ref().unwrap().source.clone();
+        for modifiers in [
+            egui::Modifiers::NONE,
+            egui::Modifiers::COMMAND,
+            egui::Modifiers::SHIFT,
+        ] {
+            app.organizer.selected = BTreeSet::from([0]);
+            overview_frame(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(start),
+                    overview_button(start, true, modifiers),
+                ],
+            );
+            overview_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(end)]);
+            let expected = if modifiers == egui::Modifiers::NONE {
+                BTreeSet::from([1, 2])
+            } else {
+                BTreeSet::from([0, 1, 2])
+            };
+            assert_eq!(app.organizer.selected, expected);
+            assert!(app.organizer.marquee.as_ref().is_some_and(|m| m.active));
+            assert!(app.organizer.dragged.is_none());
+            overview_frame(&mut app, &ctx, vec![overview_button(end, false, modifiers)]);
+            overview_frame(&mut app, &ctx, vec![]);
+            assert_eq!(
+                app.organizer.selected, expected,
+                "selection survives release and redraw"
+            );
+            assert!(app.organizer.marquee.is_none());
+        }
+        // A reversed drag also replaces the previous selection, including when
+        // press, movement and release arrive together in a single input frame.
+        let start = pos2((third.right() + fourth.left()) / 2., third.bottom() - 10.);
+        let end = second.center();
+        overview_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(start),
+                overview_button(start, true, egui::Modifiers::NONE),
+                egui::Event::PointerMoved(end),
+                overview_button(end, false, egui::Modifiers::NONE),
+            ],
+        );
+        assert_eq!(app.organizer.selected, BTreeSet::from([1, 2]));
+        assert_eq!(app.organizer.range, "2, 3");
+        let start = first.left_top() - vec2(10., 10.);
+        let end = first.center();
+        overview_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(start),
+                overview_button(start, true, egui::Modifiers::NONE),
+                egui::Event::PointerMoved(end),
+                overview_button(end, false, egui::Modifiers::NONE),
+            ],
+        );
+        assert_eq!(
+            app.organizer.selected,
+            BTreeSet::from([0]),
+            "drag can start in the canvas margin"
+        );
+        assert!(Arc::ptr_eq(
+            &source,
+            &app.tabs[0].session.as_ref().unwrap().source
+        ));
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
+        assert!(!app.organizer.busy);
+    }
+
+    #[test]
+    fn pages_drag_escape_restores_selection_and_empty_marquee_stays_empty() {
+        let (mut app, ctx) = thumbnail_fixture();
+        app.editor.mode = editing::Mode::Pages;
+        overview_frame(&mut app, &ctx, vec![]);
+        overview_frame(&mut app, &ctx, vec![]);
+        let first = overview_page(&app, &ctx, 0);
+        let second = overview_page(&app, &ctx, 1);
+        let start = pos2((first.right() + second.left()) / 2., first.top() + 10.);
+        let end = second.center();
+        app.organizer.selected = BTreeSet::from([0, 3]);
+        overview_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(start),
+                overview_button(start, true, egui::Modifiers::NONE),
+            ],
+        );
+        overview_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(end)]);
+        assert_eq!(app.organizer.selected, BTreeSet::from([1]));
+        overview_frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(app.organizer.selected, BTreeSet::from([0, 3]));
+        assert!(app.organizer.marquee.is_none());
+        overview_frame(
+            &mut app,
+            &ctx,
+            vec![overview_button(end, false, egui::Modifiers::NONE)],
+        );
+        let start = first.left_bottom() + vec2(20., 20.);
+        let end = start + vec2(40., 30.);
+        overview_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(start),
+                overview_button(start, true, egui::Modifiers::NONE),
+                egui::Event::PointerMoved(end),
+                overview_button(end, false, egui::Modifiers::NONE),
+            ],
+        );
+        overview_frame(&mut app, &ctx, vec![]);
+        assert!(app.organizer.selected.is_empty());
+        assert!(app.organizer.range.is_empty());
+    }
+
+    #[test]
+    fn pages_drag_scrolls_and_selects_rows_beyond_the_initial_viewport() {
+        let (mut app, ctx) = thumbnail_fixture_with_count(32);
+        app.editor.mode = editing::Mode::Pages;
+        overview_frame(&mut app, &ctx, vec![]);
+        overview_frame(&mut app, &ctx, vec![]);
+        let first = overview_page(&app, &ctx, 0);
+        let second = overview_page(&app, &ctx, 1);
+        let start = pos2((first.right() + second.left()) / 2., first.top() + 10.);
+        let bounds = app.organizer.thumbnail_bounds.unwrap();
+        let end = pos2(second.center().x, bounds.bottom() - 1.);
+        overview_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(start),
+                overview_button(start, true, egui::Modifiers::NONE),
+            ],
+        );
+        overview_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(end)]);
+        let initial_last = *app.organizer.selected.last().unwrap();
+        for _ in 0..80 {
+            overview_frame(&mut app, &ctx, vec![]);
+        }
+        assert!(
+            *app.organizer.selected.last().unwrap() > initial_last,
+            "drag reaches initially hidden rows"
+        );
+        assert!(
+            app.organizer.selected.contains(&1),
+            "scrolling retains the original anchor"
+        );
+        assert!(
+            !app.organizer.selected.contains(&0),
+            "adjacent column stays unselected"
+        );
+        let selected = app.organizer.selected.clone();
+        overview_frame(
+            &mut app,
+            &ctx,
+            vec![overview_button(end, false, egui::Modifiers::NONE)],
+        );
+        overview_frame(&mut app, &ctx, vec![]);
+        assert!(selected.is_subset(&app.organizer.selected));
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
     }
     fn thumbnail_frame(
         app: &mut Viewer,
