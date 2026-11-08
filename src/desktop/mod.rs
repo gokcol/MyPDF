@@ -710,6 +710,10 @@ impl Viewer {
         }
     }
     fn action(&mut self, action: &str, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        if self.printing.previewing() {
+            return;
+        }
         if self.content.context.bookmark.is_some()
             || self.productivity.owns_input()
                 && !matches!(
@@ -1182,6 +1186,10 @@ impl Viewer {
             && !self.editor.text_editing
     }
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        if self.printing.previewing() {
+            return;
+        }
         if self.productivity.owns_input() || self.content.context.bookmark.is_some() {
             return;
         }
@@ -2598,6 +2606,8 @@ impl eframe::App for Viewer {
         self.link_dialog(ctx);
         self.watermark_dialog(ctx);
         self.nup_dialog(ctx);
+        #[cfg(target_os = "windows")]
+        self.print_preview_dialog(ctx);
         self.ocr_dialogs(ctx);
         self.compare_dialog(ctx);
         self.details_dialogs(ctx);

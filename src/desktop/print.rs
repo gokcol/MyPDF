@@ -3,12 +3,15 @@
 use super::*;
 
 #[cfg(target_os = "windows")]
+mod preview;
+#[cfg(target_os = "windows")]
 mod windows;
 
 #[cfg(target_os = "windows")]
 pub(super) struct State {
     owner: isize,
     pending: Option<mpsc::Receiver<Result<String, String>>>,
+    preview: Option<preview::Preview>,
 }
 
 #[cfg(target_os = "windows")]
@@ -25,6 +28,7 @@ impl State {
         Self {
             owner,
             pending: None,
+            preview: None,
         }
     }
 
@@ -39,9 +43,31 @@ impl State {
             self.pending.is_none(),
             "A document is already being sent to the printer."
         );
-        let Some(job) = windows::choose_printer(self.owner, pages.len())? else {
+        if self.preview.is_some() {
+            return Ok(true);
+        }
+        let Some(job) = windows::choose_printer(self.owner, pages.len(), None, true)
+            .or_else(|_| windows::choose_printer(self.owner, pages.len(), None, false))?
+        else {
             return Ok(false);
         };
+        self.preview = Some(preview::Preview::new(bytes, pages, name, job)?);
+        ctx.request_repaint();
+        Ok(true)
+    }
+
+    pub fn previewing(&self) -> bool {
+        self.preview.is_some()
+    }
+
+    fn spool(&mut self, preview: preview::Preview, ctx: &egui::Context) -> anyhow::Result<()> {
+        let preview::Preview {
+            bytes,
+            pages,
+            name,
+            job,
+            ..
+        } = preview;
         let (tx, rx) = mpsc::channel();
         let wake = ctx.clone();
         std::thread::Builder::new()
@@ -60,7 +86,26 @@ impl State {
                 wake.request_repaint();
             })?;
         self.pending = Some(rx);
-        Ok(true)
+        Ok(())
+    }
+
+    fn dialog(&mut self, ctx: &egui::Context) -> Option<(String, bool)> {
+        let draft = self.preview.as_mut()?;
+        match draft.show(ctx) {
+            preview::Action::None => {}
+            preview::Action::Settings => draft.configure(self.owner),
+            preview::Action::Cancel => {
+                self.preview = None;
+            }
+            preview::Action::Print => {
+                let preview = self.preview.take()?;
+                return Some(match self.spool(preview, ctx) {
+                    Ok(()) => ("Sending document to the printer…".into(), false),
+                    Err(error) => (format!("Could not print: {error:#}"), true),
+                });
+            }
+        }
+        None
     }
 
     pub fn poll(&mut self) -> Option<(String, bool)> {
@@ -150,7 +195,7 @@ impl Viewer {
     /// Print the active document as it looks now.
     pub(super) fn print_document(&mut self, ctx: &egui::Context) {
         let _ = ctx;
-        if !self.apply_pending_annotation() {
+        if self.unfinished_edit(None) || !self.apply_pending_annotation() {
             return;
         }
         let Some(tab) = self.tabs.get(self.active) else {
@@ -167,7 +212,7 @@ impl Viewer {
             self.status = match bytes
                 .and_then(|bytes| self.printing.start(bytes, tab.pages.clone(), name, ctx))
             {
-                Ok(true) => Some(("Sending document to the printer…".into(), false)),
+                Ok(true) => None,
                 Ok(false) => None,
                 Err(error) => Some((format!("Could not print: {error:#}"), true)),
             };
@@ -219,6 +264,13 @@ impl Viewer {
             }
         }
     }
+
+    #[cfg(target_os = "windows")]
+    pub(super) fn print_preview_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(status) = self.printing.dialog(ctx) {
+            self.status = Some(status);
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -249,6 +301,7 @@ mod windows_state_tests {
         let mut state = State {
             owner: 0,
             pending: Some(rx),
+            preview: None,
         };
         assert!(state.poll().is_none());
         assert!(

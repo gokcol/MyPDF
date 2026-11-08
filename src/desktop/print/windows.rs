@@ -3,16 +3,17 @@ use anyhow::{Context as _, Result, bail, ensure};
 use mypdf_milestone0::viewer::{self, PageSize};
 use std::{ops::Range, path::Path, ptr};
 use windows_sys::Win32::{
-    Foundation::{GlobalFree, HWND},
+    Foundation::{GlobalFree, HGLOBAL, HWND},
     Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteDC, GetDeviceCaps, HALFTONE,
-        HDC, HORZRES, LOGPIXELSX, LOGPIXELSY, SRCCOPY, SetBrushOrgEx, SetStretchBltMode,
-        StretchDIBits, VERTRES,
+        HDC, HORZRES, LOGPIXELSX, LOGPIXELSY, PHYSICALHEIGHT, PHYSICALOFFSETX, PHYSICALOFFSETY,
+        PHYSICALWIDTH, SRCCOPY, SetBrushOrgEx, SetStretchBltMode, StretchDIBits, VERTRES,
     },
     Storage::Xps::{AbortDoc, DOCINFOW, EndDoc, EndPage, StartDocW, StartPage},
+    System::Memory::{GlobalLock, GlobalSize, GlobalUnlock},
     UI::Controls::Dialogs::{
-        CommDlgExtendedError, PD_HIDEPRINTTOFILE, PD_NOSELECTION, PD_PAGENUMS, PD_RETURNDC,
-        PD_USEDEVMODECOPIESANDCOLLATE, PRINTDLGW, PrintDlgW,
+        CommDlgExtendedError, DEVNAMES, PD_HIDEPRINTTOFILE, PD_NOSELECTION, PD_PAGENUMS,
+        PD_RETURNDC, PD_RETURNDEFAULT, PD_USEDEVMODECOPIESANDCOLLATE, PRINTDLGW, PrintDlgW,
     },
 };
 
@@ -33,6 +34,76 @@ impl Drop for PrinterDc {
 pub(super) struct Job {
     dc: PrinterDc,
     pages: Range<usize>,
+    settings: Settings,
+}
+
+#[derive(Default)]
+struct Settings {
+    mode: HGLOBAL,
+    names: HGLOBAL,
+}
+// SAFETY: these uniquely owned global allocations move with the printer DC.
+// They are only locked on the UI thread and freed once, after printing.
+unsafe impl Send for Settings {}
+impl Drop for Settings {
+    fn drop(&mut self) {
+        for handle in [self.mode, self.names] {
+            if !handle.is_null() {
+                unsafe { GlobalFree(handle) };
+            }
+        }
+    }
+}
+impl Settings {
+    fn printer_name(&self) -> String {
+        // SAFETY: the dialog owns a DEVNAMES followed by UTF-16 strings. Bound
+        // every read by the allocation size and release the lock afterwards.
+        unsafe {
+            let size = GlobalSize(self.names);
+            let data = GlobalLock(self.names);
+            if data.is_null() {
+                return "Selected printer".into();
+            }
+            let name = if size >= std::mem::size_of::<DEVNAMES>() {
+                let offset = (*data.cast::<DEVNAMES>()).wDeviceOffset as usize;
+                let words = std::slice::from_raw_parts(data.cast::<u16>(), size / 2);
+                words.get(offset..).map(|s| {
+                    String::from_utf16_lossy(
+                        &s[..s.iter().position(|c| *c == 0).unwrap_or(s.len())],
+                    )
+                })
+            } else {
+                None
+            };
+            GlobalUnlock(self.names);
+            name.filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Selected printer".into())
+        }
+    }
+}
+
+/// Printer metrics shared by preview and output. GDI's origin is the printable
+/// area; the preview includes the physical paper and its unprintable margins.
+#[derive(Clone, Copy)]
+pub(super) struct Paper {
+    area: [i32; 2],
+    dpi: [i32; 2],
+    physical: [i32; 2],
+    offset: [i32; 2],
+}
+impl Paper {
+    pub fn points(self) -> [f32; 2] {
+        std::array::from_fn(|i| self.physical[i] as f32 * 72. / self.dpi[i] as f32)
+    }
+    pub fn page_rect(self, page: PageSize) -> Result<[f32; 4]> {
+        let [x, y, w, h] = fit_page(page, self.area, self.dpi)?;
+        Ok([
+            (x + self.offset[0]) as f32 / self.physical[0] as f32,
+            (y + self.offset[1]) as f32 / self.physical[1] as f32,
+            w as f32 / self.physical[0] as f32,
+            h as f32 / self.physical[1] as f32,
+        ])
+    }
 }
 
 fn dialog_options(owner: isize, count: usize) -> Result<PRINTDLGW> {
@@ -66,26 +137,43 @@ fn selected_pages(dialog: &PRINTDLGW, count: usize) -> Result<Range<usize>> {
     Ok(first - 1..last)
 }
 
-pub(super) fn choose_printer(owner: isize, count: usize) -> Result<Option<Job>> {
+pub(super) fn choose_printer(
+    owner: isize,
+    count: usize,
+    mut previous: Option<&mut Job>,
+    defaults: bool,
+) -> Result<Option<Job>> {
     let mut dialog = dialog_options(owner, count)?;
-    show_dialog(&mut dialog, count)
-}
-
-fn show_dialog(dialog: &mut PRINTDLGW, count: usize) -> Result<Option<Job>> {
+    if defaults {
+        dialog.Flags |= PD_RETURNDEFAULT;
+    }
+    if let Some(job) = previous.as_mut() {
+        let settings = std::mem::take(&mut job.settings);
+        dialog.hDevMode = settings.mode;
+        dialog.hDevNames = settings.names;
+        std::mem::forget(settings); // Ownership passes to the dialog, then back below.
+        if job.pages != (0..count) {
+            dialog.Flags |= PD_PAGENUMS;
+            dialog.nFromPage = (job.pages.start + 1) as u16;
+            dialog.nToPage = job.pages.end as u16;
+        }
+    }
     // SAFETY: called on the UI thread with a live owner (or null in native tests).
     // PrintDlgW initializes the owned handles; none escape without a Drop guard.
     let (accepted, error) = unsafe {
-        let accepted = PrintDlgW(dialog) != 0;
+        let accepted = PrintDlgW(&mut dialog) != 0;
         let error = if accepted { 0 } else { CommDlgExtendedError() };
-        for handle in [dialog.hDevMode, dialog.hDevNames] {
-            if !handle.is_null() {
-                GlobalFree(handle);
-            }
-        }
         (accepted, error)
+    };
+    let settings = Settings {
+        mode: dialog.hDevMode,
+        names: dialog.hDevNames,
     };
     let dc = PrinterDc(dialog.hDC);
     if !accepted {
+        if let Some(job) = previous {
+            job.settings = settings;
+        }
         if error == 0 {
             return Ok(None);
         }
@@ -96,7 +184,8 @@ fn show_dialog(dialog: &mut PRINTDLGW, count: usize) -> Result<Option<Job>> {
     ensure!(!dc.0.is_null(), "Windows did not return a printer.");
     Ok(Some(Job {
         dc,
-        pages: selected_pages(dialog, count)?,
+        pages: selected_pages(&dialog, count)?,
+        settings,
     }))
 }
 
@@ -191,6 +280,47 @@ impl Drop for ActiveDocument<'_> {
 }
 
 impl Job {
+    pub(super) fn pages(&self) -> Range<usize> {
+        self.pages.clone()
+    }
+    pub(super) fn printer_name(&self) -> String {
+        self.settings.printer_name()
+    }
+    pub(super) fn paper(&self) -> Result<Paper> {
+        let dc = self.dc.0;
+        // SAFETY: a live, exclusively owned printer DC.
+        let paper = unsafe {
+            Paper {
+                area: [
+                    GetDeviceCaps(dc, HORZRES as i32),
+                    GetDeviceCaps(dc, VERTRES as i32),
+                ],
+                dpi: [
+                    GetDeviceCaps(dc, LOGPIXELSX as i32),
+                    GetDeviceCaps(dc, LOGPIXELSY as i32),
+                ],
+                physical: [
+                    GetDeviceCaps(dc, PHYSICALWIDTH as i32),
+                    GetDeviceCaps(dc, PHYSICALHEIGHT as i32),
+                ],
+                offset: [
+                    GetDeviceCaps(dc, PHYSICALOFFSETX as i32),
+                    GetDeviceCaps(dc, PHYSICALOFFSETY as i32),
+                ],
+            }
+        };
+        ensure!(
+            paper
+                .area
+                .iter()
+                .chain(paper.dpi.iter())
+                .chain(paper.physical.iter())
+                .all(|v| *v > 0)
+                && paper.offset.iter().all(|v| *v >= 0),
+            "The printer returned invalid paper dimensions."
+        );
+        Ok(paper)
+    }
     pub(super) fn spool(
         self,
         bytes: &[u8],
@@ -217,19 +347,7 @@ impl Job {
                 .collect::<Vec<_>>()
         });
         let dc = self.dc.0;
-        // SAFETY: reading metrics from the selected printer's live DC.
-        let (area, dpi) = unsafe {
-            (
-                [
-                    GetDeviceCaps(dc, HORZRES as i32),
-                    GetDeviceCaps(dc, VERTRES as i32),
-                ],
-                [
-                    GetDeviceCaps(dc, LOGPIXELSX as i32),
-                    GetDeviceCaps(dc, LOGPIXELSY as i32),
-                ],
-            )
-        };
+        let Paper { area, dpi, .. } = self.paper()?;
         let targets = self
             .pages
             .clone()
@@ -343,6 +461,38 @@ mod tests {
     }
 
     #[test]
+    fn preview_includes_physical_margins_and_matches_the_printed_rectangle() {
+        let paper = Paper {
+            area: [2400, 6300],
+            dpi: [300, 600],
+            physical: [2550, 6600],
+            offset: [50, 100],
+        };
+        assert_eq!(paper.points(), [612., 792.]);
+        for page in [
+            PageSize {
+                width: 792.,
+                height: 612.,
+            },
+            PageSize {
+                width: 72.,
+                height: 72.,
+            },
+        ] {
+            let preview = paper.page_rect(page).unwrap();
+            let printed = fit_page(page, paper.area, paper.dpi).unwrap();
+            for (i, expected) in [printed[0] + 50, printed[1] + 100, printed[2], printed[3]]
+                .into_iter()
+                .enumerate()
+            {
+                assert!((preview[i] * paper.physical[i % 2] as f32 - expected as f32).abs() < 0.01);
+            }
+            assert!(preview[0] > 0. && preview[1] > 0.);
+            assert!(preview[0] + preview[2] <= 1. && preview[1] + preview[3] <= 1.);
+        }
+    }
+
+    #[test]
     fn gdi_print_bitmap_preserves_colors_and_top_down_orientation() {
         use windows_sys::Win32::Graphics::Gdi::{
             CreateCompatibleDC, CreateDIBSection, DeleteObject, SelectObject,
@@ -422,26 +572,41 @@ mod tests {
             "Microsoft Print to PDF is unavailable: {}",
             std::io::Error::last_os_error()
         );
-        Job {
+        let job = Job {
             dc: PrinterDc(dc),
             pages: 1..2,
-        }
-        .spool(
-            &bytes,
-            &[
-                PageSize {
-                    width: 144.,
-                    height: 144.,
-                },
-                PageSize {
-                    width: 144.,
-                    height: 72.,
-                },
-            ],
-            "MyPDF print regression",
-            Some(&output),
+            settings: Settings::default(),
+        };
+        let sizes = vec![
+            PageSize {
+                width: 144.,
+                height: 144.,
+            },
+            PageSize {
+                width: 144.,
+                height: 72.,
+            },
+        ];
+        // Opening and rendering the preview must not send a job. It uses the
+        // same annotated snapshot and selected range that is spooled below.
+        let preview = super::super::preview::Preview::new(
+            bytes.clone(),
+            sizes.clone(),
+            "Regression".into(),
+            job,
         )
         .unwrap();
+        assert!(!output.exists());
+        assert_eq!(preview.job.pages(), 1..2);
+        preview
+            .job
+            .spool(
+                &preview.bytes,
+                &preview.pages,
+                "MyPDF print regression",
+                Some(&output),
+            )
+            .unwrap();
         let printed = lopdf::Document::load(&output).unwrap();
         assert_eq!(
             printed.get_pages().len(),
