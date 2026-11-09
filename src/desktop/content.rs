@@ -702,6 +702,25 @@ impl ContentState {
         self.new_commit = false;
         Some(area)
     }
+    pub(super) fn selects_complete_table(&self, key: Key, rect: [f32; 4]) -> bool {
+        let Some((selected_key, area)) = self.table_selection else {
+            return false;
+        };
+        let contains = |outer: [f32; 4], inner: [f32; 4]| {
+            inner[0] >= outer[0] - 3.
+                && inner[1] >= outer[1] - 3.
+                && inner[2] <= outer[2] + 3.
+                && inner[3] <= outer[3] + 3.
+        };
+        selected_key == key
+            && contains(area, rect)
+            && self.existing.as_ref().is_some_and(|draft| {
+                draft.key == key
+                    && !draft.changed()
+                    && matches!(&draft.target, InlineTarget::Block(block)
+                        if block.masks.iter().all(|mask| contains(rect, *mask)))
+            })
+    }
     pub(super) fn pending_text(&self) -> Option<u64> {
         if let Some(text) = &self.existing {
             return Some(text.key.0);
@@ -4162,6 +4181,40 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn complete_table_selection_preserves_partial_selections_and_pending_edits() {
+        let key = (1, 0, 0);
+        let rect = [40., 80., 440., 200.];
+        let item = InlineText {
+            key,
+            target: InlineTarget::Run(0),
+            geometry: None,
+            original: "Cell".into(),
+            text: "Cell".into(),
+            rect: [50., 90., 100., 110.],
+            size: 12.,
+            color: [0.; 3],
+            font: "Helvetica".into(),
+            focus: true,
+        };
+        let mut state = ContentState::new();
+        state.table_selection = Some((key, rect));
+        state.existing = selected_block(
+            vec![item],
+            rect,
+            PageSize {
+                width: 500.,
+                height: 600.,
+            },
+        );
+        assert!(state.selects_complete_table(key, rect));
+        assert!(!state.selects_complete_table((1, 1, 0), rect));
+        assert!(!state.selects_complete_table(key, [40., 80., 460., 200.]));
+        assert!(!state.selects_complete_table(key, [120., 80., 440., 200.]));
+        state.existing.as_mut().unwrap().text.push('!');
+        assert!(!state.selects_complete_table(key, rect));
+    }
+
     #[test]
     fn spacing_adjustment_preserves_indents_and_is_written_to_pdf() {
         use mypdf_milestone0::{

@@ -55,6 +55,115 @@ fn tables_round_trip_unicode_edit_cells_and_keep_neighboring_content() {
     );
 }
 #[test]
+fn short_detected_header_cells_remain_editable_at_the_original_font_size() {
+    let mut table = Table::new(2, 2, [40., 80., 440., 130.]);
+    table.ys = vec![80., 93., 130.];
+    table.cells = vec!["Role".into(), "Name".into(), "Team".into(), "Deniz".into()];
+    table.styles = vec![
+        tables::CellStyle {
+            size: 11.,
+            insets: [7.5, 0., 3., 0.],
+            vertical: 1,
+            ..Default::default()
+        };
+        4
+    ];
+    let source =
+        external_grid(&tables::write(&convert::blank(500., 500.).unwrap(), 1, &table).unwrap());
+    let detected = tables::detect(&source, 1).unwrap().remove(0);
+    let style = detected.style(0);
+    assert_eq!(style.size, 11.);
+    assert!((style.insets[0] - 7.5).abs() < 0.01);
+    assert!(style.insets[1] + style.insets[3] < 1.);
+    let edited = tables::edit_cell(&source, 1, &detected, 0, "Owner").unwrap();
+    let found = tables::detect(&edited, 1).unwrap().remove(0);
+    assert_eq!(found.cells, ["Owner", "Name", "Team", "Deniz"]);
+    assert_eq!(found.ys, detected.ys);
+    let cell = found.cell(0);
+    let runs = text_geometry::runs(&edited, 1).unwrap();
+    let text = runs.iter().find(|run| run.text == "Owner").unwrap();
+    let bounds = text.rect.unwrap();
+    assert!((text.layout.as_ref().unwrap().origin[0] - 47.5).abs() < 0.01);
+    assert!(
+        bounds[1] >= cell[1] && bounds[3] <= cell[3],
+        "{bounds:?} in {cell:?}"
+    );
+}
+
+#[test]
+fn imported_cell_baselines_survive_text_edits_and_color_changes() {
+    use mypdf_milestone0::rich_text::{self, LineLayout, Span};
+    let table = Table::new(2, 2, [40., 80., 440., 200.]);
+    let grid =
+        external_grid(&tables::write(&convert::blank(500., 500.).unwrap(), 1, &table).unwrap());
+    let font = mypdf_milestone0::text_style::fonts()
+        .iter()
+        .find(|f| f.family == "Arial" && !f.bold && !f.italic)
+        .unwrap()
+        .path
+        .clone();
+    let text = "First line\nSecond line";
+    let source = rich_text::add_positioned(
+        &grid,
+        1,
+        text,
+        [40., 80., 200., 60.],
+        &[Span {
+            range: 0..text.len(),
+            font: Some(font),
+            size: 11.,
+            color: [0.; 3],
+        }],
+        &[
+            LineLayout {
+                start: 0,
+                left: 7.,
+                baseline: 19.,
+            },
+            LineLayout {
+                start: 11,
+                left: 7.,
+                baseline: 34.,
+            },
+        ],
+    )
+    .unwrap();
+    let mut detected = tables::detect(&source, 1).unwrap().remove(0);
+    assert_eq!(detected.style(0).baselines, [19., 34.]);
+    let mut style = detected.style(0);
+    style.color = [0.5, 0., 0.];
+    detected.set_style(0, tables::Scope::Table, style);
+    assert_eq!(detected.style(0).baselines, [19., 34.]);
+    assert!(
+        detected.style(1).baselines.is_empty(),
+        "Do not copy another cell's origins"
+    );
+    let edited = tables::edit_cell(&source, 1, &detected, 0, "Other line\nEdited line").unwrap();
+    let runs = text_geometry::runs(&edited, 1).unwrap();
+    for (text, y) in [("Other line", 99.), ("Edited line", 114.)] {
+        let origin = runs
+            .iter()
+            .find(|r| r.text == text)
+            .unwrap()
+            .layout
+            .as_ref()
+            .unwrap()
+            .origin;
+        assert!(
+            (origin[0] - 47.).abs() < 0.01 && (origin[1] - y).abs() < 0.01,
+            "{origin:?}"
+        );
+    }
+    let mut style = detected.style(0);
+    style.vertical = 2;
+    detected.set_style(0, tables::Scope::Cell, style);
+    assert!(
+        detected.style(0).baselines.is_empty(),
+        "Explicit alignment must reflow"
+    );
+}
+
+#[test]
 fn bordered_table_detection_is_non_mutating_and_cell_changes_preserve_grid() {
     let mut t = Table::new(3, 2, [40., 70., 460., 250.]);
     t.cells[0] = "Name".into();
@@ -285,10 +394,13 @@ fn detected_cell_formatting_persists_without_changing_neighbors() {
     style.alignment = 1;
     style.vertical = 1;
     changed.set_style(2, Scope::Row, style.clone());
+    assert!(changed.style(2).baselines.is_empty());
     changed.cells[2] = "İstanbul".into();
     let bytes = tables::edit_detected(&input, 1, &changed, &base).unwrap();
     let found = tables::detect(&bytes, 1).unwrap().remove(0);
     assert_eq!(found.cells, changed.cells);
+    style.baselines = found.style(2).baselines.clone();
+    assert_eq!(style.baselines.len(), 1);
     assert_eq!(found.style(2), style);
     assert_eq!(found.style(3), style);
     assert_eq!(found.style(0), base.style(0));

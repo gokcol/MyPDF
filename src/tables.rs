@@ -24,6 +24,9 @@ pub struct CellStyle {
     pub vertical: u8,
     pub bold: bool,
     pub italic: bool,
+    /// Original PDF baselines relative to the cell top, retained until reflow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub baselines: Vec<f32>,
 }
 impl Default for CellStyle {
     fn default() -> Self {
@@ -38,7 +41,21 @@ impl Default for CellStyle {
             vertical: 0,
             bold: false,
             italic: false,
+            baselines: vec![],
         }
+    }
+}
+impl CellStyle {
+    pub fn baseline(&self, line: usize) -> Option<f32> {
+        self.baselines.get(line).copied().or_else(|| {
+            let last = *self.baselines.last()?;
+            let step = if self.baselines.len() > 1 {
+                last - self.baselines[self.baselines.len() - 2]
+            } else {
+                self.size * 1.3
+            };
+            Some(last + step * (line + 1 - self.baselines.len()) as f32)
+        })
     }
 }
 pub const TEMPLATES: [&str; 5] = ["Plain", "Business blue", "Sage", "Warm", "Ledger"];
@@ -136,7 +153,22 @@ impl Table {
                 Scope::Column => i % columns == index % columns,
                 Scope::Table => true,
             } {
-                self.styles[i] = style.clone();
+                let previous = &self.styles[i];
+                let mut updated = style.clone();
+                // Placement belongs to the destination cell, not to the style
+                // being copied from another row or column.
+                updated.baselines = if !style.baselines.is_empty()
+                    && previous.size == style.size
+                    && previous.vertical == style.vertical
+                    && previous.insets == style.insets
+                    && previous.bold == style.bold
+                    && previous.italic == style.italic
+                {
+                    previous.baselines.clone()
+                } else {
+                    vec![]
+                };
+                self.styles[i] = updated;
             }
         }
     }
@@ -468,6 +500,8 @@ impl Table {
                     && s.alignment <= 2
                     && s.vertical <= 2
                     && s.insets.iter().all(|v| (0. ..=36.).contains(v))
+                    && s.baselines.iter().all(|v| v.is_finite() && *v >= 0.)
+                    && s.baselines.windows(2).all(|v| v[1] > v[0])
                     && (0. ..=8.).contains(&s.border_width)
                     && s.color
                         .iter()
@@ -780,7 +814,14 @@ fn layout_lines(
                 2 => (height - used).max(0.),
                 _ => 0.,
             };
-        for line in lines {
+        for (line_index, line) in lines.into_iter().enumerate() {
+            if let Some(baseline) = style.baseline(line_index) {
+                let [ascent, descent, _] = writer.line_metrics(&line.line, style.size);
+                ensure!(
+                    baseline >= ascent - 0.5 && baseline + descent <= b - t + 0.5,
+                    "Text does not fit inside the cell. Enlarge the row or change vertical alignment."
+                );
+            }
             let x = match style.alignment {
                 1 => l + left + (width - line.width) / 2.,
                 2 => r - right - line.width,
@@ -790,7 +831,9 @@ fn layout_lines(
                 line: line.line,
                 text: line.text,
                 x,
-                y: y + line.baseline,
+                y: style
+                    .baseline(line_index)
+                    .map_or(y + line.baseline, |v| t + v),
                 style: style.clone(),
                 writer: index,
             });
@@ -1175,22 +1218,53 @@ pub fn edit_cell(
             .clone()
             .unwrap_or(crate::document::default_font()?),
     ))?;
-    let lines = writer.wrap(text, style.size, rect[2])?;
-    let used = lines.len() as f32 * style.size * 1.25;
-    let y = rect[1]
+    let lines = measured_lines(text, &style, rect[2], &mut writer)?;
+    let used = lines.iter().map(|line| line.height).sum::<f32>();
+    ensure!(used <= rect[3] + 0.1, "Text does not fit inside the cell");
+    let mut top = top
         + match style.vertical {
             1 => (rect[3] - used).max(0.) / 2.,
             2 => (rect[3] - used).max(0.),
             _ => 0.,
         };
-    crate::content::add_text_styled(
+    let mut text = String::new();
+    let mut layout = Vec::new();
+    for (line_index, line) in lines.into_iter().enumerate() {
+        if let Some(baseline) = style.baseline(line_index) {
+            let [ascent, descent, _] = writer.line_metrics(&line.line, style.size);
+            ensure!(
+                baseline >= ascent - 0.5 && baseline + descent <= b - t + 0.5,
+                "Text does not fit inside the cell. Change vertical alignment or reduce font size."
+            );
+        }
+        if !layout.is_empty() {
+            text.push('\n');
+        }
+        layout.push(crate::rich_text::LineLayout {
+            start: text.len(),
+            left: left
+                + match style.alignment {
+                    1 => (rect[2] - line.width) / 2.,
+                    2 => rect[2] - line.width,
+                    _ => 0.,
+                },
+            baseline: style.baseline(line_index).unwrap_or(top + line.baseline),
+        });
+        text.push_str(&line.text);
+        top += line.height;
+    }
+    crate::rich_text::add_positioned(
         &stripped,
         page,
-        text,
-        [rect[0], y, rect[2], (rect[1] + rect[3] - y).max(1.)],
-        style.size,
-        style.color,
-        &format,
+        &text,
+        [l, t, r - l, b - t],
+        &[crate::rich_text::Span {
+            range: 0..text.len(),
+            font: format.font,
+            size: style.size,
+            color: style.color,
+        }],
+        &layout,
     )
 }
 const CELL_STYLE: &[u8] = b"MyPDFCellStyle";
@@ -1441,13 +1515,22 @@ fn detected_style(
             .is_some_and(|r| contains(cell, [(r[0] + r[2]) / 2., (r[1] + r[3]) / 2.]))
     }) {
         style.size = run.size.clamp(4., 72.);
+        // Imported header rows can be barely taller than their text. Leave
+        // room for a full line instead of imposing the default six-point gap.
+        let padding = ((cell[3] - cell[1] - style.size * 1.3) / 2.).clamp(0., 3.);
+        style.insets[1] = padding;
+        style.insets[3] = padding;
         style.color = run.color;
         let name = run.base_font.to_lowercase();
         style.bold = name.contains("bold");
         style.italic = name.contains("italic") || name.contains("oblique");
         if let Some(rect) = run.rect {
-            let left = rect[0] - cell[0];
-            let right = cell[2] - rect[2];
+            let (left, right) = run
+                .layout
+                .as_ref()
+                .map_or((rect[0] - cell[0], cell[2] - rect[2]), |layout| {
+                    (layout.origin[0] - cell[0], cell[2] - layout.end[0])
+                });
             style.alignment = if (left - right).abs() < 4. {
                 1
             } else if right < left && right < 12. {
@@ -1455,11 +1538,30 @@ fn detected_style(
             } else {
                 0
             };
+            // Use advances rather than glyph ink bounds so changing the first
+            // letter does not move the cell's insertion point.
+            match style.alignment {
+                0 => style.insets[0] = left.clamp(0., 36.),
+                2 => style.insets[2] = right.clamp(0., 36.),
+                _ => {}
+            }
             if ((rect[1] + rect[3] - cell[1] - cell[3]) / 2.).abs() < style.size * 0.4 {
                 style.vertical = 1;
             }
         }
     }
+    style.baselines = runs
+        .iter()
+        .filter_map(|run| {
+            let rect = run.rect?;
+            let layout = run.layout.as_ref()?;
+            contains(cell, [(rect[0] + rect[2]) / 2., (rect[1] + rect[3]) / 2.])
+                .then_some(layout.origin[1] - cell[1])
+        })
+        .filter(|v| v.is_finite() && *v >= 0.)
+        .collect();
+    style.baselines.sort_by(f32::total_cmp);
+    style.baselines.dedup_by(|a, b| (*a - *b).abs() < 3.);
     style
 }
 
@@ -1666,12 +1768,16 @@ pub fn detect(bytes: &[u8], page: u32) -> Result<Vec<Table>> {
                     table.styles = (0..table.cells.len())
                         .map(|i| {
                             let rect = table.cell(i);
-                            painted
+                            let mut style = painted
                                 .iter()
                                 .rev()
                                 .find(|(r, _)| r.iter().zip(rect).all(|(a, b)| (*a - b).abs() < 1.))
                                 .map(|(_, s)| s.clone())
-                                .unwrap_or_else(|| detected_style(rect, &runs, &paints))
+                                .unwrap_or_else(|| detected_style(rect, &runs, &paints));
+                            // Older saved cell styles predate retained baselines;
+                            // the PDF remains the authority after every edit.
+                            style.baselines = detected_style(rect, &runs, &paints).baselines;
+                            style
                         })
                         .collect();
                 }

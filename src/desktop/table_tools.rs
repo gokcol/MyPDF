@@ -568,6 +568,22 @@ impl Viewer {
         {
             self.table.editor = None;
         }
+        // A complete grid must retain its cell positions. The ordinary text
+        // block editor joins fragments on a baseline across column borders.
+        if self.editor.mode == editing::Mode::Edit
+            && self.table.key == Some(key)
+            && self.table.rx.is_none()
+            && self.table.editor.is_none()
+            && self.table.area.is_none()
+            && self
+                .table
+                .owned
+                .iter()
+                .chain(&self.table.detected)
+                .any(|table| self.content.selects_complete_table(key, table.rect()))
+        {
+            self.table_from_selection();
+        }
         if self.table.key == Some(key)
             && self.table.rx.is_none()
             && let Some((request, area)) = self.table.area.take()
@@ -1297,7 +1313,7 @@ impl Viewer {
                                 ui.small(format!("Row {} · Column {}{}", e.cell / e.table.columns() + 1, e.cell % e.table.columns() + 1,
                                     if span != [1,1] { format!(" · {} × {} merged", span[0],span[1]) } else { String::new() }));
                             }
-                            egui::CollapsingHeader::new("Layout").default_open(true).show(ui, |ui| {
+                            egui::CollapsingHeader::new("Layout").default_open(false).show(ui, |ui| {
                                 if e.owned {
                                     let (r, c) = (e.cell / e.table.columns(), e.cell % e.table.columns());
                                     let [l, t, right, bottom] = e.table.rect();
@@ -1330,7 +1346,11 @@ impl Viewer {
                             });
                             egui::CollapsingHeader::new("Cell properties").default_open(true).show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    for (i, label) in ["Cell", "Row", "Column", "Table"].iter().enumerate() { ui.selectable_value(&mut e.scope, i, *label); }
+                                    ui.label("Apply to");
+                                    let scopes = ["Selected cell", "Entire row", "Entire column", "Entire table"];
+                                    egui::ComboBox::from_id_salt("cell_scope").width(150.).selected_text(scopes[e.scope]).show_ui(ui, |ui| {
+                                        for (i, label) in scopes.iter().enumerate() { ui.selectable_value(&mut e.scope, i, *label); }
+                                    });
                                 });
                                 let mut style = e.table.style(e.cell);
                                 let before = style.clone();
@@ -1805,16 +1825,20 @@ pub(super) fn overlay(
     }
     let r = screen(e.table.cell(e.cell));
     let cell_style = e.table.style(e.cell);
+    let font = cell_font(&cell_style, scale);
     let [left, top, right, bottom] = cell_style.insets;
     let mut textrect = Rect::from_min_max(
         r.min + vec2(left, top) * scale,
         r.max - vec2(right, bottom) * scale,
     );
-    if cell_style.vertical != 0 {
+    if !cell_style.baselines.is_empty() {
+        textrect.min.y = r.min.y;
+        textrect.max.y = r.max.y;
+    } else if cell_style.vertical != 0 {
         let galley = ui.fonts_mut(|f| {
             f.layout(
                 e.text.clone(),
-                FontId::proportional(cell_style.size * scale),
+                font.clone(),
                 rgb(cell_style.color),
                 textrect.width().max(1.),
             )
@@ -1847,18 +1871,27 @@ pub(super) fn overlay(
     ui.scope_builder(egui::UiBuilder::new().max_rect(textrect), |ui| {
         ui.set_clip_rect(textrect.intersect(rect));
         ui.add_enabled_ui(!waiting, |ui| {
+            let id = egui::Id::new((tab.id, "table_cell_text"));
+            let owner = (e.key.2, e.table.id.clone(), e.cell);
+            let owner_id = id.with("owner");
+            if ui
+                .ctx()
+                .data_mut(|data| data.get_temp::<(usize, String, usize)>(owner_id))
+                != Some(owner.clone())
+            {
+                egui::text_edit::TextEditState::default().store(ui.ctx(), id);
+                ui.ctx().data_mut(|data| data.insert_temp(owner_id, owner));
+            }
+            let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, width: f32| {
+                cell_galley(ui, text.as_str(), &cell_style, scale, width)
+            };
             let response = ui.add_sized(
                 textrect.size(),
                 egui::TextEdit::multiline(&mut e.text)
-                    .id(egui::Id::new((tab.id, "table_cell_text")))
-                    .font(FontId::new(
-                        cell_style.size * scale,
-                        if cell_style.bold {
-                            ui::semibold()
-                        } else {
-                            egui::FontFamily::Proportional
-                        },
-                    ))
+                    .id(id)
+                    .layouter(&mut layouter)
+                    .font(font.clone())
+                    .desired_rows(1)
                     .text_color(rgb(cell_style.color))
                     .margin(0.)
                     .horizontal_align(match cell_style.alignment {
@@ -1893,6 +1926,70 @@ pub(super) fn overlay(
     }
     true
 }
+fn cell_font(style: &tables::CellStyle, scale: f32) -> FontId {
+    let family = mypdf_milestone0::text_style::fonts()
+        .iter()
+        .find(|font| {
+            font.family == "Arial" && font.bold == style.bold && font.italic == style.italic
+        })
+        .map(|font| egui::FontFamily::Name(font.ui_name().into()))
+        .unwrap_or_else(|| {
+            if style.bold {
+                ui::semibold()
+            } else {
+                egui::FontFamily::Proportional
+            }
+        });
+    FontId::new(style.size * scale, family)
+}
+fn cell_galley(
+    ui: &egui::Ui,
+    text: &str,
+    style: &tables::CellStyle,
+    scale: f32,
+    width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let job = egui::text::LayoutJob::simple(
+        text.to_owned(),
+        cell_font(style, scale),
+        rgb(style.color),
+        width.max(1.),
+    );
+    let ordinary = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    if style.baselines.is_empty() && style.alignment == 0 {
+        return ordinary;
+    }
+    let mut galley = (*ordinary).clone();
+    let block_width = ordinary.size().x;
+    galley.rect = Rect::ZERO;
+    galley.mesh_bounds = Rect::NOTHING;
+    for (index, row) in galley.rows.iter_mut().enumerate() {
+        let indent = match style.alignment {
+            1 => (block_width - row.size.x) / 2.,
+            2 => block_width - row.size.x,
+            _ => 0.,
+        };
+        // Align each line inside the block, retaining row-local cursor and
+        // pointer coordinates as well as the painted glyph positions.
+        let content = std::sync::Arc::make_mut(&mut row.row);
+        for glyph in &mut content.glyphs {
+            glyph.pos.x += indent;
+        }
+        content.visuals.mesh.translate(vec2(indent, 0.));
+        content.visuals.mesh_bounds = content.visuals.mesh_bounds.translate(vec2(indent, 0.));
+        content.size.x += indent;
+        let ascent = row
+            .glyphs
+            .first()
+            .map_or(style.size * scale, |glyph| glyph.pos.y);
+        if let Some(baseline) = style.baseline(index) {
+            row.pos.y = baseline * scale - ascent;
+        }
+        galley.rect |= Rect::from_min_size(row.pos, row.size);
+        galley.mesh_bounds |= row.visuals.mesh_bounds.translate(row.pos.to_vec2());
+    }
+    std::sync::Arc::new(galley)
+}
 fn paint_grid(ui: &egui::Ui, table: &Table, screen: impl Fn([f32; 4]) -> Rect, owned: bool) {
     let painter = ui.painter().with_clip_rect(ui.clip_rect());
     let scale = screen([0., 0., 1., 1.]).width();
@@ -1923,31 +2020,20 @@ fn paint_grid(ui: &egui::Ui, table: &Table, screen: impl Fn([f32; 4]) -> Rect, o
             let [l, t, right, b] = style.insets;
             let textrect =
                 Rect::from_min_max(r.min + vec2(l, t) * scale, r.max - vec2(right, b) * scale);
-            let font = FontId::new(
-                style.size * scale,
-                if style.bold {
-                    ui::semibold()
-                } else {
-                    egui::FontFamily::Proportional
-                },
-            );
-            let galley = ui.fonts_mut(|f| {
-                f.layout(
-                    table.cells[i].clone(),
-                    font,
-                    rgb(style.color),
-                    textrect.width().max(1.),
-                )
-            });
+            let galley = cell_galley(ui, &table.cells[i], &style, scale, textrect.width());
             let x = match style.alignment {
                 1 => textrect.center().x - galley.size().x / 2.,
                 2 => textrect.right() - galley.size().x,
                 _ => textrect.left(),
             };
-            let y = match style.vertical {
-                1 => textrect.center().y - galley.size().y / 2.,
-                2 => textrect.bottom() - galley.size().y,
-                _ => textrect.top(),
+            let y = if !style.baselines.is_empty() {
+                r.top()
+            } else {
+                match style.vertical {
+                    1 => textrect.center().y - galley.size().y / 2.,
+                    2 => textrect.bottom() - galley.size().y,
+                    _ => textrect.top(),
+                }
             };
             painter
                 .with_clip_rect(r)
@@ -2178,68 +2264,97 @@ pub(super) fn preview(app: &mut Viewer, ctx: &egui::Context, detected: bool) {
 }
 
 fn cell_properties(ui: &mut egui::Ui, style: &mut tables::CellStyle) {
-    ui.horizontal(|ui| {
-        ui.label("Text");
-        ui.add(
-            egui::DragValue::new(&mut style.size)
-                .range(4. ..=72.)
-                .suffix(" pt"),
-        );
-        if ui.selectable_label(style.bold, "B").clicked() {
-            style.bold = !style.bold;
-        }
-        if ui.selectable_label(style.italic, "I").clicked() {
-            style.italic = !style.italic;
-        }
-        ui::color_swatch(ui, &mut style.color, "Table text color");
-    });
-    ui.horizontal(|ui| {
-        ui.label("Align");
-        for (i, label) in ["Left", "Center", "Right"].iter().enumerate() {
-            ui.selectable_value(&mut style.alignment, i as u8, *label);
-        }
-    });
-    ui.horizontal(|ui| {
-        ui.label("Vertical");
-        for (i, label) in ["Top", "Middle", "Bottom"].iter().enumerate() {
-            ui.selectable_value(&mut style.vertical, i as u8, *label);
-        }
-    });
-    ui.horizontal(|ui| {
-        let mut fill = style.fill.is_some();
-        if ui.checkbox(&mut fill, "Fill").changed() {
-            style.fill = fill.then_some([0.95; 3]);
-        }
-        if let Some(color) = &mut style.fill {
-            ui::color_swatch(ui, color, "Table cell fill");
-        }
-        ui.label("Border");
-        ui::color_swatch(ui, &mut style.border, "Table border color");
-        ui.add(
-            egui::DragValue::new(&mut style.border_width)
-                .range(0. ..=8.)
-                .speed(0.1)
-                .suffix(" pt"),
-        );
-    });
-    ui.small("Inside spacing");
-    egui::Grid::new("table_cell_insets")
-        .num_columns(4)
-        .spacing([6., 4.])
+    ui.add_space(6.);
+    egui::Grid::new("table_cell_properties")
+        .num_columns(2)
+        .spacing([12., 8.])
         .show(ui, |ui| {
-            for (i, label) in ["Left", "Top", "Right", "Bottom"].iter().enumerate() {
-                ui.label(*label);
+            ui.label("Font");
+            ui.horizontal(|ui| {
                 ui.add(
-                    egui::DragValue::new(&mut style.insets[i])
-                        .range(0. ..=36.)
-                        .speed(0.5)
+                    egui::DragValue::new(&mut style.size)
+                        .range(4. ..=72.)
                         .suffix(" pt"),
                 );
-                if i % 2 == 1 {
-                    ui.end_row();
-                }
+                ui.toggle_value(&mut style.bold, egui::RichText::new("B").strong())
+                    .on_hover_text("Bold");
+                ui.toggle_value(&mut style.italic, egui::RichText::new("I").italics())
+                    .on_hover_text("Italic");
+            });
+            ui.end_row();
+            ui.label("Text color");
+            ui::color_swatch(ui, &mut style.color, "Table text color");
+            ui.end_row();
+            for (label, value, choices) in [
+                (
+                    "Horizontal",
+                    &mut style.alignment,
+                    ["Left", "Center", "Right"],
+                ),
+                ("Vertical", &mut style.vertical, ["Top", "Middle", "Bottom"]),
+            ] {
+                ui.label(label);
+                egui::ComboBox::from_id_salt(label)
+                    .width(120.)
+                    .selected_text(if label == "Vertical" && !style.baselines.is_empty() {
+                        "Original"
+                    } else {
+                        choices[*value as usize]
+                    })
+                    .show_ui(ui, |ui| {
+                        for (i, choice) in choices.iter().enumerate() {
+                            if ui.selectable_value(value, i as u8, *choice).clicked()
+                                && label == "Vertical"
+                            {
+                                style.baselines.clear();
+                            }
+                        }
+                    });
+                ui.end_row();
             }
+            ui.label("Background");
+            ui.horizontal(|ui| {
+                let mut fill = style.fill.is_some();
+                if ui.checkbox(&mut fill, "Fill").changed() {
+                    style.fill = fill.then_some([0.95; 3]);
+                }
+                if let Some(color) = &mut style.fill {
+                    ui::color_swatch(ui, color, "Table cell fill");
+                }
+            });
+            ui.end_row();
+            ui.label("Border");
+            ui.horizontal(|ui| {
+                ui::color_swatch(ui, &mut style.border, "Table border color");
+                ui.add(
+                    egui::DragValue::new(&mut style.border_width)
+                        .range(0. ..=8.)
+                        .speed(0.1)
+                        .suffix(" pt"),
+                );
+            });
+            ui.end_row();
         });
+    ui.add_space(8.);
+    egui::CollapsingHeader::new("Cell padding").show(ui, |ui| {
+        egui::Grid::new("table_cell_insets")
+            .num_columns(4)
+            .spacing([8., 6.])
+            .show(ui, |ui| {
+                for (i, label) in ["Left", "Top", "Right", "Bottom"].iter().enumerate() {
+                    ui.label(*label);
+                    ui.add(
+                        egui::DragValue::new(&mut style.insets[i])
+                            .range(0. ..=36.)
+                            .speed(0.5)
+                            .suffix(" pt"),
+                    );
+                    if i % 2 == 1 {
+                        ui.end_row();
+                    }
+                }
+            });
+    });
 }
 fn template_choice(ui: &mut egui::Ui, choice: &mut usize) -> bool {
     let before = *choice;
@@ -2289,6 +2404,67 @@ fn rgb(c: [f32; 3]) -> Color32 {
 mod tests {
     use super::*;
     use eframe::App;
+    #[test]
+    fn cell_editor_keeps_pdf_baselines_at_different_zoom_levels() {
+        let (_, ctx) = fixture();
+        for scale in [0.75, 1., 2.] {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for (text, baselines) in [
+                        ("Role", vec![10.5]),
+                        ("Version\ncreated", vec![10.5, 23.]),
+                        ("Validity", vec![22.]),
+                    ] {
+                        let style = tables::CellStyle {
+                            baselines: baselines.clone(),
+                            ..Default::default()
+                        };
+                        let galley = cell_galley(ui, text, &style, scale, 200. * scale);
+                        assert_eq!(galley.rows.len(), baselines.len());
+                        for (row, baseline) in galley.rows.iter().zip(baselines) {
+                            for glyph in &row.glyphs {
+                                assert!((row.pos.y + glyph.pos.y - baseline * scale).abs() < 0.01);
+                            }
+                        }
+                    }
+                });
+            });
+        }
+    }
+    #[test]
+    fn multiline_cell_alignment_keeps_each_line_and_cursor_in_place() {
+        let (_, ctx) = fixture();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for alignment in [1, 2] {
+                    let style = tables::CellStyle {
+                        alignment,
+                        baselines: vec![14., 28.],
+                        ..Default::default()
+                    };
+                    let galley = cell_galley(ui, "A much longer line\nShort", &style, 1., 300.);
+                    let width = galley.size().x;
+                    for row in &galley.rows {
+                        let left = row.glyphs.first().unwrap().pos.x;
+                        let last = row.glyphs.last().unwrap();
+                        let right = last.pos.x + last.advance_width;
+                        assert!(
+                            (if alignment == 1 {
+                                (left + right) / 2. - width / 2.
+                            } else {
+                                right - width
+                            })
+                            .abs()
+                                < 0.1
+                        );
+                    }
+                    let cursor = egui::text::CCursor::new("A much longer line\n".chars().count());
+                    let rect = galley.pos_from_cursor(cursor);
+                    assert!((rect.left() - galley.rows[1].glyphs[0].pos.x).abs() < 0.1);
+                }
+            });
+        });
+    }
     fn fixture() -> (Viewer, egui::Context) {
         let ctx = egui::Context::default();
         let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
@@ -2583,10 +2759,34 @@ mod tests {
     #[test]
     fn selecting_a_table_area_works_in_the_complete_desktop_layout() {
         let (mut app, ctx) = fixture();
-        let mut table = Table::new(2, 2, [40., 80., 440., 200.]);
-        table.cells[0] = "Name".into();
-        table.cells[1] = "Status".into();
-        table.cells[2] = "İstanbul".into();
+        let mut table = Table::new(4, 5, [40., 80., 440., 260.]);
+        table.ys[1] = 93.;
+        table.styles = vec![
+            tables::CellStyle {
+                insets: [3., 0., 3., 0.],
+                vertical: 1,
+                ..Default::default()
+            };
+            table.cells.len()
+        ];
+        table.merge_range(10, 11).unwrap();
+        table.merge_range(15, 19).unwrap();
+        for (i, text) in [
+            (0, "Role"),
+            (1, "Department"),
+            (2, "Name"),
+            (3, "Date"),
+            (4, "Result"),
+            (5, "Version\ncreated"),
+            (6, "Team A"),
+            (7, "Deniz"),
+            (8, "6 November\n2026"),
+            (10, "Validity"),
+            (13, "until"),
+            (15, "Approved electronically"),
+        ] {
+            table.cells[i] = text.into();
+        }
         let bytes =
             tables::write(&app.tabs[0].session.as_ref().unwrap().source, 1, &table).unwrap();
         let mut doc = lopdf::Document::load_mem(&bytes).unwrap();
@@ -2606,7 +2806,7 @@ mod tests {
             .set("Contents", stream);
         let bytes = mypdf_milestone0::content::serialize(&mut doc).unwrap();
         app.tabs[0].session = Some(mypdf_milestone0::annotations::Session::new(
-            bytes.into(),
+            bytes.clone().into(),
             vec![],
             true,
         ));
@@ -2638,7 +2838,7 @@ mod tests {
         let layout = tab.document_layout.as_ref().unwrap();
         let origin = view.min - offset + layout.rects[0].min.to_vec2();
         let start = origin + vec2(30., 70.) * layout.scale;
-        let end = origin + vec2(450., 210.) * layout.scale;
+        let end = origin + vec2(450., 270.) * layout.scale;
         frame(
             &mut app,
             vec![
@@ -2665,6 +2865,28 @@ mod tests {
             app.content.loading,
             app.content.area_mode,
             app.table.editor.is_some()
+        );
+        while app.table.editor.is_none() {
+            frame(&mut app, vec![]);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Table selection did not open"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let editor = app.table.editor.as_ref().unwrap();
+        assert_eq!(editor.table.cells, table.cells);
+        assert_eq!(editor.table.spans, table.spans);
+        let style = editor.table.style(0);
+        let line_height = ctx.fonts_mut(|fonts| fonts.row_height(&cell_font(&style, 1.)));
+        let header = editor.table.cell(0);
+        assert!(line_height + style.insets[1] + style.insets[3] <= header[3] - header[1]);
+        assert!(app.content.existing_text().is_none());
+        let session = app.tabs[0].session.as_ref().unwrap();
+        assert_eq!(session.source.as_ref(), bytes.as_slice());
+        assert!(
+            !session.can_undo(),
+            "Selecting a table must not rewrite its text"
         );
     }
 
