@@ -1,10 +1,10 @@
 # Privacy Policy for MyPDF (OG)
 
-Effective date: 20 October 2026
+Effective date: 10 November 2026
 
 This policy covers MyPDF (OG), the Microsoft Store edition of MyPDF by
 Orhan Gökçöl, and the MyPDF desktop application distributed through the project's
-GitHub releases. It describes the behavior in version 1.4.1.
+GitHub releases. It describes the behavior in version 2.3.0.
 
 ## Information processed on your device
 
@@ -31,7 +31,8 @@ Document templates contain local copies of the PDFs you save as templates. Batch
 
 The default application-data locations are:
 
-- Windows: `%LOCALAPPDATA%\MyPDF`
+- Windows installer/portable edition: `%LOCALAPPDATA%\MyPDF`
+- Microsoft Store edition: Windows manages new AppData files in private package storage, presented to the app as `%LOCALAPPDATA%\MyPDF`. Existing installer files may be visible through Windows' normal fallback.
 - macOS: `~/Library/Application Support/MyPDF`
 
 A configured `MYPDF_DATA_DIR` can change this location. Files you save or export
@@ -107,9 +108,12 @@ delete its PDF. Saving or explicitly discarding a document clears its associated
 recovery copy; abandoned recovery copies remain available for your decision.
 Other saved preferences and library items remain until changed or removed.
 
-Uninstalling MyPDF preserves application data so settings and custom stamps are
-not lost. To remove all MyPDF application data, close the app and delete its
-application-data folder, keeping a backup of anything you want to retain. Saved
+Uninstalling the Microsoft Store edition removes its private application data,
+including settings, custom stamps and recovery copies. Save recovered documents
+and export artwork you want to keep before uninstalling. Existing application data
+from the Windows installer/portable edition and the Mac app is retained after
+uninstall. To remove that data, close the app and delete its application-data
+folder, keeping a backup of anything you want to retain. Saved
 documents and exported certificates must be managed separately. Certificates
 and private keys in Keychain, the Windows certificate store or a hardware token
 must be managed through that system or provider.
