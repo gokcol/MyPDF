@@ -6,6 +6,11 @@ on:
       - 'packaging/windows/msix/**'
       - 'packaging/branding/**'
       - 'scripts/*msix*'
+      - 'scripts/*ocr*'
+      - 'packaging/windows/ocr/**'
+      - 'src/ocr.rs'
+      - 'src/ocr/**'
+      - 'examples/ocr_smoke.rs'
       - 'scripts/*translation*'
       - 'native/translation-ct2/**'
       - 'src/translation.rs'
@@ -20,6 +25,11 @@ on:
       - 'packaging/windows/msix/**'
       - 'packaging/branding/**'
       - 'scripts/*msix*'
+      - 'scripts/*ocr*'
+      - 'packaging/windows/ocr/**'
+      - 'src/ocr.rs'
+      - 'src/ocr/**'
+      - 'examples/ocr_smoke.rs'
       - 'scripts/*translation*'
       - 'native/translation-ct2/**'
       - 'src/translation.rs'
@@ -60,6 +70,16 @@ jobs:
           python-version: '3.12'
       - name: Install pinned native build tooling
         run: python -m pip install cmake==3.31.6
+      - name: Cache offline OCR bundle
+        id: ocr-cache
+        uses: actions/cache@v4
+        with:
+          path: dist/ocr/windows-x64
+          key: windows-ocr-${{ hashFiles('scripts/build-ocr-windows.ps1', 'packaging/windows/ocr/**') }}
+      - name: Build offline OCR runtime and language models
+        if: steps.ocr-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: '& ./scripts/build-ocr-windows.ps1'
       - name: Build and verify offline translation runtime
         shell: pwsh
         run: |
@@ -67,7 +87,15 @@ jobs:
           & ./scripts/test-translation-runtime.ps1
           & ./scripts/test-translation-packaging.ps1
       - name: Build desktop app and Store artwork
-        run: cargo build --locked --release --bin mypdf --example msix_assets
+        run: cargo build --locked --release --bin mypdf --example msix_assets --example ocr_smoke
+      - name: Verify real offline OCR on a scanned PDF
+        shell: pwsh
+        run: |
+          # Exercise Unicode/spaces in the installed location as well as recognition.
+          & ./scripts/copy-ocr-runtime.ps1 -DestinationDirectory "$pwd/artifacts/OCR Türkçe review"
+          $env:MYPDF_OCR_RUNTIME_DIR = "$pwd/artifacts/OCR Türkçe review/ocr"
+          & ./target/release/examples/ocr_smoke.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Real OCR smoke test failed.' }
       - name: Package and validate
         shell: pwsh
         env:

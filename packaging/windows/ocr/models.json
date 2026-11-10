@@ -1,0 +1,18 @@
+{
+  "repository": "tesseract-ocr/tessdata_fast",
+  "commit": "87416418657359cb625c412a48b6e1d6d41c29bd",
+  "models": [
+    {
+      "language": "eng",
+      "sha256": "7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2"
+    },
+    {
+      "language": "tur",
+      "sha256": "7393381111e1152420fc4092cb44eef4237580d21b92bf30d7d221aad192c6b7"
+    },
+    {
+      "language": "deu",
+      "sha256": "19d219bbb6672c869d20a9636c6816a81eb9a71796cb93ebe0cb1530e2cdb22d"
+    }
+  ]
+}

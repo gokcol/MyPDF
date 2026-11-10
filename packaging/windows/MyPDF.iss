@@ -68,6 +68,13 @@ Source: "{#Source}\translation\mypdf_ct2.dll"; DestDir: "{app}\translation"; Fla
 Source: "{#Source}\translation\mypdf_ct2.dll.sha256"; DestDir: "{app}\translation"; Flags: ignoreversion
 Source: "{#Source}\translation\licenses\*"; DestDir: "{app}\translation\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+; Offline OCR, including language models and dependency notices.
+Source: "{#Source}\ocr\tesseract.exe"; DestDir: "{app}\ocr"; Flags: ignoreversion
+Source: "{#Source}\ocr\*.txt"; DestDir: "{app}\ocr"; Flags: ignoreversion
+Source: "{#Source}\ocr\*.json"; DestDir: "{app}\ocr"; Flags: ignoreversion
+Source: "{#Source}\ocr\tessdata\*.traineddata"; DestDir: "{app}\ocr\tessdata"; Flags: ignoreversion
+Source: "{#Source}\ocr\licenses\*"; DestDir: "{app}\ocr\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
+
 [Icons]
 Name: "{autoprograms}\MyPDF"; Filename: "{app}\MyPDF.exe"
 Name: "{autodesktop}\MyPDF"; Filename: "{app}\MyPDF.exe"; Tasks: desktopicon

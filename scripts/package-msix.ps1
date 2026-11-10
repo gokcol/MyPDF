@@ -64,6 +64,7 @@ try {
     $makepri = Join-Path $sdk.FullName 'x64/makepri.exe'
     if (-not $SkipBuild) {
         & (Join-Path $PSScriptRoot 'build-translation-windows.ps1')
+        & (Join-Path $PSScriptRoot 'build-ocr-windows.ps1')
         & cargo build --locked --release --bin mypdf --example msix_assets
         if ($LASTEXITCODE -ne 0) { throw 'Rust release build failed.' }
     }
@@ -91,6 +92,7 @@ try {
         Copy-Item $exe (Join-Path $layout 'MyPDF.exe')
         Copy-Item -Path @('README.md', 'LICENSE-MIT', 'LICENSE-APACHE', 'THIRD_PARTY_NOTICES.md') -Destination $layout
         & (Join-Path $PSScriptRoot 'copy-translation-runtime.ps1') -DestinationDirectory $layout
+        & (Join-Path $PSScriptRoot 'copy-ocr-runtime.ps1') -DestinationDirectory $layout
         & $assetsTool (Join-Path $layout 'Assets')
         if ($LASTEXITCODE -ne 0) { throw 'MSIX artwork generation failed.' }
         [xml]$manifest = Get-Content packaging/windows/msix/AppxManifest.xml -Raw
@@ -116,7 +118,7 @@ try {
             throw 'Packaged executable differs from the release build.'
         }
         $runtime = Join-Path $layout 'translation'
-        foreach ($file in @(Get-ChildItem $runtime -Recurse -File)) {
+        foreach ($file in @(Get-ChildItem $runtime, (Join-Path $layout 'ocr') -Recurse -File)) {
             $relative = $file.FullName.Substring($layout.Length).TrimStart([char[]]@('/', '\'))
             $roundTripFile = Join-Path $unpacked $relative
             if (-not (Test-Path $roundTripFile -PathType Leaf) -or
@@ -153,6 +155,7 @@ try {
             minimumWindowsVersion = '10.0.19041.0'; sdkVersion = $sdk.Name
             sourceCommit = $commit; sha256 = $digest; signed = $false
             offlineTranslation = 'CTranslate2 CPU'; languageModelsBundled = $false
+            offlineOCR = 'Tesseract'; ocrLanguages = (Get-Content (Join-Path $layout 'ocr/languages.txt') -Raw).Trim()
             translationRuntimeSha256 = (Get-FileHash (Join-Path $runtime 'mypdf_ct2.dll') -Algorithm SHA256).Hash.ToLowerInvariant()
         } | ConvertTo-Json | Set-Content "$package.json" -Encoding utf8
         Write-Host "Built $package"

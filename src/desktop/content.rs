@@ -888,10 +888,9 @@ impl Viewer {
         let changes: Vec<_> = self.content.rx.try_iter().collect();
         for result in changes {
             self.content.busy = false;
-            if self
-                .content
-                .recognition
-                .take()
+            let recognition = self.content.recognition.take();
+            if recognition
+                .as_ref()
                 .is_some_and(|p| p.cancellation.is_cancelled())
             {
                 self.ocr_progress = None;
@@ -931,6 +930,19 @@ impl Viewer {
                                     && target.tab == id
                                 {
                                     target.revision = Some(s.revision());
+                                }
+                                if let Some(report) =
+                                    recognition.as_ref().and_then(|p| p.take_result())
+                                {
+                                    self.ocr_result = Some(super::recognize::Results::new(
+                                        id,
+                                        tab.path
+                                            .file_name()
+                                            .unwrap_or_default()
+                                            .to_string_lossy()
+                                            .into_owned(),
+                                        report,
+                                    ));
                                 }
                                 s.name_last_change(self.content.change_name);
                                 s.set_change_focus(self.content.change_page, None);
@@ -1380,6 +1392,7 @@ impl Viewer {
                                     String::new()
                                 }
                             ));
+                            progress.finish(r);
                             bytes
                         }
                         Edit::ReduceSize(level) => {

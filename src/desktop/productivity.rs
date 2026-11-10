@@ -338,7 +338,7 @@ impl State {
             mypdf_milestone0::ocr::available(),
             egui::Checkbox::new(&mut self.prefs.recipe.ocr, "Recognize text (on-device OCR)"),
         )
-        .on_hover_text("OCR is available on macOS. No cloud service is used.");
+        .on_hover_text("OCR is available on Mac and Windows. No cloud service is used.");
         ui.checkbox(
             &mut self.prefs.recipe.numbers,
             "Page numbers — bottom center, page / total",

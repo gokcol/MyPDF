@@ -4,7 +4,7 @@ Effective date: 10 November 2026
 
 This policy covers MyPDF (OG), the Microsoft Store edition of MyPDF by
 Orhan Gökçöl, and the MyPDF desktop application distributed through the project's
-GitHub releases. It describes the behavior in version 2.3.0.
+GitHub releases. It describes the behavior in version 2.3.1.
 
 ## Information processed on your device
 
@@ -12,7 +12,9 @@ MyPDF is a desktop PDF editor. It accesses the documents, images, SVG artwork,
 form data and certificate files you choose to open or import. These files may
 contain personal information. The app processes their contents on your device
 to display, search, edit, annotate, convert, organize, print and sign documents.
-Supported text recognition also runs on the device. MyPDF does not upload these
+Text recognition also runs on the device: Apple Vision on Mac, and bundled
+Tesseract with local language models on Windows. OCR results can be reviewed and
+explicitly copied to the clipboard; they are not uploaded. MyPDF does not upload these
 files or their contents to the developer or to a MyPDF server.
 
 No MyPDF account is required. The app has no advertising, usage analytics,

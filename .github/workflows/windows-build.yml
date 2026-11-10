@@ -30,13 +30,31 @@ jobs:
           python-version: '3.12'
       - name: Install pinned native build tooling
         run: python -m pip install cmake==3.31.6
+      - name: Cache offline OCR bundle
+        id: ocr-cache
+        uses: actions/cache@v4
+        with:
+          path: dist/ocr/windows-x64
+          key: windows-ocr-${{ hashFiles('scripts/build-ocr-windows.ps1', 'packaging/windows/ocr/**') }}
+      - name: Build offline OCR runtime and language models
+        if: steps.ocr-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: '& ./scripts/build-ocr-windows.ps1'
       - name: Build and verify offline translation runtime
         shell: pwsh
         run: |
           & ./scripts/build-translation-windows.ps1
           & ./scripts/test-translation-runtime.ps1
           & ./scripts/test-translation-packaging.ps1
-      - run: cargo build --locked --release --bin mypdf
+      - run: cargo build --locked --release --bin mypdf --example ocr_smoke
+      - name: Verify real offline OCR on a scanned PDF
+        shell: pwsh
+        run: |
+          # Exercise Unicode/spaces in the installed location as well as recognition.
+          & ./scripts/copy-ocr-runtime.ps1 -DestinationDirectory "$pwd/artifacts/OCR Türkçe review"
+          $env:MYPDF_OCR_RUNTIME_DIR = "$pwd/artifacts/OCR Türkçe review/ocr"
+          & ./target/release/examples/ocr_smoke.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Real OCR smoke test failed.' }
       - name: Pack
         shell: pwsh
         env:
@@ -51,6 +69,7 @@ jobs:
           Copy-Item target\release\mypdf.exe pack\MyPDF\MyPDF.exe
           Copy-Item -Path @('README.md', 'LICENSE-MIT', 'LICENSE-APACHE', 'THIRD_PARTY_NOTICES.md') -Destination 'pack\MyPDF\'
           & ./scripts/copy-translation-runtime.ps1 -DestinationDirectory "$pwd\pack\MyPDF"
+          & ./scripts/copy-ocr-runtime.ps1 -DestinationDirectory "$pwd\pack\MyPDF"
           Compress-Archive -Path pack\MyPDF -DestinationPath "$name.zip"
           $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File -Encoding ascii -NoNewline "$name.zip.sha256"

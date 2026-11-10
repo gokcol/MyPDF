@@ -32,6 +32,12 @@ Version **1.6.0** adds Graphite, Glacier and Calico visual styles, three icon-co
 
 > MyPDF was built with the help of Claude, Anthropic's AI assistant, to make everyday business paperwork easier. It is provided as is, without warranty of any kind: keep copies of important documents and use it at your own risk.
 
+## OCR (Mac and Windows)
+
+On Mac, choose **Edit PDF → Recognize Text…** in the system menu bar. On Windows, choose **Scan & OCR → Recognize Text…**. Recognition adds an invisible searchable text layer; the scan keeps its appearance. The results window shows recognized text by page, with Copy and Show page in PDF actions. Save the PDF to retain the layer. Pages that already contain text are skipped.
+
+Windows OCR runs locally using bundled Tesseract and English, Turkish and German models, with no download or account needed. Mac uses Apple Vision. Batch Processing also supports OCR on both platforms. Cancel recognition to leave the document unchanged.
+
 ## New in 1.4
 
 - **Add text → Match surrounding text** explicitly copies the nearest text's size, color and a matching installed font. Unavailable fonts use an installed substitute. It affects the new block, not surrounding page content. **Fit height to text** starts at one line, grows for wrapping/newlines and shrinks after deletion; resizing manually keeps your chosen minimum height.
@@ -39,7 +45,7 @@ Version **1.6.0** adds Graphite, Glacier and Calico visual styles, three icon-co
 - **Select multiple objects → right inspector** offers equal horizontal/vertical gaps and Same width/height/size. Size matching uses the first selected object in document order, preserving centers. An arrangement that would exceed the page is rejected. Each action is one Undo step.
 - **Tools menu** groups Document Templates, Batch Processing, Prepare Copy for Sharing and Workflow Settings in a pull-down menu, without an extra icon row. These commands are also available through Find a Tool.
 - **Document Templates** (Tools menu or Find a Tool) saves a local reusable copy with pages, forms, placed artwork and the current Add text style. Templates can be renamed or deleted. **New copy** opens an unsaved document; the library template remains unchanged. Signed/encrypted documents must first be made into an editable unsigned copy.
-- **Batch Processing** combines on-device OCR (macOS), compression, bottom-center page numbering and text watermarks for up to 50 saved PDFs. Preview one of the selected files, then choose a different output folder. Inputs and existing outputs are never overwritten. Files are processed sequentially, with per-file results and cancellation between operations; OCR also supports cancellation during recognition. Windows has compression, numbering and watermarks, but no OCR.
+- **Batch Processing** combines on-device OCR (Mac and Windows), compression, bottom-center page numbering and text watermarks for up to 50 saved PDFs. Preview one of the selected files, then choose a different output folder. Inputs and existing outputs are never overwritten. Files are processed sequentially, with per-file results and cancellation between operations; OCR also supports cancellation during recognition. Windows also includes offline OCR.
 - **Prepare Copy for Sharing** reviews removal of notes/comment text, embedded attachments and document/annotation metadata. Visible drawings, highlights, page text and form values remain. Removing comments/metadata also removes MyPDF's private object-editing data so deleted comments cannot reappear. This is **not redaction**: page content, form values, bookmarks and hidden layers remain. Review the full output before sending it. The source and its Undo history stay unchanged.
 
 All three copy workflows work locally. Batch recipes, placement preferences and templates are saved in MyPDF's application data folder alongside, without replacing, existing settings and artwork.

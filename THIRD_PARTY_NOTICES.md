@@ -37,3 +37,7 @@ The viewer uses egui/eframe 0.33.3 (MIT OR Apache-2.0), winit 0.30.13 (Apache-2.
 ## Annotation and artwork dependencies
 
 SVG parsing/rasterization uses resvg/usvg 0.45.1 and tiny-skia 0.11.4 (MIT OR Apache-2.0), with external SVG image resolution explicitly disabled by application options. image 0.25.10 (MIT OR Apache-2.0) decodes PNG/JPEG and embeds normalized artwork. base64 0.22.1 (MIT OR Apache-2.0) supports embedded asset data. These are unmodified registry dependencies. The viewer and exported text appearances use an installed TrueType font; no operating-system font file is shipped in the app bundle. Existing source/rasterization dependencies and transitive font licenses remain part of the release audit.
+
+## Windows OCR
+
+The Windows distributions bundle Tesseract OCR (Apache-2.0), Leptonica and its image codec dependencies, and English, Turkish and German models from tesseract-ocr/tessdata_fast (Apache-2.0). Exact model revisions and hashes are in `ocr/models.json`; runtime and dependency licenses are in `ocr/licenses`. OCR runs locally. The pinned build disables network image retrieval and archive support.

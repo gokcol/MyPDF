@@ -1,6 +1,6 @@
 //! Recognize Text (OCR): scanned pages get an invisible text layer, so their
 //! words can be searched, selected and copied. Recognition uses the text
-//! recognition built into macOS (Vision), on this computer.
+//! recognition built into macOS (Vision) or bundled Windows Tesseract, locally.
 use crate::header_footer::{content_ids, isolation};
 use crate::pdf_font::PdfFont;
 use anyhow::{Context as _, Result, ensure};
@@ -12,7 +12,7 @@ use std::sync::{
 
 const MARK: &[u8] = b"MyPDFOCR";
 /// Pages are read at this many pixels per point (about 216 dpi).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const SCALE: f32 = 3.0;
 
 /// Cancellation is cooperative during PDF rendering and immediate for an
@@ -116,19 +116,24 @@ pub struct Line {
     pub rect: [f32; 4],
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Report {
     /// Pages that got a text layer.
     pub pages: usize,
     /// Pages left alone because they already had text.
     pub skipped: usize,
     pub lines: usize,
+    /// Zero-based page numbers and the recognized text, for reviewing results.
+    pub text: Vec<(usize, String)>,
 }
 
 /// Whether text recognition is available here.
 pub fn available() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(any(target_os = "macos", target_os = "windows"))
 }
+
+#[cfg(any(target_os = "windows", test))]
+mod tesseract;
 
 #[cfg(target_os = "macos")]
 mod vision {
@@ -329,7 +334,7 @@ pub fn read_page_cancellable(
     recognizing: &dyn Fn(),
 ) -> Result<Vec<Line>> {
     cancellation.check()?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         let geometry = crate::annotations::page_geometry(bytes)?;
         let (page_box, _) = geometry.get(page).context("Page not found")?;
@@ -344,12 +349,24 @@ pub fn read_page_cancellable(
         cancellation.check()?;
         recognizing();
         cancellation.check()?;
-        vision::read(&png.into_inner(), page_box[2], page_box[3], cancellation)
+        #[cfg(target_os = "macos")]
+        {
+            vision::read(&png.into_inner(), page_box[2], page_box[3], cancellation)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            tesseract::read(
+                &png.into_inner(),
+                [w as u32, h as u32],
+                [page_box[2], page_box[3]],
+                cancellation,
+            )
+        }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (bytes, page, recognizing);
-        anyhow::bail!("Recognize Text needs macOS")
+        anyhow::bail!("Recognize Text needs macOS or Windows")
     }
 }
 
@@ -397,7 +414,7 @@ pub fn recognize_cancellable(
     progress: &dyn Fn(Progress),
 ) -> Result<(Vec<u8>, Report)> {
     cancellation.check()?;
-    ensure!(available(), "Recognize Text needs macOS");
+    ensure!(available(), "Recognize Text needs macOS or Windows");
     progress(Progress::default());
     let wanted = needs_text(bytes, cancellation, progress)?;
     recognize_pages(
@@ -448,6 +465,20 @@ fn recognize_pages(
         pages: found.iter().filter(|(_, l)| !l.is_empty()).count(),
         skipped: wanted.len() - total,
         lines: found.iter().map(|(_, l)| l.len()).sum(),
+        text: found
+            .iter()
+            .filter(|(_, lines)| !lines.is_empty())
+            .map(|(page, lines)| {
+                (
+                    *page,
+                    lines
+                        .iter()
+                        .map(|line| line.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            })
+            .collect(),
     };
     ensure!(report.lines > 0, "No text was found on the scanned pages");
     progress(Progress {

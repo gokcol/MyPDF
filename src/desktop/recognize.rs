@@ -9,6 +9,7 @@ pub(super) struct Progress {
     pub cancellation: ocr::Cancellation,
     state: Mutex<ocr::Progress>,
     started: Instant,
+    result: Mutex<Option<ocr::Report>>,
 }
 impl Default for Progress {
     fn default() -> Self {
@@ -16,12 +17,19 @@ impl Default for Progress {
             cancellation: Default::default(),
             state: Default::default(),
             started: Instant::now(),
+            result: Mutex::new(None),
         }
     }
 }
 impl Progress {
     pub(super) fn update(&self, state: ocr::Progress) {
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = state;
+    }
+    pub(super) fn finish(&self, report: ocr::Report) {
+        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(report);
+    }
+    pub(super) fn take_result(&self) -> Option<ocr::Report> {
+        self.result.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
     fn message(&self) -> String {
         let state = *self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -41,7 +49,91 @@ impl Progress {
     }
 }
 
+pub(super) struct Results {
+    tab: u64,
+    name: String,
+    report: ocr::Report,
+    selected: usize,
+}
+impl Results {
+    pub(super) fn new(tab: u64, name: String, report: ocr::Report) -> Self {
+        Self {
+            tab,
+            name,
+            report,
+            selected: 0,
+        }
+    }
+}
+
 impl Viewer {
+    fn ocr_results(&mut self, ctx: &egui::Context) {
+        let Some(result) = &mut self.ocr_result else {
+            return;
+        };
+        let mut open = true;
+        let mut show_page = None;
+        let mut save = false;
+        let available = self.tabs.iter().any(|tab| tab.id == result.tab);
+        egui::Window::new("Recognized text")
+            .id(egui::Id::new("ocr_results"))
+            .open(&mut open)
+            .default_size(vec2(560., 420.))
+            .min_width(320.)
+            .show(ctx, |ui| {
+                ui.strong(&result.name);
+                ui.label(format!("Text recognized on {} page{} ({} lines).", result.report.pages, if result.report.pages == 1 { "" } else { "s" }, result.report.lines));
+                ui.label("The page appearance is unchanged. The added text lets you search, select and copy words from the scan.");
+                if result.report.skipped > 0 {
+                    ui.small(format!("{} page(s) already had text and were left unchanged.", result.report.skipped));
+                }
+                ui.small("Check recognition accuracy. Save the PDF to keep its searchable text.");
+                ui.separator();
+                if let Some((page, _)) = result.report.text.get(result.selected) {
+                    egui::ComboBox::from_id_salt("ocr_result_page")
+                        .selected_text(format!("Page {}", page + 1))
+                        .show_ui(ui, |ui| {
+                            for (index, (page, _)) in result.report.text.iter().enumerate() {
+                                ui.selectable_value(&mut result.selected, index, format!("Page {}", page + 1));
+                            }
+                        });
+                }
+                if let Some((page, text)) = result.report.text.get(result.selected) {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Copy page text").clicked() { ctx.copy_text(text.clone()); }
+                        if ui.button("Copy all text").clicked() {
+                            ctx.copy_text(result.report.text.iter().map(|(page, text)| format!("Page {}\n{text}", page + 1)).collect::<Vec<_>>().join("\n\n"));
+                        }
+                        if ui.add_enabled(available, egui::Button::new("Show page in PDF")).clicked() { show_page = Some((result.tab, *page)); }
+                        if ui.add_enabled(available, egui::Button::new("Save PDF…")).clicked() { save = true; }
+                    });
+                    egui::ScrollArea::vertical().id_salt("ocr_result_text").max_height(360.).show(ui, |ui| {
+                        // An immutable str lets TextEdit select/copy without editing the result.
+                        let mut preview = text.as_str();
+                        ui.add(egui::TextEdit::multiline(&mut preview).desired_width(f32::INFINITY).desired_rows(12));
+                    });
+                }
+            });
+        let tab_id = result.tab;
+        if let Some((id, page)) = show_page {
+            if let Some(index) = self.tabs.iter().position(|tab| tab.id == id) {
+                self.active = index;
+                self.home.visible = false;
+                self.tabs[index].jump(page);
+                self.editor.mode = editing::Mode::Read;
+            }
+            open = false;
+        }
+        if save && let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) {
+            self.active = index;
+            self.home.visible = false;
+            self.action("save", ctx);
+        }
+        if !open {
+            self.ocr_result = None;
+        }
+    }
+
     pub(super) fn request_ocr(&mut self) {
         if self.content.busy || self.organizer.busy {
             self.status = Some((
@@ -51,7 +143,7 @@ impl Viewer {
             return;
         }
         if !mypdf_milestone0::ocr::available() {
-            self.status = Some(("Recognize Text needs macOS.".into(), true));
+            self.status = Some(("Recognize Text needs macOS or Windows.".into(), true));
             return;
         }
         let editable = self
@@ -60,6 +152,7 @@ impl Viewer {
             .and_then(|t| t.session.as_ref())
             .is_some_and(|s| s.editable);
         if editable {
+            self.ocr_result = None;
             self.ocr_confirm = true;
         } else {
             self.status = Some((
@@ -70,12 +163,13 @@ impl Viewer {
     }
 
     pub(super) fn ocr_dialogs(&mut self, ctx: &egui::Context) {
+        self.ocr_results(ctx);
         if self.ocr_confirm {
             match ui::confirmation(
                 ctx,
                 "recognize_text",
                 "Recognize text?",
-                "MyPDF reads the words on scanned pages, so you can search, select and copy them. Pages that already have text stay as they are. It happens on this Mac; nothing is uploaded. Processing time depends on the document. You can cancel without changing the original.",
+                "MyPDF reads the words on scanned pages, so you can search, select and copy them. Pages that already have text stay as they are. The page appearance stays the same. A results window shows the recognized words when finished. Everything happens on this computer; nothing is uploaded. Processing time depends on the document. You can cancel without changing the original.",
                 &[
                     ("Recognize", ui::DialogTone::Primary),
                     ("Cancel", ui::DialogTone::Secondary),
@@ -189,5 +283,11 @@ mod tests {
         .text;
         assert!(text.to_lowercase().contains("invoice"), "{text}");
         assert!(app.ocr_progress.is_none());
+        let result = app
+            .ocr_result
+            .as_ref()
+            .expect("visible OCR results after commit");
+        assert_eq!(result.report.pages, 2);
+        assert!(result.report.text[0].1.to_lowercase().contains("invoice"));
     }
 }
