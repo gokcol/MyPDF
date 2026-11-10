@@ -311,8 +311,6 @@ pub(super) enum Icon {
     Strikeout,
     Text,
     TextArea,
-    Bold,
-    Italic,
     AlignLeft,
     AlignCenter,
     AlignRight,
@@ -795,20 +793,6 @@ fn draw_icon_impl(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             line(&[[0.5, 0.46], [0.5, 0.74]]);
         }
         Icon::Document => page(true),
-        Icon::Bold | Icon::Italic => {
-            let bold = matches!(icon, Icon::Bold);
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                if bold { "B" } else { "I" },
-                font(
-                    painter.ctx(),
-                    if bold { BOLD } else { SANS },
-                    rect.height() * 0.85,
-                ),
-                color,
-            );
-        }
         Icon::AlignLeft | Icon::AlignCenter | Icon::AlignRight | Icon::AlignJustify => {
             for i in 0..4 {
                 let y = 0.2 + i as f32 * 0.2;

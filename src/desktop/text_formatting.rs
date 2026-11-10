@@ -39,7 +39,9 @@ pub(super) fn capture(
 pub(super) enum Change {
     Family(String),
     Face(usize),
+    #[cfg_attr(not(test), allow(dead_code))]
     Bold(bool),
+    #[cfg_attr(not(test), allow(dead_code))]
     Italic(bool),
     Size(f32),
     Color([f32; 3]),
@@ -95,13 +97,12 @@ pub(super) fn apply(
 }
 
 // Stable IDs also let native UI regression tests exercise the actual controls.
-pub(super) fn control(ui: &mut egui::Ui, name: &str, button: ActionButton<'_>) -> egui::Response {
-    let response = ui.add(button);
+fn remember_control(ui: &egui::Ui, name: &str, response: egui::Response) -> egui::Response {
     #[cfg(test)]
     ui.ctx()
         .data_mut(|d| d.insert_temp(egui::Id::new(("text_style_control", name)), response.rect));
     #[cfg(not(test))]
-    let _ = name;
+    let _ = (ui, name);
     response
 }
 
@@ -130,129 +131,70 @@ pub(super) fn panel(
         *size = style.size;
         *color = style.color;
     }
-    let preset = styles::Preset::Text {
-        font: fonts.get(*font).map(|f| f.path.clone()),
-        size: *size,
-        color: *color,
-    };
-    if let Some(styles::Preset::Text {
-        font: next_font,
-        size: next_size,
-        color: next_color,
-    }) = styles::panel(ui, preset)
-    {
-        let range = selected
-            .clone()
-            .filter(|r| !r.is_empty())
-            .unwrap_or(0..text.len());
-        *spans = rich_text::restyle(spans, range, |s| {
-            s.font = next_font.clone();
-            s.size = next_size;
-            s.color = next_color;
-        });
-        if let Some(i) = fonts
-            .iter()
-            .position(|f| Some(&f.path) == next_font.as_ref())
-        {
-            *font = i;
-        }
-        *size = next_size;
-        *color = next_color;
-    }
     let selected_text = selected
         .as_ref()
         .filter(|r| !r.is_empty())
         .and_then(|r| text.get(r.clone()));
-    ui.label(
-        RichText::new(selected_text.map_or_else(
-            || "Text block".to_owned(),
-            |s| format!("{} selected characters", s.chars().count()),
-        ))
-        .small()
-        .color(theme::muted()),
-    );
+    if let Some(selected_text) = selected_text {
+        ui.label(
+            RichText::new(format!(
+                "{} selected characters",
+                selected_text.chars().count()
+            ))
+            .small()
+            .color(theme::muted()),
+        );
+    }
     let mut changes = Vec::new();
     ui::caption(ui, "Font");
     if let Some(current) = fonts.get(*font) {
-        egui::ComboBox::from_id_salt("font_family")
-            .width(ui.available_width())
-            .selected_text(&current.family)
-            .show_ui(ui, |ui| {
-                for face in fonts.iter().filter(|f| !f.bold && !f.italic) {
-                    if ui
-                        .selectable_label(face.family == current.family, &face.family)
-                        .clicked()
-                    {
-                        changes.push(Change::Family(face.family.clone()));
-                    }
-                }
-            });
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("font_style")
-                .width(ui.available_width())
-                .selected_text(current.style())
-                .show_ui(ui, |ui| {
-                    for (index, face) in fonts
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, f)| f.family == current.family)
-                    {
-                        if ui.selectable_label(index == *font, face.style()).clicked() {
-                            changes.push(Change::Face(index));
+        egui::Grid::new("text_font_fields")
+            .num_columns(2)
+            .spacing([10., 8.])
+            .show(ui, |ui| {
+                ui.label("Family");
+                egui::ComboBox::from_id_salt("font_family")
+                    .width(ui.available_width())
+                    .selected_text(&current.family)
+                    .show_ui(ui, |ui| {
+                        for face in fonts.iter().filter(|f| !f.bold && !f.italic) {
+                            if ui
+                                .selectable_label(face.family == current.family, &face.family)
+                                .clicked()
+                            {
+                                changes.push(Change::Family(face.family.clone()));
+                            }
                         }
-                    }
-                });
-        });
+                    });
+                ui.end_row();
+                ui.label("Style");
+                let response = egui::ComboBox::from_id_salt("font_style")
+                    .width(ui.available_width())
+                    .selected_text(current.style())
+                    .show_ui(ui, |ui| {
+                        for (index, face) in fonts
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, f)| f.family == current.family)
+                        {
+                            let response = ui.selectable_label(index == *font, face.style());
+                            if remember_control(ui, &format!("face {}", face.style()), response)
+                                .clicked()
+                            {
+                                changes.push(Change::Face(index));
+                            }
+                        }
+                    })
+                    .response;
+                remember_control(ui, "font style", response);
+                ui.end_row();
+            });
+        ui.add_space(8.);
         let old_size = *size;
-        editing::property_slider(ui, "Font size", size, 4.0..=144., " pt");
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("font_size_presets")
-                .selected_text("Common sizes")
-                .width((ui.available_width() - 80.).max(90.))
-                .show_ui(ui, |ui| {
-                    for value in [
-                        6., 8., 9., 10., 10.5, 11., 12., 14., 16., 18., 20., 24., 28., 32., 36.,
-                        48., 60., 72., 96., 144.,
-                    ] {
-                        ui.selectable_value(size, value, format!("{value} pt"));
-                    }
-                });
-            for (icon, label, delta) in [
-                (Icon::Minus, "Decrease font size", -1.),
-                (Icon::Plus, "Increase font size", 1.),
-            ] {
-                if control(ui, label, ActionButton::new(icon, label).compact()).clicked() {
-                    *size = (*size + delta).clamp(4., 144.);
-                }
-            }
-        });
+        font_size_controls(ui, size);
         if *size != old_size {
             changes.push(Change::Size(*size));
         }
-        ui.horizontal(|ui| {
-            if control(
-                ui,
-                "bold",
-                ActionButton::new(Icon::Bold, "Bold")
-                    .compact()
-                    .selected(current.bold),
-            )
-            .clicked()
-            {
-                changes.push(Change::Bold(!current.bold));
-            }
-            if control(
-                ui,
-                "italic",
-                ActionButton::new(Icon::Italic, "Italic")
-                    .compact()
-                    .selected(current.italic),
-            )
-            .clicked()
-            {
-                changes.push(Change::Italic(!current.italic));
-            }
-        });
     }
     ui.add_space(8.);
     ui::caption(ui, "Alignment");
@@ -299,7 +241,89 @@ pub(super) fn panel(
         apply(text, spans, selected, change);
     }
     ui.add_space(8.);
-    ui.label(RichText::new("Select characters to format them. With no selection, formatting applies to the block. Alignment applies to the whole block.").small().color(theme::muted()));
+    ui.separator();
+    let preset = styles::Preset::Text {
+        font: fonts.get(*font).map(|f| f.path.clone()),
+        size: *size,
+        color: *color,
+    };
+    if let Some(styles::Preset::Text {
+        font: next_font,
+        size: next_size,
+        color: next_color,
+    }) = styles::panel(ui, preset)
+    {
+        let range = selected
+            .clone()
+            .filter(|r| !r.is_empty())
+            .unwrap_or(0..text.len());
+        *spans = rich_text::restyle(spans, range, |s| {
+            s.font = next_font.clone();
+            s.size = next_size;
+            s.color = next_color;
+        });
+        if let Some(i) = fonts
+            .iter()
+            .position(|f| Some(&f.path) == next_font.as_ref())
+        {
+            *font = i;
+        }
+        *size = next_size;
+        *color = next_color;
+    }
+}
+
+fn font_size_step(ui: &mut egui::Ui, name: &str, symbol: &str) -> egui::Response {
+    let response = ui
+        .scope(|ui| {
+            ui.spacing_mut().interact_size = vec2(22., 24.);
+            ui.add_sized(
+                vec2(22., 24.),
+                egui::Button::new(RichText::new(symbol).size(16.))
+                    .small()
+                    .frame(false),
+            )
+        })
+        .inner
+        .on_hover_text(name);
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), name));
+    remember_control(ui, name, response)
+}
+
+fn font_size_controls(ui: &mut egui::Ui, size: &mut f32) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.;
+        let response = ui::numeric_value(
+            ui,
+            egui::DragValue::new(size)
+                .range(4. ..=144.)
+                .speed(0.5)
+                .max_decimals(1)
+                .suffix(" pt"),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::DragValue, ui.is_enabled(), "Font size")
+        });
+        if font_size_step(ui, "Decrease font size", "−").clicked() {
+            *size = (*size - 1.).clamp(4., 144.);
+        }
+        ui.spacing_mut().slider_width =
+            (ui.available_width() - 22. - ui.spacing().item_spacing.x).max(1.);
+        let response = ui::numeric_slider(
+            ui,
+            egui::Slider::new(size, 4. ..=144.)
+                .show_value(false)
+                .trailing_fill(true),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Slider, ui.is_enabled(), "Font size")
+        });
+        remember_control(ui, "Font size slider", response);
+        if font_size_step(ui, "Increase font size", "+").clicked() {
+            *size = (*size + 1.).clamp(4., 144.);
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -957,7 +981,8 @@ mod tests {
         ctx.memory_mut(|m| m.request_focus(text_id));
         frame(vec![]);
         for id in [
-            egui::Id::new(("text_style_control", "italic")),
+            egui::Id::new(("text_style_control", "font style")),
+            egui::Id::new(("text_style_control", "face Italic")),
             egui::Id::new(("text_style_control", "Increase font size")),
             egui::Id::new(("color_swatch", "Coral")),
         ] {
