@@ -10,6 +10,7 @@ pub(super) struct Progress {
     state: Mutex<ocr::Progress>,
     started: Instant,
     result: Mutex<Option<ocr::Report>>,
+    pub(super) pages: Option<Vec<usize>>,
 }
 impl Default for Progress {
     fn default() -> Self {
@@ -18,6 +19,7 @@ impl Default for Progress {
             state: Default::default(),
             started: Instant::now(),
             result: Mutex::new(None),
+            pages: None,
         }
     }
 }
@@ -46,6 +48,35 @@ impl Progress {
             elapsed / 60,
             elapsed % 60
         )
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Scope {
+    #[default]
+    All,
+    Current,
+    Range,
+}
+
+pub(super) struct Draft {
+    tab: u64,
+    revision: u64,
+    count: usize,
+    current: usize,
+    scope: Scope,
+    range: String,
+}
+impl Draft {
+    fn pages(&self) -> anyhow::Result<Vec<usize>> {
+        match self.scope {
+            Scope::All => Ok((0..self.count).collect()),
+            Scope::Current => Ok(vec![self.current]),
+            Scope::Range => mypdf_milestone0::pages::parse_range(
+                &self.range.replace(['–', '—'], "-"),
+                self.count,
+            ),
+        }
     }
 }
 
@@ -153,6 +184,8 @@ impl Viewer {
             .is_some_and(|s| s.editable);
         if editable {
             self.ocr_result = None;
+            self.ocr_error = None;
+            self.ocr_draft = None;
             self.ocr_confirm = true;
         } else {
             self.status = Some((
@@ -165,25 +198,91 @@ impl Viewer {
     pub(super) fn ocr_dialogs(&mut self, ctx: &egui::Context) {
         self.ocr_results(ctx);
         if self.ocr_confirm {
-            match ui::confirmation(
-                ctx,
-                "recognize_text",
-                "Recognize text?",
-                "MyPDF reads the words on scanned pages, so you can search, select and copy them. Pages that already have text stay as they are. The page appearance stays the same. A results window shows the recognized words when finished. Everything happens on this computer; nothing is uploaded. Processing time depends on the document. You can cancel without changing the original.",
-                &[
-                    ("Recognize", ui::DialogTone::Primary),
-                    ("Cancel", ui::DialogTone::Secondary),
-                ],
-                1,
-            ) {
-                Some(0) => {
-                    self.ocr_confirm = false;
-                    let progress = Arc::new(Progress::default());
-                    self.content_change(ctx, content::Edit::RecognizeText(progress));
-                }
-                Some(_) => self.ocr_confirm = false,
-                None => {}
+            if self.ocr_draft.is_none()
+                && let Some(tab) = self.tabs.get(self.active)
+                && let Some(session) = &tab.session
+            {
+                self.ocr_draft = Some(Draft {
+                    tab: tab.id,
+                    revision: session.revision(),
+                    count: tab.pages.len(),
+                    current: tab.page,
+                    scope: Scope::All,
+                    range: (tab.page + 1).to_string(),
+                });
             }
+            if let Some(draft) = &mut self.ocr_draft {
+                let mut start = false;
+                let mut cancel = false;
+                let valid_document = self.tabs.iter().any(|tab| {
+                    tab.id == draft.tab
+                        && tab
+                            .session
+                            .as_ref()
+                            .is_some_and(|s| s.revision() == draft.revision)
+                });
+                let modal = egui::Modal::new(egui::Id::new("recognize_text"))
+                    .frame(ui::modal_frame())
+                    .show(ctx, |ui| {
+                        ui.set_width(420.);
+                        ui.heading("Recognize text");
+                        ui.label("Choose pages to make searchable, selectable and copyable. Pages that already have text are left unchanged.");
+                        ui.add_space(8.);
+                        ui.radio_value(&mut draft.scope, Scope::All, format!("All {} pages", draft.count));
+                        ui.radio_value(&mut draft.scope, Scope::Current, format!("Current page ({})", draft.current + 1));
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut draft.scope, Scope::Range, "Page range");
+                            let input = ui.add(egui::TextEdit::singleline(&mut draft.range).hint_text("1-3, 5, 8").desired_width(220.));
+                            if input.has_focus() { draft.scope = Scope::Range; }
+                        });
+                        let pages = draft.pages();
+                        match &pages {
+                            Ok(pages) => { ui.small(format!("{} page(s) selected", pages.len())); }
+                            Err(error) => { ui.colored_label(egui::Color32::from_rgb(220, 80, 80), error.to_string()); }
+                        }
+                        if !valid_document { ui.label("The document changed. Close this dialog and choose pages again."); }
+                        ui.separator();
+                        ui.label("The scan keeps its appearance. A results window shows the recognized text when finished. Everything runs locally; nothing is uploaded.");
+                        ui.small("Save the PDF afterwards to keep the searchable text. You can cancel recognition without changing the document.");
+                        ui.horizontal(|ui| {
+                            start = ui.add_enabled(valid_document && pages.as_ref().is_ok_and(|p| !p.is_empty()), egui::Button::new("Recognize selected pages")).clicked();
+                            cancel = ui.button("Cancel").clicked();
+                        });
+                    });
+                if start {
+                    if let Ok(pages) = draft.pages() {
+                        let tab = draft.tab;
+                        self.ocr_confirm = false;
+                        self.ocr_draft = None;
+                        if let Some(index) = self.tabs.iter().position(|t| t.id == tab) {
+                            self.active = index;
+                            let progress = Arc::new(Progress {
+                                pages: Some(pages),
+                                ..Default::default()
+                            });
+                            self.content_change(ctx, content::Edit::RecognizeText(progress));
+                        }
+                    }
+                } else if cancel || modal.should_close() {
+                    self.ocr_confirm = false;
+                    self.ocr_draft = None;
+                }
+            } else {
+                self.ocr_confirm = false;
+            }
+        }
+        if let Some(error) = self.ocr_error.clone()
+            && ui::confirmation(
+                ctx,
+                "ocr_error",
+                "Text recognition",
+                &error,
+                &[("OK", ui::DialogTone::Primary)],
+                0,
+            )
+            .is_some()
+        {
+            self.ocr_error = None;
         }
         if let Some(progress) = &self.ocr_progress {
             if self.content.busy {
@@ -289,5 +388,30 @@ mod tests {
             .expect("visible OCR results after commit");
         assert_eq!(result.report.pages, 2);
         assert!(result.report.text[0].1.to_lowercase().contains("invoice"));
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    #[test]
+    fn page_choices_use_current_page_and_validate_custom_ranges() {
+        let mut draft = Draft {
+            tab: 1,
+            revision: 0,
+            count: 8,
+            current: 4,
+            scope: Scope::All,
+            range: "1–3, 5, 8".into(),
+        };
+        assert_eq!(draft.pages().unwrap(), (0..8).collect::<Vec<_>>());
+        draft.scope = Scope::Current;
+        assert_eq!(draft.pages().unwrap(), vec![4]);
+        draft.scope = Scope::Range;
+        assert_eq!(draft.pages().unwrap(), vec![0, 1, 2, 4, 7]);
+        for invalid in ["", "0", "9", "3-1", "one"] {
+            draft.range = invalid.into();
+            assert!(draft.pages().is_err(), "{invalid}");
+        }
     }
 }

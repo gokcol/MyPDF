@@ -1637,3 +1637,63 @@ fn visual_scenes_are_independent_and_check_expected_content() {
         capture_scene(scene, egui::Theme::Light, None);
     }
 }
+
+#[test]
+#[ignore = "Manual OCR visual QA; explicit preview output and isolated data required"]
+fn ocr_visual_preview() {
+    let root = PathBuf::from(std::env::var_os("MYPDF_PREVIEW_DIR").expect("preview output"));
+    assert!(std::env::var_os("MYPDF_DATA_DIR").is_some());
+    std::fs::create_dir_all(&root).unwrap();
+    let ctx = egui::Context::default();
+    let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+    let font = mypdf_milestone0::document::default_font().unwrap();
+    app.open_memory(
+        PathBuf::from("OCR example.pdf"),
+        mypdf_milestone0::document::fixture(&font).unwrap(),
+        &ctx,
+    );
+    app.home.visible = false;
+    let mut preview = Preview::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while app.tabs[0].session.as_ref().is_none_or(|s| !s.editable) {
+        preview.capture(&mut app, &ctx);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    app.request_ocr();
+    preview.settle(&mut app, &ctx);
+    let output = preview.capture(&mut app, &ctx);
+    let labels = rendered_text(&output).join("\n");
+    assert!(
+        labels.contains("Current page")
+            && labels.contains("Page range")
+            && labels.contains("Recognize selected pages"),
+        "{labels}"
+    );
+    preview.save(&ctx, output, &root.join("ocr-pages.png"));
+    app.ocr_confirm = false;
+    app.ocr_draft = None;
+    app.ocr_result = Some(super::recognize::Results::new(
+        app.tabs[0].id,
+        "OCR example.pdf".into(),
+        mypdf_milestone0::ocr::Report {
+            pages: 1,
+            skipped: 0,
+            lines: 3,
+            text: vec![(
+                1,
+                "Invoice total: 1250.00 EUR\nTürkçe belge ve fatura\nDeutsche Rechnung".into(),
+            )],
+        },
+    ));
+    preview.settle(&mut app, &ctx);
+    let output = preview.capture(&mut app, &ctx);
+    let labels = rendered_text(&output).join("\n");
+    assert!(
+        labels.contains("Recognized text")
+            && labels.contains("Copy page text")
+            && labels.contains("Show page in PDF"),
+        "{labels}"
+    );
+    preview.save(&ctx, output, &root.join("ocr-results.png"));
+}

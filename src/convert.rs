@@ -112,7 +112,7 @@ fn text_pages(bytes: &[u8], pages: &[usize]) -> Result<Vec<String>> {
     }
     ensure!(
         result.iter().any(|s| !s.trim().is_empty()),
-        "No extractable text on the selected pages. Scanned pages need OCR, which is not included yet."
+        "No extractable text on the selected pages. Scanned pages need Recognize Text (OCR) before text export."
     );
     Ok(result)
 }

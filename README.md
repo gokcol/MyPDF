@@ -34,7 +34,7 @@ Version **1.6.0** adds Graphite, Glacier and Calico visual styles, three icon-co
 
 ## OCR (Mac and Windows)
 
-On Mac, choose **Edit PDF → Recognize Text…** in the system menu bar. On Windows, choose **Scan & OCR → Recognize Text…**. Recognition adds an invisible searchable text layer; the scan keeps its appearance. The results window shows recognized text by page, with Copy and Show page in PDF actions. Save the PDF to retain the layer. Pages that already contain text are skipped.
+On Mac, choose **Edit PDF → Recognize Text…** in the system menu bar. On Windows, choose **Scan & OCR → Recognize Text…**. Choose all pages, the current page, or a range such as `1-3, 5, 8`. Recognition adds an invisible searchable text layer; the scan keeps its appearance. The results window shows recognized text by page, with Copy and Show page in PDF actions. Save the PDF to retain the layer. Pages that already contain text are skipped.
 
 Windows OCR runs locally using bundled Tesseract and English, Turkish and German models, with no download or account needed. Mac uses Apple Vision. Batch Processing also supports OCR on both platforms. Cancel recognition to leave the document unchanged.
 

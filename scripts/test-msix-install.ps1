@@ -60,6 +60,8 @@ try {
         packageFullName = $installed.PackageFullName
         runtimeDirectory = Join-Path $installed.InstallLocation 'translation'
         smokeScript = Join-Path $PSScriptRoot 'test-translation-runtime.ps1'
+        ocrScript = Join-Path $PSScriptRoot 'test-ocr-runtime.ps1'
+        ocrDirectory = Join-Path $installed.InstallLocation 'ocr'
         resultPath = $runtimeResult
         startedPath = $runtimeStarted
     } | ConvertTo-Json -Compress
@@ -98,6 +100,7 @@ public static class MyPDFPackageIdentity {
         throw 'Runtime smoke host does not have the expected installed package identity.'
     }
     & $config.smokeScript -RuntimeDirectory $config.runtimeDirectory
+    & $config.ocrScript -RuntimeDirectory $config.ocrDirectory
     $result.success = $true
 } catch {
     $result.error = $_.Exception.Message
@@ -138,7 +141,7 @@ public static class MyPDFPackageIdentity {
     if ($runtimeHost -and -not $runtimeHost.WaitForExit(10000)) {
         throw 'Installed package runtime smoke host did not exit.'
     }
-    Write-Host 'PASS installed translation runtime: package identity, checksum, dependency load, exports, and ABI.'
+    Write-Host 'PASS installed OCR recognition and translation runtime: package identity, checksum, dependency load, exports, and ABI.'
     Write-Host "PASS package installation: $($installed.PackageFullName)"
     Remove-AppxPackage -Package $installed.PackageFullName
     $installed = $null

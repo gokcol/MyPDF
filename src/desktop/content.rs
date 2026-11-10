@@ -1003,6 +1003,9 @@ impl Viewer {
                     }
                 }
                 Err(e) => {
+                    if recognition.is_some() {
+                        self.ocr_error = Some(e.clone());
+                    }
                     self.content.image_reselect = None;
                     self.content.image_nudge_delta = [0.; 2];
                     if let Some(draft) = &self.content.existing {
@@ -1377,8 +1380,9 @@ impl Viewer {
                             result
                         }
                         Edit::RecognizeText(progress) => {
-                            let (bytes, r) = mypdf_milestone0::ocr::recognize_cancellable(
+                            let (bytes, r) = mypdf_milestone0::ocr::recognize_selected_cancellable(
                                 &bytes,
+                                progress.pages.as_deref(),
                                 &progress.cancellation,
                                 &|state| progress.update(state),
                             )?;

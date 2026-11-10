@@ -123,7 +123,7 @@ try {
             $roundTripFile = Join-Path $unpacked $relative
             if (-not (Test-Path $roundTripFile -PathType Leaf) -or
                 (Get-FileHash $file.FullName).Hash -ne (Get-FileHash $roundTripFile).Hash) {
-                throw "Packaged translation runtime differs from the release build: $relative"
+                throw "Packaged offline runtime differs from the release build: $relative"
             }
         }
         [xml]$roundTrip = Get-Content (Join-Path $unpacked 'AppxManifest.xml') -Raw

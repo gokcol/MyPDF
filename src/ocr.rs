@@ -373,18 +373,32 @@ pub fn read_page_cancellable(
 /// Pages whose own text is too little to search: scans and photos of pages.
 fn needs_text(
     bytes: &[u8],
+    selected: Option<&[usize]>,
     cancellation: &Cancellation,
     progress: &dyn Fn(Progress),
-) -> Result<Vec<bool>> {
+) -> Result<(Vec<bool>, usize)> {
     cancellation.check()?;
     let pdf = hayro::hayro_syntax::Pdf::new(bytes.to_vec())
         .map_err(|e| anyhow::anyhow!("Could not read the PDF: {e:?}"))?;
     let cache = hayro::hayro_interpret::InterpreterCache::new();
-    pdf.pages()
+    let selected: std::collections::BTreeSet<_> = selected.map_or_else(
+        || (0..pdf.pages().len()).collect(),
+        |pages| pages.iter().copied().collect(),
+    );
+    ensure!(!selected.is_empty(), "Select at least one page for OCR");
+    ensure!(
+        selected.iter().all(|page| *page < pdf.pages().len()),
+        "OCR page selection is outside the document"
+    );
+    let wanted = pdf
+        .pages()
         .iter()
         .enumerate()
         .map(|(i, p)| {
             cancellation.check()?;
+            if !selected.contains(&i) {
+                return Ok(false);
+            }
             progress(Progress {
                 phase: Phase::Inspecting,
                 page: i + 1,
@@ -395,7 +409,8 @@ fn needs_text(
             cancellation.check()?;
             Ok(text.chars().filter(|c| !c.is_whitespace()).count() < 20)
         })
-        .collect::<Result<_>>()
+        .collect::<Result<_>>()?;
+    Ok((wanted, selected.len()))
 }
 
 /// Recognize the text of every page that has none, adding it as an invisible
@@ -413,13 +428,24 @@ pub fn recognize_cancellable(
     cancellation: &Cancellation,
     progress: &dyn Fn(Progress),
 ) -> Result<(Vec<u8>, Report)> {
+    recognize_selected_cancellable(bytes, None, cancellation, progress)
+}
+
+/// Recognize only the selected zero-based pages; `None` selects the whole document.
+pub fn recognize_selected_cancellable(
+    bytes: &[u8],
+    selected: Option<&[usize]>,
+    cancellation: &Cancellation,
+    progress: &dyn Fn(Progress),
+) -> Result<(Vec<u8>, Report)> {
     cancellation.check()?;
     ensure!(available(), "Recognize Text needs macOS or Windows");
     progress(Progress::default());
-    let wanted = needs_text(bytes, cancellation, progress)?;
+    let (wanted, selected_count) = needs_text(bytes, selected, cancellation, progress)?;
     recognize_pages(
         bytes,
         &wanted,
+        selected_count,
         cancellation,
         progress,
         &|page, recognizing| read_page_cancellable(bytes, page, cancellation, recognizing),
@@ -431,6 +457,7 @@ type PageReader<'a> = dyn Fn(usize, &dyn Fn()) -> Result<Vec<Line>> + 'a;
 fn recognize_pages(
     bytes: &[u8],
     wanted: &[bool],
+    selected_count: usize,
     cancellation: &Cancellation,
     progress: &dyn Fn(Progress),
     read: &PageReader<'_>,
@@ -438,7 +465,7 @@ fn recognize_pages(
     let total = wanted.iter().filter(|w| **w).count();
     ensure!(
         total > 0,
-        "Every page already has text you can search and copy"
+        "Every selected page already has text you can search and copy"
     );
     let mut found: Vec<(usize, Vec<Line>)> = vec![];
     for (page, _) in wanted.iter().enumerate().filter(|(_, w)| **w) {
@@ -463,7 +490,7 @@ fn recognize_pages(
     }
     let report = Report {
         pages: found.iter().filter(|(_, l)| !l.is_empty()).count(),
-        skipped: wanted.len() - total,
+        skipped: selected_count - total,
         lines: found.iter().map(|(_, l)| l.len()).sum(),
         text: found
             .iter()
@@ -591,6 +618,67 @@ mod cancellation_tests {
     use super::*;
 
     #[test]
+    fn selection_checks_only_chosen_pages_and_deduplicates_them() {
+        let source = crate::document::fixture(&crate::document::default_font().unwrap()).unwrap();
+        let seen = Mutex::new(Vec::new());
+        let (wanted, count) = needs_text(&source, Some(&[1, 1]), &Cancellation::default(), &|p| {
+            seen.lock().unwrap().push(p.page);
+        })
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(wanted, vec![false, false]);
+        assert_eq!(*seen.lock().unwrap(), vec![2]);
+        for pages in [&[][..], &[2][..], &[usize::MAX][..]] {
+            assert!(needs_text(&source, Some(pages), &Cancellation::default(), &|_| {}).is_err());
+        }
+    }
+
+    #[test]
+    fn selected_scan_result_keeps_other_pages_untouched_and_counts_only_selected_pages() {
+        let source = crate::document::fixture(&crate::document::default_font().unwrap()).unwrap();
+        let (result, report) = recognize_pages(
+            &source,
+            &[false, true],
+            1,
+            &Cancellation::default(),
+            &|_| {},
+            &|page, recognizing| {
+                assert_eq!(
+                    page, 1,
+                    "the unselected page must not reach the OCR backend"
+                );
+                recognizing();
+                Ok(vec![Line {
+                    text: "Selected page words".into(),
+                    rect: [20., 20., 180., 40.],
+                }])
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            report.skipped, 0,
+            "unselected pages are not already-text skips"
+        );
+        assert_eq!(report.text, vec![(1, "Selected page words".into())]);
+        assert_eq!(
+            crate::viewer::render_page(&source, 0, 0.5).unwrap(),
+            crate::viewer::render_page(&result, 0, 0.5).unwrap()
+        );
+        let pdf = hayro::hayro_syntax::Pdf::new(result).unwrap();
+        let cache = hayro::hayro_interpret::InterpreterCache::new();
+        assert!(
+            !crate::viewer::extract_page(&pdf.pages()[0], &cache)
+                .text
+                .contains("Selected page words")
+        );
+        assert!(
+            crate::viewer::extract_page(&pdf.pages()[1], &cache)
+                .text
+                .contains("Selected page words")
+        );
+    }
+
+    #[test]
     fn cancellation_before_start_does_not_parse_or_modify_the_source() {
         let source = b"not a PDF".to_vec();
         let cancellation = Cancellation::default();
@@ -610,6 +698,7 @@ mod cancellation_tests {
             let error = recognize_pages(
                 &source,
                 &[true, false, true],
+                3,
                 &cancellation,
                 &|state| {
                     if state.phase == phase {
