@@ -1,6 +1,8 @@
-New in MyPDF 2.2.1:
+MyPDF 2.3
 
-- Area Highlight creates a translucent rectangle without snapping to text. Find it at the end of Annotate → More.
-- Underline, Squiggly, Strikeout and Table now live in the More menu for a simpler annotation toolbar.
-- Area highlights preserve their appearance when saved and reopened, with undo and redo support.
-- Retains optional Comfortable spacing, the compact Home screen, highlighted search results and thumbnails that follow page navigation from 2.2.
+- Edit detected tables while preserving columns, merged cells and text positions.
+- Improved cell properties and stable text placement when selecting cells.
+- Cleaner text properties with compact font size controls and no duplicate formatting controls.
+- Native Windows print preview with printer and page settings.
+- Improved scrolling, substitute-font performance and window sizing across display scales.
+- Updated Microsoft Store packaging using standard app-data handling.

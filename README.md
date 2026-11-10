@@ -2,7 +2,7 @@
 
 # MyPDF — native Rust desktop PDF editor
 
-Version **2.2.2** is a Windows-only update. Mouse wheel and touchpad scrolling follow the Windows scroll setting and move with your fingers; the first page that needs a substitute font no longer pauses while scrolling. The first window fits the screen above the taskbar at any display scaling, and the installer registers MyPDF for Settings → Default apps. The Mac version remains 2.2.1, build 200.
+Version **2.3.0**, Mac build **202**, is available for Mac and Windows. Detected tables retain their columns, merged cells and text positions during editing, and cell properties are easier to use. Text properties now group font family/style, compact size controls, alignment and color without redundant controls. Windows includes native print preview, improved scrolling and display scaling. The Microsoft Store package uses standard app-data virtualization and no longer requests the rejected `unvirtualizedResources` capability.
 
 Version **2.2.1**, Mac build **200**, adds **Area Highlight** at the end of Annotate → More: drag a translucent rectangle without snapping to text. Underline, Squiggly, Strikeout and Table are now grouped in More. It retains the compact Home screen, reading-resume labels, highlighted search results and thumbnail following from 2.2. **Comfortable spacing is optional; Compact remains the default.**
 
@@ -423,7 +423,7 @@ The PKCS#12 adapter uses `p12-keystore` for modern AES-encrypted PKCS#12 and aut
 
 The Windows app and installer are currently unsigned; no Windows code-signing provider is configured. Release downloads include SHA-256 checksum files for integrity verification. These checksums do not authenticate the publisher or replace code signing. The Mac app is signed with the maintainer's Apple Developer ID and notarized by Apple.
 
-Microsoft Store packaging is available through the **Microsoft Store MSIX** workflow, under the reserved Store name **MyPDF (OG)**. It packages the same native desktop app, with PDF Open With registration and shared settings/stamp storage. Store mode requires the real Partner Center product identity; test mode uses a clearly marked validation identity. The unsigned `.msix` is a submission artifact, not a signed GitHub installer. Microsoft signs Store-distributed packages after certification. See [Windows Store packaging](packaging/windows/msix/README.md) for setup, validation and submission steps. MyPDF is not yet published in the Microsoft Store.
+Microsoft Store packaging is available through the **Microsoft Store MSIX** workflow, under the reserved Store name **MyPDF (OG)**. It packages the same native desktop app, with PDF Open With registration and standard Store-managed app data. Store mode requires the real Partner Center product identity; test mode uses a clearly marked validation identity. The unsigned `.msix` is a submission artifact, not a signed GitHub installer. Microsoft signs Store-distributed packages after certification. See [Windows Store packaging](packaging/windows/msix/README.md) for setup, validation and submission steps. MyPDF is not yet published in the Microsoft Store.
 
 - **Committers and reviewers:** [gokcol](https://github.com/gokcol)
 - **Approvers:** [gokcol](https://github.com/gokcol)

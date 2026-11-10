@@ -37,8 +37,8 @@ On GitHub, run **Actions → Microsoft Store MSIX → Run workflow**:
 - `ref`: the release tag or full commit SHA to package.
 - `mode`: `store` after configuring the three variables; `test` otherwise.
 - `package_version`: usually blank, which uses `version.txt` in this directory.
-  For MyPDF **2.2.1**, the internal MSIX version is **2.2.1.0**, which
-  sorts above the previous 2.2.0 package **2.2.0.0** and preserves ordinary
+  For MyPDF **2.3.0**, the internal MSIX version is **2.3.0.0**, which
+  sorts above the previous submitted package **2.2.1.0** and preserves ordinary
   upgrades. Public app versions and MSIX package versions are maintained
   separately. Increase `version.txt` for each Store release.
   An explicit override must be at least the checked-in package version.
@@ -73,21 +73,21 @@ manual packaged-app review or Microsoft certification.
 
 ## Settings, stamps, and capability declarations
 
-MyPDF keeps its existing `%LOCALAPPDATA%\MyPDF` settings, artwork, certificate
-references, recovery files and single-instance mailbox. On Windows 11 the
-manifest excludes only this directory from MSIX file virtualization. Windows 10
-uses the broader filesystem opt-out required on that OS. Registry virtualization
-stays enabled. User PDFs remain in the locations the user chooses. Uninstalling
-the Store package preserves the shared MyPDF data directory.
+MyPDF uses the default MSIX AppData and registry virtualization. It no longer
+requests `unvirtualizedResources` or disables filesystem virtualization; this
+addresses the November 2026 certification rejection under policy 10.6.3.
+New settings, stamps, certificate references, recovery files and the file-open
+mailbox are managed within the Store app's private data. Windows may expose
+existing installer data through its normal AppData fallback, but ongoing sharing
+with the portable/Inno edition is not guaranteed. Store-private data is removed
+on uninstall. Save recovered documents and export custom artwork before removing
+the app. PDFs saved in user-chosen document folders remain outside app data.
+Installing or removing the Store edition does not delete existing installer data.
 
-The Store submission must explain these restricted capabilities:
-
-- `runFullTrust`: the existing native Win32/Rust PDF editor uses native file
-  dialogs, GPU rendering and Windows certificate APIs at the current user's
-  privilege level. It does not request administrator elevation.
-- `unvirtualizedResources`: preserve the user's stamp library/settings/recovery
-  files and share the file-open mailbox with the existing portable/Inno version.
-  Removing the Store app must not delete this user-created content.
+The only requested restricted capability is `runFullTrust`: the existing native
+Win32/Rust PDF editor uses native file dialogs, GPU rendering and Windows
+certificate APIs at the current user's privilege level. It does not request
+administrator elevation. Include this explanation in the Store submission.
 
 Microsoft reviews these declarations; packaging success is not Store approval.
 The package does not bundle a certificate, user data, or a WebView runtime.
@@ -98,8 +98,8 @@ The package does not bundle a certificate, user data, or a WebView runtime.
 2. Test the packaged app on Windows: launch from Start, open PDFs with spaces and
    Unicode in their names, open another PDF while running, save a new copy, use
    custom stamps and certificate signing, and verify upgrade/uninstall behavior.
-   Check coexistence with the installer version and that existing user data stays
-   visible. Use an isolated test machine/profile, not your only copy of user data.
+   Check coexistence with the installer version and that its existing data is
+   unchanged. Use an isolated test machine/profile, not your only copy of user data.
 3. Run the Windows App Certification Kit on the final package; review its report.
 4. In Partner Center, create the submission and upload the `.msix` (an accepted
    upload format). Complete the listing, screenshots, privacy policy, age ratings,

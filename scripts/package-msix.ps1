@@ -133,6 +133,14 @@ try {
             $roundTripVisual.GetAttribute('DisplayName') -cne $DisplayName) {
             throw 'Packaged display names do not match the requested Store names.'
         }
+        # Guard against reintroducing the capability rejected under Store policy 10.6.3.
+        $capabilities = @($roundTrip.SelectNodes("//*[local-name()='Capability']"))
+        if ($capabilities.Count -ne 1 -or $capabilities[0].GetAttribute('Name') -cne 'runFullTrust') {
+            throw 'Store package must request only runFullTrust.'
+        }
+        if ($roundTrip.SelectNodes("//*[local-name()='FileSystemWriteVirtualization' or local-name()='RegistryWriteVirtualization']").Count -ne 0) {
+            throw 'Store package must use default AppData and registry virtualization.'
+        }
         if (Test-Path (Join-Path $unpacked 'AppxSignature.p7x')) { throw 'The Store submission artifact should be unsigned.' }
         $digest = (Get-FileHash $package -Algorithm SHA256).Hash.ToLowerInvariant()
         "$digest  $name" | Set-Content "$package.sha256" -Encoding ascii
