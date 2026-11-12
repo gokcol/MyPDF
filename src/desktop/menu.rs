@@ -184,6 +184,7 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             &MenuItem::with_id("nup", "Multiple Pages per Sheet…", true, None),
             &MenuItem::with_id("edit_navigation", "Bookmarks and Page Labels…", true, None),
             &MenuItem::with_id("review_comments", "Review Comments…", true, None),
+            &MenuItem::with_id("document_properties", "Document Properties…", true, None),
             &P::separator(),
             &MenuItem::with_id("protect", "Protect with Password…", true, None),
             &MenuItem::with_id("unprotect", "Remove Password…", true, None),

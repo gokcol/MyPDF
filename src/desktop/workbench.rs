@@ -326,6 +326,11 @@ pub(super) fn reveal_overlay(
 
 const COMMANDS: &[(&str, &str, &str)] = &[
     (
+        "Document Properties",
+        "document_properties",
+        "metadata title author subject keywords creator producer dates PDF information",
+    ),
+    (
         "Workflow settings",
         "workflow_settings",
         "placement snap table baseline guides",
@@ -490,6 +495,10 @@ impl Viewer {
     }
     pub(super) fn workbench_action(&mut self, action: &str, ctx: &egui::Context) -> bool {
         match action {
+            "document_properties" => {
+                self.open_document_properties(ctx);
+                return true;
+            }
             "edit_navigation" => {
                 self.open_navigation_editor();
                 return true;

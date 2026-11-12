@@ -83,6 +83,7 @@ type Change = Result<(u64, u64, Vec<u8>, Option<String>), String>;
 type Output = Result<(String, Option<PathBuf>), String>;
 #[derive(Clone)]
 pub(super) enum Edit {
+    Metadata(mypdf_milestone0::properties::Metadata),
     Navigation {
         bookmarks: Option<Vec<mypdf_milestone0::navigation_edit::Bookmark>>,
         labels: Option<Vec<mypdf_milestone0::navigation_edit::LabelRule>>,
@@ -1197,6 +1198,7 @@ impl Viewer {
         let tx = self.content.tx.clone();
         let wake = ctx.clone();
         self.content.change_name = match &edit {
+            Edit::Metadata(_) => "Edit document properties",
             Edit::AddText { .. } => "Add text",
             Edit::Text { .. } | Edit::Block { .. } => "Edit text",
             Edit::DetachTable { .. } => "Detach table as layer",
@@ -1239,6 +1241,10 @@ impl Viewer {
                     }
                     let mut note = None;
                     let result = match edit {
+                        Edit::Metadata(metadata) => {
+                            note = Some("Document properties updated • Save to keep changes • Undo is available".into());
+                            mypdf_milestone0::properties::update(&bytes, &metadata)?
+                        }
                         Edit::AddText {
                             spans,
                             page,

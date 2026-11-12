@@ -1697,3 +1697,69 @@ fn ocr_visual_preview() {
     );
     preview.save(&ctx, output, &root.join("ocr-results.png"));
 }
+
+#[test]
+#[ignore = "Manual document properties visual QA; isolated data and preview output required"]
+fn properties_visual_preview() {
+    let root = PathBuf::from(std::env::var_os("MYPDF_PREVIEW_DIR").expect("preview output"));
+    assert!(std::env::var_os("MYPDF_DATA_DIR").is_some());
+    std::fs::create_dir_all(&root).unwrap();
+    let ctx = egui::Context::default();
+    let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+    let font = mypdf_milestone0::document::default_font().unwrap();
+    let bytes = mypdf_milestone0::document::fixture(&font).unwrap();
+    let metadata = mypdf_milestone0::properties::Metadata {
+        fields: [
+            "Project report",
+            "Çağrı Öztürk",
+            "Review copy",
+            "report; review",
+            "MyPDF",
+            "MyPDF",
+        ]
+        .map(str::to_string),
+    };
+    let bytes = mypdf_milestone0::properties::update(&bytes, &metadata).unwrap();
+    app.open_memory(PathBuf::from("Project report.pdf"), bytes, &ctx);
+    app.home.visible = false;
+    let mut preview = Preview::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while app.tabs[0].session.as_ref().is_none_or(|s| !s.editable) {
+        preview.capture(&mut app, &ctx);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    app.open_document_properties(&ctx);
+    loop {
+        let output = preview.capture(&mut app, &ctx);
+        if rendered_text(&output).join("\n").contains("Producer") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    preview.settle(&mut app, &ctx);
+    let output = preview.capture(&mut app, &ctx);
+    let labels = rendered_text(&output).join("\n");
+    for text in [
+        "Document Properties",
+        "Description",
+        "Title",
+        "Author",
+        "Subject",
+        "Keywords",
+        "Creator",
+        "Producer",
+        "PDF version",
+        "Protection",
+        "Apply",
+    ] {
+        assert!(labels.contains(text), "Missing {text}: {labels}");
+    }
+    preview.save(&ctx, output, &root.join("document-properties.png"));
+    preview.size = Some(vec2(760., 640.));
+    preview.settle(&mut app, &ctx);
+    let output = preview.capture(&mut app, &ctx);
+    assert!(rendered_text(&output).join("\n").contains("Apply"));
+    preview.save(&ctx, output, &root.join("document-properties-small.png"));
+}

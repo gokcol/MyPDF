@@ -34,6 +34,10 @@ Version **1.6.0** adds Graphite, Glacier and Calico visual styles, three icon-co
 
 > MyPDF was built with the help of Claude, Anthropic's AI assistant, to make everyday business paperwork easier. It is provided as is, without warranty of any kind: keep copies of important documents and use it at your own risk.
 
+## Document properties
+
+Choose **File → Document Properties…** on Mac or Windows (also available through Find a Tool). Edit title, author, subject, keywords, creator and producer, then click **Apply** and save the PDF. Clear a field to remove it. Changes support Undo/Redo and keep the PDF Info dictionary and XMP metadata synchronized. Creation and modification dates, PDF version, page count, current page size, protection status and existing XMP can be inspected; applying edits updates the modification date automatically. Signed documents are read-only here.
+
 ## OCR (Mac and Windows)
 
 On Mac, choose **Edit PDF → Recognize Text…** in the system menu bar. On Windows, choose **Scan & OCR → Recognize Text…**. Choose all pages, the current page, or a range such as `1-3, 5, 8`. Recognition adds an invisible searchable text layer; the scan keeps its appearance. The results window shows recognized text by page, with Copy and Show page in PDF actions. Save the PDF to retain the layer. Pages that already contain text are skipped.

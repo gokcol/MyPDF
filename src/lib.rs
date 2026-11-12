@@ -30,6 +30,7 @@ pub mod ocr;
 pub mod pages;
 pub mod pdf_font;
 pub mod proof;
+pub mod properties;
 pub mod recovery;
 pub mod redact;
 pub mod render_fonts;

@@ -30,6 +30,7 @@ mod preferences;
 mod preview;
 mod print;
 mod productivity;
+mod properties;
 mod protect;
 mod reading;
 mod recent_menu;
@@ -301,6 +302,7 @@ pub struct Viewer {
     ocr_confirm: bool,
     ocr_progress: Option<Arc<recognize::Progress>>,
     ocr_result: Option<recognize::Results>,
+    document_properties: Option<properties::Draft>,
     ocr_draft: Option<recognize::Draft>,
     ocr_error: Option<String>,
     save_events: mpsc::Receiver<Result<save::Completed, String>>,
@@ -379,6 +381,7 @@ impl Viewer {
             ocr_confirm: false,
             ocr_progress: None,
             ocr_result: None,
+            document_properties: None,
             ocr_draft: None,
             ocr_error: None,
             focus_search: false,
@@ -2615,6 +2618,7 @@ impl eframe::App for Viewer {
         #[cfg(target_os = "windows")]
         self.print_preview_dialog(ctx);
         self.ocr_dialogs(ctx);
+        self.document_properties_dialog(ctx);
         self.compare_dialog(ctx);
         self.details_dialogs(ctx);
         self.page_dialogs(ctx);
@@ -2900,6 +2904,54 @@ mod tests {
             frame(app, ctx, vec![]);
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn document_properties_changes_follow_save_and_undo_history() {
+        use mypdf_milestone0::properties::{self, Metadata};
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        until(&mut app, &ctx, |a| a.tabs[0].session.is_some());
+        let original = app.tabs[0].session.as_ref().unwrap().source.clone();
+        app.action("document_properties", &ctx);
+        assert!(app.document_properties.is_some());
+        app.document_properties = None;
+        let metadata = Metadata {
+            fields: [
+                "Updated title",
+                "Çağrı",
+                "Subject",
+                "review",
+                "Creator",
+                "Producer",
+            ]
+            .map(str::to_string),
+        };
+        app.content_change(&ctx, content::Edit::Metadata(metadata.clone()));
+        until(&mut app, &ctx, |a| !a.content.busy);
+        let session = app.tabs[0].session.as_ref().unwrap();
+        assert_eq!(
+            properties::read(&session.source).unwrap().metadata,
+            metadata
+        );
+        assert!(session.dirty());
+        assert_eq!(
+            session.undo_label().as_deref(),
+            Some("Edit document properties")
+        );
+        let saved =
+            mypdf_milestone0::annotations::export(&session.source, &session.annotations).unwrap();
+        assert_eq!(properties::read(&saved).unwrap().metadata, metadata);
+        app.editor_undo(false);
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().source, original);
+        app.editor_undo(true);
+        assert_eq!(
+            properties::read(&app.tabs[0].session.as_ref().unwrap().source)
+                .unwrap()
+                .metadata,
+            metadata
+        );
     }
 
     #[test]

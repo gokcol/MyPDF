@@ -21,6 +21,7 @@ const MENUS: &[(&str, &[Entry])] = &[
             S,
             C("save", "Save"),
             C("save_as", "Save As…"),
+            C("document_properties", "Document Properties…"),
             S,
             C("print", "Print…"),
             C("nup", "Multiple Pages per Sheet…"),
@@ -284,7 +285,7 @@ fn icon(id: &str) -> Icon {
         "ocr" => Icon::Ocr,
         "templates" => Icon::Document,
         "close" | "quit" => Icon::Close,
-        "about" => Icon::Info,
+        "about" | "document_properties" => Icon::Info,
         _ => Icon::Document,
     }
 }
