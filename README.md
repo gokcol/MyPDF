@@ -2,6 +2,8 @@
 
 # MyPDF — native Rust desktop PDF editor
 
+Version **2.4.0**, Mac build **205**, adds **File → Document Properties…** on Mac and Windows. View document information and edit title, author, subject, keywords, creator and producer. Changes keep PDF Info and XMP metadata synchronized, support Undo/Redo, and persist when you save. Signed documents remain read-only. [Downloads](https://github.com/gokcol/MyPDF/releases/tag/v2.4.0).
+
 Version **2.3.1**, Mac build **203**, is [available for Mac and Windows](https://github.com/gokcol/MyPDF/releases/tag/v2.3.1). Windows now includes offline OCR with bundled English, Turkish and German models. On both platforms, choose all pages, the current page or a custom range, then review and copy recognized text in a results window. OCR preserves the scan's appearance and adds searchable text; save the PDF to keep it.
 
 Version **2.3.0**, Mac build **202**, is available for Mac and Windows. Detected tables retain their columns, merged cells and text positions during editing, and cell properties are easier to use. Text properties now group font family/style, compact size controls, alignment and color without redundant controls. Windows includes native print preview, improved scrolling and display scaling. The Microsoft Store package uses standard app-data virtualization and no longer requests the rejected `unvirtualizedResources` capability.
