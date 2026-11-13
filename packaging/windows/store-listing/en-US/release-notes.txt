@@ -1,8 +1,1 @@
-MyPDF 2.3
-
-- Edit detected tables while preserving columns, merged cells and text positions.
-- Improved cell properties and stable text placement when selecting cells.
-- Cleaner text properties with compact font size controls and no duplicate formatting controls.
-- Native Windows print preview with printer and page settings.
-- Improved scrolling, substitute-font performance and window sizing across display scales.
-- Updated Microsoft Store packaging using standard app-data handling.
+Version 2.4.2 fixes saving and autosaving PDFs with text annotations. Text layout now matches the editor, and visible text is preserved without reducing its font size. Includes file insertion, image editing and rotation improvements from 2.4.1.

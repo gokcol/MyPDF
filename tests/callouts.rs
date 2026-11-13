@@ -69,7 +69,7 @@ fn callout_exports_standard_semantics_vector_text_and_editable_metadata() {
     let content = String::from_utf8(stream.decompressed_content().unwrap()).unwrap();
     assert!(content.contains("0.8 0.1 0.1 RG"), "{content}");
     assert!(content.contains("0.05 0.2 0.65 rg BT"), "{content}");
-    assert!(content.contains(" Tj ET"));
+    assert!(content.contains(" Tj\n"));
     assert!(
         !content.contains("/Im Do"),
         "Callout text and geometry must remain vector"

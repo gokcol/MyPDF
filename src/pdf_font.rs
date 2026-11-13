@@ -2,11 +2,14 @@
 use anyhow::{Context, Result, ensure};
 use lopdf::{Document, Object, ObjectId, Stream, dictionary};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub struct PdfFont {
     pub id: ObjectId,
     cids: BTreeMap<char, u16>,
     widths: BTreeMap<char, f32>,
+    font_bytes: Arc<[u8]>,
+    annotation_fonts: OnceLock<Mutex<epaint::text::Fonts>>,
 }
 impl PdfFont {
     pub fn embed(doc: &mut Document, text: &str) -> Result<Self> {
@@ -17,6 +20,7 @@ impl PdfFont {
         Self::embed_bytes(doc, text, font_bytes)
     }
     pub fn embed_bytes(doc: &mut Document, text: &str, font_bytes: Vec<u8>) -> Result<Self> {
+        let layout_bytes: Arc<[u8]> = font_bytes.clone().into();
         let face =
             ttf_parser::Face::parse(&font_bytes, 0).context("Could not read annotation font")?;
         let chars: BTreeSet<_> = text
@@ -101,7 +105,46 @@ impl PdfFont {
         let cid = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "CIDFontType2", "BaseFont" => Object::Name(font_name.as_bytes().to_vec()), "CIDSystemInfo" => dictionary! { "Registry" => Object::string_literal("Adobe"), "Ordering" => Object::string_literal("Identity"), "Supplement" => 0 }, "FontDescriptor" => descriptor, "DW" => 1000, "W" => Object::Array(w), "CIDToGIDMap" => cid_map });
         let unicode = doc.add_object(Stream::new(dictionary! {}, cmap.into_bytes()));
         let id = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type0", "BaseFont" => Object::Name(font_name.as_bytes().to_vec()), "Encoding" => "Identity-H", "DescendantFonts" => vec![Object::Reference(cid)], "ToUnicode" => unicode });
-        Ok(Self { id, cids, widths })
+        Ok(Self {
+            id,
+            cids,
+            widths,
+            font_bytes: layout_bytes,
+            annotation_fonts: OnceLock::new(),
+        })
+    }
+    /// Use the editor's layout engine for plain annotation appearances, including
+    /// kerning, whitespace, long-word wrapping and actual font line metrics.
+    pub fn annotation_layout(
+        &self,
+        text: &str,
+        size: f32,
+        width: f32,
+    ) -> Arc<epaint::text::Galley> {
+        let fonts = self.annotation_fonts.get_or_init(|| {
+            let mut definitions = epaint::text::FontDefinitions::empty();
+            definitions.font_data.insert(
+                "annotation".into(),
+                Arc::new(epaint::text::FontData::from_owned(self.font_bytes.to_vec())),
+            );
+            definitions.families.insert(
+                epaint::text::FontFamily::Name("annotation".into()),
+                vec!["annotation".into()],
+            );
+            Mutex::new(epaint::text::Fonts::new(
+                2048,
+                Default::default(),
+                definitions,
+            ))
+        });
+        let mut fonts = fonts.lock().unwrap_or_else(|poison| poison.into_inner());
+        fonts.begin_pass(2048, Default::default());
+        fonts.with_pixels_per_point(1.).layout(
+            text.replace('\t', "    "),
+            epaint::text::FontId::new(size, epaint::text::FontFamily::Name("annotation".into())),
+            epaint::Color32::BLACK,
+            width.max(1.),
+        )
     }
     pub fn hex(&self, text: &str) -> Result<String> {
         text.chars()

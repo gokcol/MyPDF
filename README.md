@@ -2,7 +2,7 @@
 
 # MyPDF — native Rust desktop PDF editor
 
-Version **2.4.1**, Mac build **211**, adds drag-and-drop and **File → Insert Files…** for PDFs, images and documents, improves text layering and direct image editing, and adds **Reset rotation** for images, text boxes and stamps (drawings excluded). [Downloads](https://github.com/gokcol/MyPDF/releases/tag/v2.4.1).
+Version **2.4.2**, Mac build **212**, fixes Save and autosave rejecting text boxes that look correct on screen. PDF annotation text now uses the editor’s layout engine and preserves visible overflow without shrinking text. Includes the file insertion and image editing improvements from 2.4.1. [Downloads](https://github.com/gokcol/MyPDF/releases/tag/v2.4.2).
 
 Version **2.3.1**, Mac build **203**, is [available for Mac and Windows](https://github.com/gokcol/MyPDF/releases/tag/v2.3.1). Windows now includes offline OCR with bundled English, Turkish and German models. On both platforms, choose all pages, the current page or a custom range, then review and copy recognized text in a results window. OCR preserves the scan's appearance and adds searchable text; save the PDF to keep it.
 

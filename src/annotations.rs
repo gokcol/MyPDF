@@ -2564,7 +2564,7 @@ pub fn appearance(
         normal[2] as f64,
         normal[3] as f64,
     ));
-    let rect = [
+    let mut rect = [
         pdf_box.x0 as f32,
         pdf_box.y0 as f32,
         pdf_box.x1 as f32,
@@ -2695,42 +2695,54 @@ pub fn appearance(
             }
             Primitive::Text {
                 text,
-                rect,
+                rect: text_rect,
                 size,
                 centered,
                 color: text_color,
             } => {
                 let color = text_color.unwrap_or(color);
                 let font = font.context("Text appearance needs an embedded font")?;
-                let lines = font.wrap(&text.replace('\t', "    "), size, rect[2] - rect[0] - 8.0);
-                let height = lines.len() as f32 * size * 1.25;
-                ensure!(
-                    height <= rect[3] - rect[1] - 4.0,
-                    "The text does not fit in this annotation. Enlarge the box or reduce its font size."
-                );
-                for (i, line) in lines.iter().enumerate() {
-                    ensure!(
-                        font.width(line, size) <= rect[2] - rect[0] - 8.0,
-                        "A word does not fit in this annotation. Enlarge the box or reduce its font size."
-                    );
-                    let x = if centered {
-                        (rect[0] + rect[2] - font.width(line, size)) / 2.0
-                    } else {
-                        rect[0] + 4.0
-                    };
-                    let y = if centered {
-                        (rect[1] + rect[3] - height) / 2.0 + size
-                    } else {
-                        rect[1] + 4.0 + size
-                    } + i as f32 * size * 1.25;
-                    content.push_str(&format!(
-                        "{} {} {} rg BT /UF {size} Tf 1 0 0 -1 {x} {y} Tm <{}> Tj ET\n",
-                        color[0],
-                        color[1],
-                        color[2],
-                        font.hex(line)?
-                    ));
+                let galley = font.annotation_layout(&text, size, text_rect[2] - text_rect[0] - 8.);
+                let origin = if centered {
+                    [
+                        (text_rect[0] + text_rect[2] - galley.size().x) / 2.,
+                        (text_rect[1] + text_rect[3] - galley.size().y) / 2.,
+                    ]
+                } else {
+                    [text_rect[0] + 4., text_rect[1] + 4.]
+                };
+                // The editor paints overflowing text. Preserve that visible text
+                // in the PDF too, without changing its editable box or font size.
+                // Expand the appearance clip in page space, including rotation.
+                let ink = galley.rect.union(galley.mesh_bounds);
+                let painted = (inverse * rotation).transform_rect_bbox(Rect::new(
+                    (origin[0] + ink.min.x - 1.) as f64,
+                    (origin[1] + ink.min.y - 1.) as f64,
+                    (origin[0] + ink.max.x + 1.) as f64,
+                    (origin[1] + ink.max.y + 1.) as f64,
+                ));
+                rect[0] = rect[0].min(painted.x0 as f32);
+                rect[1] = rect[1].min(painted.y0 as f32);
+                rect[2] = rect[2].max(painted.x1 as f32);
+                rect[3] = rect[3].max(painted.y1 as f32);
+                content.push_str(&format!(
+                    "{} {} {} rg BT /UF {size} Tf\n",
+                    color[0], color[1], color[2]
+                ));
+                for row in &galley.rows {
+                    for glyph in &row.glyphs {
+                        if glyph.chr.is_control() {
+                            continue;
+                        }
+                        let x = origin[0] + row.pos.x + glyph.pos.x;
+                        let y = origin[1] + row.pos.y + glyph.pos.y;
+                        content.push_str(&format!(
+                            "1 0 0 -1 {x} {y} Tm <{}> Tj\n",
+                            font.hex(&glyph.chr.to_string())?
+                        ));
+                    }
                 }
+                content.push_str("ET\n");
             }
             Primitive::Image { png, rect } => {
                 let id = image_resource(doc, &png)?;

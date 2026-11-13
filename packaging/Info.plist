@@ -7,8 +7,8 @@
     <key>CFBundleExecutable</key><string>MyPDF</string>
     <key>CFBundleIconFile</key><string>MyPDF-calico-v2</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>2.4.1</string>
-    <key>CFBundleVersion</key><string>211</string>
+    <key>CFBundleShortVersionString</key><string>2.4.2</string>
+    <key>CFBundleVersion</key><string>212</string>
     <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSAppleEventsUsageDescription</key><string>MyPDF uses Microsoft Word to convert DOCX and RTF documents to PDF for insertion.</string>
