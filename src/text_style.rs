@@ -76,7 +76,7 @@ pub fn fonts() -> &'static [FontFace] {
         out
     })
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Alignment {
     #[default]
     Left,

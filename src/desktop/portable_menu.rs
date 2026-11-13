@@ -15,6 +15,7 @@ const MENUS: &[(&str, &[Entry])] = &[
         &[
             C("new", "New Blank PDF"),
             C("open", "Open…"),
+            C("insert_files", "Insert Files…"),
             R,
             C("reopen_closed", "Reopen Closed Tab"),
             C("workspace", "Workspace…"),
@@ -270,6 +271,7 @@ fn icon(id: &str) -> Icon {
         "protect" => Icon::Lock,
         "unprotect" => Icon::Unlock,
         "shrink" => Icon::Crop,
+        "insert_files" => Icon::Import,
         "add_image" => Icon::FieldImage,
         "edit_table" => Icon::Table,
         "redact" => Icon::Redact,
@@ -310,6 +312,7 @@ fn enabled(id: &str, document: bool, saving: bool) -> bool {
             id,
             "new"
                 | "open"
+                | "insert_files"
                 | "reopen_closed"
                 | "workspace"
                 | "settings"

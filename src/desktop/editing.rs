@@ -473,7 +473,7 @@ fn keeps_proportions(kind: &ann::Kind) -> bool {
 }
 
 /// The rectangle after dragging `corner` to `p`; the opposite corner stays put.
-fn resized(rect: [f32; 4], corner: usize, p: [f32; 2], proportional: bool) -> [f32; 4] {
+pub(super) fn resized(rect: [f32; 4], corner: usize, p: [f32; 2], proportional: bool) -> [f32; 4] {
     let (ow, oh) = ((rect[2] - rect[0]).max(1.0), (rect[3] - rect[1]).max(1.0));
     let right = matches!(corner, 1 | 2);
     let bottom = matches!(corner, 2 | 3);
@@ -487,6 +487,17 @@ fn resized(rect: [f32; 4], corner: usize, p: [f32; 2], proportional: bool) -> [f
     }
     let x = if right { ax } else { ax - w };
     let y = if bottom { ay } else { ay - h };
+    [x, y, x + w, y + h]
+}
+
+/// Large artwork may extend beyond the page; retain a small visible grip.
+pub(super) fn moved_image_rect(rect: [f32; 4], delta: [f32; 2], page: PageSize) -> [f32; 4] {
+    let w = rect[2] - rect[0];
+    let h = rect[3] - rect[1];
+    let gx = w.min(8.);
+    let gy = h.min(8.);
+    let x = (rect[0] + delta[0]).clamp(gx - w, (page.width - gx).max(gx - w));
+    let y = (rect[1] + delta[1]).clamp(gy - h, (page.height - gy).max(gy - h));
     [x, y, x + w, y + h]
 }
 type SvgPreviewResult = (String, Result<Arc<Vec<u8>>, String>);
@@ -1983,6 +1994,10 @@ pub(super) fn page_interaction(
                     let y = (original.rect[1] + delta[1])
                         .clamp(0.0, (tab.pages[page].height - h).max(0.0));
                     next.rect = [x, y, x + w, y + h];
+                    let artwork = matches!(original.kind, Kind::Image { .. } | Kind::Svg { .. });
+                    if artwork {
+                        next.rect = moved_image_rect(original.rect, delta, page_size);
+                    }
                     gesture.guides = Default::default();
                     if editor.snapping
                         && !ctx
@@ -1995,7 +2010,11 @@ pub(super) fn page_interaction(
                             std::slice::from_ref(&original.id),
                             scale,
                         );
-                        next = selection::moved(&[next], d, page_size).remove(0);
+                        if artwork {
+                            next.rect = moved_image_rect(next.rect, d, page_size);
+                        } else {
+                            next = selection::moved(&[next], d, page_size).remove(0);
+                        }
                         gesture.guides = guides;
                     }
                 }
@@ -2149,10 +2168,16 @@ pub(super) fn page_interaction(
         {
             let b = a.bounds();
             let h = page_rect.min + vec2(h[0], h[1]) * scale;
-            painter.line_segment(
-                [pos2(h.x, page_rect.top() + b[1] * scale), h],
-                Stroke::new(1., theme::accent()),
-            );
+            if editor
+                .gesture
+                .as_ref()
+                .is_none_or(|g| g.tab != tab.id || g.page != page)
+            {
+                painter.line_segment(
+                    [pos2(h.x, page_rect.top() + b[1] * scale), h],
+                    Stroke::new(1., theme::accent()),
+                );
+            }
             painter.circle_filled(h, 7., theme::paper());
             ui::draw_icon(
                 &painter,

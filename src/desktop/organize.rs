@@ -192,8 +192,8 @@ pub(super) struct Organizer {
     pressed: Option<(usize, egui::Pos2)>,
     marquee: Option<PageMarquee>,
     pub busy: bool,
-    change_name: &'static str,
-    tx: mpsc::Sender<Change>,
+    pub(super) change_name: &'static str,
+    pub(super) tx: mpsc::Sender<Change>,
     rx: mpsc::Receiver<Change>,
     output_tx: mpsc::Sender<Result<String, String>>,
     output_rx: mpsc::Receiver<Result<String, String>>,
@@ -441,7 +441,7 @@ impl Tab {
 impl Viewer {
     /// Page snapshots and document replacement must not leave an editor draft
     /// behind on an old page index or silently omit it from a copied page.
-    fn page_edits_ready(&mut self, copying: bool) -> bool {
+    pub(super) fn page_edits_ready(&mut self, copying: bool) -> bool {
         let Some(id) = self.tabs.get(self.active).map(|tab| tab.id) else {
             return false;
         };
@@ -1053,54 +1053,7 @@ impl Viewer {
         }
     }
     fn import_pages(&mut self, ctx: &egui::Context, at: usize) {
-        let Some(paths) = self.native_picks(
-            rfd::FileDialog::new()
-                .set_title("Insert PDFs in selected order")
-                .add_filter("PDF", &["pdf"]),
-        ) else {
-            return;
-        };
-        if self.organizer.busy || self.content.busy || !self.apply_pending_annotation() {
-            return;
-        }
-        let Some(tab) = self.tabs.get(self.active) else {
-            return;
-        };
-        let Some(s) = &tab.session else { return };
-        let (id, revision, source, annotations) = (
-            tab.id,
-            s.revision(),
-            s.source.clone(),
-            s.annotations.clone(),
-        );
-        let tx = self.organizer.tx.clone();
-        let wake = ctx.clone();
-        self.organizer.busy = true;
-        self.status = Some(("Importing pages…".into(), false));
-        std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<_> {
-                use std::io::Read;
-                let mut current = if revision == 0 {
-                    source.to_vec()
-                } else {
-                    mypdf_milestone0::annotations::export(&source, &annotations)?
-                };
-                let mut at = at;
-                for path in paths {
-                    let mut bytes = vec![];
-                    std::fs::File::open(path)?
-                        .take(viewer::MAX_FILE_BYTES + 1)
-                        .read_to_end(&mut bytes)?;
-                    let before = lopdf::Document::load_mem(&current)?.get_pages().len();
-                    current = pages::apply(&current, &Operation::InsertPdf { at, bytes })?;
-                    at += lopdf::Document::load_mem(&current)?.get_pages().len() - before;
-                }
-                Ok((id, revision, current, None))
-            })()
-            .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(result);
-            wake.request_repaint();
-        });
+        self.pick_insert_files(ctx, Some(at), false);
     }
     fn insert_dialog(&mut self, ctx: &egui::Context) {
         // The insertion controls live in the organizer panel, so the position is reviewable.
@@ -1120,7 +1073,7 @@ impl Viewer {
             ui.horizontal(|ui|{ui.label("Before page");ui.add(egui::DragValue::new(&mut self.organizer.before).range(1..=count+1));ui.label(format!("({} = append)",count+1));});
             ui.add_space(10.0);
             if ui.add(ActionButton::new(Icon::Plus,"Blank page · same size")).clicked(){action="blank";}
-            if ui.add(ActionButton::new(Icon::Import,"Pages from PDF…")).clicked(){action="pdf";}
+            if ui.add(ActionButton::new(Icon::Import,"Pages from files…")).clicked(){action="pdf";}
             ui.label(RichText::new("Imported pages keep their contents and annotations.\nDocument-level bookmarks are not merged.").small().color(theme::muted()));
         });
         if !action.is_empty() {

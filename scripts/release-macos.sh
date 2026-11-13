@@ -175,7 +175,7 @@ PY
 
 # Compile Apple Silicon once and package directly into the unpublished release.
 sh scripts/bundle-macos.sh --target aarch64-apple-darwin --output "$app"
-codesign --force --options runtime --timestamp --sign "$identity" "$app"
+codesign --force --options runtime --entitlements packaging/entitlements.plist --timestamp --sign "$identity" "$app"
 codesign --verify --strict --verbose=2 "$app"
 
 if [ -n "$profile" ]; then

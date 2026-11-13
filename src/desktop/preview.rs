@@ -1763,3 +1763,98 @@ fn properties_visual_preview() {
     assert!(rendered_text(&output).join("\n").contains("Apply"));
     preview.save(&ctx, output, &root.join("document-properties-small.png"));
 }
+
+#[test]
+#[ignore = "Manual file insertion visual QA; isolated data and preview output required"]
+fn file_insert_visual_preview() {
+    let root = PathBuf::from(std::env::var_os("MYPDF_PREVIEW_DIR").expect("preview output"));
+    assert!(std::env::var_os("MYPDF_DATA_DIR").is_some());
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("Project notes.rtf");
+    std::fs::write(&path, br"{\rtf1 Project notes}").unwrap();
+    let ctx = egui::Context::default();
+    let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+    let mut preview = Preview {
+        size: Some(vec2(820., 650.)),
+        ..Default::default()
+    };
+    preview.settle(&mut app, &ctx);
+    app.prepare_file_insert(vec![path], None, &ctx);
+    app.file_insert.draft.as_mut().unwrap().error =
+        Some(mypdf_milestone0::import_files::CONVERTER_WARNING.into());
+    preview.settle(&mut app, &ctx);
+    let output = preview.capture(&mut app, &ctx);
+    let labels = rendered_text(&output).join("\n");
+    assert!(
+        labels.contains("DOCX and RTF import requires Microsoft Word or LibreOffice."),
+        "{labels}"
+    );
+    assert!(labels.contains("Cancel"));
+    preview.save(
+        &ctx,
+        output,
+        &root.join("insert-files-converter-warning.png"),
+    );
+}
+
+#[test]
+#[ignore = "Manual text layer visual QA; isolated data and preview output required"]
+fn text_layer_visual_preview() {
+    use mypdf_milestone0::{
+        annotations::{self, Annotation, Kind, Style},
+        text_layer,
+        text_style::TextFormat,
+    };
+    let root = PathBuf::from(std::env::var_os("MYPDF_PREVIEW_DIR").unwrap());
+    assert!(std::env::var_os("MYPDF_DATA_DIR").is_some());
+    std::fs::create_dir_all(&root).unwrap();
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbImage::from_pixel(80, 80, image::Rgb([120, 190, 245]))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let image = Annotation::new(
+        0,
+        [60., 80., 535., 500.],
+        Kind::Image {
+            png: png.into_inner().into(),
+        },
+        Style::default(),
+    );
+    let pdf = annotations::export(
+        &mypdf_milestone0::convert::blank(595., 842.).unwrap(),
+        &[image],
+    )
+    .unwrap();
+    let pdf = text_layer::add(
+        &pdf,
+        1,
+        "Text above image",
+        [90., 110., 400., 80.],
+        28.,
+        [0.05, 0.05, 0.05],
+        &TextFormat::default(),
+        &[],
+    )
+    .unwrap();
+    std::fs::write(root.join("layer-regression.pdf"), &pdf).unwrap();
+    let ctx = egui::Context::default();
+    let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+    app.open_memory(PathBuf::from("Text above image.pdf"), pdf, &ctx);
+    app.editor.mode = editing::Mode::Edit;
+    let mut preview = Preview::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let output = preview.capture(&mut app, &ctx);
+        if rendered_text(&output)
+            .iter()
+            .any(|s| s == "Text above image")
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    preview.settle(&mut app, &ctx);
+    let output = preview.capture(&mut app, &ctx);
+    preview.save(&ctx, output, &root.join("text-above-image.png"));
+}

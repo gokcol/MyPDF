@@ -528,6 +528,9 @@ impl Default for Style {
 /// Editable object metadata travels with the artwork, including through the clipboard.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ObjectProperties {
+    /// Styled text placed above earlier artwork; ordered with the other layers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<crate::text_layer::TextLayer>,
     /// Structured table data accompanying its movable vector appearance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table: Option<crate::tables::Table>,
@@ -579,6 +582,13 @@ impl Annotation {
         }
     }
     pub fn validate(&self) -> Result<()> {
+        if let Some(layer) = &self.object.text {
+            ensure!(
+                matches!(self.kind, Kind::Text { .. }),
+                "Rich text requires a text object"
+            );
+            layer.validate(self.kind.text().unwrap())?;
+        }
         ensure!(
             self.id.len() == 32 && self.id.bytes().all(|c| c.is_ascii_hexdigit()),
             "Invalid annotation ID"
@@ -2598,8 +2608,21 @@ pub fn appearance(
     if let Some(font) = font {
         resources.set("Font", dictionary! { "UF" => font.id });
     }
+    let mut layered_text = None;
     let primitives = if a.object.hidden {
         vec![]
+    } else if a.object.text.is_some() {
+        let (id, height) = crate::text_layer::embed(doc, a)?;
+        resources.set("XObject", dictionary! { "TextLayer" => id });
+        layered_text = Some(format!(
+            "q 1 0 0 -1 {} {} cm /TextLayer Do Q\n",
+            a.rect[0],
+            a.rect[1] + height
+        ));
+        primitives(a)
+            .into_iter()
+            .filter(|p| !matches!(p, Primitive::Text { .. }))
+            .collect()
     } else if let Kind::Svg { source, tint } = &a.kind {
         let (id, w, h) = crate::svg::embed(doc, source, tint.then_some(a.style.color))?;
         resources.set("XObject", dictionary! { "Svg" => id });
@@ -2721,6 +2744,9 @@ pub fn appearance(
                 ));
             }
         }
+    }
+    if let Some(text) = layered_text {
+        content.push_str(&text);
     }
     if matches!(a.kind, Kind::Vector { .. }) && a.style.stroke == StrokeStyle::Solid {
         content.push_str("f\n");

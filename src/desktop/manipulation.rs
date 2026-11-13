@@ -77,7 +77,10 @@ pub(super) fn rotation_handle(a: &Annotation, scale: f32) -> Option<[f32; 2]> {
         return None;
     }
     let b = a.bounds();
-    Some([(b[0] + b[2]) / 2., b[1] - 25. / scale.max(0.1)])
+    let scale = scale.max(0.1);
+    // Full-page artwork has no space above it. Keep its rotation control
+    // visible and reachable inside the page instead of clipping it away.
+    Some([(b[0] + b[2]) / 2., (b[1] - 25. / scale).max(12. / scale)])
 }
 pub(super) fn rotation_at(a: &Annotation, p: [f32; 2], scale: f32) -> bool {
     rotation_handle(a, scale).is_some_and(|h| (p[0] - h[0]).hypot(p[1] - h[1]) * scale < 11.)

@@ -25,6 +25,16 @@ pub struct Replacement {
 }
 
 pub fn replace(bytes: &[u8], page: u32, block: &Replacement) -> Result<Vec<u8>> {
+    if block.selection.runs.is_empty() && block.selection.annotations.len() == 1 {
+        let (id, expected) = &block.selection.annotations[0];
+        let doc = lopdf::Document::load_mem(bytes)?;
+        if crate::annotations::load(&doc)
+            .iter()
+            .any(|a| &a.id == id && a.object.text.is_some())
+        {
+            return crate::text_layer::replace(bytes, page, id, expected, block);
+        }
+    }
     let mut doc = crate::content::editable(bytes)?;
     let id = *doc.get_pages().get(&page).context("Page not found")?;
     ensure!(

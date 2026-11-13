@@ -601,47 +601,9 @@ impl Viewer {
         }
     }
 
-    /// Edit → Add image…: a PNG or JPEG placed as page content on the current page.
+    /// Insert supported raster or vector images on the current page.
     pub(super) fn add_image_file(&mut self, ctx: &egui::Context) {
-        let Some(path) = self.native_pick(
-            rfd::FileDialog::new()
-                .set_title("Add image")
-                .add_filter("Images", &["png", "jpg", "jpeg"]),
-        ) else {
-            return;
-        };
-        let read = std::fs::metadata(&path)
-            .map_err(anyhow::Error::from)
-            .and_then(|m| {
-                anyhow::ensure!(m.len() <= 32 * 1024 * 1024, "Image exceeds 32 MB");
-                Ok(std::fs::read(&path)?)
-            })
-            .and_then(|bytes| {
-                let image = mypdf_milestone0::content::decode_image(&bytes)?;
-                Ok((bytes, [image.width(), image.height()]))
-            });
-        match read {
-            Ok((bytes, pixels)) => {
-                let Some(tab) = self.tabs.get(self.active) else {
-                    return;
-                };
-                let page = tab.page.min(tab.pages.len().saturating_sub(1));
-                let Some(size) = tab.pages.get(page).copied() else {
-                    return;
-                };
-                // Images at 144 dpi, at most 60% of the page.
-                let rect = centered(size, [pixels[0] as f32 / 2., pixels[1] as f32 / 2.], 0.6);
-                self.content_change(
-                    ctx,
-                    content::Edit::AddImage {
-                        page: page as u32 + 1,
-                        rect,
-                        image: bytes,
-                    },
-                );
-            }
-            Err(e) => self.status = Some((format!("{e:#}"), true)),
-        }
+        self.pick_insert_files(ctx, None, true);
     }
 }
 

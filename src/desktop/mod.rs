@@ -14,6 +14,7 @@ mod form_tools;
 mod header_footer;
 mod home;
 pub mod icon;
+mod insert_files;
 mod interface;
 mod manipulation;
 mod menu;
@@ -303,6 +304,7 @@ pub struct Viewer {
     ocr_progress: Option<Arc<recognize::Progress>>,
     ocr_result: Option<recognize::Results>,
     document_properties: Option<properties::Draft>,
+    file_insert: insert_files::State,
     ocr_draft: Option<recognize::Draft>,
     ocr_error: Option<String>,
     save_events: mpsc::Receiver<Result<save::Completed, String>>,
@@ -382,6 +384,7 @@ impl Viewer {
             ocr_progress: None,
             ocr_result: None,
             document_properties: None,
+            file_insert: insert_files::State::default(),
             ocr_draft: None,
             ocr_error: None,
             focus_search: false,
@@ -1183,8 +1186,8 @@ impl Viewer {
                 .filter_map(|f| f.path.clone())
                 .collect::<Vec<_>>()
         });
-        for path in dropped {
-            self.open(path, ctx);
+        if !dropped.is_empty() {
+            self.prepare_file_insert(dropped, None, ctx);
         }
     }
     /// In Pages, Copy and Paste act on whole pages unless a text field has focus.
@@ -2289,7 +2292,8 @@ impl Viewer {
                             content::smart_select(&mut self.content,&mut self.editor,tab,ui,page,page_rect,scale,&mut self.inspector);
                         }
                         let placing = !self.table.deferring_input() && (workbench::crop_overlay(&mut self.workbench, &mut self.editor, tab, ui, page, page_rect, scale) || workbench::paste_overlay(&mut self.workbench, &mut self.editor, tab, ui, page, page_rect, scale, &mut self.status));
-                        if !placing && !table_owns && !self.table.deferring_input() {
+                        let artwork_owns = !placing && !table_owns && !self.table.deferring_input() && !self.organizer.busy && !self.redaction.active && content::artwork_overlay(&self.content, &mut self.editor, tab, ui, page, page_rect, scale, &mut self.status);
+                        if !placing && !table_owns && !self.table.deferring_input() && !artwork_owns {
                         editing::page_interaction(
                             &mut self.editor,
                             tab,
@@ -2302,7 +2306,7 @@ impl Viewer {
                         annotation_text::overlay(&mut self.editor, tab, ui, page, page_rect, scale, &mut self.status);
                         }
                         self.content.hide_guides = self.editor.hide_guides;
-                        self.content.paused = table_owns || self.table.deferring_input() || self.productivity.owns_input() || placing || self.redaction.active && self.editor.mode == editing::Mode::Edit;
+                        self.content.paused = artwork_owns || table_owns || self.table.deferring_input() || self.productivity.owns_input() || placing || self.redaction.active && self.editor.mode == editing::Mode::Edit;
                         if self.editor.mode == editing::Mode::Forms {
                             let editable = !self.content.busy
                                 && !self.organizer.busy
@@ -2311,7 +2315,7 @@ impl Viewer {
                         } else {
                             content::overlay(&mut self.content,self.editor.mode,tab,ui,page,page_rect,scale);
                         }
-                        if !placing && !self.content.paused && !self.organizer.busy {
+                        if !placing && (!self.content.paused || artwork_owns) && !self.organizer.busy {
                             content::page_menu(&mut self.content, &mut self.editor, tab, ui, page, page_rect, scale);
                         }
                         if self.redaction.active && self.editor.mode == editing::Mode::Edit && !placing {
@@ -2619,6 +2623,7 @@ impl eframe::App for Viewer {
         self.print_preview_dialog(ctx);
         self.ocr_dialogs(ctx);
         self.document_properties_dialog(ctx);
+        self.file_insert_dialog(ctx);
         self.compare_dialog(ctx);
         self.details_dialogs(ctx);
         self.page_dialogs(ctx);
@@ -2708,14 +2713,14 @@ impl eframe::App for Viewer {
             painter.text(
                 zone.center() + vec2(0., 34.),
                 egui::Align2::CENTER_CENTER,
-                "Drop PDFs to open",
+                "Drop files to insert",
                 ui::font(ctx, ui::STRONG, 22.),
                 theme::ink(),
             );
             painter.text(
                 zone.center() + vec2(0., 62.),
                 egui::Align2::CENTER_CENTER,
-                "Each file opens in its own tab",
+                "PDFs, images, text and documents",
                 FontId::proportional(13.5),
                 theme::muted(),
             );

@@ -65,6 +65,8 @@ pub struct ImageObject {
 pub enum ImageEdit {
     Replace(Vec<u8>),
     Place([f32; 4]),
+    Rotate(f32),
+    ResetRotation,
     Delete,
 }
 
@@ -485,23 +487,21 @@ fn render_image_png(bytes: &[u8], page: u32, index: usize) -> Result<Vec<u8>> {
     Ok(raster.into_png()?)
 }
 
-/// Decode bounded PNG/JPEG artwork without external resources.
+/// Decode bounded raster artwork without external resources.
 pub fn decode_image(bytes: &[u8]) -> Result<image::RgbaImage> {
     ensure!(bytes.len() <= 32 * 1024 * 1024, "Image exceeds 32 MB");
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?;
-    ensure!(
-        matches!(
-            reader.format(),
-            Some(image::ImageFormat::Png | image::ImageFormat::Jpeg)
-        ),
-        "Choose a PNG or JPEG image"
-    );
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(8192);
     limits.max_image_height = Some(8192);
     limits.max_alloc = Some(128 * 1024 * 1024);
     reader.limits(limits);
-    let image = reader.decode()?.to_rgba8();
+    use image::ImageDecoder;
+    let mut decoder = reader.into_decoder()?;
+    let orientation = decoder.orientation()?;
+    let mut decoded = image::DynamicImage::from_decoder(decoder)?;
+    decoded.apply_orientation(orientation);
+    let image = decoded.to_rgba8();
     ensure!(
         image.width() as u64 * image.height() as u64 <= 24_000_000,
         "Image exceeds 24 million pixels"
@@ -558,7 +558,12 @@ pub fn edit_image(bytes: &[u8], page: u32, index: usize, edit: &ImageEdit) -> Re
             doc.get_dictionary_mut(id)?.set("Resources", res);
             content.operations[index].operands = vec![Object::Name(name.into_bytes())];
         }
-        ImageEdit::Place(r) => {
+        ImageEdit::Place(_) | ImageEdit::Rotate(_) | ImageEdit::ResetRotation => {
+            let r = if let ImageEdit::Place(r) = edit {
+                *r
+            } else {
+                selected.rect
+            };
             ensure!(
                 r.iter().all(|v| v.is_finite() && v.abs() < 100_000.)
                     && r[2] - r[0] >= 1.
@@ -571,9 +576,34 @@ pub fn edit_image(bytes: &[u8], page: u32, index: usize, edit: &ImageEdit) -> Re
             ensure!(w > 0.001 && h > 0.001, "Image has no editable extent");
             let inverse =
                 Affine::new(crate::annotations::page_geometry(bytes)?[(page - 1) as usize].1);
-            let change = Affine::translate((r[0] as f64, r[1] as f64))
-                * Affine::scale_non_uniform(((r[2] - r[0]) / w) as f64, ((r[3] - r[1]) / h) as f64)
-                * Affine::translate((-old[0] as f64, -old[1] as f64));
+            let degrees = match edit {
+                ImageEdit::Rotate(degrees) => Some(*degrees),
+                ImageEdit::ResetRotation => {
+                    let displayed = (inverse.inverse() * Affine::new(selected.matrix)).as_coeffs();
+                    Some((-displayed[1].atan2(displayed[0]).to_degrees()) as f32)
+                }
+                _ => None,
+            };
+            let change = if let Some(degrees) = degrees {
+                ensure!(
+                    degrees.is_finite() && degrees.abs() <= 360.,
+                    "Invalid image rotation"
+                );
+                let center = (
+                    ((old[0] + old[2]) / 2.) as f64,
+                    ((old[1] + old[3]) / 2.) as f64,
+                );
+                Affine::translate(center)
+                    * Affine::rotate(f64::from(degrees).to_radians())
+                    * Affine::translate((-center.0, -center.1))
+            } else {
+                Affine::translate((r[0] as f64, r[1] as f64))
+                    * Affine::scale_non_uniform(
+                        ((r[2] - r[0]) / w) as f64,
+                        ((r[3] - r[1]) / h) as f64,
+                    )
+                    * Affine::translate((-old[0] as f64, -old[1] as f64))
+            };
             let original = Affine::new(selected.matrix);
             let delta = original.inverse() * inverse * change * inverse.inverse() * original;
             let ops = vec![

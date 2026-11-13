@@ -373,6 +373,11 @@ const COMMANDS: &[(&str, &str, &str)] = &[
     ),
     ("Image", "add_image", "add picture photo import"),
     (
+        "Insert Files",
+        "insert_files",
+        "import PDF image text markdown docx rtf",
+    ),
+    (
         "Table",
         "edit_table",
         "add rows columns cells bordered grid",
@@ -495,6 +500,10 @@ impl Viewer {
     }
     pub(super) fn workbench_action(&mut self, action: &str, ctx: &egui::Context) -> bool {
         match action {
+            "insert_files" => {
+                self.pick_insert_files(ctx, None, false);
+                return true;
+            }
             "document_properties" => {
                 self.open_document_properties(ctx);
                 return true;
@@ -1386,6 +1395,7 @@ impl Viewer {
                                 COMMANDS[i].1,
                                 "new"
                                     | "open"
+                                    | "insert_files"
                                     | "guides"
                                     | "history"
                                     | "recovery"

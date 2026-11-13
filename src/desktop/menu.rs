@@ -170,6 +170,7 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
             &item("new", "New Blank PDF", Code::KeyN, Modifiers::empty()),
             &item("open", "Open…", Code::KeyO, Modifiers::empty()),
             &recent,
+            &MenuItem::with_id("insert_files", "Insert Files…", true, None),
             &item(
                 "reopen_closed",
                 "Reopen Closed Tab",
@@ -555,6 +556,7 @@ fn native_symbol(id: &str, label: &str) -> &'static str {
         "form_export" => "square.and.arrow.up",
         "form_flatten" | "flatten" => "square.3.layers.3d.down.right",
         "edit_text" | "page_text" => "text.cursor",
+        "insert_files" => "square.and.arrow.down",
         "add_image" => "photo",
         "edit_table" => "tablecells",
         "redact" => "rectangle.fill",

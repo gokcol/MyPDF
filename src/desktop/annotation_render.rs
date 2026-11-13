@@ -7,6 +7,52 @@ pub(super) fn text_resolution(scale: f32) -> f32 {
     scale.max(1.)
 }
 
+pub(super) fn layer_layout(
+    ctx: &egui::Context,
+    a: &Annotation,
+    text: &str,
+    scale: f32,
+) -> Arc<egui::Galley> {
+    use mypdf_milestone0::text_style::{self, Alignment};
+    let layer = a.object.text.as_ref().unwrap();
+    let source = a.kind.text().unwrap_or_default();
+    let spans = mypdf_milestone0::rich_text::edited(source, text, &layer.local_spans(&a.style));
+    let mut job = egui::text::LayoutJob::simple(
+        text.into(),
+        FontId::proportional(a.style.font_size * scale),
+        editing::color(a.style.color, a.style.opacity),
+        (a.rect[2] - a.rect[0]) * scale,
+    );
+    job.halign = match layer.alignment {
+        Alignment::Center => egui::Align::Center,
+        Alignment::Right => egui::Align::RIGHT,
+        _ => egui::Align::LEFT,
+    };
+    job.justify = layer.alignment == Alignment::Justified;
+    if !spans.is_empty() {
+        job.sections.clear();
+        for span in spans {
+            let family = text_style::fonts()
+                .iter()
+                .find(|f| Some(&f.path) == span.font.as_ref())
+                .map_or(egui::FontFamily::Proportional, |f| {
+                    egui::FontFamily::Name(f.ui_name().into())
+                });
+            job.sections.push(egui::text::LayoutSection {
+                leading_space: 0.,
+                byte_range: span.range,
+                format: egui::TextFormat {
+                    font_id: FontId::new(span.size * scale, family),
+                    color: editing::color(span.color, a.style.opacity),
+                    line_height: Some(span.size * scale * 1.3),
+                    ..Default::default()
+                },
+            });
+        }
+    }
+    ctx.fonts_mut(|fonts| fonts.layout_job(job))
+}
+
 pub(super) fn paint_text(
     ctx: &egui::Context,
     painter: &egui::Painter,
@@ -27,18 +73,26 @@ pub(super) fn paint_text(
     };
     let ink = editing::color(text_color.unwrap_or(a.style.color), a.style.opacity);
     let resolution = text_resolution(scale);
-    let galley = ctx.fonts_mut(|fonts| {
-        fonts.layout(
-            text.replace('\t', "    "),
-            FontId::new(
-                size * resolution,
-                egui::FontFamily::Name("annotation".into()),
-            ),
-            ink,
-            ((rect[2] - rect[0] - 8.) * resolution).max(1.),
-        )
-    });
-    let mut origin = [rect[0] + 4., rect[1] + 4.];
+    let galley = if a.object.text.is_some() {
+        layer_layout(ctx, a, &text, resolution)
+    } else {
+        ctx.fonts_mut(|fonts| {
+            fonts.layout(
+                text.replace('\t', "    "),
+                FontId::new(
+                    size * resolution,
+                    egui::FontFamily::Name("annotation".into()),
+                ),
+                ink,
+                ((rect[2] - rect[0] - 8.) * resolution).max(1.),
+            )
+        })
+    };
+    let inset = if a.object.text.is_some() { 0. } else { 4. };
+    let mut origin = [rect[0] + inset, rect[1] + inset];
+    if a.object.text.is_some() {
+        origin[0] -= galley.rect.min.x / resolution;
+    }
     if centered {
         origin = [
             (rect[0] + rect[2]) / 2. - galley.size().x / resolution / 2.,

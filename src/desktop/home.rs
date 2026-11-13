@@ -601,9 +601,9 @@ fn open_banner(ui: &mut egui::Ui) -> egui::Response {
             theme::ink(),
         );
         let hint = if rect.width() >= 480. {
-            "or drop PDFs anywhere in this window"
+            "or drop PDFs, images and documents"
         } else {
-            "or drop PDFs here"
+            "or drop files here"
         };
         painter.text(
             pos2(left, rect.center().y + 14.),

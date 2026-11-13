@@ -20,6 +20,7 @@ pub mod identity;
 pub mod image_background;
 pub mod image_effects;
 pub mod image_region;
+pub mod import_files;
 #[cfg(target_os = "macos")]
 pub mod keychain;
 pub mod navigation;
@@ -44,6 +45,7 @@ pub mod svg;
 pub mod tables;
 pub mod text_block;
 pub mod text_geometry;
+pub mod text_layer;
 mod text_recovery;
 pub mod text_style;
 pub mod translation;

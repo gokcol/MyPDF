@@ -191,9 +191,72 @@ fn image_edits_isolate_resources_and_rotated_coordinates() {
         assert!((a - b).abs() < 0.01, "{a} {b}");
     }
     assert_eq!(content::images(&moved, 1).unwrap()[0].rect, images[0].rect);
+    let rotated =
+        content::edit_image(&moved, 2, m[0].index, &content::ImageEdit::Rotate(90.)).unwrap();
+    let after = content::images(&rotated, 2).unwrap();
+    for (a, b) in after[0].rect.iter().zip([80., 55., 140., 175.]) {
+        assert!((a - b).abs() < 0.02, "{a} {b}");
+    }
+    assert_eq!(
+        content::images(&rotated, 1).unwrap()[0].matrix,
+        images[0].matrix
+    );
+    assert_eq!(
+        Document::load_mem(&rotated)
+            .unwrap()
+            .extract_text(&[2])
+            .unwrap(),
+        Document::load_mem(&moved)
+            .unwrap()
+            .extract_text(&[2])
+            .unwrap()
+    );
     let deleted = content::edit_image(&moved, 2, m[0].index, &content::ImageEdit::Delete).unwrap();
     assert!(content::images(&deleted, 2).unwrap().is_empty());
     assert_eq!(content::images(&deleted, 1).unwrap().len(), 1);
+}
+#[test]
+fn reset_image_rotation_preserves_size_center_and_other_content() {
+    for page in [1, 2] {
+        let added = content::add_image(fixture(), page, [50., 70., 170., 130.], &png()).unwrap();
+        let before = content::images(&added, page).unwrap();
+        let original = before.last().unwrap();
+        for angle in [-125., 37., 180.] {
+            let rotated = content::edit_image(
+                &added,
+                page,
+                original.index,
+                &content::ImageEdit::Rotate(angle),
+            )
+            .unwrap();
+            let selected = content::images(&rotated, page).unwrap().pop().unwrap();
+            let reset = content::edit_image(
+                &rotated,
+                page,
+                selected.index,
+                &content::ImageEdit::ResetRotation,
+            )
+            .unwrap();
+            let after = content::images(&reset, page).unwrap();
+            for (actual, expected) in after.last().unwrap().matrix.iter().zip(original.matrix) {
+                assert!(
+                    (actual - expected).abs() < 0.002,
+                    "page {page}, angle {angle}: {actual} != {expected}"
+                );
+            }
+            assert_eq!(after[0].matrix, before[0].matrix);
+            assert_eq!(
+                Document::load_mem(&reset)
+                    .unwrap()
+                    .extract_text(&[page])
+                    .unwrap(),
+                Document::load_mem(&added)
+                    .unwrap()
+                    .extract_text(&[page])
+                    .unwrap()
+            );
+        }
+    }
 }
 #[test]
 fn form_values_multiwidget_appearances_radio_and_choice() {

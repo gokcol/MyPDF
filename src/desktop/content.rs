@@ -34,6 +34,7 @@ struct BlockDraft {
     initial_spans: Vec<mypdf_milestone0::rich_text::Span>,
     font: usize,
     alignment: Alignment,
+    initial_alignment: Alignment,
     /// Font, size, color and right edge when the block opened.
     initial: (usize, f32, [f32; 3], f32),
     initial_origin: [f32; 2],
@@ -54,6 +55,15 @@ struct InlineText {
     font: String,
     focus: bool,
 }
+struct ImageGesture {
+    key: Key,
+    ordinal: usize,
+    start: egui::Pos2,
+    original: [f32; 4],
+    rect: [f32; 4],
+    rotation: f32,
+    handle: i8,
+}
 impl InlineText {
     /// Whether committing would change the document. An untouched block is
     /// closed as it is rather than rewritten with uniform formatting.
@@ -64,7 +74,7 @@ impl InlineText {
                     || b.spans != b.initial_spans
                     || b.layout != b.initial_layout
                     || [self.rect[0], self.rect[1]] != b.initial_origin
-                    || b.alignment != Alignment::Left
+                    || b.alignment != b.initial_alignment
                     || b.preserve_layout == b.layout.is_empty())
     }
 }
@@ -134,11 +144,6 @@ pub(super) enum Edit {
         value: String,
     },
     HeaderFooter(mypdf_milestone0::header_footer::Stamp),
-    AddImage {
-        page: u32,
-        rect: [f32; 4],
-        image: Vec<u8>,
-    },
     RemoveHeaderFooter(Vec<mypdf_milestone0::header_footer::Kind>),
     Redact {
         areas: Vec<mypdf_milestone0::redact::Area>,
@@ -252,6 +257,8 @@ pub(super) struct ContentState {
     image_reselect: Option<ImageReselect>,
     image_nudge_delta: [f32; 2],
     image_effects: Option<image_effects::EmbeddedEffects>,
+    image_gesture: Option<ImageGesture>,
+    image_transform: Option<(Key, usize, content::ImageEdit)>,
     region: region::State,
     pub image_mode: bool,
     /// Another tool (Redact) owns the page overlay.
@@ -639,7 +646,11 @@ impl ContentState {
         if self.busy {
             return;
         }
-        if self.existing.as_ref().is_some_and(|e| e.key.0 == tab) {
+        if self.existing.as_ref().is_some_and(|e| e.key.0 == tab)
+            || (self.new_placed
+                && self.add_target.is_some_and(|(id, _)| id == tab)
+                && !self.new_text.trim().is_empty())
+        {
             self.new_commit = true;
         }
         if self.table_selection.is_some_and(|(key, _)| key.0 == tab) {
@@ -843,6 +854,8 @@ impl ContentState {
             image_reselect: None,
             image_nudge_delta: [0.; 2],
             image_effects: None,
+            image_gesture: None,
+            image_transform: None,
             region: region::State::default(),
             image_mode: false,
             paused: false,
@@ -882,6 +895,63 @@ impl Viewer {
         }
     }
     pub(super) fn content_events(&mut self, ctx: &egui::Context) {
+        if let Some((key, ordinal, edit)) = self.content.image_transform.take()
+            && !self.content.busy
+            && let Some(tab) = self.tabs.get(self.active)
+            && let Some(session) = &tab.session
+            && (tab.id, session.revision(), tab.page) == key
+            && let Some(image) = self
+                .content
+                .inspection
+                .as_ref()
+                .filter(|i| i.key == key)
+                .and_then(|i| i.images.as_ref().ok())
+                .and_then(|images| images.get(ordinal))
+                .cloned()
+        {
+            let rect = match &edit {
+                content::ImageEdit::Place(rect) => *rect,
+                content::ImageEdit::Rotate(degrees) => {
+                    use hayro::kurbo::{Affine, Rect};
+                    let center = (
+                        ((image.rect[0] + image.rect[2]) / 2.) as f64,
+                        ((image.rect[1] + image.rect[3]) / 2.) as f64,
+                    );
+                    let geometry = mypdf_milestone0::annotations::page_geometry(&session.source);
+                    let Ok(geometry) = geometry else { return };
+                    let matrix = Affine::translate(center)
+                        * Affine::rotate(f64::from(*degrees).to_radians())
+                        * Affine::translate((-center.0, -center.1))
+                        * Affine::new(geometry[key.2].1).inverse()
+                        * Affine::new(image.matrix);
+                    let bounds = matrix.transform_rect_bbox(Rect::new(0., 0., 1., 1.));
+                    [
+                        bounds.x0 as f32,
+                        bounds.y0 as f32,
+                        bounds.x1 as f32,
+                        bounds.y1 as f32,
+                    ]
+                }
+                _ => image.rect,
+            };
+            self.content.image_reselect = Some(ImageReselect {
+                tab: key.0,
+                page: key.2,
+                revision: None,
+                resolved: false,
+                ordinal,
+                name: image.name,
+                rect,
+            });
+            self.content_change(
+                ctx,
+                Edit::Image {
+                    page: key.2 as u32 + 1,
+                    index: image.index,
+                    edit,
+                },
+            );
+        }
         if std::mem::take(&mut self.content.show_text_inspector) {
             self.inspector = true;
         }
@@ -1206,7 +1276,6 @@ impl Viewer {
             Edit::TableDelete { .. } => "Delete table",
             Edit::TableCells { .. } => "Edit table cell",
             Edit::Image { .. } => "Edit image",
-            Edit::AddImage { .. } => "Add image",
             Edit::HeaderFooter(_) => "Add header or footer",
             Edit::RemoveHeaderFooter(_) => "Remove header or footer",
             Edit::Redact { .. } => "Redact content",
@@ -1253,7 +1322,9 @@ impl Viewer {
                             size,
                             color,
                             format,
-                        } => if spans.is_empty() {
+                        } => if mypdf_milestone0::text_layer::needed(&bytes, page)? {
+                            mypdf_milestone0::text_layer::add(&bytes, page, &text, rect, size, color, &format, &spans)?
+                        } else if spans.is_empty() {
                             content::add_text_styled(&bytes, page, &text, rect, size, color, &format)?
                         } else {
                             mypdf_milestone0::rich_text::add_aligned(&bytes, page, &text, rect, &spans, format.alignment)?
@@ -1450,13 +1521,6 @@ impl Viewer {
                         Edit::TableDelete {page,table} => mypdf_milestone0::tables::delete(&bytes,page,&table)?,
                         Edit::TableCells { page, table, base } => mypdf_milestone0::tables::edit_detected(&bytes,page,&table,&base)?,
                         Edit::Block { page, block } => text_block::replace(&bytes, page, &block)?,
-                        Edit::AddImage { page, rect, image } => {
-                            note = Some(
-                                "Image added to the page • Click it to move, resize or replace it"
-                                    .into(),
-                            );
-                            content::add_image(&bytes, page, rect, &image)?
-                        }
                         Edit::Redact { areas, options } => {
                             let (bytes, r) =
                                 mypdf_milestone0::redact::apply(&bytes, &areas, &options)?;
@@ -1609,6 +1673,25 @@ impl Viewer {
         }
         if self.content.add_target.is_some() {
             self.new_text_panel(ctx);
+            return;
+        }
+        if self.content.existing.is_none()
+            && self.tabs.get(self.active).is_some_and(|tab| {
+                tab.selected_annotation.as_ref().is_some_and(|id| {
+                    tab.session.as_ref().is_some_and(|s| {
+                        s.annotations.iter().any(|a| {
+                            &a.id == id
+                                && !a.object.hidden
+                                && !matches!(
+                                    a.kind,
+                                    mypdf_milestone0::annotations::Kind::Text { .. }
+                                )
+                        })
+                    })
+                })
+            })
+        {
+            self.annotation_inspector(ctx);
             return;
         }
         self.inspect_content(ctx);
@@ -2721,6 +2804,16 @@ impl Viewer {
     }
     fn existing_text_panel(&mut self, ctx: &egui::Context) {
         let current = self.tabs.get(self.active).map(|t| (t.id, t.page));
+        let has_text_layer = self.tabs.get(self.active).is_some_and(|tab| {
+            tab.session.as_ref().is_some_and(|session| {
+                session.annotations.iter().any(|a| {
+                    a.page == tab.page
+                        && !a.object.hidden
+                        && !a.object.locked
+                        && matches!(a.kind, mypdf_milestone0::annotations::Kind::Text { .. })
+                })
+            })
+        });
         let page_size = self
             .tabs
             .get(self.active)
@@ -2819,7 +2912,7 @@ impl Viewer {
                         ui.add_space(14.);
                         ui.label(RichText::new("Type on the page. Drag the handle or use arrow keys to move. Click outside, press Esc or ⌘Return to finish.").size(12.).color(theme::muted()));
                     } else {
-                        let empty = self.content.inspection.as_ref().is_some_and(|info| info.text.as_ref().is_ok_and(|runs| runs.is_empty()));
+                        let empty = !has_text_layer && self.content.inspection.as_ref().is_some_and(|info| info.text.as_ref().is_ok_and(|runs| runs.is_empty()));
                         if empty {
                             ui.label(RichText::new("No editable text on this page.").size(15.).color(theme::ink()));
                             ui.label(RichText::new("Click an image to edit it, or add a text block.").color(theme::muted()));
@@ -2882,6 +2975,54 @@ fn pdf_preview_font(name: &str) -> egui::FontFamily {
         .or_else(|| text_style::fonts().first())
         .map(|f| egui::FontFamily::Name(f.ui_name().into()))
         .unwrap_or(egui::FontFamily::Proportional)
+}
+
+fn annotation_candidate(a: &mypdf_milestone0::annotations::Annotation, key: Key) -> InlineText {
+    let text = a.kind.text().unwrap_or_default().to_string();
+    let target = if let Some(layer) = &a.object.text {
+        let spans = layer.local_spans(&a.style);
+        let font = spans
+            .first()
+            .and_then(|s| {
+                text_style::fonts()
+                    .iter()
+                    .position(|f| Some(&f.path) == s.font.as_ref())
+            })
+            .unwrap_or(0);
+        InlineTarget::Block(Box::new(BlockDraft {
+            selection: text_block::Selection {
+                runs: vec![],
+                annotations: vec![(a.id.clone(), text.clone())],
+            },
+            masks: vec![a.rect],
+            initial_spans: spans.clone(),
+            spans,
+            styled_text: text.clone(),
+            selected_chars: None,
+            font,
+            alignment: layer.alignment,
+            initial_alignment: layer.alignment,
+            initial: (font, a.style.font_size, a.style.color, a.rect[2]),
+            initial_origin: [a.rect[0], a.rect[1]],
+            layout: vec![],
+            initial_layout: vec![],
+            preserve_layout: false,
+        }))
+    } else {
+        InlineTarget::Annotation(a.id.clone())
+    };
+    InlineText {
+        key,
+        target,
+        geometry: None,
+        original: text.clone(),
+        text,
+        rect: a.bounds(),
+        size: a.style.font_size,
+        color: a.style.color,
+        font: "Text box".into(),
+        focus: true,
+    }
 }
 
 /// A click edits one visual line, including adjacent fragments with different
@@ -3097,6 +3238,7 @@ fn selected_block(
             selected_chars: None,
             font,
             alignment: Alignment::Left,
+            initial_alignment: Alignment::Left,
             initial: (font, size, first.color, right),
             initial_origin: [x, y],
             initial_layout: layout.clone(),
@@ -3316,19 +3458,8 @@ fn existing_overlay(
         .iter()
         .filter(|a| a.page == page && !a.object.hidden && !a.object.locked)
     {
-        if let mypdf_milestone0::annotations::Kind::Text { text } = &a.kind {
-            candidates.push(InlineText {
-                key,
-                target: InlineTarget::Annotation(a.id.clone()),
-                geometry: None,
-                original: text.clone(),
-                text: text.clone(),
-                rect: a.bounds(),
-                size: a.style.font_size,
-                color: a.style.color,
-                font: "Text box".into(),
-                focus: true,
-            });
+        if let mypdf_milestone0::annotations::Kind::Text { .. } = &a.kind {
+            candidates.push(annotation_candidate(a, key));
         }
     }
     // Dragging across the page selects an area directly.
@@ -3827,6 +3958,64 @@ fn existing_overlay(
     }
 }
 
+/// Artwork uses the same manipulation controls in Edit as in Draw. Text and
+/// region tools retain priority, even when an image covers the entire page.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn artwork_overlay(
+    state: &ContentState,
+    editor: &mut editing::EditorState,
+    tab: &mut Tab,
+    ui: &mut egui::Ui,
+    page: usize,
+    page_rect: Rect,
+    scale: f32,
+    status: &mut Option<(String, bool)>,
+) -> bool {
+    if editor.mode != editing::Mode::Edit
+        || state.busy
+        || state.add_target.is_some()
+        || state.existing.is_some()
+        || state.area_mode
+        || state.region.active
+        || state.image_mode
+    {
+        return false;
+    }
+    let selected = tab.selected_annotation.as_ref().is_some_and(|id| {
+        tab.session.as_ref().is_some_and(|s| {
+            s.annotations.iter().any(|a| {
+                &a.id == id
+                    && a.page == page
+                    && !a.object.hidden
+                    && !matches!(a.kind, mypdf_milestone0::annotations::Kind::Text { .. })
+            })
+        })
+    });
+    let hit = ui.ctx().pointer_interact_pos().and_then(|pos| {
+        let p = (pos - page_rect.min) / scale;
+        editing::hit_annotation(tab, page, [p.x, p.y], scale)
+    });
+    if hit
+        .as_ref()
+        .is_some_and(|a| matches!(a.kind, mypdf_milestone0::annotations::Kind::Text { .. }))
+    {
+        return false;
+    }
+    if !selected && hit.is_none() {
+        return false;
+    }
+    // Reuse the established move/resize/rotate gestures without changing the
+    // user's workspace or drawing tool. Selection handles are essential here,
+    // even when passive PDF editing guides have been hidden.
+    let previous = (editor.mode, editor.tool, editor.hide_guides);
+    editor.mode = editing::Mode::Draw;
+    editor.tool = editing::Tool::Select;
+    editor.hide_guides = false;
+    editing::page_interaction(editor, tab, ui, page, page_rect, scale, status);
+    (editor.mode, editor.tool, editor.hide_guides) = previous;
+    true
+}
+
 pub(super) fn overlay(
     state: &mut ContentState,
     mode: editing::Mode,
@@ -4102,65 +4291,689 @@ pub(super) fn overlay(
         existing_overlay(state, tab, ui, page, page_rect, scale);
         return;
     }
-    let Some(info) = &state.inspection else {
+    embedded_image_overlay(state, tab, ui, page, page_rect, scale);
+}
+
+fn embedded_image_overlay(
+    state: &mut ContentState,
+    tab: &Tab,
+    ui: &mut egui::Ui,
+    page: usize,
+    page_rect: Rect,
+    scale: f32,
+) {
+    let Some(session) = &tab.session else { return };
+    let key = (tab.id, session.revision(), page);
+    let Some(images) = state
+        .inspection
+        .as_ref()
+        .filter(|i| i.key == key)
+        .and_then(|i| i.images.as_ref().ok())
+        .cloned()
+    else {
         return;
     };
-    if info.key.0 != tab.id || info.key.2 != page {
-        return;
-    }
+    let screen = |r: [f32; 4]| {
+        Rect::from_min_max(
+            page_rect.min + vec2(r[0], r[1]) * scale,
+            page_rect.min + vec2(r[2], r[3]) * scale,
+        )
+    };
     let painter = ui
         .painter()
         .with_clip_rect(page_rect.intersect(ui.clip_rect()));
-    let boxes: Vec<(usize, [f32; 4], bool)> = info
-        .images
-        .as_ref()
-        .map(|images| {
-            images
-                .iter()
-                .enumerate()
-                .map(|(i, m)| (i, m.rect, state.selected == Some(i)))
-                .collect()
-        })
-        .unwrap_or_default();
-    let background = ui.interact(
-        page_rect,
-        egui::Id::new((tab.id, page, "image_background")),
-        egui::Sense::click(),
-    );
-    if background.clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        state.image_gesture = None;
         state.selected = None;
         state.image_mode = false;
+        return;
     }
-    for (i, r, selected) in boxes {
-        let r = Rect::from_min_max(
-            page_rect.min + vec2(r[0], r[1]) * scale,
-            page_rect.min + vec2(r[2], r[3]) * scale,
-        );
+    for (ordinal, image) in images.iter().enumerate() {
+        let selected = state.selected == Some(ordinal);
+        let r = screen(image.rect);
+        let rotation = pos2(r.center().x, (r.top() - 25.).max(page_rect.top() + 12.));
+        let area = if selected {
+            r.expand(10.)
+                .union(Rect::from_center_size(rotation, vec2(22., 22.)))
+        } else {
+            r
+        };
         let response = ui.interact(
-            r.intersect(page_rect),
-            egui::Id::new((tab.id, page, "content", i)),
-            egui::Sense::click(),
+            area.intersect(page_rect),
+            egui::Id::new((tab.id, page, "content", ordinal)),
+            egui::Sense::click_and_drag(),
         );
-        if !state.hide_guides && (selected || response.hovered()) {
-            painter.rect_stroke(
-                r,
-                2.,
-                Stroke::new(if selected { 1.5 } else { 1. }, theme::accent()),
-                egui::StrokeKind::Outside,
-            );
+        if response.clicked() && !state.busy {
+            state.selected = Some(ordinal);
+            state.rect = [
+                image.rect[0],
+                image.rect[1],
+                image.rect[2] - image.rect[0],
+                image.rect[3] - image.rect[1],
+            ];
         }
-        if response.clicked()
-            && let Ok(images) = &info.images
+        let corners = [
+            r.left_top(),
+            r.right_top(),
+            r.right_bottom(),
+            r.left_bottom(),
+        ];
+        let handle_at = |p: egui::Pos2| {
+            if selected && p.distance(rotation) < 11. {
+                4
+            } else {
+                corners
+                    .iter()
+                    .position(|c| selected && p.distance(*c) < 11.)
+                    .map_or(-1, |i| i as i8)
+            }
+        };
+        if response.hovered() && !state.busy {
+            let handle = response.hover_pos().map_or(-1, handle_at);
+            ui.ctx().set_cursor_icon(match handle {
+                0 | 2 => egui::CursorIcon::ResizeNwSe,
+                1 | 3 => egui::CursorIcon::ResizeNeSw,
+                _ => egui::CursorIcon::Grab,
+            });
+        }
+        let press = ui
+            .input(|i| {
+                i.events.iter().find_map(|event| {
+                    if let egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        ..
+                    } = event
+                    {
+                        Some(*pos)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .filter(|p| {
+                area.intersect(page_rect)
+                    .intersect(ui.clip_rect())
+                    .contains(*p)
+                    && ui.ctx().layer_id_at(*p) == Some(ui.layer_id())
+            });
+        if !state.busy
+            && session.editable
+            && state.image_gesture.is_none()
+            && let Some(start) = press.or_else(|| {
+                response
+                    .drag_started()
+                    .then(|| ui.input(|i| i.pointer.press_origin()))
+                    .flatten()
+            })
         {
-            state.selected = Some(i);
-            let r = images[i].rect;
-            state.rect = [r[0], r[1], r[2] - r[0], r[3] - r[1]];
+            state.selected = Some(ordinal);
+            state.image_gesture = Some(ImageGesture {
+                key,
+                ordinal,
+                start,
+                original: image.rect,
+                rect: image.rect,
+                rotation: 0.,
+                handle: handle_at(start),
+            });
+        }
+        let mut visible = image.rect;
+        let mut angle = 0.;
+        if let Some(g) = state
+            .image_gesture
+            .as_mut()
+            .filter(|g| g.key == key && g.ordinal == ordinal)
+        {
+            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+                if g.handle == 4 {
+                    let center = screen(g.original).center();
+                    let from = g.start - center;
+                    let to = pos - center;
+                    g.rotation = (to.y.atan2(to.x) - from.y.atan2(from.x)).to_degrees();
+                    if ui.input(|i| i.modifiers.shift) {
+                        g.rotation = (g.rotation / 15.).round() * 15.;
+                    }
+                } else if g.handle >= 0 {
+                    let p = (pos - page_rect.min) / scale;
+                    g.rect = editing::resized(
+                        g.original,
+                        g.handle as usize,
+                        [p.x, p.y],
+                        !ui.input(|i| i.modifiers.shift),
+                    );
+                } else {
+                    let delta = (pos - g.start) / scale;
+                    g.rect =
+                        editing::moved_image_rect(g.original, [delta.x, delta.y], tab.pages[page]);
+                }
+                visible = g.rect;
+                angle = g.rotation;
+                state.rect = [
+                    visible[0],
+                    visible[1],
+                    visible[2] - visible[0],
+                    visible[3] - visible[1],
+                ];
+            }
+            if ui.input(|i| i.pointer.primary_released()) {
+                let g = state.image_gesture.take().unwrap();
+                if g.rect != g.original || g.rotation.abs() > 0.01 {
+                    state.image_transform = Some((
+                        key,
+                        ordinal,
+                        if g.handle == 4 {
+                            content::ImageEdit::Rotate(g.rotation)
+                        } else {
+                            content::ImageEdit::Place(g.rect)
+                        },
+                    ));
+                }
+            }
+        }
+        if selected || response.hovered() {
+            let frame = screen(visible);
+            let mut points = vec![
+                frame.left_top(),
+                frame.right_top(),
+                frame.right_bottom(),
+                frame.left_bottom(),
+            ];
+            if angle != 0. {
+                let center = frame.center();
+                let rot = egui::emath::Rot2::from_angle(angle.to_radians());
+                for p in &mut points {
+                    *p = center + rot * (*p - center);
+                }
+            }
+            painter.add(egui::Shape::closed_line(
+                points.clone(),
+                Stroke::new(1.5, theme::accent()),
+            ));
+            if selected && session.editable {
+                for p in points {
+                    painter.circle_filled(p, 4.5, Color32::WHITE);
+                    painter.circle_stroke(p, 4.5, Stroke::new(1.5, theme::accent()));
+                }
+                if state
+                    .image_gesture
+                    .as_ref()
+                    .is_none_or(|g| g.key != key || g.ordinal != ordinal)
+                {
+                    painter.line_segment(
+                        [frame.center_top(), rotation],
+                        Stroke::new(1., theme::accent()),
+                    );
+                }
+                painter.circle_filled(rotation, 7., theme::paper());
+                ui::draw_icon(
+                    &painter,
+                    Rect::from_center_size(rotation, vec2(13., 13.)),
+                    Icon::RotateRight,
+                    theme::accent(),
+                );
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn embedded_full_page_image_has_mouse_controls_and_accepts_text() {
+        let (mut app, ctx, _) = keyboard_fixture();
+        let png = clipboard::png(2, 2, &[30, 100, 200, 255].repeat(4)).unwrap();
+        let source = content::add_image(
+            &convert::blank(300., 400.).unwrap(),
+            1,
+            [0., 0., 300., 400.],
+            &png,
+        )
+        .unwrap();
+        app.tabs[0].session = Some(mypdf_milestone0::annotations::Session::new(
+            source.into(),
+            vec![],
+            true,
+        ));
+        app.tabs[0].pages[0] = PageSize {
+            width: 300.,
+            height: 400.,
+        };
+        app.editor.mode = editing::Mode::Edit;
+        let refresh = |app: &mut Viewer| {
+            let s = app.tabs[0].session.as_ref().unwrap();
+            let key = (app.tabs[0].id, s.revision(), 0);
+            app.content.key = Some(key);
+            app.content.inspection = Some(Inspection {
+                key,
+                guides: Default::default(),
+                text: Ok(vec![]),
+                images: Ok(content::images(&s.source, 1).unwrap()),
+                fields: Ok(vec![]),
+                designed: Ok(vec![]),
+            });
+            app.content.image_mode = true;
+            app.content.selected = Some(0);
+        };
+        refresh(&mut app);
+        let rect = Rect::from_min_size(pos2(30., 80.), vec2(300., 400.));
+        let frame = |app: &mut Viewer, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(800., 800.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        smart_select(
+                            &mut app.content,
+                            &mut app.editor,
+                            &mut app.tabs[0],
+                            ui,
+                            0,
+                            rect,
+                            1.,
+                            &mut app.inspector,
+                        );
+                        overlay(
+                            &mut app.content,
+                            editing::Mode::Edit,
+                            &app.tabs[0],
+                            ui,
+                            0,
+                            rect,
+                            1.,
+                        );
+                    });
+                },
+            )
+        };
+        let pointer = |app: &mut Viewer, p: [f32; 2], pressed: Option<bool>| {
+            let pos = rect.min + vec2(p[0], p[1]);
+            let mut events = vec![egui::Event::PointerMoved(pos)];
+            if let Some(pressed) = pressed {
+                events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+            frame(app, events)
+        };
+        let apply = |app: &mut Viewer| {
+            assert!(app.content.image_transform.is_some());
+            app.content_events(&ctx);
+            keyboard_wait(app, &ctx);
+            refresh(app);
+        };
+        frame(&mut app, vec![]);
+        pointer(&mut app, [120., 150.], None);
+        let start = rect.min + vec2(120., 150.);
+        let end = rect.min + vec2(140., 170.);
+        frame(
+            &mut app,
+            vec![
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerMoved(end),
+                egui::Event::PointerButton {
+                    pos: end,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        apply(&mut app);
+        let image = app
+            .content
+            .inspection
+            .as_ref()
+            .unwrap()
+            .images
+            .as_ref()
+            .unwrap()[0]
+            .clone();
+        assert!(
+            (image.rect[0] - 20.).abs() < 0.1 && (image.rect[1] - 20.).abs() < 0.1,
+            "full-page images must move: {:?}",
+            image.rect
+        );
+        // Resize from the visible top-left corner, retaining the opposite one.
+        pointer(&mut app, [20., 20.], None);
+        pointer(&mut app, [20., 20.], Some(true));
+        pointer(&mut app, [45., 50.], None);
+        pointer(&mut app, [70., 80.], Some(false));
+        apply(&mut app);
+        let image = app
+            .content
+            .inspection
+            .as_ref()
+            .unwrap()
+            .images
+            .as_ref()
+            .unwrap()[0]
+            .clone();
+        assert!(image.rect[0] > 50. && image.rect[1] > 60.);
+        let handle = [
+            (image.rect[0] + image.rect[2]) / 2.,
+            (image.rect[1] - 25.).max(12.),
+        ];
+        pointer(&mut app, handle, None);
+        pointer(&mut app, handle, Some(true));
+        pointer(&mut app, [handle[0] + 15., handle[1] + 2.], None);
+        pointer(&mut app, [handle[0] + 30., handle[1] + 6.], Some(false));
+        apply(&mut app);
+        let rotated = app
+            .content
+            .inspection
+            .as_ref()
+            .unwrap()
+            .images
+            .as_ref()
+            .unwrap()[0]
+            .clone();
+        assert_ne!(image.matrix, rotated.matrix);
+        app.content.add_target = Some((app.tabs[0].id, 0));
+        frame(&mut app, vec![]);
+        pointer(&mut app, [100., 140.], None);
+        pointer(&mut app, [100., 140.], Some(true));
+        pointer(&mut app, [100., 140.], Some(false));
+        assert!(app.content.new_placed);
+        frame(
+            &mut app,
+            vec![egui::Event::Text("Text on embedded image".into())],
+        );
+        assert_eq!(app.content.new_text, "Text on embedded image");
+        app.content.click_outside(app.tabs[0].id);
+        app.finish_new_text(&ctx);
+        keyboard_wait(&mut app, &ctx);
+        let source = &app.tabs[0].session.as_ref().unwrap().source;
+        assert_eq!(
+            content::images(source, 1).unwrap()[0].matrix,
+            rotated.matrix
+        );
+        let extracted = lopdf::Document::load_mem(source)
+            .unwrap()
+            .extract_text(&[1])
+            .unwrap();
+        assert!(
+            extracted
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("Text on embedded image"),
+            "text={extracted:?}, status={:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn edit_mode_moves_resizes_rotates_large_image_and_types_above_it() {
+        use mypdf_milestone0::annotations::{Annotation, Kind, Style};
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(400, 500, image::Rgb([50, 140, 220]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let mark = Annotation::new(
+            0,
+            [20., 40., 280., 350.],
+            Kind::Image {
+                png: png.into_inner().into(),
+            },
+            Style::default(),
+        );
+        let source = mypdf_milestone0::annotations::export(
+            &convert::blank(300., 400.).unwrap(),
+            std::slice::from_ref(&mark),
+        )
+        .unwrap();
+        app.open_memory(PathBuf::from("Large image edit.pdf"), source, &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.tabs[0].session.is_none() {
+            app.events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.editor.mode = editing::Mode::Edit;
+        app.editor.hide_guides = true;
+        let page_rect = Rect::from_min_size(pos2(30., 80.), vec2(300., 400.));
+        let frame = |app: &mut Viewer, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1000., 800.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        smart_select(
+                            &mut app.content,
+                            &mut app.editor,
+                            &mut app.tabs[0],
+                            ui,
+                            0,
+                            page_rect,
+                            1.,
+                            &mut app.inspector,
+                        );
+                        let owns = artwork_overlay(
+                            &app.content,
+                            &mut app.editor,
+                            &mut app.tabs[0],
+                            ui,
+                            0,
+                            page_rect,
+                            1.,
+                            &mut app.status,
+                        );
+                        if !owns {
+                            editing::page_interaction(
+                                &mut app.editor,
+                                &mut app.tabs[0],
+                                ui,
+                                0,
+                                page_rect,
+                                1.,
+                                &mut app.status,
+                            );
+                        }
+                        app.content.paused = owns;
+                        overlay(
+                            &mut app.content,
+                            app.editor.mode,
+                            &app.tabs[0],
+                            ui,
+                            0,
+                            page_rect,
+                            1.,
+                        );
+                    });
+                },
+            )
+        };
+        let pointer = |app: &mut Viewer, p: [f32; 2], pressed: Option<bool>| {
+            let pos = page_rect.min + vec2(p[0], p[1]);
+            let mut events = vec![egui::Event::PointerMoved(pos)];
+            if let Some(pressed) = pressed {
+                events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+            frame(app, events)
+        };
+        frame(&mut app, vec![]);
+        pointer(&mut app, [120., 150.], None);
+        pointer(&mut app, [120., 150.], Some(true));
+        pointer(&mut app, [120., 150.], Some(false));
+        assert_eq!(
+            app.tabs[0].selected_annotation.as_deref(),
+            Some(mark.id.as_str())
+        );
+        let output = frame(&mut app, vec![]);
+        assert!(
+            output
+                .shapes
+                .iter()
+                .filter(|s| matches!(s.shape, egui::epaint::Shape::Circle(_)))
+                .count()
+                >= 4,
+            "selection handles must remain visible when guides are hidden"
+        );
+        pointer(&mut app, [120., 150.], Some(true));
+        pointer(&mut app, [125., 155.], None);
+        pointer(&mut app, [130., 160.], Some(false));
+        let moved = app.tabs[0].session.as_ref().unwrap().annotations[0].clone();
+        assert!((moved.rect[0] - 30.).abs() < 0.1, "{:?}", moved.rect);
+        assert!(moved.rect[1] > mark.rect[1] + 4., "{:?}", moved.rect);
+        pointer(&mut app, [moved.rect[2], moved.rect[3]], None);
+        pointer(&mut app, [moved.rect[2], moved.rect[3]], Some(true));
+        pointer(&mut app, [moved.rect[2] - 20., moved.rect[3] - 20.], None);
+        pointer(
+            &mut app,
+            [moved.rect[2] - 40., moved.rect[3] - 40.],
+            Some(false),
+        );
+        let resized = app.tabs[0].session.as_ref().unwrap().annotations[0].clone();
+        assert!(resized.rect[2] < moved.rect[2] - 20., "{:?}", resized.rect);
+        let handle = [
+            (resized.rect[0] + resized.rect[2]) / 2.,
+            resized.rect[1] - 25.,
+        ];
+        pointer(&mut app, handle, None);
+        pointer(&mut app, handle, Some(true));
+        pointer(&mut app, [handle[0] + 20., handle[1] + 5.], None);
+        pointer(&mut app, [handle[0] + 35., handle[1] + 10.], Some(false));
+        let rotated = app.tabs[0].session.as_ref().unwrap().annotations[0].clone();
+        assert!(
+            rotated.rotation.abs() > 1.,
+            "rotation handle must work in Edit"
+        );
+        assert!(app.editor.mode == editing::Mode::Edit && app.editor.hide_guides);
+        // The selected image must not intercept the text tool's click or typing.
+        app.content.add_target = Some((app.tabs[0].id, 0));
+        frame(&mut app, vec![]);
+        pointer(&mut app, [90., 140.], None);
+        pointer(&mut app, [90., 140.], Some(true));
+        pointer(&mut app, [90., 140.], Some(false));
+        assert!(app.content.new_placed);
+        frame(&mut app, vec![egui::Event::Text("Over the image".into())]);
+        assert_eq!(app.content.new_text, "Over the image");
+        pointer(&mut app, [210., 230.], Some(true));
+        pointer(&mut app, [210., 230.], Some(false));
+        assert!(app.content.new_commit);
+        app.finish_new_text(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.content.busy {
+            app.content_events(&ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let marks = &app.tabs[0].session.as_ref().unwrap().annotations;
+        assert_eq!(marks[0], rotated);
+        assert_eq!(marks[1].kind.text(), Some("Over the image"));
+    }
+
+    #[test]
+    fn click_away_keeps_new_text_above_image_and_reopens_with_formatting() {
+        use eframe::App;
+        use mypdf_milestone0::annotations::{Annotation, Kind, Style};
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(100, 100, image::Rgb([25, 120, 210]))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let image = Annotation::new(
+            0,
+            [20., 20., 280., 200.],
+            Kind::Image {
+                png: png.into_inner().into(),
+            },
+            Style::default(),
+        );
+        let source = mypdf_milestone0::annotations::export(
+            &convert::blank(300., 240.).unwrap(),
+            std::slice::from_ref(&image),
+        )
+        .unwrap();
+        app.open_memory(PathBuf::from("Text over image.pdf"), source, &ctx);
+        let frame = |app: &mut Viewer| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    max_texture_side: Some(8192),
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1200., 820.))),
+                    ..Default::default()
+                },
+                |ctx| app.update(ctx, &mut eframe::Frame::_new_kittest()),
+            );
+        };
+        let wait = |app: &mut Viewer| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                frame(app);
+                if !app.content.busy && app.tabs[0].session.as_ref().is_some_and(|s| s.editable) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "{:?}", app.status);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        wait(&mut app);
+        app.editor.mode = editing::Mode::Edit;
+        let id = app.tabs[0].id;
+        app.content
+            .place_text(id, 0, [40., 50.], app.tabs[0].pages[0]);
+        app.content.new_text = "Text above image".into();
+        app.content.new_alignment = Alignment::Center;
+        app.content.click_outside(id);
+        assert!(app.content.new_commit);
+        app.finish_new_text(&ctx);
+        wait(&mut app);
+        let session = app.tabs[0].session.as_ref().unwrap();
+        assert_eq!(session.annotations.len(), 2);
+        assert_eq!(session.annotations[0], image);
+        let text = session.annotations[1].clone();
+        assert_eq!(text.kind.text(), Some("Text above image"));
+        let mut draft = annotation_candidate(&text, (id, session.revision(), 0));
+        assert!(
+            !draft.changed(),
+            "Opening centered text must not rewrite it"
+        );
+        assert!(matches!(&draft.target,InlineTarget::Block(b) if b.alignment==Alignment::Center));
+        draft.text.push('!');
+        app.content.existing = Some(draft);
+        app.content.new_commit = true;
+        app.finish_new_text(&ctx);
+        wait(&mut app);
+        let session = app.tabs[0].session.as_mut().unwrap();
+        assert_eq!(session.annotations[1].id, text.id);
+        assert_eq!(
+            session.annotations[1].kind.text(),
+            Some("Text above image!")
+        );
+        assert_eq!(session.annotations[0], image);
+        session.undo();
+        assert_eq!(session.annotations[1].kind.text(), Some("Text above image"));
+        session.redo();
+        assert_eq!(
+            session.annotations[1].kind.text(),
+            Some("Text above image!")
+        );
+    }
+
     #[test]
     fn nearby_style_is_explicit_and_matches_only_the_new_block() {
         let pdf = mypdf_milestone0::content::add_text(

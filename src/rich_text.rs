@@ -7,7 +7,7 @@ use lopdf::{
     dictionary,
 };
 use std::{ops::Range, path::PathBuf};
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Span {
     pub range: Range<usize>,
     pub font: Option<PathBuf>,

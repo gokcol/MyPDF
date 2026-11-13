@@ -38,6 +38,12 @@ struct Item {
     action: &'static str,
     enabled: bool,
 }
+fn can_reset_rotation(a: &Annotation) -> bool {
+    matches!(
+        a.kind,
+        Kind::Text { .. } | Kind::Image { .. } | Kind::Stamp { .. } | Kind::Svg { .. }
+    )
+}
 fn item(label: &'static str, action: &'static str, enabled: bool) -> Item {
     Item {
         label,
@@ -162,6 +168,7 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
         ],
         Target::Image(_) => vec![
             item("Image properties…", "image_properties", true),
+            item("Reset rotation", "reset_image_rotation", editable),
             item("Copy image", "copy_image", true),
             item("Cut image", "cut_image", editable),
             item("Replace image…", "replace_image", editable),
@@ -216,6 +223,16 @@ fn items(target: &Target, editable: bool) -> Vec<Item> {
                     item("Flip horizontal", "flip_horizontal", change),
                     item("Flip vertical", "flip_vertical", change),
                 ]);
+            }
+            if marks.iter().any(can_reset_rotation) {
+                v.push(item(
+                    "Reset rotation",
+                    "reset_rotation",
+                    change
+                        && marks
+                            .iter()
+                            .any(|a| can_reset_rotation(a) && a.rotation.abs() > 0.001),
+                ));
             }
             v.extend([
                 item("Copy style", "copy_format", single.is_some()),
@@ -274,7 +291,7 @@ fn action_icon(action: &str, label: &str) -> Icon {
         "image_background" | "object_background" => Icon::Sparkle,
         "crop_object" | "copy_region" => Icon::Crop,
         "rotate_right" => Icon::RotateRight,
-        "rotate_left" => Icon::RotateLeft,
+        "rotate_left" | "reset_rotation" | "reset_image_rotation" => Icon::RotateLeft,
         "flip_horizontal" => Icon::FlipHorizontal,
         "flip_vertical" => Icon::FlipVertical,
         "front" => Icon::BringForward,
@@ -768,19 +785,8 @@ fn candidates(state: &ContentState, tab: &Tab, page: usize) -> Vec<InlineText> {
         .iter()
         .filter(|a| a.page == page && !a.object.hidden && !a.object.locked)
     {
-        if let Kind::Text { text } = &a.kind {
-            drafts.push(InlineText {
-                key,
-                target: InlineTarget::Annotation(a.id.clone()),
-                geometry: None,
-                original: text.clone(),
-                text: text.clone(),
-                rect: a.bounds(),
-                size: a.style.font_size,
-                color: a.style.color,
-                font: "Text box".into(),
-                focus: true,
-            });
+        if let Kind::Text { .. } = &a.kind {
+            drafts.push(annotation_candidate(a, key));
         }
     }
     drafts
@@ -896,6 +902,50 @@ pub(in crate::desktop) fn smart_select(
     let point = [p.x, p.y];
     let Some(session) = &tab.session else { return };
     let key = (tab.id, session.revision(), page);
+    // The current image gesture and handles retain the pointer even outside
+    // the painted image. In particular, rotation must survive its release.
+    if editor.mode == editing::Mode::Edit && state.existing.is_none() {
+        if state.image_gesture.as_ref().is_some_and(|g| g.key == key) {
+            return;
+        }
+        if tab.selected_annotation.as_ref().is_some_and(|id| {
+            session.annotations.iter().any(|a| {
+                &a.id == id
+                    && a.page == page
+                    && (editing::corner_at(a, point, scale).is_some()
+                        || manipulation::rotation_at(a, point, scale))
+            })
+        }) {
+            return;
+        }
+        if state.image_mode
+            && state
+                .selected
+                .and_then(|ordinal| {
+                    state
+                        .inspection
+                        .as_ref()
+                        .filter(|i| i.key == key)
+                        .and_then(|i| i.images.as_ref().ok())
+                        .and_then(|images| images.get(ordinal))
+                })
+                .is_some_and(|image| {
+                    let r = image.rect;
+                    let rotation = [(r[0] + r[2]) / 2., (r[1] - 25. / scale).max(12. / scale)];
+                    [
+                        [r[0], r[1]],
+                        [r[2], r[1]],
+                        [r[2], r[3]],
+                        [r[0], r[3]],
+                        rotation,
+                    ]
+                    .iter()
+                    .any(|p| (p[0] - point[0]).hypot(p[1] - point[1]) * scale < 12.)
+                })
+        {
+            return;
+        }
+    }
     if let Some(draft) = &state.existing {
         let active = Rect::from_min_max(
             rect.min + vec2(draft.rect[0], draft.rect[1]) * scale,
@@ -961,6 +1011,8 @@ pub(in crate::desktop) fn smart_select(
                 },
             ));
         } else if pressed {
+            state.image_mode = false;
+            state.selected = None;
             if !ui.input(|i| i.modifiers.shift) && !selection::selected_ids(tab).contains(&a.id) {
                 selection::set(tab, editor, vec![a.id]);
             }
@@ -1974,7 +2026,7 @@ impl Viewer {
                 }
             }
             "rotate_right" | "rotate_left" | "flip_horizontal" | "flip_vertical" | "front"
-            | "back" | "lock" => {
+            | "back" | "lock" | "reset_rotation" => {
                 if let Target::Artwork(marks) = &menu.target {
                     let t = &mut self.tabs[index];
                     let s = t.session.as_mut().unwrap();
@@ -1984,6 +2036,13 @@ impl Viewer {
                         let lock = !marks.iter().any(|a| a.object.locked);
                         for a in entries.iter_mut().filter(|a| ids.contains(&a.id)) {
                             a.object.locked = lock;
+                        }
+                    } else if action == "reset_rotation" {
+                        for a in entries
+                            .iter_mut()
+                            .filter(|a| ids.contains(&a.id) && can_reset_rotation(a))
+                        {
+                            a.rotation = 0.;
                         }
                     } else if action == "front" || action == "back" {
                         entries.retain(|a| !ids.contains(&a.id));
@@ -2012,8 +2071,13 @@ impl Viewer {
                     }
                 }
             }
-            "image_properties" | "copy_image" | "cut_image" | "replace_image"
-            | "image_background" | "delete_image" => {
+            "image_properties"
+            | "copy_image"
+            | "cut_image"
+            | "replace_image"
+            | "image_background"
+            | "delete_image"
+            | "reset_image_rotation" => {
                 if let Target::Image(image) = menu.target {
                     self.editor.mode = editing::Mode::Edit;
                     self.content.image_mode = true;
@@ -2028,6 +2092,14 @@ impl Viewer {
                     let r = image.rect;
                     self.content.rect = [r[0], r[1], r[2] - r[0], r[3] - r[1]];
                     match action {
+                        "reset_image_rotation" => self.content_change(
+                            ctx,
+                            Edit::Image {
+                                page: menu.key.2 as u32 + 1,
+                                index: image.index,
+                                edit: content::ImageEdit::ResetRotation,
+                            },
+                        ),
                         "delete_image" => self.content_change(
                             ctx,
                             Edit::Image {
@@ -3358,6 +3430,67 @@ mod tests {
             app.tabs[0].session.as_ref().unwrap().annotations[0].rotation,
             0.
         );
+    }
+    #[test]
+    fn reset_rotation_keeps_drawings_and_preserves_text_geometry_with_undo() {
+        let (mut app, ctx) = fixture();
+        let mut text = Annotation::new(
+            0,
+            [50., 50., 180., 100.],
+            Kind::Text {
+                text: "Keep this text".into(),
+            },
+            Default::default(),
+        );
+        text.rotation = 37.;
+        text.flip_x = true;
+        let mut drawing = Annotation::new(
+            0,
+            [200., 200., 280., 280.],
+            Kind::Rectangle,
+            Default::default(),
+        );
+        drawing.rotation = 45.;
+        assert!(
+            !items(&Target::Artwork(vec![drawing.clone()]), true)
+                .iter()
+                .any(|i| i.action == "reset_rotation")
+        );
+        let before = vec![text.clone(), drawing.clone()];
+        app.tabs[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .commit(before.clone())
+            .unwrap();
+        let target = target_at(
+            &app.content,
+            &mut app.editor,
+            &mut app.tabs[0],
+            0,
+            [115., 75.],
+            1.,
+        );
+        assert!(commands(&target, true).contains(&"reset_rotation"));
+        assert!(!commands(&target, false).contains(&"reset_rotation"));
+        let mut locked = text.clone();
+        locked.object.locked = true;
+        assert!(!commands(&Target::Artwork(vec![locked]), true).contains(&"reset_rotation"));
+        run_command(
+            &mut app,
+            &ctx,
+            Target::Artwork(before.clone()),
+            "reset_rotation",
+        );
+        let session = app.tabs[0].session.as_mut().unwrap();
+        text.rotation = 0.;
+        assert_eq!(session.annotations, vec![text.clone(), drawing]);
+        assert!(!commands(&Target::Artwork(vec![text]), true).contains(&"reset_rotation"));
+        session.undo();
+        assert_eq!(session.annotations, before);
+        session.redo();
+        assert_eq!(session.annotations[0].rotation, 0.);
+        assert_eq!(session.annotations[1].rotation, 45.);
     }
     #[test]
     fn locked_and_read_only_objects_cannot_be_changed_and_stale_commands_are_ignored() {

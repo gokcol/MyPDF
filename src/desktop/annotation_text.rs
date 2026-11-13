@@ -127,9 +127,10 @@ pub(super) fn overlay(
     let resolution = annotation_render::text_resolution(scale);
     let to_global = egui::emath::TSTransform::from_translation(page_rect.min.to_vec2())
         * egui::emath::TSTransform::from_scaling(scale / resolution);
+    let inset = if a.object.text.is_some() { 0. } else { 4. };
     let text_rect = Rect::from_min_max(
-        pos2(bounds[0] + 4., bounds[1] + 4.) * resolution,
-        pos2(bounds[2] - 4., bounds[3] - 4.) * resolution,
+        pos2(bounds[0] + inset, bounds[1] + inset) * resolution,
+        pos2(bounds[2] - inset, bounds[3] - inset) * resolution,
     );
     let id = egui::Id::new((tab.id, &a.id, "inline_annotation_text"));
     let finish = ui.ctx().memory(|m| m.has_focus(id))
@@ -160,6 +161,23 @@ pub(super) fn overlay(
             ui.new_child(egui::UiBuilder::new().layer_id(layer).max_rect(text_rect));
         let ui = &mut inline_ui;
         ui.set_clip_rect(clip);
+        let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, width: f32| {
+            if a.object.text.is_some() {
+                annotation_render::layer_layout(ui.ctx(), &a, text.as_str(), resolution)
+            } else {
+                ui.fonts_mut(|f| {
+                    f.layout(
+                        text.as_str().into(),
+                        FontId::new(
+                            a.style.font_size * resolution,
+                            egui::FontFamily::Name("annotation".into()),
+                        ),
+                        editing::color(a.style.color, a.style.opacity),
+                        width,
+                    )
+                })
+            }
+        };
         let mut output = egui::TextEdit::multiline(text)
             .id(id)
             .font(FontId::new(
@@ -173,6 +191,7 @@ pub(super) fn overlay(
             .desired_width(text_rect.width().max(1.))
             .min_size(text_rect.size().max(vec2(1., 1.)))
             .char_limit(8000)
+            .layouter(&mut layouter)
             .show(ui);
         output.response.widget_info(|| {
             egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Text box on page")
@@ -194,6 +213,16 @@ pub(super) fn overlay(
         editor.text_editing |= output.response.has_focus();
         output.response.changed()
     };
+    if changed
+        && let Some(draft) = &mut editor.draft
+        && let Some(layer) = &mut draft.object.text
+    {
+        layer.spans = mypdf_milestone0::rich_text::edited(
+            a.kind.text().unwrap_or_default(),
+            draft.kind.text().unwrap_or_default(),
+            &layer.spans,
+        );
+    }
     if changed && let Some(session) = &mut tab.session {
         let mut entries = session.annotations.clone();
         if let Some(target) = entries.iter_mut().find(|item| item.id == a.id) {
