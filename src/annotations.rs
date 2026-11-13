@@ -593,12 +593,19 @@ impl Annotation {
             self.id.len() == 32 && self.id.bytes().all(|c| c.is_ascii_hexdigit()),
             "Invalid annotation ID"
         );
+        // Fitting very narrow artwork to a sheet can produce a sub-point
+        // dimension. Keep its aspect ratio instead of stretching or rejecting it.
+        let minimum = if matches!(self.kind, Kind::Image { .. } | Kind::Svg { .. }) {
+            0.00001
+        } else {
+            1.0
+        };
         ensure!(
             self.rect
                 .iter()
                 .all(|v| v.is_finite() && v.abs() <= 100_000.0)
-                && self.rect[2] - self.rect[0] >= 1.0
-                && self.rect[3] - self.rect[1] >= 1.0,
+                && self.rect[2] - self.rect[0] >= minimum
+                && self.rect[3] - self.rect[1] >= minimum,
             "Invalid annotation rectangle"
         );
         ensure!(

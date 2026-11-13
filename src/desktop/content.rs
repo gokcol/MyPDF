@@ -1802,7 +1802,10 @@ impl Viewer {
             self.status = Some(("Close a tab before creating another PDF.".into(), true));
             return;
         }
-        match convert::blank(595., 842.) {
+        match convert::blank(
+            mypdf_milestone0::pages::A4[0],
+            mypdf_milestone0::pages::A4[1],
+        ) {
             Ok(bytes) => {
                 let path = PathBuf::from(format!("Untitled-{}.pdf", self.next_id + 1));
                 self.open_memory(path, bytes, ctx);

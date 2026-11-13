@@ -48,6 +48,7 @@ pub(super) enum ThumbnailAction {
     Duplicate,
     RotateLeft,
     RotateRight,
+    Resize,
     Extract,
     Delete,
     SelectAll,
@@ -62,6 +63,7 @@ impl ThumbnailAction {
             Self::Duplicate => "Duplicate pages",
             Self::RotateLeft => "Rotate left",
             Self::RotateRight => "Rotate right",
+            Self::Resize => "Page size…",
             Self::Extract => "Extract pages…",
             Self::Delete => "Delete pages",
             Self::SelectAll => "Select all pages",
@@ -74,6 +76,7 @@ impl ThumbnailAction {
             Self::PasteBefore | Self::PasteAfter => Icon::Paste,
             Self::RotateLeft => Icon::RotateLeft,
             Self::RotateRight => Icon::RotateRight,
+            Self::Resize => Icon::Crop,
             Self::Extract => Icon::Extract,
             Self::Delete => Icon::Trash,
             Self::SelectAll => Icon::Select,
@@ -132,6 +135,7 @@ pub(super) fn thumbnail_context_menu(
             ThumbnailAction::Duplicate,
             ThumbnailAction::RotateLeft,
             ThumbnailAction::RotateRight,
+            ThumbnailAction::Resize,
             ThumbnailAction::Extract,
             ThumbnailAction::Delete,
             ThumbnailAction::SelectAll,
@@ -187,6 +191,7 @@ pub(super) struct Organizer {
     before: usize,
     split_every: usize,
     pub crop: bool,
+    pub(super) resize: Option<page_resize::Draft>,
     margins: [f32; 4],
     dragged: Option<usize>,
     pressed: Option<(usize, egui::Pos2)>,
@@ -218,6 +223,7 @@ impl Organizer {
             before: 1,
             split_every: 1,
             crop: false,
+            resize: None,
             margins: [18.0; 4],
             dragged: None,
             pressed: None,
@@ -339,7 +345,8 @@ impl Organizer {
             }
             ThumbnailAction::Duplicate
             | ThumbnailAction::RotateLeft
-            | ThumbnailAction::RotateRight => editable,
+            | ThumbnailAction::RotateRight
+            | ThumbnailAction::Resize => editable,
             ThumbnailAction::SelectAll => !tab.pages.is_empty(),
         }
     }
@@ -618,6 +625,7 @@ impl Viewer {
             Operation::Rotate { .. } => "Rotate pages",
             Operation::Crop { .. } => "Crop pages",
             Operation::ResetCrop(_) => "Restore page crop",
+            Operation::Resize { .. } => "Resize pages",
         };
         self.organizer.busy = true;
         self.status = Some(("Updating pages…".into(), false));
@@ -715,6 +723,7 @@ impl Viewer {
                                 (Icon::Redo, "Rotate right", "right"),
                                 (Icon::Undo, "Rotate left", "left"),
                                 (Icon::Crop, "Crop", "crop"),
+                                (Icon::Crop, "Page size…", "resize"),
                                 (Icon::Extract, "Extract…", "extract"),
                                 (Icon::Split, "Split…", "split"),
                                 (Icon::Trash, "Delete", "delete"),
@@ -793,16 +802,16 @@ impl Viewer {
             ),
             "delete" => self.page_change(ctx, Operation::Delete(selected)),
             "move" => self.move_pages(ctx, self.organizer.before.saturating_sub(1)),
+            "resize" => self.open_page_resize(),
             "crop" => self.organizer.crop = !self.organizer.crop,
             "blank" => {
                 let at = selected.first().copied().unwrap_or(count.saturating_sub(1)) + 1;
-                let size = self.tabs[self.active].pages[at.saturating_sub(1)];
                 self.page_change(
                     ctx,
                     Operation::InsertBlank {
                         at,
-                        width: size.width,
-                        height: size.height,
+                        width: pages::A4[0],
+                        height: pages::A4[1],
                     },
                 );
             }
@@ -918,6 +927,7 @@ impl Viewer {
                     clockwise: action == ThumbnailAction::RotateRight,
                 },
             ),
+            ThumbnailAction::Resize => self.open_page_resize(),
             ThumbnailAction::Delete => self.page_change(ctx, Operation::Delete(selected)),
             ThumbnailAction::Extract => self.export_pages(ctx, false),
             ThumbnailAction::SelectAll => {
@@ -1061,6 +1071,7 @@ impl Viewer {
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("insert_pages_open"), true));
     }
     pub(super) fn page_dialogs(&mut self, ctx: &egui::Context) {
+        self.page_resize_dialog(ctx);
         let mut open = ctx
             .data(|d| d.get_temp::<bool>(egui::Id::new("insert_pages_open")))
             .unwrap_or(false);
@@ -1072,7 +1083,7 @@ impl Viewer {
         egui::Window::new("Insert pages").open(&mut open).collapsible(false).resizable(false).show(ctx,|ui| {
             ui.horizontal(|ui|{ui.label("Before page");ui.add(egui::DragValue::new(&mut self.organizer.before).range(1..=count+1));ui.label(format!("({} = append)",count+1));});
             ui.add_space(10.0);
-            if ui.add(ActionButton::new(Icon::Plus,"Blank page · same size")).clicked(){action="blank";}
+            if ui.add(ActionButton::new(Icon::Plus,"Blank page · A4")).clicked(){action="blank";}
             if ui.add(ActionButton::new(Icon::Import,"Pages from files…")).clicked(){action="pdf";}
             ui.label(RichText::new("Imported pages keep their contents and annotations.\nDocument-level bookmarks are not merged.").small().color(theme::muted()));
         });
@@ -1084,16 +1095,13 @@ impl Viewer {
         if action == "pdf" {
             self.import_pages(ctx, at);
         }
-        if action == "blank"
-            && let Some(tab) = self.tabs.get(self.active)
-            && let Some(size) = tab.pages.get(tab.page)
-        {
+        if action == "blank" && count > 0 {
             self.page_change(
                 ctx,
                 Operation::InsertBlank {
                     at,
-                    width: size.width,
-                    height: size.height,
+                    width: pages::A4[0],
+                    height: pages::A4[1],
                 },
             );
         }

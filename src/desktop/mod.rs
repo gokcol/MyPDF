@@ -23,6 +23,7 @@ mod navigation_editor;
 mod nup;
 pub mod open_with;
 mod organize;
+mod page_resize;
 mod pen_tools;
 #[cfg(any(not(target_os = "macos"), test))]
 mod portable_menu;

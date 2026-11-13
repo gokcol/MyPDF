@@ -5,6 +5,9 @@ use hayro::kurbo::{Affine, Point};
 use lopdf::{Document, Object, ObjectId, dictionary};
 use std::collections::{BTreeSet, HashSet};
 
+/// ISO A4 portrait, in PDF points (210 × 297 mm).
+pub const A4: [f32; 2] = [210. * 72. / 25.4, 297. * 72. / 25.4];
+
 #[derive(Clone, Debug)]
 pub enum Operation {
     Reorder(Vec<usize>),
@@ -28,6 +31,13 @@ pub enum Operation {
         margins: [f32; 4],
     },
     ResetCrop(Vec<usize>),
+    /// Change the sheet, keeping content at its current size and distance from
+    /// the displayed top-left corner. Content outside a smaller sheet is hidden.
+    Resize {
+        pages: Vec<usize>,
+        width: f32,
+        height: f32,
+    },
 }
 
 fn read(bytes: &[u8]) -> Result<Document> {
@@ -496,8 +506,43 @@ pub fn apply(bytes: &[u8], operation: &Operation) -> Result<Vec<u8>> {
             }
             geometry_changed = true;
         }
+        Operation::Resize {
+            pages,
+            width,
+            height,
+        } => {
+            ensure!(
+                width.is_finite()
+                    && height.is_finite()
+                    && (72. ..=14_400.).contains(width)
+                    && (72. ..=14_400.).contains(height),
+                "Page dimensions must be 25.4–5080 mm"
+            );
+            for i in selection(pages, ids.len())? {
+                // Work through the displayed-page transform, so cropped origins,
+                // quarter turns and UserUnit retain their content coordinates.
+                let bounds = Affine::new(old_geometry[i].1).transform_rect_bbox(
+                    hayro::kurbo::Rect::new(0., 0., *width as f64, *height as f64),
+                );
+                let rect = [
+                    bounds.x0 as f32,
+                    bounds.y0 as f32,
+                    bounds.x1 as f32,
+                    bounds.y1 as f32,
+                ];
+                let page = doc.get_dictionary_mut(ids[i])?;
+                for key in ["MediaBox", "CropBox", "TrimBox", "BleedBox", "ArtBox"] {
+                    page.set(key, numbers(rect));
+                }
+            }
+            // The displayed origin and scale stay unchanged. Keep annotation
+            // metadata and appearances exactly as they were, including widgets.
+        }
     }
-    set_tree(&mut doc, &ids)?;
+    // Resizing keeps the page tree and labels: no page was inserted or moved.
+    if !matches!(operation, Operation::Resize { .. }) {
+        set_tree(&mut doc, &ids)?;
+    }
     let result = serialize(&mut doc)?;
     if geometry_changed && !managed.is_empty() {
         let new_geometry = annotations::page_geometry(&result)?;

@@ -266,41 +266,23 @@ fn tiff_pages(bytes: &[u8]) -> Result<Vec<Item>> {
 }
 fn as_pdf(item: Item) -> Result<Vec<u8>> {
     use crate::annotations::{self, Annotation, Kind, Style};
-    let (pdf, kind) = match item {
+    let (kind, natural) = match item {
         Item::Pdf(bytes) => return Ok(bytes),
-        Item::Image(bytes, _) => (
-            crate::convert::images_to_pdf(std::slice::from_ref(&bytes), 144.)?,
+        Item::Image(bytes, [w, h]) => (
             Kind::Image { png: bytes.into() },
+            [w as f32 / 2., h as f32 / 2.],
         ),
-        Item::Svg(source, _) => (
-            svg2pdf::to_pdf(
-                &crate::svg::tree(&source, None)?,
-                svg2pdf::ConversionOptions {
-                    embed_text: false,
-                    ..Default::default()
-                },
-                svg2pdf::PageOptions::default(),
-            )
-            .map_err(|e| anyhow::anyhow!("SVG conversion: {e}"))?,
+        Item::Svg(source, size) => (
             Kind::Svg {
                 source,
                 tint: false,
             },
+            size,
         ),
     };
-    // Imported image pages keep their original page dimensions, with the
-    // artwork in an editable layer just like images placed on existing pages.
-    let rect = annotations::page_geometry(&pdf)?[0].0;
-    if rect[2] - rect[0] < 1. || rect[3] - rect[1] < 1. {
-        return Ok(pdf);
-    }
-    let mut doc = lopdf::Document::load_mem(&pdf)?;
-    let page = *doc.get_pages().get(&1).context("Missing image page")?;
-    doc.get_dictionary_mut(page)?.remove(b"Contents");
-    doc.get_dictionary_mut(page)?
-        .set("Resources", lopdf::Dictionary::new());
-    doc.prune_objects();
-    let blank = crate::content::serialize(&mut doc)?;
+    let [width, height] = crate::pages::A4;
+    let blank = crate::convert::blank(width, height)?;
+    let rect = crate::convert::fit_a4(natural);
     annotations::export(&blank, &[Annotation::new(0, rect, kind, Style::default())])
 }
 /// Complete conversion and insertion before committing any bytes to the open document.
@@ -339,7 +321,8 @@ pub fn insert(source: Option<&[u8]>, paths: &[PathBuf], placement: Placement) ->
                         )?,
                         None => {
                             // Copy page graphs even for a new document; imported signatures stay with their original.
-                            let blank = crate::convert::blank(595., 842.)?;
+                            let blank =
+                                crate::convert::blank(crate::pages::A4[0], crate::pages::A4[1])?;
                             let joined = crate::pages::apply(
                                 &blank,
                                 &crate::pages::Operation::InsertPdf { at: 0, bytes: pdf },
@@ -402,11 +385,10 @@ pub fn insert(source: Option<&[u8]>, paths: &[PathBuf], placement: Placement) ->
                         _ => anyhow::bail!("Choose images for page placement"),
                     };
                     let (pw, ph) = (size.0[2], size.0[3]);
-                    let scale = (pw * 0.8 / w).min(ph * 0.8 / h).min(0.5);
+                    let scale = (pw / w).min(ph / h);
                     let (w, h) = (w * scale, h * scale);
-                    let shift = (count % 5) as f32 * 8.;
-                    let x = ((pw - w) / 2. + shift).min(pw - w);
-                    let y = ((ph - h) / 2. + shift).min(ph - h);
+                    let x = (pw - w) / 2.;
+                    let y = (ph - h) / 2.;
                     marks.push(crate::annotations::Annotation::new(
                         page,
                         [x, y, x + w, y + h],
@@ -450,6 +432,81 @@ mod tests {
     }
     fn count(bytes: &[u8]) -> usize {
         lopdf::Document::load_mem(bytes).unwrap().get_pages().len()
+    }
+    #[test]
+    fn every_inserted_image_fits_the_target_page_and_new_pages_are_a4() {
+        let dir = tempfile::tempdir().unwrap();
+        for (index, (w, h)) in [(2, 1), (3000, 1000), (1000, 3000), (1, 1), (1, 4000)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut data = Cursor::new(vec![]);
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                w,
+                h,
+                image::Rgb([240, 30, 20]),
+            ))
+            .write_to(&mut data, image::ImageFormat::Png)
+            .unwrap();
+            let path = fixture(dir.path(), &format!("image-{index}.png"), data.get_ref());
+            for (source, placement, expected) in [
+                (
+                    None,
+                    Placement::Pages {
+                        at: 0,
+                        replace_blank: false,
+                    },
+                    pages::A4,
+                ),
+                (
+                    Some(convert::blank(320., 240.).unwrap()),
+                    Placement::Images { page: 0 },
+                    [320., 240.],
+                ),
+                (
+                    Some(convert::blank(320., 240.).unwrap()),
+                    Placement::Pages {
+                        at: 0,
+                        replace_blank: true,
+                    },
+                    pages::A4,
+                ),
+            ] {
+                let output =
+                    insert(source.as_deref(), std::slice::from_ref(&path), placement).unwrap();
+                let geometry = annotations::page_geometry(&output).unwrap();
+                assert_eq!(&geometry[0].0[2..], &expected);
+                let marks = annotations::load(&lopdf::Document::load_mem(&output).unwrap());
+                let [x, y, r, b] = marks[0].rect;
+                assert!(
+                    x >= -0.001
+                        && y >= -0.001
+                        && r <= expected[0] + 0.001
+                        && b <= expected[1] + 0.001
+                );
+                assert!(((r - x) / (b - y) - w as f32 / h as f32).abs() < 0.001);
+                assert!(
+                    ((r - x) - expected[0]).abs() < 0.001 || ((b - y) - expected[1]).abs() < 0.001
+                );
+                assert!(
+                    (x - (expected[0] - r)).abs() < 0.001 && (y - (expected[1] - b)).abs() < 0.001
+                );
+            }
+        }
+        let svg = fixture(dir.path(), "wide.svg", br#"<svg xmlns="http://www.w3.org/2000/svg" width="900" height="300"><rect width="900" height="300" fill="red"/></svg>"#);
+        let bytes = insert(
+            None,
+            &[svg],
+            Placement::Pages {
+                at: 0,
+                replace_blank: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            &annotations::page_geometry(&bytes).unwrap()[0].0[2..],
+            &pages::A4
+        );
     }
     #[test]
     fn raster_formats_place_on_blank_page_and_survive_save_and_undo() {
@@ -643,14 +700,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(count(&output), 2);
-        assert_eq!(
-            annotations::page_geometry(&output).unwrap()[0].0,
-            [0., 0., 2., 1.]
-        );
-        assert_eq!(
-            annotations::page_geometry(&output).unwrap()[1].0,
-            [0., 0., 1., 2.]
-        );
+        for (bounds, _) in annotations::page_geometry(&output).unwrap() {
+            assert_eq!(&bounds[2..], &pages::A4);
+        }
+        let marks = annotations::load(&lopdf::Document::load_mem(&output).unwrap());
+        for (mark, aspect) in marks.iter().zip([2., 0.5]) {
+            let [x, y, r, b] = mark.rect;
+            assert!(((r - x) / (b - y) - aspect).abs() < 0.001);
+        }
     }
     #[test]
     fn svg_stays_vector_and_utf16_text_is_readable() {

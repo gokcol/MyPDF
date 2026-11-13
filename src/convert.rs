@@ -74,16 +74,19 @@ pub fn images_to_pdf(inputs: &[Vec<u8>], dpi: f32) -> Result<Vec<u8>> {
     let mut kids = vec![];
     for input in inputs {
         let image = content::decode_image(input)?;
-        let (w, h) = (
+        let natural = [
             image.width() as f32 * 72. / dpi,
             image.height() as f32 * 72. / dpi,
-        );
+        ];
+        let [x, y, right, bottom] = fit_a4(natural);
+        let (w, h) = (right - x, bottom - y);
+        let [pw, ph] = crate::pages::A4;
         let id = content::embed_image(&mut d, &image)?;
         let stream = d.add_object(Stream::new(
             dictionary! {},
-            format!("q {w} 0 0 {h} 0 0 cm /Im0 Do Q").into_bytes(),
+            format!("q {w} 0 0 {h} {x} {} cm /Im0 Do Q", ph - bottom).into_bytes(),
         ));
-        let p=d.add_object(dictionary!{"Type"=>"Page","Parent"=>pages,"MediaBox"=>vec![0.into(),0.into(),w.into(),h.into()],"Resources"=>dictionary!{"XObject"=>dictionary!{"Im0"=>id}},"Contents"=>stream});
+        let p=d.add_object(dictionary!{"Type"=>"Page","Parent"=>pages,"MediaBox"=>vec![0.into(),0.into(),pw.into(),ph.into()],"Resources"=>dictionary!{"XObject"=>dictionary!{"Im0"=>id}},"Contents"=>stream});
         kids.push(Object::Reference(p));
     }
     let count = kids.len();
@@ -94,6 +97,14 @@ pub fn images_to_pdf(inputs: &[Vec<u8>], dpi: f32) -> Result<Vec<u8>> {
     let root = d.add_object(dictionary! {"Type"=>"Catalog","Pages"=>pages});
     d.trailer.set("Root", root);
     content::serialize(&mut d)
+}
+/// Center artwork on a new A4 sheet, preserving its aspect ratio.
+pub(crate) fn fit_a4([width, height]: [f32; 2]) -> [f32; 4] {
+    let [pw, ph] = crate::pages::A4;
+    let scale = (pw / width).min(ph / height);
+    let (w, h) = (width * scale, height * scale);
+    let (x, y) = ((pw - w) / 2., (ph - h) / 2.);
+    [x, y, x + w, y + h]
 }
 fn text_pages(bytes: &[u8], pages: &[usize]) -> Result<Vec<String>> {
     let pdf = hayro::hayro_syntax::Pdf::new(bytes.to_vec())
@@ -407,7 +418,7 @@ pub fn text_to_pdf(text: &str, markdown: bool) -> Result<Vec<u8>> {
             dictionary! {},
             std::mem::take(body).into_bytes(),
         ));
-        let id=d.add_object(dictionary!{"Type"=>"Page","Parent"=>rootpages,"MediaBox"=>vec![0.into(),0.into(),595.into(),842.into()],"Resources"=>dictionary!{"Font"=>dictionary!{"F0"=>font.id}},"Contents"=>stream});
+        let id=d.add_object(dictionary!{"Type"=>"Page","Parent"=>rootpages,"MediaBox"=>vec![0.into(),0.into(),crate::pages::A4[0].into(),crate::pages::A4[1].into()],"Resources"=>dictionary!{"Font"=>dictionary!{"F0"=>font.id}},"Contents"=>stream});
         kids.push(Object::Reference(id));
     };
     let mut code = false;

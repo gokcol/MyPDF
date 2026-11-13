@@ -58,6 +58,117 @@ fn annotated() -> Vec<u8> {
 }
 
 #[test]
+fn resize_selected_page_keeps_content_annotations_and_other_pages_unchanged() {
+    for rotation in [0, 90, 180, 270] {
+        let mut doc = Document::load_mem(&fixture()).unwrap();
+        doc.catalog_mut().unwrap().set(
+            "PageLabels",
+            dictionary! {
+                "Nums" => vec![Object::Integer(0), Object::Dictionary(dictionary! {"S"=>"r"})]
+            },
+        );
+        let id = doc.get_pages()[&2];
+        let page = doc.get_dictionary_mut(id).unwrap();
+        page.set("Rotate", rotation);
+        page.set("UserUnit", 2);
+        page.set(
+            "CropBox",
+            vec![20.into(), 30.into(), 550.into(), 370.into()],
+        );
+        let link = doc.add_object(dictionary! {"Type"=>"Annot", "Subtype"=>"Link",
+        "Rect"=>vec![60.into(),80.into(),140.into(),110.into()],
+        "A"=>dictionary!{"S"=>"URI", "URI"=>Object::string_literal("https://example.com")}});
+        doc.get_dictionary_mut(id)
+            .unwrap()
+            .set("Annots", vec![Object::Reference(link)]);
+        let mut bytes = vec![];
+        doc.save_to(&mut bytes).unwrap();
+        let mark = Annotation::new(
+            1,
+            [80., 100., 190., 140.],
+            Kind::Text {
+                text: "Same size".into(),
+            },
+            Style {
+                font_size: 14.,
+                ..Default::default()
+            },
+        );
+        let bytes = annotations::export(&bytes, std::slice::from_ref(&mark)).unwrap();
+        let old_geometry = annotations::page_geometry(&bytes).unwrap();
+        let resized = pages::apply(
+            &bytes,
+            &Operation::Resize {
+                pages: vec![1],
+                width: pages::A4[0],
+                height: pages::A4[1],
+            },
+        )
+        .unwrap();
+        let after = Document::load_mem(&resized).unwrap();
+        assert_eq!(
+            after.catalog().unwrap().get(b"PageLabels").unwrap(),
+            doc.catalog().unwrap().get(b"PageLabels").unwrap()
+        );
+        let geometry = annotations::page_geometry(&resized).unwrap();
+        assert_eq!(geometry[0], old_geometry[0]);
+        assert_eq!(geometry[2], old_geometry[2]);
+        for (a, b) in geometry[1].0[2..].iter().zip(pages::A4) {
+            assert!((a - b).abs() < 0.001, "{rotation}: {:?}", geometry[1]);
+        }
+        for (a, b) in geometry[1].1.iter().zip(old_geometry[1].1) {
+            assert!(
+                (a - b).abs() < 0.001,
+                "Content must not scale or shift at rotation {rotation}"
+            );
+        }
+        assert_eq!(annotations::load(&after), vec![mark]);
+        assert_eq!(after.get_page_content(id), doc.get_page_content(id));
+        assert_eq!(
+            after.get_dictionary(link).unwrap(),
+            doc.get_dictionary(link).unwrap()
+        );
+        assert_eq!(labels(&resized), labels(&bytes));
+        let mut session = Session::new(
+            bytes.clone().into(),
+            annotations::load(&Document::load_mem(&bytes).unwrap()),
+            true,
+        );
+        session.commit_document(resized.clone()).unwrap();
+        session.undo();
+        assert_eq!(session.source.as_ref(), bytes);
+        session.redo();
+        assert_eq!(session.source.as_ref(), resized);
+    }
+}
+
+#[test]
+fn resize_rejects_invalid_sizes_and_selections_without_changing_input() {
+    let bytes = fixture();
+    for (selected, w, h) in [
+        (vec![], 595., 842.),
+        (vec![3], 595., 842.),
+        (vec![0, 0], 595., 842.),
+        (vec![1], f32::NAN, 842.),
+        (vec![1], 0., 842.),
+        (vec![1], 595., 15000.),
+    ] {
+        assert!(
+            pages::apply(
+                &bytes,
+                &Operation::Resize {
+                    pages: selected,
+                    width: w,
+                    height: h
+                }
+            )
+            .is_err()
+        );
+    }
+    assert_eq!(labels(&bytes), ["PAGE 1", "PAGE 2", "PAGE 3"]);
+}
+
+#[test]
 fn reorder_preserves_inherited_resources_rotation_and_bookmark_targets() {
     let original = fixture();
     let changed = pages::apply(&original, &Operation::Reorder(vec![2, 0, 1])).unwrap();
