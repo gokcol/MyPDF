@@ -6832,6 +6832,9 @@ mod tests {
             }
         };
         wait(&mut app);
+        // The outside click must be inside the viewport when the sidebar is hidden.
+        app.tabs[0].zoom = super::Zoom::Page;
+        wait(&mut app);
         let id = app.tabs[0].id;
         let page = ctx
             .read_response(egui::Id::new((id, 0_usize, "text_page_background")))

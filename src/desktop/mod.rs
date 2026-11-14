@@ -4316,12 +4316,13 @@ mod tests {
                     );
                 }
                 assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), revision);
-                app.action("sidebar", &ctx);
                 assert!(!app.sidebar && app.inspector);
-                app.action("inspector", &ctx);
-                assert!(!app.sidebar && !app.inspector);
                 app.action("sidebar", &ctx);
+                assert!(app.sidebar && app.inspector);
+                app.action("inspector", &ctx);
                 assert!(app.sidebar && !app.inspector);
+                app.action("sidebar", &ctx);
+                assert!(!app.sidebar && !app.inspector);
             }
         }
     }

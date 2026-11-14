@@ -38,6 +38,8 @@ fn fixture(mode: editing::Mode, inspector: bool) -> (Viewer, egui::Context) {
         assert!(std::time::Instant::now() < deadline, "{:?}", app.status);
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    // Keep the outside-click targets visible with either panel configuration.
+    app.tabs[0].zoom = crate::desktop::Zoom::Page;
     settle(&mut app, &ctx);
     (app, ctx)
 }

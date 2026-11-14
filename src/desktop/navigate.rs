@@ -422,6 +422,7 @@ mod tests {
             let _ = frame(&mut app, vec![]);
         }
         // The outline tab lists the chapter; choosing it goes to page 2.
+        app.sidebar = true;
         app.outline = true;
         let output = frame(&mut app, vec![]);
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;

@@ -73,7 +73,6 @@ fn loaded() -> (tempfile::TempDir, Viewer, egui::Context) {
     );
     app.home.visible = false;
     app.editor.mode = editing::Mode::Read;
-    app.sidebar = true;
     app.inspector = false;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while app.tabs[0].document_view.is_none() || app.tabs[0].session.is_none() {
@@ -84,6 +83,8 @@ fn loaded() -> (tempfile::TempDir, Viewer, egui::Context) {
         frame(&mut app, &ctx, vec![]);
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    // Loading restores the document view; open the sidebar after that completes.
+    app.sidebar = true;
     settled(&mut app, &ctx);
     assert_eq!(app.tabs[0].pages.len(), PAGE_COUNT);
     (dir, app, ctx)

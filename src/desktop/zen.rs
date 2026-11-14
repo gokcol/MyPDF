@@ -271,6 +271,7 @@ mod tests {
             frame(&mut app, vec![]);
             std::thread::sleep(Duration::from_millis(10));
         }
+        app.sidebar = true;
         app.editor.mode = editing::Mode::Annotate;
         let labels = frame(&mut app, vec![]);
         for chrome in ["Home", "Toggle left panel", "Outline", "Marks"] {
