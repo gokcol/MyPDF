@@ -212,6 +212,8 @@ fn library(ui: &mut egui::Ui, state: &mut State) {
         ui.add(
             egui::TextEdit::singleline(&mut state.search)
                 .hint_text("Search name or purpose…")
+                .margin(ui::FIELD_MARGIN)
+                .min_size(vec2(0., ui::target_size(28.)))
                 .desired_width((ui.available_width() - 138.).max(60.)),
         );
         let response = ui.add_enabled(
@@ -322,9 +324,10 @@ fn library(ui: &mut egui::Ui, state: &mut State) {
                 {
                     ui.push_id(index, |ui| {
                         egui::Frame::new()
-                            .inner_margin(6.)
-                            .fill(theme::paper())
-                            .corner_radius(7.)
+                            .inner_margin(10.)
+                            .fill(theme::home_card())
+                            .stroke(egui::Stroke::new(1., theme::line()))
+                            .corner_radius(10.)
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     preview(ui, &entry.appearance, vec2(48., 34.));
@@ -454,7 +457,7 @@ fn library(ui: &mut egui::Ui, state: &mut State) {
 pub(in super::super) fn settings(ui: &mut egui::Ui) {
     // Keep utility controls compact even when the shared Settings window was
     // previously widened for a digital-signature editor.
-    ui.set_max_width(ui.available_width().min(620.));
+    ui.set_max_width(ui.available_width().min(760.));
     let shared = state(ui.ctx());
     let mut state = shared.lock().unwrap();
     ui.spacing_mut().item_spacing.y = 8.;

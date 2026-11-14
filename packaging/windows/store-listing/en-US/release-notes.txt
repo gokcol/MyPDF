@@ -1,1 +1,14 @@
-Version 2.4.2 fixes saving and autosaving PDFs with text annotations. Text layout now matches the editor, and visible text is preserved without reducing its font size. Includes file insertion, image editing and rotation improvements from 2.4.1.
+MyPDF 3.0.0
+
+• Touch controls: finger drawing on/off, two-finger pan and pinch, long-press menus, and a movable floating toolbar.
+• Automatic touchscreen detection plus Touch and Mouse only modes; tune touch targets, hold delay, stroke smoothing, and gesture hints.
+• Redesigned Home with tools, recents, favorites, and customizable section order and visibility.
+• Polished Settings and About; contextual icon tabs, compact previews, Studio and Sage styles, and three icon-color choices.
+• The left panel starts hidden; saved document layouts remain available.
+• Click existing text to edit it. Clicking outside keeps changes and finishes editing; another click starts the next edit.
+• A4 defaults for new pages; resize individual pages without scaling their contents. Inserted images always fit the page.
+• Editable image layers: move, resize, rotate, add text above images, and reset rotation from the context menu.
+• Insert PDF, images, TXT, Markdown, SVG, DOCX and RTF; Word or LibreOffice is needed for DOCX/RTF.
+• Recent improvements retained: stable table-cell editing, compact text properties, editable PDF metadata, and reliable Save/autosave.
+• OCR page selection and reviewable results; Windows bundles offline English, Turkish and German OCR.
+• Offline What’s New; Store updates on Windows and signed Mac updates with download, install and relaunch.

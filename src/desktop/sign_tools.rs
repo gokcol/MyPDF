@@ -57,7 +57,7 @@ impl State {
     }
     pub(super) fn placement_settings(&mut self, ui: &mut egui::Ui, ink: bool) {
         ui.push_id(if ink { "ink_placement" } else { "quick_placement" }, |ui| {
-            ui.strong(if ink { "When choosing Sign in ink" } else { "When choosing Quick Sign" });
+            ui::settings_group(ui, if ink { Icon::Pen } else { Icon::Sign }, if ink { "Ink signature placement" } else { "Quick Sign placement" }, |ui| {
             let choice = if ink { &mut self.signing.ink_default } else { &mut self.signing.quick_default };
             let mut changed = false;
             ui.horizontal_wrapped(|ui| {
@@ -69,7 +69,8 @@ impl State {
             if let Some(error) = &self.preference_error {
                 ui.colored_label(theme::danger(), error);
             }
-            ui.separator();
+            });
+            ui.add_space(6.);
         });
     }
 }

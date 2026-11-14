@@ -1932,6 +1932,119 @@ pub(super) fn segmented_icons(
     let (icons, names): (Vec<Icon>, Vec<&str>) = options.iter().copied().unzip();
     segments(ui, &names, &icons, selected)
 }
+
+/// Settings navigation keeps both the glyph and its readable label visible.
+pub(super) fn settings_tabs(
+    ui: &mut egui::Ui,
+    options: &[(Icon, &str)],
+    selected: usize,
+    secondary: bool,
+) -> Option<usize> {
+    target_spacing(ui);
+    let count = options.len().max(1);
+    let gap = 4.;
+    let inset = if secondary { 0. } else { 4. };
+    let columns =
+        (((ui.available_width() - inset * 2. + gap) / 130.).floor() as usize).clamp(1, count);
+    let rows = count.div_ceil(columns);
+    let height = target_size(if secondary { 30. } else { 36. });
+    let (track, _) = ui.allocate_exact_size(
+        vec2(
+            ui.available_width(),
+            inset * 2. + height * rows as f32 + gap * rows.saturating_sub(1) as f32,
+        ),
+        egui::Sense::hover(),
+    );
+    if !secondary {
+        ui.painter().rect_filled(track, 12, theme::track());
+    }
+    let width =
+        (track.width() - inset * 2. - gap * columns.saturating_sub(1) as f32) / columns as f32;
+    let mut choice = None;
+    for (i, (icon, label)) in options.iter().enumerate() {
+        let rect = Rect::from_min_size(
+            track.min
+                + vec2(
+                    inset + (i % columns) as f32 * (width + gap),
+                    inset + (i / columns) as f32 * (height + gap),
+                ),
+            vec2(width, height),
+        );
+        let active = selected == i;
+        let response = ui.interact(
+            rect,
+            ui.id().with(("settings_tab", secondary, label)),
+            egui::Sense::click(),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), active, *label)
+        });
+        if active || response.hovered() {
+            ui.painter().rect_filled(
+                rect,
+                9,
+                if active {
+                    if secondary {
+                        theme::accent_soft()
+                    } else {
+                        theme::raised()
+                    }
+                } else {
+                    theme::hover()
+                },
+            );
+        }
+        if response.has_focus() {
+            ui.painter().rect_stroke(
+                rect,
+                9,
+                Stroke::new(1.5, theme::accent()),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let ink = if active { theme::ink() } else { theme::muted() };
+        let font = if active {
+            strong(ui, 12.)
+        } else {
+            FontId::proportional(12.)
+        };
+        let galley = egui::WidgetText::from(RichText::new(*label).font(font).color(ink))
+            .into_galley(
+                ui,
+                Some(egui::TextWrapMode::Truncate),
+                (width - 38.).max(0.),
+                egui::TextStyle::Button,
+            );
+        let origin = rect.center() - vec2((galley.size().x + 24.) * 0.5, 0.);
+        let (color, duotone) = control_icon_appearance(
+            *icon,
+            true,
+            ui.is_enabled(),
+            if active {
+                theme::accent()
+            } else {
+                theme::muted()
+            },
+        );
+        draw_icon_impl(
+            ui.painter(),
+            Rect::from_center_size(origin + vec2(8., 0.), vec2(16., 16.)),
+            *icon,
+            color,
+            duotone,
+        );
+        ui.painter()
+            .galley(origin + vec2(24., -galley.size().y * 0.5), galley, ink);
+        if response
+            .on_hover_text(*label)
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            choice = Some(i);
+        }
+    }
+    choice
+}
 fn segments(ui: &mut egui::Ui, options: &[&str], icons: &[Icon], selected: usize) -> Option<usize> {
     target_spacing(ui);
     let count = options.len().max(1);
@@ -2000,99 +2113,6 @@ fn segments(ui: &mut egui::Ui, options: &[&str], icons: &[Icon], selected: usize
             response
         };
         if response
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .clicked()
-        {
-            choice = Some(i);
-        }
-    }
-    choice
-}
-
-/// Secondary navigation uses an underline rather than the primary tabs' filled track.
-pub(super) fn sub_tabs(ui: &mut egui::Ui, options: &[&str], selected: usize) -> Option<usize> {
-    target_spacing(ui);
-    let count = options.len().max(1);
-    let gap = if theme::comfortable() { 4. } else { 0. };
-    let columns = if theme::comfortable() {
-        (((ui.available_width() + gap) / (44. + gap)).floor() as usize).clamp(1, count)
-    } else {
-        count
-    };
-    let rows = count.div_ceil(columns);
-    let height = target_size(28.);
-    let (track, _) = ui.allocate_exact_size(
-        vec2(
-            ui.available_width(),
-            height * rows as f32 + gap * rows.saturating_sub(1) as f32,
-        ),
-        egui::Sense::hover(),
-    );
-    ui.painter().hline(
-        track.x_range(),
-        track.bottom(),
-        Stroke::new(1., theme::line()),
-    );
-    let width = (track.width() - gap * columns.saturating_sub(1) as f32) / columns as f32;
-    let mut choice = None;
-    for (i, label) in options.iter().enumerate() {
-        let rect = Rect::from_min_size(
-            track.min
-                + vec2(
-                    (i % columns) as f32 * (width + gap),
-                    (i / columns) as f32 * (height + gap),
-                ),
-            vec2(width, height),
-        );
-        let response = ui.interact(
-            rect,
-            ui.id().with(("sub_tab", options, i)),
-            egui::Sense::click(),
-        );
-        response.widget_info(|| {
-            egui::WidgetInfo::selected(
-                egui::WidgetType::Button,
-                ui.is_enabled(),
-                i == selected,
-                *label,
-            )
-        });
-        if response.hovered() {
-            ui.painter()
-                .rect_filled(rect.shrink2(vec2(3., 2.)), 4, theme::hover());
-        }
-        let ink = if i == selected {
-            theme::accent()
-        } else {
-            theme::muted()
-        };
-        let font = if i == selected {
-            strong(ui, 11.5)
-        } else {
-            FontId::proportional(11.5)
-        };
-        let galley = egui::WidgetText::from(RichText::new(*label).font(font).color(ink))
-            .into_galley(
-                ui,
-                Some(egui::TextWrapMode::Truncate),
-                (width - 12.).max(0.),
-                egui::TextStyle::Button,
-            );
-        let size = galley.size();
-        ui.painter()
-            .galley(rect.center() - size * 0.5 - vec2(0., 1.), galley, ink);
-        if i == selected {
-            let half = (size.x * 0.5 + 6.).min(width * 0.5 - 3.).max(0.);
-            ui.painter().line_segment(
-                [
-                    pos2(rect.center().x - half, rect.bottom() - 1.),
-                    pos2(rect.center().x + half, rect.bottom() - 1.),
-                ],
-                Stroke::new(2., theme::accent()),
-            );
-        }
-        if response
-            .on_hover_text(*label)
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
         {
@@ -2957,15 +2977,25 @@ pub(super) fn set_density(ctx: &egui::Context, density: theme::Density) -> anyho
 }
 
 /// Settings groups use a quiet inset surface and consistent padding.
-pub(super) fn settings_group(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+pub(super) fn settings_group(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    title: &str,
+    body: impl FnOnce(&mut egui::Ui),
+) {
     egui::Frame::new()
         .fill(theme::home_card())
         .stroke(Stroke::new(1., theme::line()))
         .corner_radius(14)
-        .inner_margin(14)
+        .inner_margin(12)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).family(semibold()).size(14.));
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(vec2(24., 24.), egui::Sense::hover());
+                ui.painter().rect_filled(rect, 7, theme::accent_soft());
+                draw_icon(ui.painter(), rect.shrink(5.), icon, theme::accent());
+                ui.label(RichText::new(title).family(semibold()).size(13.));
+            });
             ui.add_space(5.);
             body(ui);
         });
@@ -3202,7 +3232,7 @@ pub(super) fn appearance_settings(ui: &mut egui::Ui) {
         ui.ctx().data_mut(|d| d.insert_temp(error_id, error));
     }
     ui.add_space(10.);
-    settings_group(ui, "Light & dark", |ui| {
+    settings_group(ui, Icon::Theme, "Light & dark", |ui| {
         let current = ui.ctx().options(|o| o.theme_preference);
         let choices = [
             egui::ThemePreference::System,
@@ -3226,7 +3256,7 @@ pub(super) fn appearance_settings(ui: &mut egui::Ui) {
         );
     });
     ui.add_space(6.);
-    settings_group(ui, "Icon colors", |ui| {
+    settings_group(ui, Icon::Shapes, "Icon colors", |ui| {
         let columns = if ui.available_width() >= 530. { 3 } else { 1 };
         let width = (ui.available_width() - 8. * (columns - 1) as f32) / columns as f32;
         let mut choice = None;
@@ -3259,7 +3289,7 @@ pub(super) fn appearance_settings(ui: &mut egui::Ui) {
         );
     });
     ui.add_space(6.);
-    settings_group(ui, "Control spacing", |ui| {
+    settings_group(ui, Icon::Guides, "Control spacing", |ui| {
         let current = theme::density();
         let index = usize::from(current == theme::Density::Comfortable);
         let labels = theme::Density::ALL.map(|v| v.name());
@@ -3435,15 +3465,16 @@ mod tests {
                                     ],
                                     0,
                                 );
-                                sub_tabs(
+                                settings_tabs(
                                     ui,
                                     &[
-                                        "Density first",
-                                        "Density second",
-                                        "Density third",
-                                        "Density fourth",
+                                        (Icon::Pen, "Density first"),
+                                        (Icon::Shield, "Density second"),
+                                        (Icon::Person, "Density third"),
+                                        (Icon::Lock, "Density fourth"),
                                     ],
                                     0,
+                                    true,
                                 );
                             });
                         });
@@ -3937,15 +3968,16 @@ mod tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        sub_tabs(
+                        settings_tabs(
                             ui,
                             &[
-                                "Ink signatures",
-                                "Digital signatures",
-                                "Digital IDs",
-                                "Trusted",
+                                (Icon::Pen, "Ink signatures"),
+                                (Icon::Shield, "Digital signatures"),
+                                (Icon::Person, "Digital IDs"),
+                                (Icon::Lock, "Trusted"),
                             ],
                             1,
+                            true,
                         );
                     });
                 },
@@ -3965,11 +3997,10 @@ mod tests {
                     .1
                     .bounds()
                     .unwrap();
-                assert_eq!(rect.y1 - rect.y0, 28.);
+                assert_eq!(rect.y1 - rect.y0, 30.);
                 assert!(rect.x0 >= 0. && rect.x1 <= width as f64);
                 if let Some((x, y)) = previous {
-                    assert!(rect.x0 >= x);
-                    assert_eq!(rect.y0, y);
+                    assert!(rect.y0 > y || (rect.y0 == y && rect.x0 >= x));
                 }
                 previous = Some((rect.x1, rect.y0));
             }

@@ -1,16 +1,23 @@
 {
-  "unreleased": [
-    "New blank and image-created pages use A4 paper by default.",
-    "Resize individual pages using paper presets, orientation, or custom dimensions without scaling their contents.",
-    "Inserted images fit inside the page while keeping their proportions, and their edge handles remain usable.",
-    "View What's New offline and check for updates through Microsoft Store on Windows or GitHub on Mac.",
-    "A refreshed Home screen puts tools before recent documents. Customize lets you reorder or hide sections and remembers your layout.",
-    "Redesigned Settings with visual previews and two new styles: Studio, the new default, and Sage.",
-    "Draw with finger can be enabled or disabled independently of mouse input. Added long-press page menus, a floating touch toolbar, and icon-color previews in Settings.",
-    "A compact touch icon opens contextual settings for target size, long-press delay, finger-stroke smoothing, gesture hints, and the floating toolbar. Settings offers Automatic, Touch, and Mouse only modes.",
-    "Clicking existing text opens its editor even with the Text tool active. Clicking outside finishes the current edit and keeps changes; a separate click starts the next edit."
-  ],
+  "unreleased": [],
   "releases": [
+    {
+      "version": "3.0.0",
+      "changes": [
+        "Touch controls: finger drawing on/off, two-finger pan and pinch, long-press menus, and a movable floating toolbar.",
+        "Automatic touchscreen detection plus Touch and Mouse only modes; tune touch targets, hold delay, stroke smoothing, and gesture hints.",
+        "Redesigned Home with tools, recents, favorites, and customizable section order and visibility.",
+        "Polished Settings and About; contextual icon tabs, compact previews, Studio and Sage styles, and three icon-color choices.",
+        "The left panel starts hidden; saved document layouts remain available.",
+        "Click existing text to edit it. Clicking outside keeps changes and finishes editing; another click starts the next edit.",
+        "A4 defaults for new pages; resize individual pages without scaling their contents. Inserted images always fit the page.",
+        "Editable image layers: move, resize, rotate, add text above images, and reset rotation from the context menu.",
+        "Insert PDF, images, TXT, Markdown, SVG, DOCX and RTF; Word or LibreOffice is needed for DOCX/RTF.",
+        "Recent improvements retained: stable table-cell editing, compact text properties, editable PDF metadata, and reliable Save/autosave.",
+        "OCR page selection and reviewable results; Windows bundles offline English, Turkish and German OCR.",
+        "Offline What’s New; Store updates on Windows and signed Mac updates with download, install and relaunch."
+      ]
+    },
     {
       "version": "2.4.2",
       "changes": [

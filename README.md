@@ -2,6 +2,10 @@
 
 # MyPDF — native Rust desktop PDF editor
 
+Version **3.0.0**, Mac build **228**, brings configurable touch controls, a customizable Home screen, refreshed Settings and About, new visual styles, clearer text editing, A4 page defaults and per-page resizing, image fitting, and built-in update checks. It includes the recent OCR, table editing, metadata, file insertion, image-layer and saving improvements. [Downloads and full release notes](https://github.com/gokcol/MyPDF/releases/tag/v3.0.0).
+
+[MyPDF (OG) on Microsoft Store](https://apps.microsoft.com/detail/9MXR0WLW42XT) is live. The 3.0 update is being prepared for Store certification; Store availability follows Microsoft's review.
+
 Version **2.4.2**, Mac build **212**, fixes Save and autosave rejecting text boxes that look correct on screen. PDF annotation text now uses the editor’s layout engine and preserves visible overflow without shrinking text. Includes the file insertion and image editing improvements from 2.4.1. [Downloads](https://github.com/gokcol/MyPDF/releases/tag/v2.4.2).
 
 Version **2.3.1**, Mac build **203**, is [available for Mac and Windows](https://github.com/gokcol/MyPDF/releases/tag/v2.3.1). Windows now includes offline OCR with bundled English, Turkish and German models. On both platforms, choose all pages, the current page or a custom range, then review and copy recognized text in a results window. OCR preserves the scan's appearance and adds searchable text; save the PDF to keep it.
@@ -406,7 +410,7 @@ The pinned Sparkle framework is fetched and checksum-verified by `scripts/prepar
 `changelog.json` is the shared source for in-app, GitHub, and Store notes. Keep development changes in `unreleased`. When preparing a release, move the completed changes into a new `releases` entry matching the application version and clear those unreleased entries. Generate the publication text with:
 
 ```sh
-python3 scripts/release-notes.py --version 2.4.2 --out-dir artifacts/release-notes
+python3 scripts/release-notes.py --version 3.0.0 --out-dir artifacts/release-notes
 ```
 
 This produces `github-release.md` and Store-ready `release-notes.txt`. The Store listing workflow generates its notes from this same file. Generation never publishes a release or submits to the Store.
@@ -457,7 +461,7 @@ The PKCS#12 adapter uses `p12-keystore` for modern AES-encrypted PKCS#12 and aut
 
 The Windows app and installer are currently unsigned; no Windows code-signing provider is configured. Release downloads include SHA-256 checksum files for integrity verification. These checksums do not authenticate the publisher or replace code signing. The Mac app is signed with the maintainer's Apple Developer ID and notarized by Apple.
 
-Microsoft Store packaging is available through the **Microsoft Store MSIX** workflow, under the reserved Store name **MyPDF (OG)**. It packages the same native desktop app, with PDF Open With registration and standard Store-managed app data. Store mode requires the real Partner Center product identity; test mode uses a clearly marked validation identity. The unsigned `.msix` is a submission artifact, not a signed GitHub installer. Microsoft signs Store-distributed packages after certification. See [Windows Store packaging](packaging/windows/msix/README.md) for setup, validation and submission steps. MyPDF is not yet published in the Microsoft Store.
+Microsoft Store packaging is available through the **Microsoft Store MSIX** workflow, under the reserved Store name **MyPDF (OG)**. It packages the same native desktop app, with PDF Open With registration and standard Store-managed app data. Store mode requires the real Partner Center product identity; test mode uses a clearly marked validation identity. The unsigned `.msix` is a submission artifact, not a signed GitHub installer. Microsoft signs Store-distributed packages after certification. See [Windows Store packaging](packaging/windows/msix/README.md) for setup, validation and submission steps. [MyPDF (OG) is published in Microsoft Store](https://apps.microsoft.com/detail/9MXR0WLW42XT); new versions become available after certification.
 
 - **Committers and reviewers:** [gokcol](https://github.com/gokcol)
 - **Approvers:** [gokcol](https://github.com/gokcol)

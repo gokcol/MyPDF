@@ -372,7 +372,7 @@ impl Viewer {
             status_seen: None,
             next_id: 0,
             tick: 0,
-            sidebar: true,
+            sidebar: false,
             inspector: true,
             accessible_text: false,
             recovery: recovery::Recovery::new(&cc.egui_ctx),

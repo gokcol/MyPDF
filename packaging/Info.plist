@@ -7,8 +7,8 @@
     <key>CFBundleExecutable</key><string>MyPDF</string>
     <key>CFBundleIconFile</key><string>MyPDF-calico-v2</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>2.4.2</string>
-    <key>CFBundleVersion</key><string>226</string>
+    <key>CFBundleShortVersionString</key><string>3.0.0</string>
+    <key>CFBundleVersion</key><string>228</string>
     <key>SUFeedURL</key><string>https://github.com/gokcol/MyPDF/releases/latest/download/appcast.xml</string>
     <key>SUPublicEDKey</key><string>cjPMzBooZA6Ic435ct/rREcAG3jZ1//+JpCQjp02zxQ=</string>
     <key>SUEnableAutomaticChecks</key><false/>

@@ -1387,25 +1387,47 @@ impl Viewer {
             if !docked {
                 if settings {
                     if ctx.content_rect().height() >= 700. {
+                        let (icon, title, subtitle) = match self.digital.panel {
+                            Panel::Interface => (
+                                Icon::Theme,
+                                "Your workspace",
+                                "Choose the look, colors, and spacing that feel right for you.",
+                            ),
+                            Panel::Touch => (
+                                Icon::Touch,
+                                "Touch & gestures",
+                                "Make finger drawing and navigation feel natural.",
+                            ),
+                            Panel::Styles => (
+                                Icon::Library,
+                                "Your style library",
+                                "Keep your favorite text and drawing styles ready to use.",
+                            ),
+                            Panel::Identities => (
+                                Icon::Person,
+                                "Digital identities",
+                                "Manage the certificates you use to sign documents.",
+                            ),
+                            Panel::Trusted => (
+                                Icon::Shield,
+                                "Trusted certificates",
+                                "Choose the certificates you trust when reviewing signatures.",
+                            ),
+                            _ => (
+                                Icon::Sign,
+                                "Your signatures",
+                                "Create a personal signature and choose how you place it.",
+                            ),
+                        };
                         ui.horizontal(|ui| {
                             let (rect, _) =
                                 ui.allocate_exact_size(vec2(42., 42.), egui::Sense::hover());
                             ui.painter().rect_filled(rect, 12, theme::accent_soft());
-                            ui::draw_icon(
-                                ui.painter(),
-                                rect.shrink(10.),
-                                Icon::Settings,
-                                theme::accent(),
-                            );
+                            ui::draw_icon(ui.painter(), rect.shrink(10.), icon, theme::accent());
                             ui.add_space(4.);
                             ui.vertical(|ui| {
-                                ui.label(RichText::new("Make MyPDF yours").font(ui::bold(ui, 22.)));
-                                ui.label(
-                                    RichText::new(
-                                        "Your workspace, signatures, and favorite styles.",
-                                    )
-                                    .color(theme::muted()),
-                                );
+                                ui.label(RichText::new(title).font(ui::bold(ui, 21.)));
+                                ui.label(RichText::new(subtitle).size(12.5).color(theme::muted()));
                             });
                         });
                         ui.add_space(12.);
@@ -1424,10 +1446,16 @@ impl Viewer {
                         Panel::Styles => 3,
                         _ => 0,
                     };
-                    if let Some(i) = ui::segmented(
+                    if let Some(i) = ui::settings_tabs(
                         ui,
-                        &["Signatures", "Appearance", "Touch", "Reusable styles"],
+                        &[
+                            (Icon::Sign, "Signatures"),
+                            (Icon::Theme, "Appearance"),
+                            (Icon::Touch, "Touch"),
+                            (Icon::Library, "Reusable styles"),
+                        ],
                         section,
+                        false,
                     ) {
                         self.digital.panel = match i {
                             1 => Panel::Interface,
@@ -1453,15 +1481,21 @@ impl Viewer {
                             .iter()
                             .position(|(p, _)| *p == self.digital.panel)
                             .unwrap_or(0);
-                        let labels: Vec<&str> = panels.iter().map(|(_, name)| *name).collect();
-                        if let Some(i) = ui::sub_tabs(ui, &labels, current) {
+                        let tabs = [
+                            (Icon::Pen, "Ink signatures"),
+                            (Icon::Shield, "Digital signatures"),
+                            (Icon::Person, "Digital IDs"),
+                            (Icon::Lock, "Trusted"),
+                        ];
+                        if let Some(i) = ui::settings_tabs(ui, &tabs, current, true) {
                             self.digital.panel = panels[i].0;
                         }
                     }
-                } else if let Some(i) = ui::segmented(
+                } else if let Some(i) = ui::settings_tabs(
                     ui,
-                    &["Sign", "Validate"],
+                    &[(Icon::Sign, "Sign"), (Icon::Shield, "Validate")],
                     usize::from(self.digital.panel == Panel::Validate),
+                    false,
                 ) {
                     self.digital.panel = if i == 0 { Panel::Sign } else { Panel::Validate };
                 }
@@ -1551,7 +1585,12 @@ impl Viewer {
                     Panel::Interface => {
                         ui::appearance_settings(ui);
                         ui.add_space(8.);
-                        if ui.add(ActionButton::new(Icon::Redo, "App updates & What's New…")).clicked() { self.updates.show(false); }
+                        ui::settings_group(ui, Icon::Reload, "App updates", |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(format!("MyPDF {}", env!("CARGO_PKG_VERSION"))).color(theme::muted()));
+                                if ui.add(ActionButton::new(Icon::Redo, "App updates & What's New…")).clicked() { self.updates.show(false); }
+                            });
+                        });
                     },
                     Panel::Styles => styles::settings(ui),
                     Panel::Touch => touch_tools::settings(ui),

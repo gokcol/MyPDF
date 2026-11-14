@@ -205,152 +205,214 @@ pub(super) fn smooth_stroke(ctx: &egui::Context, raw: &[[f32; 2]]) -> Vec<[f32; 
     }
     points
 }
+fn preference_section(
+    ui: &mut egui::Ui,
+    global: bool,
+    icon: Icon,
+    title: &str,
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    if global {
+        ui::settings_group(ui, icon, title, body);
+    } else {
+        ui::section(ui, title, body);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PreferenceSection {
+    Finger,
+    Targets,
+    Drawing,
+    Gestures,
+    Toolbar,
+}
+
 fn preference_controls(ui: &mut egui::Ui, drawing: bool, global: bool) {
+    use PreferenceSection::*;
+    if global && ui.available_width() >= 580. {
+        for pair in [[Finger, Targets], [Drawing, Gestures]] {
+            ui.columns(2, |columns| {
+                for (column, section) in columns.iter_mut().zip(pair) {
+                    preference_control(column, drawing, global, section);
+                }
+            });
+        }
+        preference_control(ui, drawing, global, Toolbar);
+    } else {
+        for section in [Finger, Targets, Drawing, Gestures, Toolbar] {
+            preference_control(ui, drawing, global, section);
+        }
+    }
+    if let Some(error) = state(ui.ctx()).error {
+        ui.colored_label(theme::danger(), error);
+    }
+}
+
+fn preference_control(ui: &mut egui::Ui, drawing: bool, global: bool, section: PreferenceSection) {
     let ctx = ui.ctx().clone();
     let before = state(&ctx).preferences;
-    let mut finger = before.draw_with_finger;
-    if drawing || global {
-        ui::section(ui, "Finger drawing", |ui| {
-            if ui.checkbox(&mut finger, "Draw with finger").changed() {
-                set_finger(&ctx, finger);
-            }
-            ui.label(
-                RichText::new(
-                    "In Draw mode. When off, one finger pans; mouse drawing is unchanged.",
-                )
-                .small()
-                .color(theme::muted()),
-            );
-        });
-    }
-    ui::section(ui, "Touch targets", |ui| {
-        let mut value = before.targets;
-        egui::ComboBox::from_id_salt("touch_target_size")
-            .selected_text(match value {
-                Targets::Standard => "Standard",
-                Targets::Large => "Large · 44 pt",
-                Targets::ExtraLarge => "Extra large · 52 pt",
-            })
-            .show_ui(ui, |ui| {
-                for (v, label) in [
-                    (Targets::Standard, "Standard"),
-                    (Targets::Large, "Large · 44 pt"),
-                    (Targets::ExtraLarge, "Extra large · 52 pt"),
-                ] {
-                    ui.selectable_value(&mut value, v, label);
-                }
-            });
-        if value != before.targets {
-            update_preferences(&ctx, |p| p.targets = value);
-        }
-        ui.label(
-            RichText::new("Larger buttons and object handles while touch mode is active.")
-                .small()
-                .color(theme::muted()),
-        );
-    });
-    ui::section(ui, "Drawing", |ui| {
-        ui.label("Finger stroke smoothing");
-        let mut value = before.smoothing;
-        egui::ComboBox::from_id_salt("touch_smoothing")
-            .selected_text(match value {
-                Smoothing::Off => "Off",
-                Smoothing::Light => "Light",
-                Smoothing::Strong => "Strong",
-            })
-            .show_ui(ui, |ui| {
-                for (v, label) in [
-                    (Smoothing::Off, "Off"),
-                    (Smoothing::Light, "Light"),
-                    (Smoothing::Strong, "Strong"),
-                ] {
-                    ui.selectable_value(&mut value, v, label);
-                }
-            });
-        if value != before.smoothing {
-            update_preferences(&ctx, |p| p.smoothing = value);
-        }
-        ui.label(
-            RichText::new("Steadies new finger pen strokes. Mouse strokes stay unchanged.")
-                .small()
-                .color(theme::muted()),
-        );
-    });
-    ui::section(ui, "Gestures", |ui| {
-        ui.label("Long-press delay");
-        let mut value = before.hold_delay;
-        egui::ComboBox::from_id_salt("touch_hold_delay")
-            .selected_text(match value {
-                HoldDelay::Quick => "Quick · 0.35 s",
-                HoldDelay::Normal => "Normal · 0.55 s",
-                HoldDelay::Slow => "Slow · 0.85 s",
-            })
-            .show_ui(ui, |ui| {
-                for (v, label) in [
-                    (HoldDelay::Quick, "Quick · 0.35 s"),
-                    (HoldDelay::Normal, "Normal · 0.55 s"),
-                    (HoldDelay::Slow, "Slow · 0.85 s"),
-                ] {
-                    ui.selectable_value(&mut value, v, label);
-                }
-            });
-        if value != before.hold_delay {
-            update_preferences(&ctx, |p| p.hold_delay = value);
-        }
-        let mut hints = before.gesture_hints;
-        if ui.checkbox(&mut hints, "Show gesture hints").changed() {
-            update_preferences(&ctx, |p| p.gesture_hints = hints);
-        }
-        if hints {
-            ui.label(
-                RichText::new("Two fingers: pan and pinch to zoom.")
-                    .small()
-                    .color(theme::muted()),
-            );
+    match section {
+        PreferenceSection::Finger => {
+            let mut finger = before.draw_with_finger;
             if drawing || global {
-                ui.label(
-                    RichText::new("With finger drawing off, hold still to open the page menu.")
+                preference_section(ui, global, Icon::Pen, "Finger drawing", |ui| {
+                    if ui.checkbox(&mut finger, "Draw with finger").changed() {
+                        set_finger(&ctx, finger);
+                    }
+                    ui.label(
+                        RichText::new(
+                            "In Draw mode. When off, one finger pans; mouse drawing is unchanged.",
+                        )
                         .small()
                         .color(theme::muted()),
-                );
-            } else {
-                ui.label(
-                    RichText::new("One finger uses the selected annotation tool.")
-                        .small()
-                        .color(theme::muted()),
-                );
+                    );
+                });
             }
         }
-    });
-    ui::section(ui, "Floating toolbar", |ui| {
-        let mut current = state(&ctx);
-        if ui
-            .checkbox(&mut current.visible, "Show floating toolbar")
-            .changed()
-        {
-            ctx.data_mut(|d| d.insert_temp(id(), current.clone()));
+        PreferenceSection::Targets => {
+            preference_section(ui, global, Icon::Touch, "Touch targets", |ui| {
+                let mut value = before.targets;
+                egui::ComboBox::from_id_salt("touch_target_size")
+                    .selected_text(match value {
+                        Targets::Standard => "Standard",
+                        Targets::Large => "Large · 44 pt",
+                        Targets::ExtraLarge => "Extra large · 52 pt",
+                    })
+                    .show_ui(ui, |ui| {
+                        for (v, label) in [
+                            (Targets::Standard, "Standard"),
+                            (Targets::Large, "Large · 44 pt"),
+                            (Targets::ExtraLarge, "Extra large · 52 pt"),
+                        ] {
+                            ui.selectable_value(&mut value, v, label);
+                        }
+                    });
+                if value != before.targets {
+                    update_preferences(&ctx, |p| p.targets = value);
+                }
+                ui.label(
+                    RichText::new("Larger buttons and object handles while touch mode is active.")
+                        .small()
+                        .color(theme::muted()),
+                );
+            });
         }
-        if ui
-            .add(ActionButton::new(Icon::Reload, "Reset position"))
-            .clicked()
-        {
-            current.palette_revision = current.palette_revision.wrapping_add(1);
-            current.visible = true;
-            ctx.data_mut(|d| d.insert_temp(id(), current));
+        PreferenceSection::Drawing => {
+            preference_section(ui, global, Icon::Shapes, "Drawing", |ui| {
+                ui.label("Finger stroke smoothing");
+                let mut value = before.smoothing;
+                egui::ComboBox::from_id_salt("touch_smoothing")
+                    .selected_text(match value {
+                        Smoothing::Off => "Off",
+                        Smoothing::Light => "Light",
+                        Smoothing::Strong => "Strong",
+                    })
+                    .show_ui(ui, |ui| {
+                        for (v, label) in [
+                            (Smoothing::Off, "Off"),
+                            (Smoothing::Light, "Light"),
+                            (Smoothing::Strong, "Strong"),
+                        ] {
+                            ui.selectable_value(&mut value, v, label);
+                        }
+                    });
+                if value != before.smoothing {
+                    update_preferences(&ctx, |p| p.smoothing = value);
+                }
+                ui.label(
+                    RichText::new("Steadies new finger pen strokes. Mouse strokes stay unchanged.")
+                        .small()
+                        .color(theme::muted()),
+                );
+            });
         }
-        ui.label(
-            RichText::new("Available in Draw and Annotate. Drag its title to move it.")
-                .small()
-                .color(theme::muted()),
-        );
-    });
-    if let Some(error) = state(&ctx).error {
-        ui.colored_label(theme::danger(), error);
+        PreferenceSection::Gestures => {
+            preference_section(ui, global, Icon::History, "Gestures", |ui| {
+                ui.label("Long-press delay");
+                let mut value = before.hold_delay;
+                egui::ComboBox::from_id_salt("touch_hold_delay")
+                    .selected_text(match value {
+                        HoldDelay::Quick => "Quick · 0.35 s",
+                        HoldDelay::Normal => "Normal · 0.55 s",
+                        HoldDelay::Slow => "Slow · 0.85 s",
+                    })
+                    .show_ui(ui, |ui| {
+                        for (v, label) in [
+                            (HoldDelay::Quick, "Quick · 0.35 s"),
+                            (HoldDelay::Normal, "Normal · 0.55 s"),
+                            (HoldDelay::Slow, "Slow · 0.85 s"),
+                        ] {
+                            ui.selectable_value(&mut value, v, label);
+                        }
+                    });
+                if value != before.hold_delay {
+                    update_preferences(&ctx, |p| p.hold_delay = value);
+                }
+                let mut hints = before.gesture_hints;
+                if ui.checkbox(&mut hints, "Show gesture hints").changed() {
+                    update_preferences(&ctx, |p| p.gesture_hints = hints);
+                }
+                if hints {
+                    ui.label(
+                        RichText::new("Two fingers: pan and pinch to zoom.")
+                            .small()
+                            .color(theme::muted()),
+                    );
+                    if drawing || global {
+                        ui.label(
+                            RichText::new(
+                                "With finger drawing off, hold still to open the page menu.",
+                            )
+                            .small()
+                            .color(theme::muted()),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new("One finger uses the selected annotation tool.")
+                                .small()
+                                .color(theme::muted()),
+                        );
+                    }
+                }
+            });
+        }
+        PreferenceSection::Toolbar => {
+            preference_section(ui, global, Icon::Form, "Floating toolbar", |ui| {
+                let controls = |ui: &mut egui::Ui| {
+                    let mut current = state(&ctx);
+                    if ui
+                        .checkbox(&mut current.visible, "Show floating toolbar")
+                        .changed()
+                    {
+                        ctx.data_mut(|d| d.insert_temp(id(), current.clone()));
+                    }
+                    if ui
+                        .add(ActionButton::new(Icon::Reload, "Reset position"))
+                        .clicked()
+                    {
+                        current.palette_revision = current.palette_revision.wrapping_add(1);
+                        current.visible = true;
+                        ctx.data_mut(|d| d.insert_temp(id(), current));
+                    }
+                };
+                if global {
+                    ui.horizontal_wrapped(controls);
+                } else {
+                    controls(ui);
+                }
+                ui.label(
+                    RichText::new("Available in Draw and Annotate. Drag its title to move it.")
+                        .small()
+                        .color(theme::muted()),
+                );
+            });
+        }
     }
 }
 pub(super) fn settings(ui: &mut egui::Ui) {
     let current = state(ui.ctx());
-    ui::section(ui, "Input mode", |ui| {
+    ui::settings_group(ui, Icon::Touch, "Input mode", |ui| {
         let index = match current.preferences.mode {
             InputMode::Automatic => 0,
             InputMode::Touch => 1,

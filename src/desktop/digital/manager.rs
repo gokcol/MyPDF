@@ -2451,7 +2451,7 @@ impl DigitalState {
         }
         ui.separator();
         if ui
-            .add(ActionButton::new(Icon::Plus, "New ink signature…"))
+            .add(ActionButton::new(Icon::Plus, "New ink signature…").primary())
             .clicked()
         {
             self.adopt_asset = false;

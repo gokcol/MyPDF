@@ -101,6 +101,30 @@ fn settings_styles_preview() {
             false,
             vec2(1200., 960.),
         ),
+        (
+            "ink-settings",
+            theme::Style::Studio,
+            false,
+            vec2(1200., 960.),
+        ),
+        (
+            "styles-settings",
+            theme::Style::Studio,
+            false,
+            vec2(1200., 960.),
+        ),
+        (
+            "identities-settings",
+            theme::Style::Studio,
+            false,
+            vec2(1200., 960.),
+        ),
+        (
+            "trusted-settings",
+            theme::Style::Studio,
+            false,
+            vec2(1200., 960.),
+        ),
         ("studio-dark", theme::Style::Studio, true, vec2(1200., 960.)),
         ("sage", theme::Style::Sage, false, vec2(1200., 960.)),
         ("sage-dark", theme::Style::Sage, true, vec2(1200., 960.)),
@@ -132,10 +156,13 @@ fn settings_styles_preview() {
             preview.save(&ctx, output, &root.join(format!("{name}-home.png")));
         }
         app.digital.open = true;
-        app.digital.panel = if name == "touch-settings" {
-            digital::Panel::Touch
-        } else {
-            digital::Panel::Interface
+        app.digital.panel = match name {
+            "touch-settings" => digital::Panel::Touch,
+            "ink-settings" => digital::Panel::Ink,
+            "styles-settings" => digital::Panel::Styles,
+            "identities-settings" => digital::Panel::Identities,
+            "trusted-settings" => digital::Panel::Trusted,
+            _ => digital::Panel::Interface,
         };
         preview.settle(&mut app, &ctx);
         for _ in 0..8 {

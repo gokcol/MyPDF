@@ -29,7 +29,7 @@ impl Default for Saved {
             tabs: vec![],
             active: None,
             home: true,
-            sidebar: true,
+            sidebar: false,
             inspector: true,
             outline: false,
             groups: tabs::State::default().groups,

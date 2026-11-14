@@ -29,7 +29,7 @@ impl Default for ReadingState {
             scale: None,
             fit_page: false,
             layout: 0,
-            sidebar: true,
+            sidebar: false,
             inspector: true,
         }
     }
