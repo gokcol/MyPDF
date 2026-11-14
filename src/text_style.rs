@@ -76,6 +76,35 @@ pub fn fonts() -> &'static [FontFace] {
         out
     })
 }
+/// Portable annotation font identity; never trusts a filesystem path from a PDF.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AnnotationFont {
+    pub family: String,
+    pub bold: bool,
+    pub italic: bool,
+}
+impl AnnotationFont {
+    pub fn from_face(face: &FontFace) -> Self {
+        Self {
+            family: face.family.clone(),
+            bold: face.bold,
+            italic: face.italic,
+        }
+    }
+    pub fn resolve(&self) -> Option<&'static FontFace> {
+        let fonts = fonts();
+        fonts
+            .iter()
+            .find(|f| f.family == self.family && f.bold == self.bold && f.italic == self.italic)
+            .or_else(|| {
+                fonts
+                    .iter()
+                    .find(|f| f.bold == self.bold && f.italic == self.italic)
+            })
+            .or_else(|| fonts.first())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Alignment {
     #[default]

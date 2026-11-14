@@ -3,6 +3,13 @@
 use super::*;
 use mypdf_milestone0::annotations::{Annotation, Primitive};
 
+pub(super) fn font_family(style: &mypdf_milestone0::annotations::Style) -> egui::FontFamily {
+    style.font.as_ref().and_then(|f| f.resolve()).map_or_else(
+        || egui::FontFamily::Name("annotation".into()),
+        |f| egui::FontFamily::Name(f.ui_name().into()),
+    )
+}
+
 pub(super) fn text_resolution(scale: f32) -> f32 {
     scale.max(1.)
 }
@@ -79,10 +86,7 @@ pub(super) fn paint_text(
         ctx.fonts_mut(|fonts| {
             fonts.layout(
                 text.replace('\t', "    "),
-                FontId::new(
-                    size * resolution,
-                    egui::FontFamily::Name("annotation".into()),
-                ),
+                FontId::new(size * resolution, font_family(&a.style)),
                 ink,
                 ((rect[2] - rect[0] - 8.) * resolution).max(1.),
             )

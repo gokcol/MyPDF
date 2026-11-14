@@ -62,6 +62,9 @@ impl TextLayer {
                 if style.color != self.base_color {
                     s.color = style.color;
                 }
+                if let Some(face) = style.font.as_ref().and_then(|f| f.resolve()) {
+                    s.font = Some(face.path.clone());
+                }
                 if !crate::text_style::fonts()
                     .iter()
                     .any(|f| Some(&f.path) == s.font.as_ref())

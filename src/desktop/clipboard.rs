@@ -330,7 +330,8 @@ fn centered(page: PageSize, size: [f32; 2], room: f32) -> [f32; 4] {
 impl Viewer {
     /// Copy and paste act on marks in Annotate and Draw when no text field has focus.
     pub(super) fn marks_keys(&self, ctx: &egui::Context) -> bool {
-        !self.home.visible
+        !self.editor.selection_dialog_open()
+            && !self.home.visible
             && matches!(
                 self.editor.mode,
                 editing::Mode::Annotate | editing::Mode::Draw
@@ -340,7 +341,8 @@ impl Viewer {
     }
     /// Paste places clipboard content in Read, Annotate, Draw and Edit.
     pub(super) fn paste_keys(&self, ctx: &egui::Context) -> bool {
-        !self.home.visible
+        !self.editor.selection_dialog_open()
+            && !self.home.visible
             && !self
                 .tabs
                 .get(self.active)

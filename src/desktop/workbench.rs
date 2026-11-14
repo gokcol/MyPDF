@@ -127,15 +127,28 @@ pub(super) fn place(
     let Some(s) = &mut tab.session else {
         return false;
     };
+    let stamp = !marks.is_empty() && marks.iter().all(|a| stamp_properties::is_stamp(editor, a));
     let ids = marks.iter().map(|a| a.id.clone()).collect();
     let mut entries = s.annotations.clone();
     entries.extend(marks);
     match s.commit(entries) {
         Ok(()) => {
             selection::set(tab, editor, ids);
-            editor.mode = editing::Mode::Draw;
+            editor.mode = if stamp {
+                editing::Mode::Annotate
+            } else {
+                editing::Mode::Draw
+            };
             editor.tool = editing::Tool::Select;
-            *status = Some(("Artwork placed · Undo to remove".into(), false));
+            *status = Some((
+                if stamp {
+                    "Stamp placed · Undo to remove"
+                } else {
+                    "Artwork placed · Undo to remove"
+                }
+                .into(),
+                false,
+            ));
             true
         }
         Err(e) => {

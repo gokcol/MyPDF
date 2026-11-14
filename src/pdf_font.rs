@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub struct PdfFont {
     pub id: ObjectId,
+    source_path: Option<std::path::PathBuf>,
     cids: BTreeMap<char, u16>,
     widths: BTreeMap<char, f32>,
     font_bytes: Arc<[u8]>,
@@ -17,7 +18,12 @@ impl PdfFont {
     }
     pub fn embed_file(doc: &mut Document, text: &str, path: &std::path::Path) -> Result<Self> {
         let font_bytes = std::fs::read(path)?;
-        Self::embed_bytes(doc, text, font_bytes)
+        let mut font = Self::embed_bytes(doc, text, font_bytes)?;
+        font.source_path = Some(path.to_owned());
+        Ok(font)
+    }
+    pub(crate) fn is_file(&self, path: &std::path::Path) -> bool {
+        self.source_path.as_deref() == Some(path)
     }
     pub fn embed_bytes(doc: &mut Document, text: &str, font_bytes: Vec<u8>) -> Result<Self> {
         let layout_bytes: Arc<[u8]> = font_bytes.clone().into();
@@ -107,6 +113,7 @@ impl PdfFont {
         let id = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type0", "BaseFont" => Object::Name(font_name.as_bytes().to_vec()), "Encoding" => "Identity-H", "DescendantFonts" => vec![Object::Reference(cid)], "ToUnicode" => unicode });
         Ok(Self {
             id,
+            source_path: None,
             cids,
             widths,
             font_bytes: layout_bytes,

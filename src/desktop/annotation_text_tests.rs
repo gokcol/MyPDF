@@ -5,8 +5,19 @@ use mypdf_milestone0::annotations::{Annotation, Kind, Style};
 use std::path::PathBuf;
 
 fn frame(app: &mut Viewer, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
+    frame_after(app, ctx, events, 1. / 60.)
+}
+
+fn frame_after(
+    app: &mut Viewer,
+    ctx: &egui::Context,
+    events: Vec<egui::Event>,
+    seconds: f64,
+) -> egui::FullOutput {
+    let time = ctx.input(|i| i.time) + seconds;
     ctx.run(
         egui::RawInput {
+            time: Some(time),
             screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1200., 820.))),
             max_texture_side: Some(8192),
             events,
@@ -74,7 +85,15 @@ fn pointer(app: &mut Viewer, ctx: &egui::Context, at: Pos2, pressed: Option<bool
 }
 
 fn click(app: &mut Viewer, ctx: &egui::Context, at: Pos2) {
+    // Independent clicks must not accidentally count as double/triple clicks.
+    frame_after(app, ctx, vec![], 0.7);
     pointer(app, ctx, at, None);
+    pointer(app, ctx, at, Some(true));
+    pointer(app, ctx, at, Some(false));
+}
+
+fn double_click(app: &mut Viewer, ctx: &egui::Context, at: Pos2) {
+    click(app, ctx, at);
     pointer(app, ctx, at, Some(true));
     pointer(app, ctx, at, Some(false));
 }
@@ -298,7 +317,7 @@ fn drag_placed_annotation_text_accepts_typing_and_existing_box_reopens_in_place(
         let original = annotations(&app).to_vec();
         let r = original[0].rect;
         let inside = page_point(&app, &ctx, r[0] + 15., r[1] + 12.);
-        click(&mut app, &ctx, inside);
+        double_click(&mut app, &ctx, inside);
         settle(&mut app, &ctx);
         assert!(ctx.memory(|m| m.has_focus(inline_id(&app))));
         frame(
@@ -411,7 +430,7 @@ fn compact_fill_presets_enable_background_and_survive_inline_text_pdf_roundtrip(
     });
     settle(&mut app, &ctx);
     let at = page_point(&app, &ctx, 105., 172.);
-    click(&mut app, &ctx, at);
+    double_click(&mut app, &ctx, at);
     settle(&mut app, &ctx);
     assert_eq!(annotations(&app)[0].style.fill, None);
     let output = frame(&mut app, &ctx, vec![]);
@@ -482,7 +501,7 @@ fn compact_fill_presets_enable_background_and_survive_inline_text_pdf_roundtrip(
     assert!((annotations(&app)[0].style.opacity - 0.4).abs() < 0.001);
 
     let at = page_point(&app, &ctx, 105., 172.);
-    click(&mut app, &ctx, at);
+    double_click(&mut app, &ctx, at);
     frame(
         &mut app,
         &ctx,
@@ -537,7 +556,7 @@ fn leaving_inline_annotation_for_library_or_read_mode_keeps_text_visible() {
     );
 
     let inside = page_point(&app, &ctx, 105., 172.);
-    click(&mut app, &ctx, inside);
+    double_click(&mut app, &ctx, inside);
     assert!(app.editor.annotation_text.is_some());
     app.editor.mode = editing::Mode::Read;
     let output = frame(&mut app, &ctx, vec![]);
@@ -683,5 +702,93 @@ fn transformed_annotation_text_keeps_static_appearance_and_properties_editor() {
             assert!(app.editor.annotation_text.is_none());
             assert!(app.editor.mode == mode);
         }
+    }
+}
+
+#[test]
+fn selecting_existing_text_moves_and_resizes_before_explicit_typing() {
+    for mode in [editing::Mode::Annotate, editing::Mode::Draw] {
+        let (mut app, ctx) = fixture(mode, false);
+        let a = Annotation::new(
+            0,
+            [90., 160., 330., 232.],
+            Kind::Text {
+                text: "Move this box".into(),
+            },
+            Style::default(),
+        );
+        app.tabs[0]
+            .session
+            .as_mut()
+            .unwrap()
+            .commit(vec![a.clone()])
+            .unwrap();
+        app.editor.snapping = false;
+        settle(&mut app, &ctx);
+        let inside = page_point(&app, &ctx, 180., 190.);
+        click(&mut app, &ctx, inside);
+        assert_eq!(app.tabs[0].selected_annotation.as_ref(), Some(&a.id));
+        assert!(
+            app.editor.annotation_text.is_none(),
+            "Select must leave text available for dragging"
+        );
+        let output = frame(&mut app, &ctx, vec![]);
+        let rect = Rect::from_min_max(
+            page_point(&app, &ctx, a.rect[0], a.rect[1]),
+            page_point(&app, &ctx, a.rect[2], a.rect[3]),
+        )
+        .expand(3.);
+        for corner in [
+            rect.left_top(),
+            rect.right_top(),
+            rect.right_bottom(),
+            rect.left_bottom(),
+        ] {
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Circle(c) if c.stroke.color == crate::desktop::theme::accent() && c.center.distance(corner) < 0.1)),
+                "Each text-box corner must have a visible resize handle");
+        }
+        let end = inside + vec2(40., 30.);
+        pointer(&mut app, &ctx, inside, Some(true));
+        pointer(&mut app, &ctx, end, None);
+        pointer(&mut app, &ctx, end, Some(false));
+        settle(&mut app, &ctx);
+        let moved = annotations(&app)[0].clone();
+        assert!(moved.rect[0] > a.rect[0] && moved.rect[1] > a.rect[1]);
+        assert_eq!(moved.kind.text(), Some("Move this box"));
+        let corner = page_point(&app, &ctx, moved.rect[2], moved.rect[3]);
+        let end = corner + vec2(35., 25.);
+        pointer(&mut app, &ctx, corner, Some(true));
+        pointer(&mut app, &ctx, end, None);
+        pointer(&mut app, &ctx, end, Some(false));
+        settle(&mut app, &ctx);
+        assert!(annotations(&app)[0].rect[2] > moved.rect[2]);
+        app.editor_undo(false);
+        assert_eq!(annotations(&app)[0].rect, moved.rect);
+        app.editor_undo(false);
+        assert_eq!(annotations(&app)[0].rect, a.rect);
+        settle(&mut app, &ctx);
+        let inside = page_point(&app, &ctx, 180., 190.);
+        click(&mut app, &ctx, inside);
+        let scale = page(&app, &ctx).width() / app.tabs[0].pages[0].width;
+        let h = crate::desktop::manipulation::rotation_handle(&a, scale)
+            .expect("Text boxes expose a rotation handle");
+        let handle = page_point(&app, &ctx, h[0], h[1]);
+        pointer(&mut app, &ctx, handle, None);
+        pointer(&mut app, &ctx, handle, Some(true));
+        pointer(&mut app, &ctx, handle + vec2(45., 25.), None);
+        pointer(&mut app, &ctx, handle + vec2(45., 25.), Some(false));
+        settle(&mut app, &ctx);
+        assert!(annotations(&app)[0].rotation.abs() > 1.);
+        app.editor_undo(false);
+        assert_eq!(annotations(&app)[0], a);
+        settle(&mut app, &ctx);
+        let inside = page_point(&app, &ctx, 110., 180.);
+        double_click(&mut app, &ctx, inside);
+        assert!(
+            app.editor.annotation_text.is_some(),
+            "Double-click enters typing mode"
+        );
+        assert!(ctx.memory(|m| m.has_focus(inline_id(&app))));
     }
 }

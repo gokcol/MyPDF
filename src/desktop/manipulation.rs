@@ -70,10 +70,7 @@ pub(super) fn snap(
     )
 }
 pub(super) fn rotation_handle(a: &Annotation, scale: f32) -> Option<[f32; 2]> {
-    if matches!(
-        a.kind,
-        Kind::Text { .. } | Kind::Note { .. } | Kind::Markup { .. }
-    ) {
+    if matches!(a.kind, Kind::Note { .. } | Kind::Markup { .. }) {
         return None;
     }
     let b = a.bounds();

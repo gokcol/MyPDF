@@ -2,6 +2,22 @@
   "unreleased": [],
   "releases": [
     {
+      "version": "3.1.0",
+      "changes": [
+        "Move and resize annotations reliably; drag inside text boxes to move, double-click to type. Choose font family and regular, bold or italic styles.",
+        "Stamps stay in Annotate with editable text and colors. Reuse custom variants or open the visual artwork editor.",
+        "Visual stamp designer: select, move, resize, rotate and layer objects; edit text, shapes, colors and transparency with Undo/Redo.",
+        "Six border templates, rounded corners and independent background, fill and outline opacity; advanced SVG source remains available.",
+        "Touchscreen detection, Touch/Mouse modes, finger drawing, two-finger pan/pinch, long-press menus and a floating toolbar.",
+        "Customizable Home, polished Settings/About, five visual styles and compact icon previews. Left panel starts hidden.",
+        "Click existing text to edit; click outside to finish, then click again for the next edit. Improved table-cell editing.",
+        "A4 new pages, per-page resizing and images fitted to the page; move/resize/rotate images and add text above them.",
+        "Insert PDF, images, TXT, Markdown and SVG; DOCX/RTF use installed Word or LibreOffice.",
+        "Choose OCR pages and review results; offline Windows OCR includes English, Turkish and German. Edit PDF metadata.",
+        "Reliable Save/autosave, offline What’s New and update checks. Mac 3.1 uses a signed, notarized DMG download."
+      ]
+    },
+    {
       "version": "3.0.0",
       "changes": [
         "Touch controls: finger drawing on/off, two-finger pan and pinch, long-press menus, and a movable floating toolbar.",

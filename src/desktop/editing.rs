@@ -506,6 +506,7 @@ pub(super) fn moved_image_rect(rect: [f32; 4], delta: [f32; 2], page: PageSize) 
 }
 type SvgPreviewResult = (String, Result<Arc<Vec<u8>>, String>);
 struct SvgEditor {
+    visual: svg_visual::State,
     open: bool,
     source: String,
     name: String,
@@ -525,6 +526,7 @@ impl Default for SvgEditor {
             open: false,
             source: mypdf_milestone0::svg::DEFAULT.into(),
             name: "My SVG artwork".into(),
+            visual: svg_visual::State::default(),
             target: None,
             library_target: None,
             stamp: false,
@@ -607,7 +609,7 @@ pub(super) struct EditorState {
     library_query: String,
     stamp_source: usize,
     library_folder: String,
-    builtins: Vec<assets::BuiltinAsset>,
+    pub(super) builtins: Vec<assets::BuiltinAsset>,
     signature_name: String,
     signature_typed: String,
     signature_name_style: usize,
@@ -1042,6 +1044,7 @@ impl EditorState {
         let mut a = Annotation::new(page, r, kind, style);
         if self.tool == Tool::Asset {
             a.asset_id = self.placed.as_ref().map(|a| a.id.clone());
+            a.object.stamp = self.placed.as_ref().is_some_and(|a| a.stamp);
         }
         a
     }
@@ -1875,7 +1878,11 @@ pub(super) fn page_interaction(
                 if matches!(a.kind, Kind::Note { .. }) {
                     editor.note_requested = Some((tab.id, a.id.clone()));
                 }
-                annotation_text::start(editor, tab.id, &a, false);
+                // Select is for moving/resizing. Enter typing deliberately so
+                // dragging a selected text box does not select its characters.
+                if response.double_clicked() || editor.tool == Tool::Text {
+                    annotation_text::start(editor, tab.id, &a, false);
+                }
             }
             editor.library_open = false;
             if editor.tool != Tool::Lasso {
@@ -2634,6 +2641,14 @@ impl Viewer {
         }
     }
     pub(super) fn editor_undo(&mut self, redo: bool) {
+        if self.editor.svg.open {
+            self.editor
+                .svg
+                .visual
+                .undo_redo(&mut self.editor.svg.source, redo);
+            self.editor.svg.changed = Some(std::time::Instant::now());
+            return;
+        }
         if self.content.busy || self.organizer.busy {
             return;
         }
@@ -2958,7 +2973,14 @@ impl Viewer {
                                     if !matches!(tool, Tool::Select | Tool::Lasso | Tool::Eraser) && tinted {
                                         button = button.tint(color(if tool == Tool::Highlight { HIGHLIGHT } else { ink }, 1.));
                                     }
-                                    if ui.add(button).clicked() {
+                                    let response = ui.add(button);
+                                    let response = match tool {
+                                        Tool::Text => response.on_hover_text("Text box: visible text on the page. Double-click an existing box to type; drag to move it."),
+                                        Tool::Note => response.on_hover_text("Comment: place a small note icon. Read and edit its contents in the side panel."),
+                                        Tool::Callout => response.on_hover_text("Callout: visible text in a box with a leader pointing to a detail."),
+                                        _ => response,
+                                    };
+                                    if response.clicked() {
                                         self.toggle_editor_tool(ctx, tool);
                                     }
                                 }
@@ -3296,8 +3318,8 @@ impl Viewer {
                         let hint = match self.editor.tool {
                             Tool::AreaHighlight => "Drag a rectangle to highlight any area without snapping to text. Click an existing highlight to edit its appearance.",
                             Tool::Highlight | Tool::Underline | Tool::Squiggly | Tool::Strikeout => "Drag across PDF text to mark it. Click an existing annotation to edit its appearance.",
-                            Tool::Note => "Click the page to add a note. Click an existing note to edit it.",
-                            Tool::Text => "Click or drag on the page to add a text box.",
+                            Tool::Note => "Place a small comment icon. Its note opens in the side panel.",
+                            Tool::Text => "Add visible text to the page. Double-click an existing box to type.",
                             Tool::Pen => "Draw on the page with your mouse, pen, or touch input.",
                             Tool::Eraser => "Drag across pen strokes to erase. Text, images and shapes stay intact.",
                             Tool::Callout => "Click or drag to place a text box with a leader arrow.",
@@ -3324,10 +3346,16 @@ impl Viewer {
                             if self.editor.tool == Tool::Callout {
                                 let mut sample = Annotation::new(0, [0., 0., 240., 120.], kind, self.editor.style.clone());
                                 if let Kind::Callout { text_color, .. } = &mut sample.kind { *text_color = self.editor.callout_text_color; }
+                                annotation_text::font_controls(ui, &mut sample.style);
                                 self.editor.text_editing |= callout_properties::controls(ui, &mut sample).is_some();
                                 self.editor.style = sample.style;
                                 if let Kind::Callout { text_color, .. } = sample.kind { self.editor.callout_text_color = text_color; }
                             }
+                        } else if self.editor.tool == Tool::Text {
+                            annotation_text::font_controls(ui, &mut self.editor.style);
+                            self.editor.text_editing |= property_slider(ui, "Text size", &mut self.editor.style.font_size, 6.0..=72.0, " pt").is_some();
+                            color_palette(ui, &mut self.editor.style.color);
+                            annotation_text::fill_controls(ui, &mut self.editor.style);
                         } else if self.editor.tool == Tool::Eraser {
                             pen_tools::controls(ui, &mut self.editor.eraser);
                         } else {
@@ -3356,6 +3384,7 @@ impl Viewer {
         let mut save_asset = false;
         let mut edit_svg = None;
         let mut update_library = false;
+        let stamp = stamp_properties::is_stamp(&self.editor, &selected);
         let standard_asset = selected
             .asset_id
             .as_ref()
@@ -3372,7 +3401,7 @@ impl Viewer {
                 ui::property_scroll(ui, "annotation_properties", |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new(selected.kind.label())
+                                RichText::new(if stamp { "Stamp" } else { selected.kind.label() })
                                     .size(17.)
                                     .family(ui::semibold()),
                             );
@@ -3400,6 +3429,16 @@ impl Viewer {
                         if ui.add(ActionButton::new(Icon::Copy, "Repeat on pages…")).clicked() { self.workbench.request = Some("repeat_objects".into()); }
                         if selected.object.locked { ui.weak("Locked · Unlock in the Marks panel"); }
                         let editable = tab.session.as_ref().is_some_and(|s| s.editable) && !selected.object.locked;
+                        if matches!(selected.kind, Kind::Text { .. }) && annotation_text::supports(&selected) {
+                            let typing = annotation_text::is_editing(&self.editor, &selected.id);
+                            if ui.add_enabled(editable, ActionButton::new(Icon::Text, if typing { "Finish typing" } else { "Edit text on page" })).clicked() {
+                                if typing {
+                                    self.editor.annotation_text = None;
+                                } else {
+                                    annotation_text::start(&mut self.editor, tab.id, &selected, false);
+                                }
+                            }
+                        }
                         ui.add_enabled_ui(editable, |ui| {
                             let a = self.editor.draft.as_mut().unwrap();
                             if let Some(styles::Preset::Drawing(style))=styles::panel(ui, styles::Preset::Drawing(a.style.clone())) { a.style=style; }
@@ -3418,6 +3457,10 @@ impl Viewer {
                                     property_focus = Some(r.id);
                                 }
                             }
+                            if stamp { property_focus = stamp_properties::text_controls(ui, &mut a.kind).or(property_focus); }
+                            if matches!(a.kind, Kind::Text { .. } | Kind::Callout { .. } | Kind::Stamp { .. }) {
+                                annotation_text::font_controls(ui, &mut a.style);
+                            }
                             let image = matches!(a.kind, Kind::Image { .. });
                             if let Kind::Image { png } = &a.kind
                                 && ui.add(ActionButton::new(Icon::FieldImage, "Remove background…")).clicked()
@@ -3431,7 +3474,9 @@ impl Viewer {
                                     property_focus = callout_properties::controls(ui, a).or(property_focus);
                                 }
                             } else {
-                            if !image {
+                            if stamp && matches!(a.kind, Kind::Svg { .. }) {
+                                stamp_properties::colors(ui, &mut a.kind, &mut a.style);
+                            } else if !image {
                                 ui::caption(ui, "Color");
                                 if color_palette(ui, &mut a.style.color)
                                     && let Kind::Svg { tint, .. } = &mut a.kind
@@ -3440,8 +3485,8 @@ impl Viewer {
                                 }
                             }
                             if let Kind::Svg { source, tint } = &mut a.kind {
-                                ui.checkbox(tint, "Use selected color");
-                                if ui.add(ActionButton::new(Icon::Text, "Edit SVG…")).clicked() {
+                                if !stamp { ui.checkbox(tint, "Use selected color"); }
+                                if ui.add(ActionButton::new(Icon::Text, if stamp { "Edit artwork…" } else { "Edit SVG…" })).clicked() {
                                     edit_svg = Some((source.clone(), a.id.clone()));
                                 }
                             }
@@ -3637,7 +3682,7 @@ impl Viewer {
                                 ui.label(RichText::new("Changes on this page affect only this copy.").small().color(theme::muted()));
                                 update_library = ui.add(ActionButton::new(
                                     Icon::Library,
-                                    if standard_asset { "Save as custom asset" } else { "Update library asset" },
+                                    if stamp { if standard_asset { "Save as custom stamp" } else { "Update library stamp" } } else if standard_asset { "Save as custom asset" } else { "Update library asset" },
                                 )).clicked();
                                 ui.separator();
                             }
@@ -3655,7 +3700,11 @@ impl Viewer {
                         });
                         ui.label(
                             RichText::new(
-                                if self
+                                if matches!(selected.kind, Kind::Text { .. }) && annotation_text::is_editing(&self.editor, &selected.id) {
+                                    "Typing · Finish typing to move · Drag a corner to resize"
+                                } else if matches!(selected.kind, Kind::Text { .. }) && annotation_text::supports(&selected) {
+                                    "Drag to move · Corners resize · Double-click to edit text"
+                                } else if self
                                     .editor
                                     .draft
                                     .as_ref()
@@ -3675,7 +3724,13 @@ impl Viewer {
             self.editor.svg = SvgEditor {
                 open: true,
                 source,
-                name: "Edited SVG artwork".into(),
+                name: if stamp {
+                    "Stamp artwork"
+                } else {
+                    "Edited SVG artwork"
+                }
+                .into(),
+                stamp,
                 target: Some((tab.id, id)),
                 error: None,
                 preview: None,
@@ -3699,6 +3754,9 @@ impl Viewer {
             && s.editable
             && self.editor.draft.as_ref().is_some_and(|a| a != &selected)
         {
+            if stamp {
+                self.editor.draft.as_mut().unwrap().object.stamp = true;
+            }
             let mut entries = s.annotations.clone();
             if let Some(target) = entries.iter_mut().find(|a| a.id == selected.id) {
                 *target = self.editor.draft.clone().unwrap();
@@ -3783,7 +3841,7 @@ impl Viewer {
             }
         }
         if save_asset {
-            let asset = Asset::new(
+            let mut asset = Asset::new(
                 &self.editor.asset_name,
                 {
                     let a = self.editor.draft.as_ref().unwrap_or(&selected);
@@ -3804,6 +3862,7 @@ impl Viewer {
                     .clone(),
                 (selected.rect[2] - selected.rect[0]) / (selected.rect[3] - selected.rect[1]),
             );
+            asset.stamp = stamp;
             match self.editor.add_asset(asset) {
                 Ok(()) => {
                     self.status = Some(("Saved to the local asset library".into(), false));
@@ -4119,7 +4178,7 @@ impl Viewer {
                                                             .add(
                                                                 ActionButton::new(
                                                                     Icon::Pen,
-                                                                    "Manage asset",
+                                                                    if asset.stamp { "Edit stamp" } else { "Manage asset" },
                                                                 )
                                                                 .compact(),
                                                             )
@@ -4337,10 +4396,12 @@ impl Viewer {
             asset.style.clone(),
         );
         mark.asset_id = Some(asset.id.clone());
+        mark.object.stamp = asset.stamp;
+        let stamp = asset.stamp;
         selection::set(tab, &mut self.editor, vec![]);
         self.editor.placed = Some(asset);
         if self.editor.mode != Mode::Sign {
-            self.editor.mode = Mode::Draw;
+            self.editor.mode = if stamp { Mode::Annotate } else { Mode::Draw };
         }
         self.editor.tool = Tool::Select;
         self.editor.draft = None;
@@ -4873,11 +4934,17 @@ impl Viewer {
         let mut replace = false;
         let mut edit = false;
         let mut cancel = false;
-        egui::Window::new("Manage asset").open(&mut open).collapsible(false)
+        egui::Window::new(if asset.stamp { "Edit stamp" } else { "Manage asset" }).id(egui::Id::new("asset_details")).open(&mut open).collapsible(false)
             .resizable([true, false])
             .default_width(ui::dialog_width(ctx, 380.))
             .max_width(ui::dialog_width(ctx, 640.)).show(ctx, |ui| {
             ui::dialog_body(ui, "manage_asset_body", 400., |ui| {
+            if asset.stamp {
+                stamp_properties::preview(ui, &mut self.editor, &asset);
+                self.editor.text_editing |= stamp_properties::text_controls(ui, &mut asset.kind).is_some();
+                stamp_properties::colors(ui, &mut asset.kind, &mut asset.style);
+                ui.separator();
+            }
             ui.label("Name");
             let r = ui.add(egui::TextEdit::singleline(&mut asset.name).margin(ui::FIELD_MARGIN).char_limit(200).desired_width(f32::INFINITY));
             self.editor.text_editing |= r.has_focus();
@@ -4887,7 +4954,7 @@ impl Viewer {
             ui.label("Tags"); self.editor.text_editing |= ui.add(egui::TextEdit::singleline(&mut asset.tags).margin(ui::FIELD_MARGIN).char_limit(400).hint_text("Comma-separated keywords")).has_focus();
             ui.add_space(8.);
             ui.horizontal(|ui| {
-                if matches!(asset.kind, Kind::Svg { .. }) { edit=ui.add(ActionButton::new(Icon::Text,"Edit SVG…")).clicked(); }
+                if matches!(asset.kind, Kind::Svg { .. }) { edit=ui.add(ActionButton::new(Icon::Text,if asset.stamp { "Edit artwork…" } else { "Edit SVG…" })).clicked(); }
                 replace=ui.add_enabled(!self.editor.asset_busy,ActionButton::new(Icon::Import,"Replace artwork…")).clicked();
             });
             ui.label(RichText::new("Library updates affect future placements. Existing marks in PDFs keep their own artwork.").small().color(theme::muted()));
@@ -4958,11 +5025,14 @@ impl Viewer {
             self.editor.svg.changed = None;
         }
         if self.editor.svg.job.is_none()
-            && self
-                .editor
-                .svg
-                .changed
-                .is_some_and(|t| t.elapsed() >= std::time::Duration::from_millis(300))
+            && self.editor.svg.changed.is_some_and(|t| {
+                t.elapsed()
+                    >= std::time::Duration::from_millis(if self.editor.svg.visual.source_mode {
+                        300
+                    } else {
+                        60
+                    })
+            })
         {
             self.editor.svg.changed = None;
             let (tx, rx) = mpsc::channel();
@@ -4984,18 +5054,20 @@ impl Viewer {
         let mut open = true;
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new("SVG Studio")
-            .id(egui::Id::new("svg_studio"))
+        let before_source = self.editor.svg.source.clone();
+        egui::Window::new(if self.editor.svg.stamp { "Edit stamp artwork" } else { "Artwork editor" })
+            .id(egui::Id::new("svg_studio_v2"))
             .open(&mut open)
             .collapsible(false)
             .resizable([true, false])
-            .default_width(ui::dialog_width(ctx, 760.))
-            .max_width(ui::dialog_width(ctx, 960.))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .default_width(ui::dialog_width(ctx, 960.))
+            .max_width(ui::dialog_width(ctx, 1050.))
             .show(ctx, |ui| {
-                ui::dialog_body(ui, "svg_studio_body", 520., |ui| {
+                ui::dialog_body(ui, "svg_studio_body", 550., |ui| {
                 ui.label(
                     RichText::new(
-                        "Paste SVG code. Preview, refine, then place as scalable artwork.",
+                        "Customize your artwork, or choose a ready-made stamp border.",
                     )
                     .color(theme::muted()),
                 );
@@ -5015,14 +5087,18 @@ impl Viewer {
                     });
                     ui.add_space(8.);
                 } else if self.editor.svg.target.is_none() && ui.add(ActionButton::new(Icon::Star,"Build an LLM prompt…")).clicked() { self.editor.svg.prompt_open=true; }
+                if self.editor.svg.target.is_none() {
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut self.editor.svg.name).margin(ui::FIELD_MARGIN)
                         .hint_text("Asset name")
                         .char_limit(200),
                 );
                 self.editor.text_editing |= r.has_focus();
-                if self.editor.svg.target.is_none() { ui.checkbox(&mut self.editor.svg.stamp,"Include in Stamps collection"); }
+                ui.checkbox(&mut self.editor.svg.stamp,"Include in Stamps collection");
+                }
                 ui.add_space(8.);
+                svg_visual::toolbar(ui, &mut self.editor.svg.source, &mut self.editor.svg.visual);
+                if self.editor.svg.visual.source_mode {
                 ui.columns(2, |cols| {
                     cols[0].label(RichText::new("SVG source").family(ui::semibold()));
                     egui::ScrollArea::both()
@@ -5038,7 +5114,6 @@ impl Viewer {
                             );
                             self.editor.text_editing |= r.has_focus();
                             if r.changed() {
-                                self.editor.svg.preview = None;
                                 self.editor.svg.changed = Some(std::time::Instant::now());
                             }
                         });
@@ -5048,36 +5123,23 @@ impl Viewer {
                             Err(e) => self.editor.svg.error=Some(format!("{e:#}")),
                         }
                     }
-                    cols[1].label(RichText::new("Preview").family(ui::semibold()));
-                    let (r, _) = cols[1].allocate_exact_size(
-                        vec2(cols[1].available_width(), if self.editor.svg.prompt_open { 200. } else { 300. }),
-                        egui::Sense::hover(),
-                    );
-                    cols[1].painter().rect_filled(r, 8., Color32::WHITE);
-                    if let Some(png) = self.editor.svg.preview.clone() {
-                        let image = assets::decode_png(&png).ok();
-                        if let Some(image) = image {
-                            let size = vec2(image.width() as f32, image.height() as f32);
-                            let scale =
-                                ((r.width() - 28.) / size.x).min((r.height() - 28.) / size.y);
-                            let rect = Rect::from_center_size(r.center(), size * scale);
-                            let a = Annotation::new(
-                                0,
-                                [0., 0., rect.width(), rect.height()],
-                                Kind::Image { png },
-                                Style::default(),
-                            );
-                            paint_annotation(
-                                &mut self.editor,
-                                ctx,
-                                cols[1].painter(),
-                                rect,
-                                1.,
-                                &a,
-                            );
-                        }
-                    }
+                    svg_visual::canvas(&mut cols[1], &mut self.editor.svg.source, self.editor.svg.preview.clone(), &mut self.editor.svg.visual);
                 });
+                } else {
+                    let available = ui.available_width();
+                    let inspector_width = (available*0.40).clamp(260., 350.);
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(vec2((available-inspector_width-20.).max(180.), 0.), egui::Layout::top_down(egui::Align::Min), |ui| {
+                            svg_visual::canvas(ui, &mut self.editor.svg.source, self.editor.svg.preview.clone(), &mut self.editor.svg.visual);
+                        });
+                        egui::Frame::new().fill(theme::surface()).stroke(Stroke::new(1., theme::line())).corner_radius(12).inner_margin(12).show(ui, |ui| {
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                ui.set_width(inspector_width-24.);
+                                self.editor.text_editing |= svg_visual::inspector(ui, &mut self.editor.svg.source, &mut self.editor.svg.visual);
+                            });
+                        });
+                    });
+                }
                 if let Some(e) = &self.editor.svg.error {
                     ui.colored_label(theme::danger(), e);
                 }
@@ -5103,6 +5165,18 @@ impl Viewer {
                     cancel=ui.add(ActionButton::new(Icon::Left,"Cancel")).clicked();
                 });
             });
+        self.editor
+            .svg
+            .visual
+            .remember(before_source.clone(), &self.editor.svg.source);
+        if before_source != self.editor.svg.source {
+            self.editor
+                .svg
+                .changed
+                .get_or_insert_with(std::time::Instant::now);
+            ctx.request_repaint_after(std::time::Duration::from_millis(300));
+            save = false;
+        }
         if !egui::Popup::is_any_open(ctx)
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
@@ -5226,6 +5300,10 @@ mod tests {
         )
     }
     fn test_click(app: &mut Viewer, ctx: &egui::Context, label: &str) -> Rect {
+        // Let centered dialogs settle after a panel or object-list height change.
+        for _ in 0..3 {
+            test_frame(app, ctx, vec![]);
+        }
         let output = test_frame(app, ctx, vec![]);
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;
         let b = nodes
@@ -5259,6 +5337,187 @@ mod tests {
         }
         rect
     }
+    #[test]
+    fn placed_stamp_and_custom_variant_keep_stamp_controls_without_svg_source() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.new_blank(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.tabs[0].session.is_none() {
+            test_frame(&mut app, &ctx, vec![]);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.inspector = true;
+        app.editor.mode = Mode::Annotate;
+        let asset = app
+            .editor
+            .builtins
+            .iter()
+            .find(|b| b.asset.name.eq_ignore_ascii_case("approved"))
+            .unwrap()
+            .asset
+            .clone();
+        app.begin_asset_placement(asset.clone());
+        assert!(
+            app.editor.mode == Mode::Annotate,
+            "Stamp placement must stay in Annotate"
+        );
+        assert!(app.workbench.paste.as_ref().unwrap()[0].object.stamp);
+        app.editor.placed = Some(asset.clone());
+        app.editor.tool = Tool::Asset;
+        let a = app.editor.base_annotation(
+            &app.tabs[0],
+            0,
+            [60., 80., 260., 150.],
+            [60., 80.],
+            [260., 150.],
+            &[],
+        );
+        assert!(a.object.stamp);
+        app.editor.tool = Tool::Select;
+        for _ in 0..3 {
+            test_frame(&mut app, &ctx, vec![]);
+        }
+        let viewport = app.tabs[0].document_view.unwrap().0;
+        let point = viewport.min + vec2(viewport.width() / 2., 100.);
+        for pressed in [None, Some(true), Some(false)] {
+            let mut events = vec![egui::Event::PointerMoved(point)];
+            if let Some(pressed) = pressed {
+                events.push(egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            test_frame(&mut app, &ctx, events);
+        }
+        assert!(app.workbench.paste.is_none());
+        assert!(
+            app.editor.mode == Mode::Annotate,
+            "The final canvas placement must stay in Annotate"
+        );
+        assert!(
+            app.tabs[0].selected_annotation.is_some(),
+            "{:?}",
+            app.status
+        );
+        for _ in 0..3 {
+            test_frame(&mut app, &ctx, vec![]);
+        }
+        let output = test_frame(&mut app, &ctx, vec![]);
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let labels: Vec<_> = nodes
+            .iter()
+            .filter_map(|(_, n)| n.label().or(n.value()))
+            .collect();
+        assert!(labels.contains(&"Stamp"), "labels: {labels:?}");
+        assert!(labels.contains(&"Stamp text"));
+        assert!(labels.contains(&"Original colors"));
+        assert!(labels.contains(&"Edit artwork…"));
+        assert!(!labels.contains(&"SVG artwork"));
+        assert!(!app.editor.svg.open);
+        test_click(&mut app, &ctx, "Stamp text");
+        test_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+                egui::Event::Text("QA & approved".into()),
+            ],
+        );
+        let Kind::Svg { source, .. } = &app.tabs[0].session.as_ref().unwrap().annotations[0].kind
+        else {
+            panic!()
+        };
+        assert_eq!(
+            mypdf_milestone0::svg::text_fields(source).unwrap()[0].1,
+            "QA & approved"
+        );
+        app.editor_undo(false);
+        assert_eq!(
+            app.tabs[0].session.as_ref().unwrap().annotations[0].kind,
+            asset.kind
+        );
+        app.editor.asset_details = Some(asset);
+        let output = test_frame(&mut app, &ctx, vec![]);
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        assert!(nodes.iter().any(|(_, n)| n.label() == Some("Edit stamp")));
+        assert!(nodes.iter().any(|(_, n)| n.label() == Some("Save changes")));
+        assert!(!app.editor.svg.open);
+    }
+
+    #[test]
+    fn svg_visual_editor_opens_without_source_and_supports_undo_and_cancel() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.editor.svg = SvgEditor {
+            open: true,
+            stamp: true,
+            ..Default::default()
+        };
+        let original = app.editor.svg.source.clone();
+        for _ in 0..3 {
+            test_frame(&mut app, &ctx, vec![]);
+        }
+        let output = test_frame(&mut app, &ctx, vec![]);
+        let nodes = output.platform_output.accesskit_update.unwrap().nodes;
+        let labels: Vec<_> = nodes
+            .iter()
+            .filter_map(|(_, n)| n.label().or(n.value()))
+            .collect();
+        assert!(labels.contains(&"Edit stamp artwork"));
+        assert!(labels.contains(&"Visual editor"));
+        assert!(labels.contains(&"Duplicate"));
+        assert!(!app.editor.svg.visual.source_mode);
+        test_click(&mut app, &ctx, "Duplicate");
+        assert_eq!(
+            mypdf_milestone0::svg_edit::Scene::parse(&app.editor.svg.source)
+                .unwrap()
+                .elements
+                .len(),
+            2
+        );
+        test_click(&mut app, &ctx, "Undo");
+        assert_eq!(app.editor.svg.source, original);
+        test_click(&mut app, &ctx, "Redo");
+        assert_eq!(
+            mypdf_milestone0::svg_edit::Scene::parse(&app.editor.svg.source)
+                .unwrap()
+                .elements
+                .len(),
+            2
+        );
+        test_click(&mut app, &ctx, "Stamp border");
+        test_click(&mut app, &ctx, "Rounded");
+        assert!(
+            mypdf_milestone0::svg_edit::current_border(&app.editor.svg.source)
+                .unwrap()
+                .is_some()
+        );
+        test_click(&mut app, &ctx, "Double rounded");
+        assert_eq!(
+            mypdf_milestone0::svg_edit::current_border(&app.editor.svg.source)
+                .unwrap()
+                .unwrap()
+                .kind,
+            mypdf_milestone0::svg_edit::BorderKind::DoubleRounded
+        );
+        test_click(&mut app, &ctx, "SVG source");
+        assert!(app.editor.svg.visual.source_mode);
+        test_click(&mut app, &ctx, "Cancel");
+        assert!(!app.editor.svg.open);
+    }
+
     #[test]
     fn inspector_transforms_commit_without_a_second_properties_row() {
         let ctx = egui::Context::default();

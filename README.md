@@ -2,7 +2,7 @@
 
 # MyPDF — native Rust desktop PDF editor
 
-Version **3.0.0**, Mac build **228**, brings configurable touch controls, a customizable Home screen, refreshed Settings and About, new visual styles, clearer text editing, A4 page defaults and per-page resizing, image fitting, and built-in update checks. It includes the recent OCR, table editing, metadata, file insertion, image-layer and saving improvements. [Downloads and full release notes](https://github.com/gokcol/MyPDF/releases/tag/v3.0.0).
+Version **3.1.0**, Mac build **235**, adds reliable annotation manipulation, font controls for annotation text, and a visual stamp designer with border templates, colors and transparency. It includes configurable touch controls, customizable Home, polished Settings and About, A4 page sizing, image fitting, OCR, table editing, metadata and saving improvements. [Downloads and full release notes](https://github.com/gokcol/MyPDF/releases/tag/v3.1.0).
 
 [MyPDF (OG) on Microsoft Store](https://apps.microsoft.com/detail/9MXR0WLW42XT) is live. The 3.0 update is being prepared for Store certification; Store availability follows Microsoft's review.
 
@@ -410,7 +410,7 @@ The pinned Sparkle framework is fetched and checksum-verified by `scripts/prepar
 `changelog.json` is the shared source for in-app, GitHub, and Store notes. Keep development changes in `unreleased`. When preparing a release, move the completed changes into a new `releases` entry matching the application version and clear those unreleased entries. Generate the publication text with:
 
 ```sh
-python3 scripts/release-notes.py --version 3.0.0 --out-dir artifacts/release-notes
+python3 scripts/release-notes.py --version 3.1.0 --out-dir artifacts/release-notes
 ```
 
 This produces `github-release.md` and Store-ready `release-notes.txt`. The Store listing workflow generates its notes from this same file. Generation never publishes a release or submits to the Store.

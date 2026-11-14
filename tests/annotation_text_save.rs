@@ -115,3 +115,113 @@ fn long_words_whitespace_empty_text_and_rotated_text_all_save() {
         }
     }
 }
+
+#[test]
+fn annotation_font_family_and_face_are_embedded_and_survive_reopening() {
+    use mypdf_milestone0::text_style::{self, AnnotationFont};
+    let source = convert::blank(400., 400.).unwrap();
+    let faces = text_style::fonts();
+    assert!(!faces.is_empty());
+    for face in faces.iter().filter(|f| f.bold || f.italic).take(6) {
+        for kind in [
+            Kind::Text {
+                text: "İstanbul – Grüße".into(),
+            },
+            Kind::callout("İstanbul – Grüße"),
+        ] {
+            let a = Annotation::new(
+                0,
+                [40., 40., 300., 140.],
+                kind,
+                Style {
+                    font: Some(Box::new(AnnotationFont::from_face(face))),
+                    ..Default::default()
+                },
+            );
+            let bytes = ann::export(&source, std::slice::from_ref(&a)).unwrap();
+            let doc = lopdf::Document::load_mem(&bytes).unwrap();
+            assert_eq!(ann::load(&doc), vec![a.clone()]);
+            let resources = appearance(&doc)
+                .dict
+                .get(b"Resources")
+                .unwrap()
+                .as_dict()
+                .unwrap();
+            let font_id = resources
+                .get(b"Font")
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get(b"UF")
+                .unwrap()
+                .as_reference()
+                .unwrap();
+            let font = doc.get_dictionary(font_id).unwrap();
+            let descendant = font.get(b"DescendantFonts").unwrap().as_array().unwrap()[0]
+                .as_reference()
+                .unwrap();
+            let descriptor = doc
+                .get_dictionary(descendant)
+                .unwrap()
+                .get(b"FontDescriptor")
+                .unwrap()
+                .as_reference()
+                .unwrap();
+            let file = doc
+                .get_dictionary(descriptor)
+                .unwrap()
+                .get(b"FontFile2")
+                .unwrap()
+                .as_reference()
+                .unwrap();
+            let embedded = doc
+                .get_object(file)
+                .unwrap()
+                .as_stream()
+                .unwrap()
+                .decompressed_content()
+                .unwrap();
+            let embedded_face = ttf_parser::Face::parse(&embedded, 0).unwrap();
+            let original = std::fs::read(&face.path).unwrap();
+            let original_face = ttf_parser::Face::parse(&original, 0).unwrap();
+            assert_eq!(embedded_face.is_bold(), original_face.is_bold());
+            assert_eq!(embedded_face.is_italic(), original_face.is_italic());
+            assert_eq!(embedded_face.units_per_em(), original_face.units_per_em());
+            let annot = doc
+                .objects
+                .values()
+                .filter_map(|o| o.as_dict().ok())
+                .find(|d| d.has(b"MyPDFData"))
+                .unwrap();
+            assert_eq!(
+                annot
+                    .get(b"DR")
+                    .unwrap()
+                    .as_dict()
+                    .unwrap()
+                    .get(b"Font")
+                    .unwrap()
+                    .as_dict()
+                    .unwrap()
+                    .get(b"UF")
+                    .unwrap()
+                    .as_reference()
+                    .unwrap(),
+                font_id
+            );
+            let (_, pixels) = viewer::render_page(&bytes, 0, 1.).unwrap();
+            assert!(
+                pixels
+                    .chunks_exact(4)
+                    .filter(|p| p[0] < 180 && p[3] > 0)
+                    .count()
+                    > 100
+            );
+            let again = ann::export(&bytes, std::slice::from_ref(&a)).unwrap();
+            assert_eq!(
+                ann::load(&lopdf::Document::load_mem(&again).unwrap()),
+                vec![a]
+            );
+        }
+    }
+}

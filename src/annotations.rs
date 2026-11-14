@@ -504,6 +504,8 @@ pub struct Style {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_endings: Option<LineEndings>,
     pub font_size: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font: Option<Box<crate::text_style::AnnotationFont>>,
     #[serde(default)]
     pub image_blur: f32,
     #[serde(default)]
@@ -520,6 +522,7 @@ impl Default for Style {
             stroke: StrokeStyle::Solid,
             line_endings: None,
             font_size: 14.0,
+            font: None,
             image_blur: 0.,
             image_border: false,
         }
@@ -528,6 +531,9 @@ impl Default for Style {
 /// Editable object metadata travels with the artwork, including through the clipboard.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ObjectProperties {
+    /// Preserve stamp identity independently of the local asset library.
+    #[serde(default)]
+    pub stamp: bool,
     /// Styled text placed above earlier artwork; ordered with the other layers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<crate::text_layer::TextLayer>,
@@ -2476,11 +2482,7 @@ fn arrow_head(points: &[Point2], width: f32) -> Option<Primitive> {
     })
 }
 
-fn set_text_defaults(
-    d: &mut lopdf::Dictionary,
-    a: &Annotation,
-    font: Option<&crate::pdf_font::PdfFont>,
-) {
+fn set_text_defaults(d: &mut lopdf::Dictionary, a: &Annotation, font: Option<ObjectId>) {
     let color = if let Kind::Callout { text_color, .. } = a.kind {
         text_color
     } else {
@@ -2494,10 +2496,7 @@ fn set_text_defaults(
         )),
     );
     if let Some(font) = font {
-        d.set(
-            "DR",
-            dictionary! { "Font" => dictionary! { "UF" => font.id } },
-        );
+        d.set("DR", dictionary! { "Font" => dictionary! { "UF" => font } });
     }
 }
 
@@ -2559,6 +2558,24 @@ pub fn appearance(
     inverse: Affine,
     font: Option<&crate::pdf_font::PdfFont>,
 ) -> Result<(ObjectId, Box2)> {
+    let chosen_font = if a.object.text.is_none() {
+        a.style
+            .font
+            .as_ref()
+            .and_then(|f| f.resolve())
+            .filter(|face| font.is_none_or(|font| !font.is_file(&face.path)))
+            .map(|face| {
+                crate::pdf_font::PdfFont::embed_file(
+                    doc,
+                    a.kind.text().unwrap_or_default(),
+                    &face.path,
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let font = chosen_font.as_ref().or(font);
     let mut normal = a.bounds();
     let margin = a.style.width / 2.0 + 0.5;
     normal[0] -= margin;
@@ -2815,10 +2832,40 @@ pub fn export(bytes: &[u8], annotations: &[Annotation]) -> Result<Vec<u8>> {
     } else {
         None
     };
+    // Share embedded font resources across annotations using the same face.
+    let mut chosen_fonts = std::collections::BTreeMap::new();
+    for a in annotations.iter().filter(|a| a.object.text.is_none()) {
+        if let Some(face) = a.style.font.as_ref().and_then(|f| f.resolve())
+            && !chosen_fonts.contains_key(&face.path)
+        {
+            chosen_fonts.insert(
+                face.path.clone(),
+                crate::pdf_font::PdfFont::embed_file(&mut doc, &text, &face.path)?,
+            );
+        }
+    }
     for a in annotations {
+        let font = a
+            .style
+            .font
+            .as_ref()
+            .and_then(|f| f.resolve())
+            .and_then(|face| chosen_fonts.get(&face.path))
+            .or(font.as_ref());
         let page_id = pages[&(a.page as u32 + 1)];
         let inverse = Affine::new(geometry[a.page].1);
-        let (ap, rect) = appearance(&mut doc, a, inverse, font.as_ref())?;
+        let (ap, rect) = appearance(&mut doc, a, inverse, font)?;
+        let appearance_font = doc
+            .get_object(ap)?
+            .as_stream()?
+            .dict
+            .get(b"Resources")
+            .ok()
+            .and_then(|v| v.as_dict().ok())
+            .and_then(|d| d.get(b"Font").ok())
+            .and_then(|v| v.as_dict().ok())
+            .and_then(|d| d.get(b"UF").ok())
+            .and_then(|v| v.as_reference().ok());
         let subtype = match a.kind {
             Kind::Markup {
                 kind: Markup::Highlight,
@@ -3050,10 +3097,10 @@ pub fn export(bytes: &[u8], annotations: &[Annotation]) -> Result<Vec<u8>> {
                 if let Some(fill) = a.style.fill {
                     d.set("IC", pdf_numbers(fill));
                 }
-                set_text_defaults(&mut d, a, font.as_ref());
+                set_text_defaults(&mut d, a, appearance_font);
             }
             Kind::Note { .. } => d.set("Name", "Comment"),
-            Kind::Text { .. } => set_text_defaults(&mut d, a, font.as_ref()),
+            Kind::Text { .. } => set_text_defaults(&mut d, a, appearance_font),
             Kind::Stamp { .. } | Kind::Image { .. } | Kind::Symbol(_) => {
                 d.set("Name", "MyPDFStamp")
             }

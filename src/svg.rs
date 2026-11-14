@@ -258,3 +258,98 @@ pub fn embed(
     let id=doc.add_object(Stream::new(dictionary!{"Type"=>"XObject","Subtype"=>"Form","BBox"=>vec![0.into(),0.into(),w.into(),h.into()],"Resources"=>resources},content));
     Ok((id, w, h))
 }
+
+/// Editable literal SVG labels. Outlined lettering and rich text remain artwork.
+/// Ranges refer to the original source, so unrelated shapes and styles stay intact.
+pub fn text_fields(source: &str) -> Result<Vec<(std::ops::Range<usize>, String)>> {
+    use quick_xml::events::Event;
+    ensure!(source.len() <= 256 * 1024, "SVG source exceeds 256 KB");
+    let mut reader = quick_xml::Reader::from_str(source);
+    let mut start = None;
+    let mut fields = Vec::new();
+    loop {
+        let before = reader.buffer_position() as usize;
+        match reader.read_event()? {
+            Event::Start(e) if e.local_name().as_ref() == b"text" => {
+                start = Some(reader.buffer_position() as usize);
+            }
+            Event::End(e) if e.local_name().as_ref() == b"text" => {
+                if let Some(begin) = start.take() {
+                    let raw = &source[begin..before];
+                    if !raw.contains('<') {
+                        fields.push((
+                            begin..before,
+                            quick_xml::escape::unescape(raw)?.into_owned(),
+                        ));
+                    }
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    ensure!(fields.len() <= 64, "Too many stamp text fields");
+    Ok(fields)
+}
+
+pub fn replace_text_field(source: &str, index: usize, text: &str) -> Result<String> {
+    ensure!(text.chars().count() <= 8000, "Stamp text is too long");
+    let fields = text_fields(source)?;
+    let (range, _) = fields
+        .get(index)
+        .context("Stamp text field no longer exists")?;
+    let mut updated = source.to_owned();
+    updated.replace_range(range.clone(), &quick_xml::escape::escape(text));
+    tree(&updated, None)?;
+    // Standard label stamps use a centered 28pt face in a 64-unit frame.
+    // Keep longer custom labels within that frame instead of clipping them.
+    if source.contains("height=\"64\"")
+        && source.contains("font-family=\"Arial,Helvetica,sans-serif\"")
+        && source.contains("text-anchor=\"middle\"")
+        && fields.len() == 1
+    {
+        updated = label_text_length(&updated, None)?;
+        let parsed = tree(&updated, None)?;
+        fn text_width(group: &resvg::usvg::Group) -> Option<f32> {
+            group.children().iter().find_map(|node| match node {
+                resvg::usvg::Node::Text(text) => Some(text.bounding_box().width()),
+                resvg::usvg::Node::Group(group) => text_width(group),
+                _ => None,
+            })
+        }
+        let available = (parsed.size().width() - 48.).max(1.);
+        if text_width(parsed.root()).is_some_and(|width| width > available) {
+            updated = label_text_length(&updated, Some(available))?;
+        }
+    }
+    Ok(updated)
+}
+
+fn label_text_length(source: &str, width: Option<f32>) -> Result<String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(source);
+    let mut writer = quick_xml::Writer::new(Vec::new());
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) if element.local_name().as_ref() == b"text" => {
+                let mut out = element.to_owned();
+                out.clear_attributes();
+                for attribute in element.attributes() {
+                    let attribute = attribute?;
+                    if !matches!(attribute.key.as_ref(), b"textLength" | b"lengthAdjust") {
+                        out.push_attribute(attribute);
+                    }
+                }
+                if let Some(width) = width {
+                    let width = width.to_string();
+                    out.push_attribute(("textLength", width.as_str()));
+                    out.push_attribute(("lengthAdjust", "spacingAndGlyphs"));
+                }
+                writer.write_event(Event::Start(out))?;
+            }
+            Event::Eof => break,
+            event => writer.write_event(event)?,
+        }
+    }
+    Ok(String::from_utf8(writer.into_inner())?)
+}

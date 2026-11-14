@@ -13,8 +13,86 @@ pub(super) struct State {
 
 // TextEdit cannot rotate or mirror its caret and glyphs. Keep transformed
 // boxes in their original appearance while the inspector edits their text.
-fn supports(a: &Annotation) -> bool {
+pub(super) fn supports(a: &Annotation) -> bool {
     a.rotation.rem_euclid(360.) == 0. && !a.flip_x && !a.flip_y
+}
+
+/// Family and real installed faces, shared by new and existing annotations.
+pub(super) fn font_controls(ui: &mut egui::Ui, style: &mut Style) {
+    use mypdf_milestone0::text_style::{self, AnnotationFont};
+    let fonts = text_style::fonts();
+    if fonts.is_empty() {
+        return;
+    }
+    let current = style
+        .font
+        .as_ref()
+        .and_then(|f| f.resolve())
+        .or_else(|| {
+            mypdf_milestone0::document::default_font()
+                .ok()
+                .and_then(|path| fonts.iter().find(|f| f.path == path))
+        })
+        .unwrap_or(&fonts[0]);
+    ui::caption(ui, "Font");
+    egui::ComboBox::from_id_salt("annotation_font_family")
+        .width(ui.available_width())
+        .selected_text(&current.family)
+        .show_ui(ui, |ui| {
+            for face in fonts.iter().filter(|f| !f.bold && !f.italic) {
+                if ui
+                    .selectable_label(face.family == current.family, &face.family)
+                    .clicked()
+                {
+                    let face = fonts
+                        .iter()
+                        .find(|f| {
+                            f.family == face.family
+                                && f.bold == current.bold
+                                && f.italic == current.italic
+                        })
+                        .unwrap_or(face);
+                    style.font = Some(Box::new(AnnotationFont::from_face(face)));
+                }
+            }
+        })
+        .response
+        .widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, "Annotation font family")
+        });
+    let current = style
+        .font
+        .as_ref()
+        .and_then(|f| f.resolve())
+        .unwrap_or(current);
+    egui::ComboBox::from_id_salt("annotation_font_style")
+        .width(ui.available_width())
+        .selected_text(current.style())
+        .show_ui(ui, |ui| {
+            for face in fonts.iter().filter(|f| f.family == current.family) {
+                let label = RichText::new(face.style()).font(FontId::new(
+                    13.,
+                    egui::FontFamily::Name(face.ui_name().into()),
+                ));
+                if ui
+                    .selectable_label(face.path == current.path, label)
+                    .clicked()
+                {
+                    style.font = Some(Box::new(AnnotationFont::from_face(face)));
+                }
+            }
+        })
+        .response
+        .widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, "Annotation font style")
+        });
+}
+
+pub(super) fn is_editing(editor: &EditorState, annotation: &str) -> bool {
+    editor
+        .annotation_text
+        .as_ref()
+        .is_some_and(|state| state.annotation == annotation)
 }
 
 pub(super) fn start(editor: &mut EditorState, tab: u64, a: &Annotation, select_all: bool) {
@@ -170,7 +248,7 @@ pub(super) fn overlay(
                         text.as_str().into(),
                         FontId::new(
                             a.style.font_size * resolution,
-                            egui::FontFamily::Name("annotation".into()),
+                            annotation_render::font_family(&a.style),
                         ),
                         editing::color(a.style.color, a.style.opacity),
                         width,
@@ -182,7 +260,7 @@ pub(super) fn overlay(
             .id(id)
             .font(FontId::new(
                 a.style.font_size * resolution,
-                egui::FontFamily::Name("annotation".into()),
+                annotation_render::font_family(&a.style),
             ))
             .text_color(editing::color(a.style.color, a.style.opacity))
             .frame(false)

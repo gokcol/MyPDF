@@ -1,14 +1,13 @@
-MyPDF 3.0.0
+MyPDF 3.1.0
 
-• Touch controls: finger drawing on/off, two-finger pan and pinch, long-press menus, and a movable floating toolbar.
-• Automatic touchscreen detection plus Touch and Mouse only modes; tune touch targets, hold delay, stroke smoothing, and gesture hints.
-• Redesigned Home with tools, recents, favorites, and customizable section order and visibility.
-• Polished Settings and About; contextual icon tabs, compact previews, Studio and Sage styles, and three icon-color choices.
-• The left panel starts hidden; saved document layouts remain available.
-• Click existing text to edit it. Clicking outside keeps changes and finishes editing; another click starts the next edit.
-• A4 defaults for new pages; resize individual pages without scaling their contents. Inserted images always fit the page.
-• Editable image layers: move, resize, rotate, add text above images, and reset rotation from the context menu.
-• Insert PDF, images, TXT, Markdown, SVG, DOCX and RTF; Word or LibreOffice is needed for DOCX/RTF.
-• Recent improvements retained: stable table-cell editing, compact text properties, editable PDF metadata, and reliable Save/autosave.
-• OCR page selection and reviewable results; Windows bundles offline English, Turkish and German OCR.
-• Offline What’s New; Store updates on Windows and signed Mac updates with download, install and relaunch.
+• Move and resize annotations reliably; drag inside text boxes to move, double-click to type. Choose font family and regular, bold or italic styles.
+• Stamps stay in Annotate with editable text and colors. Reuse custom variants or open the visual artwork editor.
+• Visual stamp designer: select, move, resize, rotate and layer objects; edit text, shapes, colors and transparency with Undo/Redo.
+• Six border templates, rounded corners and independent background, fill and outline opacity; advanced SVG source remains available.
+• Touchscreen detection, Touch/Mouse modes, finger drawing, two-finger pan/pinch, long-press menus and a floating toolbar.
+• Customizable Home, polished Settings/About, five visual styles and compact icon previews. Left panel starts hidden.
+• Click existing text to edit; click outside to finish, then click again for the next edit. Improved table-cell editing.
+• A4 new pages, per-page resizing and images fitted to the page; move/resize/rotate images and add text above them.
+• Insert PDF, images, TXT, Markdown and SVG; DOCX/RTF use installed Word or LibreOffice.
+• Choose OCR pages and review results; offline Windows OCR includes English, Turkish and German. Edit PDF metadata.
+• Reliable Save/autosave, offline What’s New and update checks. Mac 3.1 uses a signed, notarized DMG download.
