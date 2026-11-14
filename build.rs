@@ -6,6 +6,7 @@ fn main() {
     println!("cargo:rerun-if-changed=packaging/windows/MyPDF.ico");
     println!("cargo:rerun-if-changed=native/translation/TranslationBridge.swift");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        build_mac_updater();
         build_apple_translation();
     }
     #[cfg(windows)]
@@ -24,6 +25,50 @@ fn main() {
             .compile()
             .expect("Windows icon and version details could not be added");
     }
+}
+
+fn build_mac_updater() {
+    use std::{path::PathBuf, process::Command};
+    println!("cargo:rerun-if-changed=native/updater/SparkleBridge.m");
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
+    let arch = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("aarch64") => "arm64",
+        Ok("x86_64") => "x86_64",
+        _ => panic!("Unsupported Mac architecture"),
+    };
+    let object = out.join("SparkleBridge.o");
+    assert!(
+        Command::new("xcrun")
+            .args([
+                "clang",
+                "-fobjc-arc",
+                "-fmodules",
+                "-Wall",
+                "-Werror",
+                "-arch",
+                arch,
+                "-mmacosx-version-min=12.0",
+                "-c",
+                "native/updater/SparkleBridge.m",
+                "-o"
+            ])
+            .arg(&object)
+            .status()
+            .expect("Compile Sparkle bridge")
+            .success()
+    );
+    assert!(
+        Command::new("xcrun")
+            .args(["ar", "crs"])
+            .arg(out.join("libmypdf_updater.a"))
+            .arg(object)
+            .status()
+            .expect("Archive Sparkle bridge")
+            .success()
+    );
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=mypdf_updater");
+    println!("cargo:rustc-link-lib=framework=AppKit");
 }
 
 fn build_apple_translation() {

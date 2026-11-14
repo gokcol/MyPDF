@@ -101,6 +101,11 @@ for size in 16 32 128 256 512; do
 done
 iconutil -c icns "$work/MyPDF.iconset" -o "$app/Contents/Resources/MyPDF-calico-v2.icns"
 touch "$app"
+sparkle=$(sh scripts/prepare-sparkle.sh)
+mkdir -p "$app/Contents/Frameworks"
+ditto "$sparkle/Sparkle.framework" "$app/Contents/Frameworks/Sparkle.framework"
+cp "$sparkle/LICENSE" "$app/Contents/Resources/Sparkle-LICENSE.txt"
+sh scripts/sign-macos-frameworks.sh "$app" -
 codesign --force --sign - "$app"
 if [ -e "$output" ] || [ -L "$output" ]; then
     mv "$output" "$work/previous.app"

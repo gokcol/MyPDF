@@ -142,16 +142,9 @@ pub fn install(ctx: egui::Context) -> (Option<NativeMenu>, mpsc::Receiver<String
         "MyPDF",
         true,
         &[
-            &P::about(
-                Some("About MyPDF"),
-                Some(muda::AboutMetadata {
-                    name: Some("MyPDF".into()),
-                    version: Some(format!("{} · Native PDF editor", env!("CARGO_PKG_VERSION"))),
-                    credits: Some("Developed by Orhan Gökçöl".into()),
-                    comments: Some(ABOUT.into()),
-                    ..Default::default()
-                }),
-            ),
+            &MenuItem::with_id("about", "About MyPDF", true, None),
+            &MenuItem::with_id("whats_new", "What's New", true, None),
+            &MenuItem::with_id("check_updates", "Check for Updates…", true, None),
             &P::separator(),
             &item("settings", "Settings…", Code::Comma, Modifiers::empty()),
             &P::separator(),
@@ -576,6 +569,8 @@ fn native_symbol(id: &str, label: &str) -> &'static str {
         "inspector" => "sidebar.right",
         "guides" => "ruler",
         "history" => "clock.arrow.circlepath",
+        "whats_new" => "info.circle",
+        "check_updates" => "arrow.clockwise",
         "templates" => "doc.text",
         "batch" => "square.stack.3d.up",
         "workflow_settings" | "settings" => "gearshape",

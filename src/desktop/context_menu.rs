@@ -756,7 +756,7 @@ fn formatted_inline_text(
     mypdf_milestone0::clipboard_text::from_styled_text(shown, &style)
 }
 
-fn candidates(state: &ContentState, tab: &Tab, page: usize) -> Vec<InlineText> {
+pub(super) fn candidates(state: &ContentState, tab: &Tab, page: usize) -> Vec<InlineText> {
     let Some(s) = &tab.session else { return vec![] };
     let key = (tab.id, s.revision(), page);
     let mut drafts = vec![];
@@ -951,26 +951,14 @@ pub(in crate::desktop) fn smart_select(
             rect.min + vec2(draft.rect[0], draft.rect[1]) * scale,
             rect.min + vec2(draft.rect[2], draft.rect[3]) * scale,
         );
-        // Typing and its move/resize handles keep their input. A click on
-        // another object commits the draft first, then resolves that point
-        // against the new revision so old image/text indices cannot leak.
+        // An outside click finishes this editor only. Selecting the next
+        // object is a separate click, after the revision has been refreshed.
         if clicked
             && draft.key.0 == tab.id
             && !(draft.key.2 == page
-                && (active.expand(6.).contains(pos)
+                && (active.expand(8.).contains(pos)
                     || text_move_handle(active, rect).expand(6.).contains(pos)))
-            && !candidates(state, tab, page)
-                .iter()
-                .any(|text| contains(text.rect, point))
-            && (editing::hit_annotation(tab, page, point, scale).is_some()
-                || state.inspection.as_ref().is_some_and(|info| {
-                    info.key == key
-                        && info.images.as_ref().is_ok_and(|images| {
-                            images.iter().any(|image| contains(image.rect, point))
-                        })
-                }))
         {
-            state.after_text = Some(AfterText::SelectAt(tab.id, page, point));
             state.new_commit = true;
         }
         return;
@@ -1092,6 +1080,7 @@ pub(in crate::desktop) fn page_menu(
         .input(|i| i.pointer.secondary_clicked())
         .then(|| ctx.pointer_interact_pos())
         .flatten()
+        .or_else(|| touch_navigation::context_press(ctx, tab.id))
         .filter(|p| {
             rect.intersect(ui.clip_rect()).contains(*p)
                 && ctx.layer_id_at(*p) == Some(ui.layer_id())
@@ -4240,6 +4229,54 @@ mod tests {
     }
 
     #[test]
+    fn text_tool_reopens_existing_text_and_waits_for_page_inspection() {
+        let (mut app, ctx, point) = auto_edit_fixture([0., 0., 500., 500.]);
+        app.content.add_target = Some((app.tabs[0].id, 0));
+        // A click before inspection completes must resolve against the PDF,
+        // never assume that the as-yet unknown content is an empty page.
+        app.content.inspection = None;
+        app.content.loading = true;
+        for _ in 0..2 {
+            auto_edit_frame(&mut app, &ctx, vec![]);
+        }
+        auto_edit_click(&mut app, &ctx, point);
+        assert!(!app.content.new_placed);
+        assert!(app.content.pending_text_hit.is_some());
+        app.content.loading = false;
+        app.content.key = None;
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.content.existing.is_none() {
+            auto_edit_frame(&mut app, &ctx, vec![]);
+            assert!(std::time::Instant::now() < end);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            app.content.existing.as_ref().unwrap().text,
+            "Original words"
+        );
+        assert!(!app.content.new_placed);
+        // A clean editor also requires a separate click to begin a new one.
+        let empty = pos2(400., 400.);
+        auto_edit_click(&mut app, &ctx, empty);
+        assert!(app.content.existing.is_none() && !app.content.new_placed);
+        for _ in 0..2 {
+            auto_edit_frame(&mut app, &ctx, vec![]);
+        }
+        auto_edit_click(&mut app, &ctx, empty);
+        assert!(app.content.new_placed);
+        // Leaving an untouched placeholder closes it, without moving it or
+        // creating another placeholder at the next click position.
+        auto_edit_click(&mut app, &ctx, point);
+        assert!(!app.content.new_placed && app.content.existing.is_none());
+        for _ in 0..2 {
+            auto_edit_frame(&mut app, &ctx, vec![]);
+        }
+        auto_edit_click(&mut app, &ctx, point);
+        assert!(app.content.existing.is_some() && !app.content.new_placed);
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
+    }
+
+    #[test]
     fn automatic_edit_switches_text_and_images_and_keeps_committed_typing() {
         let (mut app, ctx, text_point) = auto_edit_fixture([100., 200., 200., 300.]);
         // A tool remembered from Draw must not prevent selection in Edit.
@@ -4256,12 +4293,15 @@ mod tests {
         app.content.existing.as_mut().unwrap().text = "Edited words".into();
         auto_edit_click(&mut app, &ctx, pos2(170., 270.));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while !app.content.image_mode || app.content.selected != Some(0) {
+        while app.content.busy || app.content.existing.is_some() || app.content.loading {
             assert!(std::time::Instant::now() < deadline, "{:?}", app.status);
             auto_edit_frame(&mut app, &ctx, vec![]);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(app.content.existing.is_none());
+        assert!(!app.content.image_mode, "first click only finishes text");
+        auto_edit_click(&mut app, &ctx, pos2(170., 270.));
+        assert!(app.content.image_mode && app.content.selected == Some(0));
         let session = app.tabs[0].session.as_mut().unwrap();
         assert_eq!(session.revision(), 1);
         assert!(

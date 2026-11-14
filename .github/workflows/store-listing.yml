@@ -30,6 +30,9 @@ jobs:
             if (!(Test-Path "$env:MYPDF_PREVIEW_DIR/$name.png")) { throw "Missing $name.png" }
           }
           Copy-Item packaging/windows/store-listing/en-US/*.txt artifacts/store-listing/
+          $appVersion = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
+          python scripts/release-notes.py --version $appVersion --out-dir artifacts/store-listing
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           @{
             commit = '${{ github.sha }}'
             platform = 'Windows x64'

@@ -3594,6 +3594,7 @@ dependencies = [
  "unicode-bidi",
  "wgpu",
  "windows 0.61.3",
+ "windows-future",
  "windows-sys 0.61.2",
  "winresource",
  "x509-parser",

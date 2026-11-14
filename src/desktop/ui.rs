@@ -13,7 +13,7 @@ pub(super) const FIELD_MARGIN: egui::Vec2 = egui::vec2(8., 6.);
 /// Keep compact geometry by default; Comfortable reserves a full touch target.
 pub(super) fn target_size(compact: f32) -> f32 {
     if theme::comfortable() {
-        compact.max(44.)
+        compact.max(44.).max(theme::touch_target())
     } else {
         compact
     }
@@ -280,6 +280,7 @@ pub(super) fn logo(painter: &egui::Painter, rect: Rect) {
 #[derive(Clone, Copy)]
 pub(super) enum Icon {
     Settings,
+    Touch,
     Home,
     Blank,
     Document,
@@ -411,8 +412,15 @@ pub(super) enum Icon {
 /// Only control glyphs receive decorative color; artwork previews, warnings,
 /// disabled/primary actions and tools showing a document color keep their ink.
 fn control_icon_family(icon: Icon, mode_tab: bool) -> Option<theme::IconFamily> {
+    control_icon_family_for(theme::icon_style(), icon, mode_tab)
+}
+fn control_icon_family_for(
+    style: theme::IconStyle,
+    icon: Icon,
+    mode_tab: bool,
+) -> Option<theme::IconFamily> {
     use theme::{IconFamily as F, IconStyle as S};
-    if theme::icon_style() == S::Selective {
+    if style == S::Selective {
         return match icon {
             Icon::Open => Some(F::Document),
             Icon::Sign => Some(F::Signing),
@@ -450,6 +458,9 @@ pub(super) fn draw_icon(painter: &egui::Painter, rect: Rect, icon: Icon, color: 
 }
 
 fn draw_icon_impl(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32, duotone: bool) {
+    if duotone {
+        painter.rect_filled(rect.expand(3.), 5, color.gamma_multiply(0.16));
+    }
     let p = |x: f32, y: f32| rect.min + vec2(x, y) * rect.size();
     let width = (rect.width() * 0.082).clamp(1.3, 3.0);
     let stroke = Stroke::new(width, color);
@@ -465,7 +476,7 @@ fn draw_icon_impl(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
         {
             painter.add(egui::Shape::convex_polygon(
                 points[..points.len() - 1].to_vec(),
-                color.gamma_multiply(0.17),
+                color.gamma_multiply(0.34),
                 Stroke::NONE,
             ));
         }
@@ -488,7 +499,7 @@ fn draw_icon_impl(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             painter.rect_filled(
                 Rect::from_min_max(p(a[0], a[1]), p(b[0], b[1])),
                 radius * rect.width(),
-                color.gamma_multiply(0.17),
+                color.gamma_multiply(0.34),
             );
         }
         painter.rect_stroke(
@@ -1001,7 +1012,7 @@ fn draw_icon_impl(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
                 painter.circle_filled(
                     p(0.65, 0.65),
                     rect.width() * 0.27,
-                    color.gamma_multiply(0.17),
+                    color.gamma_multiply(0.34),
                 );
             }
             painter.circle_stroke(p(0.65, 0.65), rect.width() * 0.27, stroke);
@@ -1122,6 +1133,27 @@ fn draw_icon_impl(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color3
             path.push([0.36, 0.8]);
             line(&path.into_iter().map(flip).collect::<Vec<_>>());
             line(&[flip([0.32, 0.18]), flip([0.14, 0.36]), flip([0.32, 0.54])]);
+        }
+        Icon::Touch => {
+            // Finger with a touch ripple, matching the rounded outline icon set.
+            line(&arc([0.36, 0.25], 0.19, 160., 365.));
+            line(&[
+                [0.29, 0.56],
+                [0.29, 0.25],
+                [0.33, 0.2],
+                [0.39, 0.2],
+                [0.43, 0.25],
+                [0.43, 0.48],
+                [0.55, 0.43],
+                [0.78, 0.54],
+                [0.82, 0.64],
+                [0.75, 0.89],
+                [0.42, 0.89],
+                [0.18, 0.63],
+                [0.17, 0.56],
+                [0.22, 0.52],
+                [0.29, 0.56],
+            ]);
         }
         Icon::Select => {
             let outline = [
@@ -2924,93 +2956,349 @@ pub(super) fn set_density(ctx: &egui::Context, density: theme::Density) -> anyho
     Ok(())
 }
 
-pub(super) fn appearance_settings(ui: &mut egui::Ui) {
-    ui.label(RichText::new("Visual style").family(semibold()));
-    let mut selected = theme::style();
-    ui.horizontal_wrapped(|ui| {
-        for style in theme::Style::ALL {
-            ui.selectable_value(&mut selected, style, style.name());
-        }
+/// Settings groups use a quiet inset surface and consistent padding.
+pub(super) fn settings_group(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(theme::home_card())
+        .stroke(Stroke::new(1., theme::line()))
+        .corner_radius(14)
+        .inner_margin(14)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(title).family(semibold()).size(14.));
+            ui.add_space(5.);
+            body(ui);
+        });
+}
+
+fn style_preview(ui: &mut egui::Ui, style: theme::Style, width: f32) -> egui::Response {
+    let selected = theme::style() == style;
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 82.), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            selected,
+            style.name(),
+        )
     });
+    let p = theme::palette_for_style(style, theme::is_dark());
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        12,
+        if selected {
+            theme::accent_soft()
+        } else {
+            theme::home_card()
+        },
+        Stroke::new(
+            if selected || response.has_focus() {
+                2.
+            } else {
+                1.
+            },
+            if selected || response.has_focus() {
+                theme::accent()
+            } else if response.hovered() {
+                theme::accent_line()
+            } else {
+                theme::line()
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    // A miniature workspace, drawn with the actual palette for this appearance.
+    let preview = Rect::from_min_max(rect.min + vec2(9., 9.), rect.right_top() + vec2(-9., 49.));
+    painter.rect_filled(preview, 6, p.paper);
+    let top = Rect::from_min_size(preview.min, vec2(preview.width(), 10.));
+    painter.rect_filled(
+        top,
+        egui::CornerRadius {
+            nw: 6,
+            ne: 6,
+            sw: 0,
+            se: 0,
+        },
+        p.chrome,
+    );
+    for x in [5., 10., 15.] {
+        painter.circle_filled(top.min + vec2(x, 6.), 1.5, p.muted);
+    }
+    let side = Rect::from_min_max(
+        preview.min + vec2(0., 10.),
+        preview.left_bottom() + vec2(14., 0.),
+    );
+    painter.rect_filled(side, 0, p.control);
+    for y in [17., 24., 31.] {
+        painter.line_segment(
+            [preview.min + vec2(5., y), preview.min + vec2(10., y)],
+            Stroke::new(2., p.muted),
+        );
+    }
+    let hero = Rect::from_min_max(
+        preview.min + vec2(20., 15.),
+        preview.right_bottom() - vec2(5., 13.),
+    );
+    painter.rect_filled(hero, 4, p.accent_soft);
+    painter.rect_filled(
+        Rect::from_center_size(hero.center(), vec2(hero.width().min(24.), 5.)),
+        4,
+        p.accent,
+    );
+    let tile_width = (hero.width() - 6.) / 3.;
+    for i in 0..3 {
+        painter.rect_filled(
+            Rect::from_min_size(
+                pos2(
+                    hero.left() + i as f32 * (tile_width + 3.),
+                    hero.bottom() + 3.,
+                ),
+                vec2(tile_width, 6.),
+            ),
+            2,
+            p.control,
+        );
+    }
+    painter.text(
+        rect.left_top() + vec2(10., 65.),
+        egui::Align2::LEFT_CENTER,
+        style.name(),
+        bold(ui, 13.),
+        theme::ink(),
+    );
+    if selected {
+        painter.circle_filled(rect.right_top() + vec2(-14., 65.), 6., theme::accent());
+        draw_icon(
+            painter,
+            Rect::from_center_size(rect.right_top() + vec2(-14., 65.), vec2(9., 9.)),
+            Icon::Check,
+            theme::on_accent(),
+        );
+    }
+    response.on_hover_text(format!(
+        "{} — {}. Click to apply.",
+        style.name(),
+        if style == theme::Style::Studio {
+            "Default · White & blue"
+        } else {
+            style.description()
+        }
+    ))
+}
+
+fn icon_style_preview(ui: &mut egui::Ui, style: theme::IconStyle, width: f32) -> egui::Response {
+    let selected = style == theme::icon_style();
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 74.), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            selected,
+            style.name(),
+        )
+    });
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        10,
+        if selected {
+            theme::accent_soft()
+        } else {
+            theme::surface()
+        },
+        Stroke::new(
+            if selected || response.has_focus() {
+                2.
+            } else {
+                1.
+            },
+            if selected || response.has_focus() {
+                theme::accent()
+            } else if response.hovered() {
+                theme::accent_line()
+            } else {
+                theme::line()
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    let step = ((width - 20.) / 5.).min(34.);
+    for (i, icon) in [
+        Icon::Pen,
+        Icon::Shapes,
+        Icon::Library,
+        Icon::Sign,
+        Icon::Save,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let family = control_icon_family_for(style, icon, false);
+        let color = family
+            .map(|family| theme::icon_color_for(style, family))
+            .unwrap_or_else(theme::ink);
+        let glyph = Rect::from_center_size(
+            pos2(rect.center().x + (i as f32 - 2.) * step, rect.top() + 21.),
+            vec2(19., 19.),
+        );
+        draw_icon_impl(
+            painter,
+            glyph,
+            icon,
+            color,
+            family.is_some() && style == theme::IconStyle::Duotone,
+        );
+    }
+    painter.text(
+        rect.center_top() + vec2(0., 45.),
+        egui::Align2::CENTER_CENTER,
+        style.name(),
+        strong(ui, 12.5),
+        theme::ink(),
+    );
+    painter.text(
+        rect.center_top() + vec2(0., 62.),
+        egui::Align2::CENTER_CENTER,
+        match style {
+            theme::IconStyle::Selective => "Mostly neutral",
+            theme::IconStyle::Families => "Colored outlines",
+            theme::IconStyle::Duotone => "Tinted tiles + fills",
+        },
+        FontId::proportional(10.5),
+        theme::muted(),
+    );
+    response
+}
+
+pub(super) fn appearance_settings(ui: &mut egui::Ui) {
     let error_id = egui::Id::new("appearance_save_error");
+    ui.label(RichText::new("Visual style").family(semibold()).size(15.));
+    ui.add_space(4.);
+    let columns = if ui.available_width() >= 590. {
+        5
+    } else if ui.available_width() >= 365. {
+        3
+    } else {
+        2
+    };
+    let gap = 8.;
+    let width = (ui.available_width() - gap * (columns - 1) as f32) / columns as f32;
+    let mut selected = theme::style();
+    for row in theme::Style::ALL.chunks(columns) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for style in row {
+                if style_preview(ui, *style, width).clicked() {
+                    selected = *style;
+                }
+            }
+        });
+    }
     if selected != theme::style() {
         let error = set_visual_style(ui.ctx(), selected)
             .err()
             .map(|e| format!("Could not save appearance: {e}"));
         ui.ctx().data_mut(|d| d.insert_temp(error_id, error));
     }
-    ui.weak(match theme::style() {
-        theme::Style::Graphite => "Clean graphite surfaces with blue highlights.",
-        theme::Style::Glacier => "Cool surfaces, teal highlights and softly raised controls.",
-        theme::Style::Calico => "Warm neutrals, copper highlights and crisp edges.",
+    ui.add_space(10.);
+    settings_group(ui, "Light & dark", |ui| {
+        let current = ui.ctx().options(|o| o.theme_preference);
+        let choices = [
+            egui::ThemePreference::System,
+            egui::ThemePreference::Light,
+            egui::ThemePreference::Dark,
+        ];
+        let index = choices.iter().position(|v| *v == current).unwrap_or(0);
+        if let Some(i) = segmented(ui, &["Match System", "Light", "Dark"], index) {
+            let error = theme::save_preference(choices[i])
+                .err()
+                .map(|e| format!("Could not save appearance: {e}"));
+            if error.is_none() {
+                ui.ctx().set_theme(choices[i]);
+            }
+            ui.ctx().data_mut(|d| d.insert_temp(error_id, error));
+        }
+        ui.label(
+            RichText::new("Every style has a light and a dark appearance.")
+                .small()
+                .color(theme::muted()),
+        );
+    });
+    ui.add_space(6.);
+    settings_group(ui, "Icon colors", |ui| {
+        let columns = if ui.available_width() >= 530. { 3 } else { 1 };
+        let width = (ui.available_width() - 8. * (columns - 1) as f32) / columns as f32;
+        let mut choice = None;
+        for row in theme::IconStyle::ALL.chunks(columns) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.;
+                for style in row {
+                    if icon_style_preview(ui, *style, width).clicked() {
+                        choice = Some(*style);
+                    }
+                }
+            });
+        }
+        if let Some(style) = choice {
+            let error = set_icon_style(ui.ctx(), style)
+                .err()
+                .map(|e| format!("Could not save icon colors: {e}"));
+            ui.ctx().data_mut(|d| d.insert_temp(error_id, error));
+        }
+        ui.label(
+            RichText::new(match theme::icon_style() {
+                theme::IconStyle::Selective => "A few colorful accents for your everyday tools.",
+                theme::IconStyle::Families => {
+                    "Blue editing, teal signing, and amber document tools."
+                }
+                theme::IconStyle::Duotone => "Colored icons with tinted tiles and filled details.",
+            })
+            .small()
+            .color(theme::muted()),
+        );
+    });
+    ui.add_space(6.);
+    settings_group(ui, "Control spacing", |ui| {
+        let current = theme::density();
+        let index = usize::from(current == theme::Density::Comfortable);
+        let labels = theme::Density::ALL.map(|v| v.name());
+        if let Some(i) = segmented(ui, &labels, index) {
+            let error = set_density(ui.ctx(), theme::Density::ALL[i])
+                .err()
+                .map(|e| format!("Could not save control spacing: {e}"));
+            ui.ctx().data_mut(|d| d.insert_temp(error_id, error));
+        }
+        ui.label(
+            RichText::new(match theme::density() {
+                theme::Density::Compact => "More room for your document, with compact controls.",
+                theme::Density::Comfortable => "Larger controls and more space for touch.",
+            })
+            .small()
+            .color(theme::muted()),
+        );
     });
     ui.add_space(8.);
-    ui.label(RichText::new("Icon colors").family(semibold()));
-    let mut icons = theme::icon_style();
-    ui.horizontal_wrapped(|ui| {
-        for style in theme::IconStyle::ALL {
-            ui.selectable_value(&mut icons, style, style.name());
-        }
-    });
-    if icons != theme::icon_style() {
-        let error = set_icon_style(ui.ctx(), icons)
-            .err()
-            .map(|e| format!("Could not save icon colors: {e}"));
-        ui.ctx().data_mut(|d| d.insert_temp(error_id, error));
-    }
-    ui.weak(match theme::icon_style() {
-        theme::IconStyle::Selective => "A few accents for Open, editing modes and signing.",
-        theme::IconStyle::Families => {
-            "Blue editing, teal signing and saving, amber document tools."
-        }
-        theme::IconStyle::Duotone => "The same color families with softly filled icon details.",
-    });
-    ui.add_space(8.);
-    ui.label(RichText::new("Control spacing").family(semibold()));
-    let mut density = theme::density();
-    ui.horizontal_wrapped(|ui| {
-        for choice in theme::Density::ALL {
-            ui.selectable_value(&mut density, choice, choice.name());
-        }
-    });
-    if density != theme::density() {
-        let error = set_density(ui.ctx(), density)
-            .err()
-            .map(|e| format!("Could not save control spacing: {e}"));
-        ui.ctx().data_mut(|d| d.insert_temp(error_id, error));
-    }
-    ui.weak(match theme::density() {
-        theme::Density::Compact => "Compact controls leave more room for your document.",
-        theme::Density::Comfortable => {
-            "Larger controls and more space for touch, with the same text size."
-        }
-    });
-    ui.add_space(8.);
-    ui.label(RichText::new("Appearance").family(semibold()));
-    let current = ui.ctx().options(|o| o.theme_preference);
-    let mut preference = current;
-    ui.horizontal_wrapped(|ui| {
-        for (value, label) in [
-            (egui::ThemePreference::System, "Match System"),
-            (egui::ThemePreference::Light, "Light"),
-            (egui::ThemePreference::Dark, "Dark"),
-        ] {
-            ui.selectable_value(&mut preference, value, label);
-        }
-    });
-    if preference != current {
-        let error = theme::save_preference(preference)
-            .err()
-            .map(|e| format!("Could not save appearance: {e}"));
-        if error.is_none() {
-            ui.ctx().set_theme(preference);
-        }
-        ui.ctx().data_mut(|d| d.insert_temp(error_id, error));
-    }
-    ui.weak("Changes appear immediately. Each style supports light and dark appearance.");
+    ui.label(
+        RichText::new("Changes are saved automatically.")
+            .small()
+            .color(theme::muted()),
+    );
     if let Some(Some(error)) = ui.ctx().data(|d| d.get_temp::<Option<String>>(error_id)) {
         ui.colored_label(theme::danger(), error);
     }
+}
+
+pub(super) fn chrome_scope<R>(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    theme::with_chrome(|| {
+        ui.scope(|ui| {
+            if theme::contrasting_chrome() {
+                style_for(ui.style_mut(), theme::palette_for(true), true);
+            }
+            body(ui)
+        })
+        .inner
+    })
 }
 
 fn style_for(style: &mut egui::Style, p: &theme::Palette, dark: bool) {

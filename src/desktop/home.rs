@@ -1,7 +1,66 @@
 //! Native Home workspace; thumbnails are rendered lazily on one bounded worker.
 use super::*;
 use mypdf_milestone0::home::{Entry, History};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+enum Section {
+    Drop,
+    Tools,
+    Recents,
+    Favorites,
+}
+impl Section {
+    const ALL: [Self; 4] = [Self::Drop, Self::Tools, Self::Recents, Self::Favorites];
+    fn label(self) -> &'static str {
+        match self {
+            Self::Drop => "Drop Area",
+            Self::Tools => "Tools",
+            Self::Recents => "Recents",
+            Self::Favorites => "Favorites",
+        }
+    }
+    fn icon(self) -> Icon {
+        match self {
+            Self::Drop => Icon::Import,
+            Self::Tools => Icon::Library,
+            Self::Recents => Icon::Document,
+            Self::Favorites => Icon::Star,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct HomeLayout {
+    sections: Vec<Section>,
+}
+impl Default for HomeLayout {
+    fn default() -> Self {
+        Self {
+            sections: Section::ALL.to_vec(),
+        }
+    }
+}
+impl HomeLayout {
+    fn normalize(&mut self) {
+        let mut seen = std::collections::HashSet::new();
+        self.sections.retain(|s| seen.insert(*s));
+        if self.sections.is_empty() {
+            *self = Self::default();
+        }
+    }
+    fn move_to(&mut self, section: Section, index: usize) {
+        self.sections.retain(|s| *s != section);
+        self.sections
+            .insert(index.min(self.sections.len()), section);
+    }
+    fn hide(&mut self, section: Section) {
+        if self.sections.len() > 1 {
+            self.sections.retain(|s| *s != section);
+        }
+    }
+}
 
 type PreviewResult = (PathBuf, Result<egui::ColorImage, String>);
 struct Thumbnail {
@@ -18,6 +77,8 @@ pub(super) struct Home {
     all_favorites: bool,
     pub(super) focus_search: bool,
     import_open: bool,
+    layout: HomeLayout,
+    layout_error: Option<String>,
     previews: HashMap<PathBuf, Thumbnail>,
     pending: Option<PathBuf>,
     requests: mpsc::SyncSender<PathBuf>,
@@ -57,6 +118,8 @@ impl Home {
             all_favorites: false,
             focus_search: false,
             import_open: false,
+            layout: HomeLayout::default(),
+            layout_error: None,
             previews: HashMap::new(),
             pending: None,
             requests,
@@ -66,6 +129,13 @@ impl Home {
             _temporary: temporary,
         };
         home.reload();
+        match preferences::load::<HomeLayout>(&home.root, "home-layout.json") {
+            Ok(mut layout) => {
+                layout.normalize();
+                home.layout = layout;
+            }
+            Err(error) => home.layout_error = Some(format!("Could not load Home layout: {error}")),
+        }
         home
     }
     fn reload(&mut self) {
@@ -220,17 +290,21 @@ impl Viewer {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(theme::paper())).show(ctx, |ui| {
             ui.spacing_mut().item_spacing.y = 5.;
             egui::ScrollArea::vertical().id_salt("home_scroll").auto_shrink([false, false]).show(ui, |ui| {
-                let margin = ((ui.available_width() - 1140.) / 2.).max(28.);
+                let margin = ((ui.available_width() - 1140.) / 2.).clamp(24., 120.);
                 egui::Frame::new().inner_margin(egui::Margin { left: margin as i8, right: margin as i8, top: 26, bottom: 32 }).show(ui, |ui| {
                     if ui.available_width() >= 800. {
                         ui.horizontal(|ui| {
                             home_heading(ui);
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                home_search(ui, &mut self.home, 230.);
+                                home_customize(ui, &mut self.home);
+                                home_search(ui, &mut self.home, 210.);
                             });
                         });
                     } else {
-                        home_heading(ui);
+                        ui.horizontal(|ui| {
+                            home_heading(ui);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { home_customize(ui, &mut self.home); });
+                        });
                         ui.add_space(10.);
                         home_search(ui, &mut self.home, ui.available_width());
                     }
@@ -238,9 +312,21 @@ impl Viewer {
                         ui.horizontal(|ui| { ui.spinner(); ui.label("Creating your PDF…"); });
                     }
                     ui.add_space(18.);
-                    if open_banner(ui).clicked() { action = Some(HomeAction::Open); }
-                    ui.add_space(20.);
-                    for favorite in [false, true] {
+                    for section in self.home.layout.sections.clone() {
+                        match section {
+                            Section::Drop => {
+                                if open_banner(ui).clicked() { action = Some(HomeAction::Open); }
+                                ui.add_space(28.);
+                                continue;
+                            }
+                            Section::Tools => {
+                                if let Some(tool) = quick_tools(ui) { action = Some(tool); }
+                                ui.add_space(28.);
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        let favorite = section == Section::Favorites;
                         let entries = self.home.entries(favorite);
                         let columns = ((ui.available_width() + 16.) / 186.).floor().max(1.) as usize;
                         ui.horizontal(|ui| {
@@ -280,11 +366,8 @@ impl Viewer {
                             }
                         }
                         ui.add_space(20.);
-                        if !favorite {
-                            if let Some(tool) = quick_tools(ui) { action = Some(tool); }
-                            ui.add_space(20.);
-                        }
                     }
+                    if let Some(error) = &self.home.layout_error { ui.colored_label(theme::danger(), error); }
                     if let Some(error) = &self.home.error {
                         ui.colored_label(theme::danger(), format!("Home history: {error}"));
                         if ui.link("Reload history").clicked() { self.home.reload(); }
@@ -402,12 +485,161 @@ impl Viewer {
         }
     }
 }
+fn home_customize(ui: &mut egui::Ui, home: &mut Home) {
+    let before = home.layout.clone();
+    let button = ui.add(
+        egui::Button::new("Customize")
+            .corner_radius(16)
+            .min_size(vec2(96., 34.)),
+    );
+    egui::Popup::menu(&button)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .frame(
+            egui::Frame::popup(ui.style())
+                .inner_margin(14.)
+                .corner_radius(16),
+        )
+        .show(|ui| {
+            ui.set_width(330.);
+            ui.strong("Page sections");
+            ui.weak("Drag to reorder, or use the arrows.");
+            ui.add_space(10.);
+            let sections = home.layout.sections.clone();
+            for (index, section) in sections.iter().copied().enumerate() {
+                ui.push_id(section, |ui| {
+                    let row = egui::Frame::new()
+                        .fill(theme::canvas())
+                        .corner_radius(12)
+                        .inner_margin(8.)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.dnd_drag_source(
+                                    egui::Id::new(("home_section_drag", section)),
+                                    section,
+                                    |ui| {
+                                        ui.horizontal(|ui| {
+                                            let (r, _) = ui.allocate_exact_size(
+                                                vec2(24., 24.),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui::draw_icon(
+                                                ui.painter(),
+                                                r.shrink(3.),
+                                                section.icon(),
+                                                theme::accent(),
+                                            );
+                                            ui.add_sized(
+                                                [120., 28.],
+                                                egui::Label::new(section.label()),
+                                            );
+                                            ui.weak("≡");
+                                        });
+                                    },
+                                );
+                                let up = ui.add_enabled(
+                                    index > 0,
+                                    egui::Button::new("↑").min_size(vec2(26., 28.)),
+                                );
+                                button_info(&up, &format!("Move {} up", section.label()));
+                                if up.clicked() {
+                                    home.layout.move_to(section, index - 1);
+                                }
+                                let down = ui.add_enabled(
+                                    index + 1 < sections.len(),
+                                    egui::Button::new("↓").min_size(vec2(26., 28.)),
+                                );
+                                button_info(&down, &format!("Move {} down", section.label()));
+                                if down.clicked() {
+                                    home.layout.move_to(section, index + 1);
+                                }
+                                let hide =
+                                    ui.add_enabled(sections.len() > 1, egui::Button::new("Hide"));
+                                button_info(&hide, &format!("Hide {}", section.label()));
+                                if hide.clicked() {
+                                    home.layout.hide(section);
+                                }
+                            });
+                        });
+                    if row.response.dnd_hover_payload::<Section>().is_some() {
+                        ui.painter().rect_stroke(
+                            row.response.rect,
+                            12,
+                            Stroke::new(2., theme::accent()),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    if let Some(source) = row.response.dnd_release_payload::<Section>() {
+                        home.layout.move_to(*source, index);
+                    }
+                });
+                ui.add_space(4.);
+            }
+            ui.add_space(10.);
+            ui.strong("Hidden sections");
+            let (_, dropped) = ui.dnd_drop_zone::<Section, _>(
+                egui::Frame::new()
+                    .fill(theme::canvas())
+                    .corner_radius(12)
+                    .inner_margin(10.),
+                |ui| {
+                    ui.set_min_width(310.);
+                    let hidden: Vec<_> = Section::ALL
+                        .into_iter()
+                        .filter(|s| !home.layout.sections.contains(s))
+                        .collect();
+                    if hidden.is_empty() {
+                        ui.weak("Drag a section here to hide it");
+                    }
+                    for section in hidden {
+                        ui.horizontal(|ui| {
+                            ui.dnd_drag_source(
+                                egui::Id::new(("home_section_drag", section)),
+                                section,
+                                |ui| {
+                                    ui.label(section.label());
+                                },
+                            );
+                            let show = ui.button("Show");
+                            button_info(&show, &format!("Show {}", section.label()));
+                            if show.clicked() {
+                                home.layout.move_to(section, home.layout.sections.len());
+                            }
+                        });
+                    }
+                },
+            );
+            if let Some(section) = dropped {
+                home.layout.hide(*section);
+            }
+            ui.add_space(8.);
+            ui.weak("Keep at least one section visible.");
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Restore Default").clicked() {
+                    home.layout = HomeLayout::default();
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Done").clicked() {
+                        ui.close();
+                    }
+                });
+            });
+            if let Some(error) = &home.layout_error {
+                ui.colored_label(theme::danger(), error);
+            }
+        });
+    if before != home.layout {
+        home.layout_error = preferences::save(&home.root, "home-layout.json", &home.layout)
+            .err()
+            .map(|e| format!("Could not save Home layout: {e}"));
+    }
+}
 fn home_heading(ui: &mut egui::Ui) {
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 2.;
         ui.label(
             RichText::new("Home")
-                .font(home_font(ui, 28., true))
+                .font(home_font(ui, 32., true))
                 .color(theme::ink()),
         );
         ui.label(
@@ -552,21 +784,22 @@ pub(super) fn dashed_outline(painter: &egui::Painter, rect: Rect, r: f32, stroke
     border.push(border[0]);
     painter.extend(egui::Shape::dashed_line(&border, stroke, 9., 7.));
 }
-/// A compact drop strip that uses the selected interface accent.
+/// A prominent, centered file drop target.
 fn open_banner(ui: &mut egui::Ui) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(vec2(ui.available_width(), 104.), egui::Sense::click());
+        ui.allocate_exact_size(vec2(ui.available_width(), 200.), egui::Sense::click());
     button_info(&response, "Open Files");
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        painter.rect_filled(rect, 14, theme::accent_soft());
+        let active = response.hovered() || ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+        painter.rect_filled(rect, 22, theme::accent_soft());
         dashed_outline(
             painter,
-            rect.shrink(6.),
-            9.,
+            rect.shrink(8.),
+            16.,
             Stroke::new(
-                1.,
-                if response.hovered() {
+                if active { 2. } else { 1. },
+                if active {
                     theme::accent()
                 } else {
                     theme::accent_line()
@@ -576,50 +809,57 @@ fn open_banner(ui: &mut egui::Ui) -> egui::Response {
         if response.has_focus() {
             painter.rect_stroke(
                 rect,
-                14,
+                22,
                 Stroke::new(2.5, theme::accent()),
                 egui::StrokeKind::Inside,
             );
         }
-        let tile = Rect::from_center_size(pos2(rect.left() + 46., rect.center().y), vec2(44., 44.));
+        let center = rect.center_top() + vec2(0., 55.);
+        for offset in [-20., 20., 0.] {
+            let page = Rect::from_center_size(
+                center + vec2(offset, if offset == 0. { -4. } else { 4. }),
+                vec2(39., 50.),
+            );
+            ui::shadow(painter, page, 4, 1);
+            painter.rect(
+                page,
+                5,
+                theme::surface(),
+                Stroke::new(1., theme::accent_line()),
+                egui::StrokeKind::Inside,
+            );
+            if offset == 0. {
+                ui::draw_icon(painter, page.shrink(9.), Icon::Document, theme::accent());
+            }
+        }
+        let button = Rect::from_center_size(rect.center_top() + vec2(0., 121.), vec2(142., 38.));
         painter.rect_filled(
-            tile,
-            10,
-            if response.hovered() {
+            button,
+            19,
+            if active {
                 theme::accent_hover()
             } else {
                 theme::accent()
             },
         );
-        ui::draw_icon(painter, tile.shrink(11.), Icon::Open, theme::on_accent());
-        let left = rect.left() + 82.;
         painter.text(
-            pos2(left, rect.center().y - 12.),
-            egui::Align2::LEFT_CENTER,
+            button.center(),
+            egui::Align2::CENTER_CENTER,
             "Open Files",
-            ui::strong(ui, 18.),
-            theme::ink(),
+            ui::strong(ui, 16.),
+            theme::on_accent(),
         );
-        let hint = if rect.width() >= 480. {
-            "or drop PDFs, images and documents"
-        } else {
-            "or drop files here"
-        };
         painter.text(
-            pos2(left, rect.center().y + 14.),
-            egui::Align2::LEFT_CENTER,
-            hint,
-            home_font(ui, 12.5, false),
+            rect.center_top() + vec2(0., 163.),
+            egui::Align2::CENTER_CENTER,
+            if rect.width() > 380. {
+                "or drop PDFs, images and documents here"
+            } else {
+                "or drop files here"
+            },
+            home_font(ui, 13., false),
             theme::muted(),
         );
-        if rect.width() >= 480. {
-            ui::draw_icon(
-                painter,
-                Rect::from_center_size(pos2(rect.right() - 32., rect.center().y), vec2(18., 18.)),
-                Icon::Right,
-                theme::accent(),
-            );
-        }
     }
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
@@ -693,7 +933,7 @@ fn card(painter: &egui::Painter, rect: Rect, hovered: bool, focused: bool) {
     painter.rect(
         rect,
         16,
-        theme::surface(),
+        theme::home_card(),
         Stroke::new(
             1.,
             if hovered {
@@ -720,15 +960,15 @@ fn tool_card(
     detail: &str,
     width: f32,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(width, 98.), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 120.), egui::Sense::click());
     button_info(&response, label);
     if ui.is_rect_visible(rect) {
         card(ui.painter(), rect, response.hovered(), response.has_focus());
-        let tile = Rect::from_center_size(rect.center_top() + vec2(0., 27.), vec2(32., 32.));
+        let tile = Rect::from_center_size(rect.center_top() + vec2(0., 34.), vec2(42., 42.));
         ui.painter().rect_filled(tile, 8, theme::accent_soft());
-        ui::draw_icon(ui.painter(), tile.shrink(7.), icon, theme::accent());
+        ui::draw_icon(ui.painter(), tile.shrink(9.), icon, theme::accent());
         ui.painter().text(
-            rect.center_top() + vec2(0., 60.),
+            rect.center_top() + vec2(0., 78.),
             egui::Align2::CENTER_CENTER,
             label,
             ui::strong(ui, 13.),
@@ -742,7 +982,7 @@ fn tool_card(
         job.wrap = egui::text::TextWrapping::truncate_at_width((width - 16.).max(1.));
         let text = ui.fonts_mut(|fonts| fonts.layout_job(job));
         ui.painter().galley(
-            pos2(rect.center().x - text.size().x / 2., rect.top() + 76.),
+            pos2(rect.center().x - text.size().x / 2., rect.top() + 95.),
             text,
             theme::muted(),
         );
@@ -1006,6 +1246,104 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+    fn home_control(app: &mut Viewer, ctx: &egui::Context, label: &str) -> egui::Pos2 {
+        frame(app, ctx, 1200., vec![]);
+        let nodes = frame(app, ctx, 1200., vec![])
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes;
+        let r = nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some(label) || n.value() == Some(label))
+            .unwrap_or_else(|| panic!("Missing {label}"))
+            .1
+            .bounds()
+            .unwrap();
+        pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32)
+    }
+    fn home_click(app: &mut Viewer, ctx: &egui::Context, label: &str) {
+        let pos = home_control(app, ctx, label);
+        for pressed in [true, false] {
+            frame(
+                app,
+                ctx,
+                1200.,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+    }
+    #[test]
+    fn customize_reorders_hides_restores_and_persists_without_changing_documents() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        home_click(&mut app, &ctx, "Customize");
+        home_click(&mut app, &ctx, "Move Tools up");
+        assert_eq!(app.home.layout.sections[0], Section::Tools);
+        home_click(&mut app, &ctx, "Hide Drop Area");
+        assert!(!app.home.layout.sections.contains(&Section::Drop));
+        let saved: HomeLayout = preferences::load(&app.home.root, "home-layout.json").unwrap();
+        assert_eq!(saved, app.home.layout);
+        home_click(&mut app, &ctx, "Show Drop Area");
+        assert_eq!(app.home.layout.sections.last(), Some(&Section::Drop));
+        // Drag the last section to the first, using the actual popup hit targets.
+        let from = home_control(&mut app, &ctx, "Drop Area");
+        let to = home_control(&mut app, &ctx, "Tools");
+        frame(
+            &mut app,
+            &ctx,
+            1200.,
+            vec![
+                egui::Event::PointerMoved(from),
+                egui::Event::PointerButton {
+                    pos: from,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        for _ in 0..2 {
+            frame(&mut app, &ctx, 1200., vec![egui::Event::PointerMoved(to)]);
+        }
+        frame(
+            &mut app,
+            &ctx,
+            1200.,
+            vec![egui::Event::PointerButton {
+                pos: to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(app.home.layout.sections[0], Section::Drop);
+        for label in ["Hide Tools", "Hide Recents", "Hide Favorites"] {
+            home_click(&mut app, &ctx, label);
+        }
+        home_click(&mut app, &ctx, "Hide Drop Area");
+        assert_eq!(
+            app.home.layout.sections,
+            vec![Section::Drop],
+            "The last section must stay visible"
+        );
+        home_click(&mut app, &ctx, "Restore Default");
+        assert_eq!(app.home.layout, HomeLayout::default());
+        assert_eq!(
+            preferences::load::<HomeLayout>(&app.home.root, "home-layout.json").unwrap(),
+            HomeLayout::default()
+        );
+        assert!(app.tabs.is_empty());
+    }
     #[test]
     fn settings_opens_without_a_document() {
         let ctx = egui::Context::default();
@@ -1094,7 +1432,7 @@ mod tests {
         }
     }
     #[test]
-    fn home_recents_show_resume_before_tools_with_readable_names_and_optional_touch_targets() {
+    fn home_default_hierarchy_has_tools_before_recents_with_readable_names_and_touch_targets() {
         use egui::accesskit::{NodeId, Role};
 
         for preview_portable_menu in [false, true] {
@@ -1197,14 +1535,14 @@ mod tests {
                     let tools = bounds("Edit PDF", Role::Button);
                     let filename = bounds(name, Role::Label);
                     let favorite = bounds(&format!("Add to Favorites: {name}"), Role::Button);
-                    assert_eq!(banner.y1 - banner.y0, 104., "Banner {banner:?}: {case}");
+                    assert_eq!(banner.y1 - banner.y0, 200., "Banner {banner:?}: {case}");
                     assert!(
-                        recent.y0 > banner.y1 && recent.y1 < tools.y0,
-                        "Recents should be visible before quick tools: {case}; banner={banner:?}, recent={recent:?}, tools={tools:?}"
+                        tools.y0 > banner.y1 && recent.y0 > tools.y1,
+                        "Quick tools should precede recents: {case}; banner={banner:?}, recent={recent:?}, tools={tools:?}"
                     );
                     assert!(
-                        resume.y0 >= recent.y1 && resume.y1 < tools.y0,
-                        "Resume label must follow its card before tools: {case}; recent={recent:?}, resume={resume:?}, tools={tools:?}"
+                        resume.y0 >= recent.y1,
+                        "Resume label must follow its card: {case}; recent={recent:?}, resume={resume:?}, tools={tools:?}"
                     );
                     assert!(
                         filename.y1 - filename.y0 >= 24.,

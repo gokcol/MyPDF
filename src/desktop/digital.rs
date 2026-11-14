@@ -16,6 +16,7 @@ use manager::{Look, ManagerState, SavedSignature};
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Panel {
     Interface,
+    Touch,
     Styles,
     Signatures,
     Ink,
@@ -1385,31 +1386,63 @@ impl Viewer {
             let previous_panel = self.digital.panel;
             if !docked {
                 if settings {
+                    if ctx.content_rect().height() >= 700. {
+                        ui.horizontal(|ui| {
+                            let (rect, _) =
+                                ui.allocate_exact_size(vec2(42., 42.), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 12, theme::accent_soft());
+                            ui::draw_icon(
+                                ui.painter(),
+                                rect.shrink(10.),
+                                Icon::Settings,
+                                theme::accent(),
+                            );
+                            ui.add_space(4.);
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new("Make MyPDF yours").font(ui::bold(ui, 22.)));
+                                ui.label(
+                                    RichText::new(
+                                        "Your workspace, signatures, and favorite styles.",
+                                    )
+                                    .color(theme::muted()),
+                                );
+                            });
+                        });
+                        ui.add_space(12.);
+                    }
                     let remembered = egui::Id::new("settings_signature_tab");
-                    if !matches!(self.digital.panel, Panel::Interface | Panel::Styles) {
+                    if !matches!(
+                        self.digital.panel,
+                        Panel::Interface | Panel::Styles | Panel::Touch
+                    ) {
                         ui.ctx()
                             .data_mut(|d| d.insert_temp(remembered, self.digital.panel));
                     }
                     let section = match self.digital.panel {
                         Panel::Interface => 1,
-                        Panel::Styles => 2,
+                        Panel::Touch => 2,
+                        Panel::Styles => 3,
                         _ => 0,
                     };
                     if let Some(i) = ui::segmented(
                         ui,
-                        &["Signatures", "Appearance", "Reusable styles"],
+                        &["Signatures", "Appearance", "Touch", "Reusable styles"],
                         section,
                     ) {
                         self.digital.panel = match i {
                             1 => Panel::Interface,
-                            2 => Panel::Styles,
+                            2 => Panel::Touch,
+                            3 => Panel::Styles,
                             _ => ui
                                 .ctx()
                                 .data(|d| d.get_temp::<Panel>(remembered))
                                 .unwrap_or(Panel::Ink),
                         };
                     }
-                    if !matches!(self.digital.panel, Panel::Interface | Panel::Styles) {
+                    if !matches!(
+                        self.digital.panel,
+                        Panel::Interface | Panel::Styles | Panel::Touch
+                    ) {
                         let panels = [
                             (Panel::Ink, "Ink signatures"),
                             (Panel::Signatures, "Digital signatures"),
@@ -1443,65 +1476,85 @@ impl Viewer {
                 self.digital.pinned_preview(ui, &assets, docked);
             }
             let preview_height = ui.cursor().top() - preview_top;
-            ui::dialog_body(
-                ui,
-                "digital_manager_body",
-                if docked {
-                    (ui.available_height() - 105.).max(80.)
-                } else {
-                    (ctx.content_rect().height()
-                        - 240.
-                        - preview_height
-                        - if settings
-                            && !matches!(self.digital.panel, Panel::Interface | Panel::Styles)
-                        {
-                            40.
-                        } else {
-                            0.
-                        })
-                    .clamp(80., 560.)
-                },
-                |ui| {
-                    #[cfg(test)]
-                    ui.ctx().data_mut(|data| {
-                        data.insert_temp(
-                            egui::Id::new("digital_manager_geometry"),
-                            (ui.clip_rect(), ui.min_rect().top()),
+            let body_height = if docked {
+                (ui.available_height() - 105.).max(80.)
+            } else {
+                (ctx.content_rect().height()
+                    - if settings && ctx.content_rect().height() >= 700. {
+                        390.
+                    } else {
+                        240.
+                    }
+                    - preview_height
+                    - if settings
+                        && !matches!(
+                            self.digital.panel,
+                            Panel::Interface | Panel::Styles | Panel::Touch
                         )
-                    });
-                    if self.digital.busy {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(
-                                RichText::new("Working… Your files are not changed.")
-                                    .color(theme::muted()),
-                            );
-                        });
-                    }
-                    for error in [&self.digital.error, &self.digital.catalogue_error]
-                        .into_iter()
-                        .flatten()
                     {
-                        ui::callout(ui, ui::Tone::Danger, error);
-                    }
-                    if !self.digital.message.is_empty() {
-                        ui::callout(ui, ui::Tone::Success, &self.digital.message);
-                    }
-                    if self.digital.scanning {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(
-                                RichText::new("Looking for digital IDs, cards and tokens…")
-                                    .color(theme::muted()),
-                            );
-                        });
-                    }
-                    if let Some(error) = &self.digital.store_error {
-                        ui::callout(ui, ui::Tone::Danger, error);
-                    }
-                    ui.add_enabled_ui(!self.digital.busy, |ui| match self.digital.panel {
-                    Panel::Interface => ui::appearance_settings(ui),
+                        40.
+                    } else {
+                        0.
+                    })
+                .clamp(80., 560.)
+            };
+            let body_height = body_height.min((ctx.content_rect().height() - 240.).max(80.));
+            egui::ScrollArea::vertical()
+                .id_salt("digital_manager_body")
+                .max_height(body_height)
+                .min_scrolled_height(if settings { body_height } else { 64. })
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                ui.spacing_mut().interact_size.y = ui::target_size(28.);
+                ui.spacing_mut().button_padding.y = 5.;
+                if settings {
+                    ui.set_min_height(body_height);
+                }
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new("digital_manager_geometry"),
+                        (ui.clip_rect(), ui.min_rect().top()),
+                    )
+                });
+                if self.digital.busy {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("Working… Your files are not changed.")
+                                .color(theme::muted()),
+                        );
+                    });
+                }
+                for error in [&self.digital.error, &self.digital.catalogue_error]
+                    .into_iter()
+                    .flatten()
+                {
+                    ui::callout(ui, ui::Tone::Danger, error);
+                }
+                if !self.digital.message.is_empty() {
+                    ui::callout(ui, ui::Tone::Success, &self.digital.message);
+                }
+                if self.digital.scanning {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("Looking for digital IDs, cards and tokens…")
+                                .color(theme::muted()),
+                        );
+                    });
+                }
+                if let Some(error) = &self.digital.store_error {
+                    ui::callout(ui, ui::Tone::Danger, error);
+                }
+                ui.add_enabled_ui(!self.digital.busy, |ui| match self.digital.panel {
+                    Panel::Interface => {
+                        ui::appearance_settings(ui);
+                        ui.add_space(8.);
+                        if ui.add(ActionButton::new(Icon::Redo, "App updates & What's New…")).clicked() { self.updates.show(false); }
+                    },
                     Panel::Styles => styles::settings(ui),
+                    Panel::Touch => touch_tools::settings(ui),
                     Panel::Ink => {
                         self.sign_tools.placement_settings(ui, true);
                         ink_place = self.digital.ink_panel(ui, &mut self.editor, &assets, active.is_some_and(|t| t.session.as_ref().is_some_and(|s| s.editable)));
@@ -2117,53 +2170,61 @@ impl Viewer {
                         }
                     }
                 });
-                },
-            );
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                if !settings
-                    && ui
-                        .add(ActionButton::new(Icon::Settings, "Signature Settings…").compact())
-                        .clicked()
-                {
-                    self.digital.manager.selected = self.digital.manager.sign_with.clone();
-                    self.digital.panel = Panel::Signatures;
-                }
-                if docked && settings && ui.button("Back to signing").clicked() {
-                    self.digital.save_if_dirty();
-                    if let Some(id) = self.digital.manager.selected.clone() {
-                        self.digital.use_signature(&id);
-                    }
-                    self.digital.panel = Panel::Sign;
-                }
-                match self.digital.panel {
-                    Panel::Sign
-                        if ui
-                            .add_enabled(
-                                !self.digital.busy && can_sign,
-                                ActionButton::new(Icon::Sign, "Sign and save a copy…").primary(),
-                            )
-                            .clicked() =>
-                    {
-                        action = Some(Action::Sign)
-                    }
-                    Panel::Signatures => self.digital.signature_actions(ui),
-                    Panel::Validate
-                        if ui
-                            .add_enabled(
-                                !self.digital.busy && active.is_some_and(|t| t.bytes.is_some()),
-                                ActionButton::new(Icon::Shield, "Validate signatures").primary(),
-                            )
-                            .clicked() =>
-                    {
-                        action = Some(Action::Verify)
-                    }
-                    _ => {}
-                }
-                close = ui
-                    .add_enabled(!self.digital.busy, ActionButton::new(Icon::Close, "Close"))
-                    .clicked();
             });
+            if !settings || docked || self.digital.panel == Panel::Signatures {
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    if !settings
+                        && ui
+                            .add(ActionButton::new(Icon::Settings, "Signature Settings…").compact())
+                            .clicked()
+                    {
+                        self.digital.manager.selected = self.digital.manager.sign_with.clone();
+                        self.digital.panel = Panel::Signatures;
+                    }
+                    if docked && settings && ui.button("Back to signing").clicked() {
+                        self.digital.save_if_dirty();
+                        if let Some(id) = self.digital.manager.selected.clone() {
+                            self.digital.use_signature(&id);
+                        }
+                        self.digital.panel = Panel::Sign;
+                    }
+                    match self.digital.panel {
+                        Panel::Sign
+                            if ui
+                                .add_enabled(
+                                    !self.digital.busy && can_sign,
+                                    ActionButton::new(Icon::Sign, "Sign and save a copy…")
+                                        .primary(),
+                                )
+                                .clicked() =>
+                        {
+                            action = Some(Action::Sign)
+                        }
+                        Panel::Signatures => self.digital.signature_actions(ui),
+                        Panel::Validate
+                            if ui
+                                .add_enabled(
+                                    !self.digital.busy && active.is_some_and(|t| t.bytes.is_some()),
+                                    ActionButton::new(Icon::Shield, "Validate signatures")
+                                        .primary(),
+                                )
+                                .clicked() =>
+                        {
+                            action = Some(Action::Verify)
+                        }
+                        _ => {}
+                    }
+                    if !settings || docked {
+                        close = ui
+                            .add_enabled(
+                                !self.digital.busy,
+                                ActionButton::new(Icon::Close, "Close"),
+                            )
+                            .clicked();
+                    }
+                });
+            }
         };
         if docked {
             let max_width = (ctx.content_rect().width() * 0.48).clamp(390., 620.);
@@ -2181,7 +2242,7 @@ impl Viewer {
                     body(ui);
                 });
         } else {
-            egui::Window::new(if settings {
+            let window = egui::Window::new(if settings {
                 "Settings"
             } else {
                 "Digital Signature"
@@ -2190,9 +2251,21 @@ impl Viewer {
             .open(&mut open)
             .collapsible(false)
             .resizable([true, false])
-            .default_width(ui::dialog_width(ctx, 640.))
-            .max_width(ui::dialog_width(ctx, 900.))
-            .show(ctx, body);
+            .default_width(ui::dialog_width(ctx, if settings { 720. } else { 640. }))
+            .frame(
+                ui::modal_frame().inner_margin(if ctx.content_rect().height() >= 700. {
+                    20
+                } else {
+                    12
+                }),
+            )
+            .max_width(ui::dialog_width(ctx, 900.));
+            let window = if settings {
+                window.anchor(egui::Align2::CENTER_CENTER, vec2(0., 0.))
+            } else {
+                window
+            };
+            window.show(ctx, body);
         }
         open &= !close;
         if !open {
@@ -4489,6 +4562,19 @@ mod tests {
                 .iter()
                 .any(|(_, n)| n.label() == Some("Ink signatures"))
         );
+        let original_style = theme::style();
+        for style in theme::Style::ALL {
+            click(&mut app, style.name());
+            assert_eq!(theme::style(), style);
+        }
+        click(&mut app, original_style.name());
+        let original_icons = theme::icon_style();
+        for icons in theme::IconStyle::ALL {
+            click(&mut app, icons.name());
+            assert_eq!(theme::icon_style(), icons);
+            assert_eq!(theme::style(), original_style);
+        }
+        click(&mut app, original_icons.name());
         click(&mut app, "Reusable styles");
         assert!(app.digital.panel == Panel::Styles);
         let output = frame(&mut app, vec![]);
@@ -4558,7 +4644,7 @@ mod tests {
             let pinned = ctx
                 .data(|d| d.get_temp::<Rect>(egui::Id::new("signature_pinned_preview_rect")))
                 .unwrap();
-            let close = bounds(&output, "Close");
+            let close = bounds(&output, "Duplicate");
             let (viewport, content_top) = ctx
                 .data(|d| d.get_temp::<(Rect, f32)>(egui::Id::new("digital_manager_geometry")))
                 .unwrap();
@@ -4582,7 +4668,7 @@ mod tests {
                     .unwrap(),
                 pinned
             );
-            assert_eq!(bounds(&output, "Close"), close);
+            assert_eq!(bounds(&output, "Duplicate"), close);
             assert!(
                 ctx.data(|d| d.get_temp::<(Rect, f32)>(egui::Id::new("digital_manager_geometry")))
                     .unwrap()

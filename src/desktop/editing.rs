@@ -381,6 +381,7 @@ struct Gesture {
     page: usize,
     start: [f32; 2],
     points: Vec<[f32; 2]>,
+    finger: bool,
     original: Option<Annotation>,
     /// The corner being dragged (top-left, top-right, bottom-right, bottom-left).
     resize: Option<usize>,
@@ -453,7 +454,10 @@ pub(super) fn corner_at(a: &Annotation, p: [f32; 2], scale: f32) -> Option<usize
     let b = a.bounds();
     [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]]
         .iter()
-        .position(|c| (p[0] - c[0]).abs() < 12.0 / scale && (p[1] - c[1]).abs() < 12.0 / scale)
+        .position(|c| {
+            (p[0] - c[0]).abs() < theme::handle_hit_radius(12.) / scale
+                && (p[1] - c[1]).abs() < theme::handle_hit_radius(12.) / scale
+        })
 }
 
 /// Artwork keeps its proportions when resized; shapes do with Shift.
@@ -1100,8 +1104,20 @@ fn annotation_ribbon_layout(ui: &egui::Ui, available: f32) -> (AnnotationLabels,
         let more = ActionButton::new(Icon::More, "More").dropdown().width(ui);
         let stamps =
             ribbon_action(Icon::Stamp, "Stamps", labels != AnnotationLabels::Icons).width(ui);
-        // Nine controls and three separators, with one gap between each item.
-        tools + more + stamps + 3. * 6. + 11. * gap
+        // Include the touch settings button and its separator before Select.
+        let touch = ActionButton::new(Icon::Touch, "Touch settings")
+            .compact()
+            .width(ui);
+        tools
+            + more
+            + stamps
+            + 3. * 6.
+            + 11. * gap
+            + if touch_tools::controls_available(ui.ctx()) {
+                touch + 6. + 2. * gap
+            } else {
+                0.
+            }
     };
     for labels in [AnnotationLabels::Full, AnnotationLabels::Essential] {
         let measured = width(labels);
@@ -1552,11 +1568,42 @@ pub(super) fn page_interaction(
         }
         return;
     }
-    let response = ui.interact(
+    let mut response = ui.interact(
         page_rect,
         egui::Id::new((tab.id, page, "page_actions")),
         egui::Sense::click_and_drag(),
     );
+    // A fitted image reaches the sheet edge, so its visible handles extend
+    // onto the canvas. Give those handles their own hit areas; the rest of the
+    // surrounding canvas must remain available for navigation and deselection.
+    if editable
+        && matches!(editor.mode, Mode::Draw | Mode::Annotate)
+        && editor.tool == Tool::Select
+        && !editor.hide_guides
+        && let Some(a) = tab.session.as_ref().and_then(|s| {
+            s.annotations.iter().find(|a| {
+                Some(&a.id) == tab.selected_annotation.as_ref()
+                    && a.page == page
+                    && !a.object.locked
+                    && !a.object.hidden
+            })
+        })
+    {
+        let b = a.bounds();
+        let mut handles = vec![[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]];
+        handles.extend(manipulation::rotation_handle(a, scale));
+        if let Some(points) = manipulation::endpoints(a) {
+            handles.extend(points);
+        }
+        for (index, p) in handles.into_iter().enumerate() {
+            let center = page_rect.min + vec2(p[0], p[1]) * scale;
+            response = response.union(ui.interact(
+                Rect::from_center_size(center, vec2(24., 24.)),
+                egui::Id::new((tab.id, page, "annotation_handle", index)),
+                egui::Sense::click_and_drag(),
+            ));
+        }
+    }
     if editor.tool == Tool::Eraser && matches!(editor.mode, Mode::Draw | Mode::Annotate) {
         pen_tools::overlay(
             &mut editor.eraser,
@@ -1601,8 +1648,14 @@ pub(super) fn page_interaction(
         );
     }
     let page_size = tab.pages[page];
+    let manipulating = editor.tool == Tool::Select;
     let normal = |p: egui::Pos2| {
         let p = (p - page_rect.min) / scale;
+        if manipulating {
+            // Manipulation may start at a handle outside the sheet. Clamping
+            // here changes the pivot and makes edge rotation/resizing jump.
+            return [p.x, p.y];
+        }
         [
             p.x.clamp(0.0, page_size.width),
             p.y.clamp(0.0, page_size.height),
@@ -1786,7 +1839,7 @@ pub(super) fn page_interaction(
         && (response.is_pointer_button_down_on()
             || response.drag_started()
             || response.drag_stopped()
-            || first_press.is_some_and(|p| page_rect.contains(p) && response.contains_pointer()))
+            || first_press.is_some() && response.contains_pointer())
         && (first_press.is_some()
             || editor
                 .pressed
@@ -1920,6 +1973,12 @@ pub(super) fn page_interaction(
                 page,
                 start: p,
                 points: vec![p],
+                finger: ctx.input(|i| {
+                    i.any_touches()
+                        || i.events
+                            .iter()
+                            .any(|e| matches!(e, egui::Event::Touch { .. }))
+                }),
                 original,
                 rotate: rotating,
                 resize,
@@ -2020,8 +2079,13 @@ pub(super) fn page_interaction(
                 }
                 next
             } else {
+                let points = if gesture.finger && editor.tool == Tool::Pen {
+                    std::borrow::Cow::Owned(touch_tools::smooth_stroke(ctx, &gesture.points))
+                } else {
+                    std::borrow::Cow::Borrowed(&gesture.points)
+                };
                 let r = if editor.tool == Tool::Pen {
-                    let b = ann::bounds(&gesture.points);
+                    let b = ann::bounds(&points);
                     [b[0], b[1], (b[2]).max(b[0] + 2.0), (b[3]).max(b[1] + 2.0)]
                 } else {
                     [
@@ -2035,7 +2099,7 @@ pub(super) fn page_interaction(
                             .max(gesture.start[1].min(p[1]) + 2.0),
                     ]
                 };
-                editor.base_annotation(tab, page, r, gesture.start, p, &gesture.points)
+                editor.base_annotation(tab, page, r, gesture.start, p, &points)
             };
             if editor.tool == Tool::SignArea {
                 preview.style.color = [0.16, 0.41, 0.96];
@@ -2139,6 +2203,9 @@ pub(super) fn page_interaction(
         paint_annotation_on_page(editor, ctx, &painter, page_rect, scale, &copy);
     }
     selection::guides(editor, tab.id, page).paint(&painter, page_rect, scale);
+    // Artwork is clipped to the PDF sheet; editing controls belong to the
+    // surrounding canvas and must remain fully visible at page edges.
+    let painter = ui.painter().clone();
     // The outline and handle must follow the same preview as the artwork in
     // this frame, including a drag that picks up a different selected object.
     let single = editor
@@ -2159,8 +2226,12 @@ pub(super) fn page_interaction(
         {
             for point in points {
                 let p = page_rect.min + vec2(point[0], point[1]) * scale;
-                painter.circle_filled(p, 5., Color32::WHITE);
-                painter.circle_stroke(p, 5., Stroke::new(1.8, theme::accent()));
+                painter.circle_filled(p, theme::handle_radius(5.), Color32::WHITE);
+                painter.circle_stroke(
+                    p,
+                    theme::handle_radius(5.),
+                    Stroke::new(1.8, theme::accent()),
+                );
             }
         }
         if !a.object.locked
@@ -2178,7 +2249,7 @@ pub(super) fn page_interaction(
                     Stroke::new(1., theme::accent()),
                 );
             }
-            painter.circle_filled(h, 7., theme::paper());
+            painter.circle_filled(h, theme::handle_radius(7.), theme::paper());
             ui::draw_icon(
                 &painter,
                 Rect::from_center_size(h, vec2(13., 13.)),
@@ -2214,8 +2285,12 @@ pub(super) fn page_interaction(
                 frame.right_bottom(),
                 frame.left_bottom(),
             ] {
-                painter.circle_filled(c, 4.5, Color32::WHITE);
-                painter.circle_stroke(c, 4.5, Stroke::new(1.5, theme::accent()));
+                painter.circle_filled(c, theme::handle_radius(4.5), Color32::WHITE);
+                painter.circle_stroke(
+                    c,
+                    theme::handle_radius(4.5),
+                    Stroke::new(1.5, theme::accent()),
+                );
             }
         }
     }
@@ -2674,7 +2749,7 @@ impl Viewer {
         }
     }
     /// Ribbon clicks toggle; native menu commands deliberately keep arming.
-    fn toggle_editor_tool(&mut self, ctx: &egui::Context, tool: Tool) {
+    pub(super) fn toggle_editor_tool(&mut self, ctx: &egui::Context, tool: Tool) {
         if !self.apply_pending_annotation() {
             return;
         }
@@ -2848,6 +2923,10 @@ impl Viewer {
                     let row = ui.horizontal(|ui| {
                         ui.add_space(inset);
                         if matches!(self.editor.mode, Mode::Annotate | Mode::Draw) {
+                            if touch_tools::controls_available(ctx) {
+                                self.touch_settings_button(ui);
+                                ui.separator();
+                            }
                             let editable = self
                                 .tabs
                                 .get(self.active)
@@ -4692,6 +4771,10 @@ impl Viewer {
             }
         } else {
             self.exit_approved = true;
+            #[cfg(target_os = "macos")]
+            if super::mac_updater::resume_installation() {
+                return;
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
@@ -4763,6 +4846,10 @@ impl Viewer {
                         }
                     } else {
                         self.exit_approved = true;
+                        #[cfg(target_os = "macos")]
+                        if super::mac_updater::resume_installation() {
+                            return;
+                        }
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }
@@ -5315,7 +5402,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         app.action("settings", &ctx);
-        for _ in 0..3 {
+        // Let the centered Settings window settle before resolving click targets.
+        for _ in 0..8 {
             test_frame(&mut app, &ctx, vec![]);
         }
         test_click(&mut app, &ctx, "New ink signature…");
@@ -5365,7 +5453,29 @@ mod tests {
         assert_eq!(&marks[0].rect[..2], &[70., 90.]);
         assert_eq!(marks[0].asset_id.as_ref(), Some(&asset.id));
         app.action("settings", &ctx);
-        for _ in 0..3 {
+        // Let the centered Settings window settle before resolving click targets.
+        for _ in 0..8 {
+            test_frame(&mut app, &ctx, vec![]);
+        }
+        // The shorter Settings window can put signature actions below the
+        // viewport; scroll the body as a user would before clicking them.
+        let viewport = ctx
+            .data(|d| d.get_temp::<(Rect, f32)>(egui::Id::new("digital_manager_geometry")))
+            .unwrap()
+            .0;
+        test_frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(viewport.center()),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0., -120.),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        for _ in 0..8 {
             test_frame(&mut app, &ctx, vec![]);
         }
         test_click(&mut app, &ctx, "Make default");
@@ -6813,8 +6923,8 @@ mod tests {
                     .collect();
                 assert_eq!(
                     buttons.len(),
-                    9,
-                    "The main annotation actions and More remain available"
+                    9 + usize::from(touch_tools::controls_available(&ctx)),
+                    "Touch settings, the annotation actions and More remain available"
                 );
                 let top = buttons[0].y0;
                 for rect in buttons {
@@ -7170,6 +7280,8 @@ mod tests {
             let buttons: Vec<_> = nodes
                 .iter()
                 .filter(|(_, n)| n.role() == egui::accesskit::Role::Button)
+                // Count creation families, excluding the separate touch-palette action.
+                .filter(|(_, n)| n.label() != Some("Touch settings"))
                 .filter_map(|(_, n)| n.bounds())
                 .collect();
             assert_eq!(buttons.len(), 10);
@@ -7337,6 +7449,8 @@ mod tests {
             let buttons: Vec<_> = nodes
                 .iter()
                 .filter(|(_, n)| n.role() == egui::accesskit::Role::Button)
+                // Count creation families, excluding the separate touch-palette action.
+                .filter(|(_, n)| n.label() != Some("Touch settings"))
                 .filter_map(|(_, n)| n.bounds())
                 .collect();
             assert_eq!(

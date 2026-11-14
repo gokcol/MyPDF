@@ -186,7 +186,12 @@ const MENUS: &[(&str, &[Entry])] = &[
     ),
     (
         "Help",
-        &[C("tool_search", "Find a Tool…"), C("about", "About MyPDF")],
+        &[
+            C("tool_search", "Find a Tool…"),
+            C("whats_new", "What's New"),
+            C("check_updates", "Check for Updates…"),
+            C("about", "About MyPDF"),
+        ],
     ),
 ];
 
@@ -287,7 +292,8 @@ fn icon(id: &str) -> Icon {
         "ocr" => Icon::Ocr,
         "templates" => Icon::Document,
         "close" | "quit" => Icon::Close,
-        "about" | "document_properties" => Icon::Info,
+        "about" | "document_properties" | "whats_new" => Icon::Info,
+        "check_updates" => Icon::Redo,
         _ => Icon::Document,
     }
 }
@@ -316,6 +322,8 @@ fn enabled(id: &str, document: bool, saving: bool) -> bool {
                 | "reopen_closed"
                 | "workspace"
                 | "settings"
+                | "whats_new"
+                | "check_updates"
                 | "quit"
                 | "home"
                 | "zen"

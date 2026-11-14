@@ -16,6 +16,8 @@ mod home;
 pub mod icon;
 mod insert_files;
 mod interface;
+#[cfg(target_os = "macos")]
+mod mac_updater;
 mod manipulation;
 mod menu;
 mod navigate;
@@ -57,9 +59,11 @@ mod theme;
 mod thumbnail_tests;
 mod thumbnails;
 mod touch_navigation;
+mod touch_tools;
 mod translation;
 mod translation_note;
 mod ui;
+mod updates;
 mod watermark;
 #[cfg(any(target_os = "windows", test))]
 mod wheel;
@@ -290,6 +294,7 @@ pub struct Viewer {
     #[cfg(target_os = "windows")]
     printing: print::State,
     about_open: bool,
+    updates: updates::State,
     /// The file name the next Save suggests.
     save_name: Option<String>,
     save_intent: save::Intent,
@@ -394,6 +399,7 @@ impl Viewer {
             #[cfg(target_os = "windows")]
             printing: print::State::new(cc),
             about_open: false,
+            updates: updates::State::new(cc),
             save_events,
             save_tx,
             close_intent: None,
@@ -750,6 +756,9 @@ impl Viewer {
             return;
         }
         if self.thumbnail_command(action, ctx) {
+            return;
+        }
+        if self.update_action(action, ctx) {
             return;
         }
         if action == "settings" {
@@ -1394,18 +1403,91 @@ impl Viewer {
         let mut file_action = None;
         let recent = recent_menu::items(self.home.recent_paths());
         if self.about_open {
-            egui::Window::new("About MyPDF")
-                .open(&mut self.about_open)
-                .collapsible(false)
-                .resizable(false)
+            let mut close = false;
+            let modal = egui::Modal::new(egui::Id::new("about_mypdf"))
+                .frame(ui::modal_frame())
                 .show(ctx, |ui| {
-                    ui.heading(concat!("MyPDF ", env!("CARGO_PKG_VERSION")));
-                    ui.label("Developed by Orhan Gökçöl");
-                    ui.label("Native PDF editor");
-                    ui.add_space(8.);
-                    ui.set_max_width(380.);
-                    ui.label(menu::ABOUT);
+                    ui.set_width(ui::dialog_width(ctx, 420.));
+                    ui::dialog_body(ui, "about_body", 440., |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(12.);
+                            let (mark, _) =
+                                ui.allocate_exact_size(vec2(80., 80.), egui::Sense::hover());
+                            ui::logo(ui.painter(), mark);
+                            ui.add_space(12.);
+                            ui.label(
+                                RichText::new("MyPDF")
+                                    .font(ui::bold(ui, 32.))
+                                    .color(theme::ink()),
+                            );
+                            ui.label(
+                                RichText::new("Native PDF editor")
+                                    .size(15.)
+                                    .color(theme::muted()),
+                            );
+                            ui.add_space(10.);
+                            egui::Frame::new()
+                                .fill(theme::accent_soft())
+                                .corner_radius(12)
+                                .inner_margin(egui::Margin::symmetric(12, 5))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(concat!(
+                                            "Version ",
+                                            env!("CARGO_PKG_VERSION")
+                                        ))
+                                        .size(12.)
+                                        .color(theme::accent()),
+                                    );
+                                });
+                            ui.add_space(16.);
+                            ui.label(
+                                RichText::new("Developed by Orhan Gökçöl")
+                                    .font(ui::strong(ui, 14.)),
+                            );
+                            ui.add_space(18.);
+                        });
+                        ui.columns(2, |columns| {
+                            columns[0].vertical_centered(|ui| {
+                                if ui
+                                    .add(ActionButton::new(Icon::Info, "What's New"))
+                                    .clicked()
+                                {
+                                    action = Some("whats_new");
+                                    close = true;
+                                }
+                            });
+                            columns[1].vertical_centered(|ui| {
+                                if ui
+                                    .add(ActionButton::new(Icon::Redo, "Check for Updates…"))
+                                    .clicked()
+                                {
+                                    action = Some("check_updates");
+                                    close = true;
+                                }
+                            });
+                        });
+                        ui.add_space(18.);
+                        ui.separator();
+                        ui.add_space(12.);
+                        ui.label(RichText::new(menu::ABOUT).size(12.).color(theme::muted()));
+                        ui.add_space(8.);
+                    });
+                    ui.add_space(10.);
+                    ui.horizontal(|ui| {
+                        ui.hyperlink_to("GitHub", "https://github.com/gokcol/MyPDF");
+                        ui.add_space(10.);
+                        ui.hyperlink_to("Support", "mailto:orhan.gokcol@hotmail.com");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            close |= ui
+                                .add(ActionButton::new(Icon::Close, "Close").primary())
+                                .clicked();
+                        });
+                    });
                 });
+            if close || modal.should_close() {
+                self.about_open = false;
+            }
         }
         #[cfg(any(not(target_os = "macos"), test))]
         if !cfg!(target_os = "macos")
@@ -1421,16 +1503,18 @@ impl Viewer {
                         .inner_margin(egui::Margin::symmetric(8, 2)),
                 )
                 .show(ctx, |ui| {
-                    file_action = portable_menu::bar(
-                        ui,
-                        !self.home.visible
-                            && self
-                                .tabs
-                                .get(self.active)
-                                .is_some_and(|t| t.bytes.is_some()),
-                        self.saving,
-                        &recent,
-                    );
+                    file_action = ui::chrome_scope(ui, |ui| {
+                        portable_menu::bar(
+                            ui,
+                            !self.home.visible
+                                && self
+                                    .tabs
+                                    .get(self.active)
+                                    .is_some_and(|t| t.bytes.is_some()),
+                            self.saving,
+                            &recent,
+                        )
+                    });
                 });
         }
         if let Some(choice) = file_action.take() {
@@ -1443,71 +1527,73 @@ impl Viewer {
                     .inner_margin(egui::Margin::symmetric(12, 6)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.;
-                    #[cfg(target_os = "macos")]
-                    ui.add_space(70.);
-                    let (mark, move_handle) =
-                        ui.allocate_exact_size(vec2(22., 22.), egui::Sense::click_and_drag());
-                    ui::logo(ui.painter(), mark);
-                    if window_drag::handle(&move_handle, |_| true) {
-                        self.tab_controls.request_window_drag();
-                    }
-                    if ui.available_width() > 960. {
-                        let move_handle = ui.add(
-                            egui::Label::new(
-                                RichText::new("MyPDF")
-                                    .font(ui::bold(ui, 14.))
-                                    .color(theme::ink()),
-                            )
-                            .selectable(false)
-                            .sense(egui::Sense::click_and_drag()),
-                        );
+                ui::chrome_scope(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.;
+                        #[cfg(target_os = "macos")]
+                        ui.add_space(70.);
+                        let (mark, move_handle) =
+                            ui.allocate_exact_size(vec2(22., 22.), egui::Sense::click_and_drag());
+                        ui::logo(ui.painter(), mark);
                         if window_drag::handle(&move_handle, |_| true) {
                             self.tab_controls.request_window_drag();
                         }
-                    }
-                    let mut home = ActionButton::new(Icon::Home, "Home")
-                        .tab()
-                        .selected(self.home.visible);
-                    if ui.available_width() < 850. {
-                        home = home.compact();
-                    }
-                    if ui
-                        .add(home)
-                        .on_hover_text(format!(
-                            "Home · {}",
-                            ui::shortcut_label(egui::KeyboardShortcut::new(
-                                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
-                                egui::Key::H
+                        if ui.available_width() > 960. {
+                            let move_handle = ui.add(
+                                egui::Label::new(
+                                    RichText::new("MyPDF")
+                                        .font(ui::bold(ui, 14.))
+                                        .color(theme::ink()),
+                                )
+                                .selectable(false)
+                                .sense(egui::Sense::click_and_drag()),
+                            );
+                            if window_drag::handle(&move_handle, |_| true) {
+                                self.tab_controls.request_window_drag();
+                            }
+                        }
+                        let mut home = ActionButton::new(Icon::Home, "Home")
+                            .tab()
+                            .selected(self.home.visible);
+                        if ui.available_width() < 850. {
+                            home = home.compact();
+                        }
+                        if ui
+                            .add(home)
+                            .on_hover_text(format!(
+                                "Home · {}",
+                                ui::shortcut_label(egui::KeyboardShortcut::new(
+                                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                                    egui::Key::H
+                                ))
                             ))
-                        ))
-                        .clicked()
-                    {
-                        action = Some("home");
-                    }
-                    self.document_tabs(ui, ctx);
-                    if ui
-                        .add(ActionButton::new(Icon::Plus, "Open PDF").compact())
-                        .clicked()
-                    {
-                        action = Some("open");
-                    }
-                    if ui
-                        .add(ActionButton::new(Icon::Settings, "Settings").compact())
-                        .on_hover_text(if cfg!(target_os = "macos") {
-                            "Settings · ⌘,"
-                        } else {
-                            "Settings · Ctrl+,"
-                        })
-                        .clicked()
-                    {
-                        action = Some("settings");
-                    }
-                    if let Some(choice) = ui::theme_menu(ui) {
-                        action = Some(choice);
-                    }
-                });
+                            .clicked()
+                        {
+                            action = Some("home");
+                        }
+                        self.document_tabs(ui, ctx);
+                        if ui
+                            .add(ActionButton::new(Icon::Plus, "Open PDF").compact())
+                            .clicked()
+                        {
+                            action = Some("open");
+                        }
+                        if ui
+                            .add(ActionButton::new(Icon::Settings, "Settings").compact())
+                            .on_hover_text(if cfg!(target_os = "macos") {
+                                "Settings · ⌘,"
+                            } else {
+                                "Settings · Ctrl+,"
+                            })
+                            .clicked()
+                        {
+                            action = Some("settings");
+                        }
+                        if let Some(choice) = ui::theme_menu(ui) {
+                            action = Some(choice);
+                        }
+                    });
+                })
             });
         if let Some(a) = action.take() {
             self.action(a, ctx);
@@ -2280,6 +2366,7 @@ impl Viewer {
                             // Panning must not trigger page links, selection,
                             // annotation handles or other overlaid tools.
                             editing::page_interaction(&mut self.editor, tab, ui, page, page_rect, scale, &mut self.status);
+                            if !self.organizer.busy { content::page_menu(&mut self.content, &mut self.editor, tab, ui, page, page_rect, scale); }
                             continue;
                         }
                         if matches!(self.editor.mode, editing::Mode::Edit|editing::Mode::Annotate) && self.table.owns_page(tab.id, page) && let Some(session) = &tab.session {
@@ -2451,6 +2538,7 @@ impl eframe::App for Viewer {
         #[cfg(target_os = "macos")]
         window_drag::configure(frame);
         theme::sync(ctx.theme());
+        touch_tools::observe(ctx);
         self.tick += 1;
         #[cfg(target_os = "macos")]
         if let Some(menu) = self._native_menu.as_mut() {
@@ -2506,6 +2594,7 @@ impl eframe::App for Viewer {
         self.editor.text_editing = false;
         self.sync_status_context();
         self.toolbar(ctx);
+        self.updates_window(ctx);
         if self.tab_controls.take_window_drag() {
             window_drag::begin(frame, ctx);
         }
@@ -2579,10 +2668,11 @@ impl eframe::App for Viewer {
                 && !translation_visible
                 && !digital_docked
             {
-                if matches!(
-                    self.editor.mode,
-                    editing::Mode::Edit | editing::Mode::Annotate
-                ) && self.table_panel(ctx)
+                if self.touch_settings_panel(ctx)
+                    || matches!(
+                        self.editor.mode,
+                        editing::Mode::Edit | editing::Mode::Annotate
+                    ) && self.table_panel(ctx)
                 {
                 } else if self.editor.mode == editing::Mode::Edit && self.redaction.active {
                     self.redaction_panel(ctx);
@@ -2629,6 +2719,7 @@ impl eframe::App for Viewer {
         self.details_dialogs(ctx);
         self.page_dialogs(ctx);
         self.digital_events(ctx);
+        self.touch_toolbar(ctx);
         self.editor_windows(ctx);
         if !digital_docked {
             self.digital_window(ctx);
@@ -3319,7 +3410,7 @@ mod tests {
             .read_response(egui::Id::new((
                 app.tabs[0].id,
                 0_usize,
-                "add_text_position",
+                "text_page_background",
             )))
             .unwrap()
             .rect;

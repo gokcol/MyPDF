@@ -3,6 +3,227 @@
 use super::*;
 use eframe::App;
 
+#[test]
+#[ignore = "Renders the finger-drawing ribbon and floating toolbar"]
+fn touch_tools_preview() {
+    let root = PathBuf::from(std::env::var_os("MYPDF_PREVIEW_DIR").expect("Set MYPDF_PREVIEW_DIR"));
+    std::fs::create_dir_all(&root).unwrap();
+    let ctx = egui::Context::default();
+    let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+    ctx.set_theme(egui::ThemePreference::Light);
+    app.open_memory(
+        PathBuf::from("Drawing.pdf"),
+        mypdf_milestone0::convert::blank(595., 842.).unwrap(),
+        &ctx,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.tabs[0].session.is_none() {
+        app.events(&ctx);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    app.home.visible = false;
+    app.editor.mode = editing::Mode::Draw;
+    touch_tools::preview(&ctx);
+    let mut preview = Preview {
+        size: Some(vec2(1200., 960.)),
+        ..Default::default()
+    };
+    preview.settle(&mut app, &ctx);
+    for _ in 0..12 {
+        preview.capture(&mut app, &ctx);
+    }
+    let output = preview.capture(&mut app, &ctx);
+    preview.save(&ctx, output, &root.join("touch-tools.png"));
+}
+
+#[test]
+fn settings_title_close_stays_clickable_in_the_full_app() {
+    for size in [vec2(1200., 960.), vec2(720., 820.), vec2(720., 480.)] {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        app.digital.open = true;
+        app.digital.panel = digital::Panel::Interface;
+        let mut preview = Preview {
+            size: Some(size),
+            ..Default::default()
+        };
+        preview.settle(&mut app, &ctx);
+        // Font measurement, window sizing, and viewport constraints settle
+        // over several frames in the complete app.
+        for _ in 0..8 {
+            preview.capture(&mut app, &ctx);
+        }
+        let output = preview.capture(&mut app, &ctx);
+        let r = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|(_, n)| n.label() == Some("Close window"))
+            .unwrap()
+            .1
+            .bounds()
+            .unwrap();
+        assert!(r.y0 >= 0. && r.y1 <= f64::from(size.y), "{size:?}: {r:?}");
+        let pos = pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32);
+        for pressed in [true, false] {
+            preview.capture_with(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(!app.digital.open, "Close must work at {size:?}");
+    }
+}
+
+#[test]
+#[ignore = "Renders the Settings redesign and new visual styles"]
+fn settings_styles_preview() {
+    let root = PathBuf::from(std::env::var_os("MYPDF_PREVIEW_DIR").expect("Set MYPDF_PREVIEW_DIR"));
+    std::fs::create_dir_all(&root).unwrap();
+    for (name, style, dark, size) in [
+        ("studio", theme::Style::Studio, false, vec2(1200., 960.)),
+        (
+            "touch-settings",
+            theme::Style::Studio,
+            false,
+            vec2(1200., 960.),
+        ),
+        ("studio-dark", theme::Style::Studio, true, vec2(1200., 960.)),
+        ("sage", theme::Style::Sage, false, vec2(1200., 960.)),
+        ("sage-dark", theme::Style::Sage, true, vec2(1200., 960.)),
+        (
+            "studio-narrow",
+            theme::Style::Studio,
+            false,
+            vec2(720., 820.),
+        ),
+    ] {
+        if std::env::var("MYPDF_PREVIEW_STYLE").is_ok_and(|filter| filter != name) {
+            continue;
+        }
+        let ctx = egui::Context::default();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        ctx.set_theme(if dark {
+            egui::ThemePreference::Dark
+        } else {
+            egui::ThemePreference::Light
+        });
+        ui::set_visual_style(&ctx, style).unwrap();
+        let mut preview = Preview {
+            size: Some(size),
+            ..Default::default()
+        };
+        if name == "studio" {
+            preview.settle(&mut app, &ctx);
+            let output = preview.capture(&mut app, &ctx);
+            preview.save(&ctx, output, &root.join(format!("{name}-home.png")));
+        }
+        app.digital.open = true;
+        app.digital.panel = if name == "touch-settings" {
+            digital::Panel::Touch
+        } else {
+            digital::Panel::Interface
+        };
+        preview.settle(&mut app, &ctx);
+        for _ in 0..8 {
+            preview.capture(&mut app, &ctx);
+        }
+        let output = preview.capture(&mut app, &ctx);
+        preview.save(&ctx, output, &root.join(format!("{name}-settings.png")));
+    }
+}
+
+#[test]
+#[ignore = "Renders update windows for visual review"]
+fn update_windows_preview() {
+    let root = PathBuf::from(std::env::var_os("MYPDF_PREVIEW_DIR").expect("Set MYPDF_PREVIEW_DIR"));
+    std::fs::create_dir_all(&root).unwrap();
+    let ctx = egui::Context::default();
+    let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+    let mut preview = Preview::default();
+    app.about_open = true;
+    preview.settle(&mut app, &ctx);
+    let output = preview.capture(&mut app, &ctx);
+    preview.save(&ctx, output, &root.join("about.png"));
+    app.about_open = false;
+    app.updates.show(true);
+    preview.settle(&mut app, &ctx);
+    let output = preview.capture(&mut app, &ctx);
+    preview.save(&ctx, output, &root.join("whats-new.png"));
+    for (name, channel) in [
+        ("mac-update", mypdf_milestone0::updates::Channel::MacArm),
+        ("store-update", mypdf_milestone0::updates::Channel::Store),
+    ] {
+        app.updates.preview_available(channel);
+        preview.settle(&mut app, &ctx);
+        let output = preview.capture(&mut app, &ctx);
+        preview.save(&ctx, output, &root.join(format!("{name}.png")));
+    }
+}
+
+#[test]
+#[ignore = "Renders Home and its customization popup"]
+fn home_layout_preview() {
+    let root = PathBuf::from(std::env::var_os("MYPDF_PREVIEW_DIR").expect("Set MYPDF_PREVIEW_DIR"));
+    std::fs::create_dir_all(&root).unwrap();
+    for (name, size) in [
+        ("home", vec2(1200., 960.)),
+        ("home-narrow", vec2(720., 1000.)),
+    ] {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = Viewer::new(&eframe::CreationContext::_new_kittest(ctx.clone()), vec![]);
+        let mut preview = Preview {
+            size: Some(size),
+            ..Default::default()
+        };
+        preview.settle(&mut app, &ctx);
+        let output = preview.capture(&mut app, &ctx);
+        let nodes = output.platform_output.accesskit_update.as_ref().unwrap();
+        let r = nodes
+            .nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("Customize"))
+            .unwrap()
+            .1
+            .bounds()
+            .unwrap();
+        let pos = pos2(((r.x0 + r.x1) / 2.) as f32, ((r.y0 + r.y1) / 2.) as f32);
+        preview.save(&ctx, output, &root.join(format!("{name}.png")));
+        for pressed in [true, false] {
+            preview.capture_with(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        preview.settle(&mut app, &ctx);
+        let output = preview.capture(&mut app, &ctx);
+        preview.save(&ctx, output, &root.join(format!("{name}-customize.png")));
+    }
+}
+
 #[derive(Default)]
 struct Preview {
     textures: HashMap<egui::TextureId, egui::ColorImage>,

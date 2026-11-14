@@ -83,7 +83,8 @@ pub(super) fn rotation_handle(a: &Annotation, scale: f32) -> Option<[f32; 2]> {
     Some([(b[0] + b[2]) / 2., (b[1] - 25. / scale).max(12. / scale)])
 }
 pub(super) fn rotation_at(a: &Annotation, p: [f32; 2], scale: f32) -> bool {
-    rotation_handle(a, scale).is_some_and(|h| (p[0] - h[0]).hypot(p[1] - h[1]) * scale < 11.)
+    rotation_handle(a, scale)
+        .is_some_and(|h| (p[0] - h[0]).hypot(p[1] - h[1]) * scale < theme::handle_hit_radius(11.))
 }
 pub(super) fn rotated_drag(a: &Annotation, start: [f32; 2], p: [f32; 2], snap: bool) -> Annotation {
     let c = [(a.rect[0] + a.rect[2]) / 2., (a.rect[1] + a.rect[3]) / 2.];
@@ -115,7 +116,7 @@ pub(super) fn endpoints(a: &Annotation) -> Option<[[f32; 2]; 2]> {
 pub(super) fn endpoint_at(a: &Annotation, p: [f32; 2], scale: f32) -> Option<usize> {
     endpoints(a)?
         .iter()
-        .position(|e| (e[0] - p[0]).hypot(e[1] - p[1]) * scale < 10.)
+        .position(|e| (e[0] - p[0]).hypot(e[1] - p[1]) * scale < theme::handle_hit_radius(10.))
 }
 pub(super) fn move_endpoint(
     a: &Annotation,

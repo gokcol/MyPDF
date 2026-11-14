@@ -1,4 +1,4 @@
-//! Graphite, Glacier and Calico palettes, each with light and dark appearances. Every color is read for the theme that is active in
+//! Five visual styles, each with light and dark appearances. Every color is read for the theme that is active in
 //! the current frame, so the whole interface follows a theme change at once.
 use eframe::egui::{Color32, Theme, ThemePreference};
 use std::cell::Cell;
@@ -103,21 +103,42 @@ const fn rgb(hex: u32) -> Color32 {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum Style {
     #[default]
+    Studio,
+    Sage,
     Graphite,
     Glacier,
     Calico,
 }
 impl Style {
-    pub const ALL: [Self; 3] = [Self::Graphite, Self::Glacier, Self::Calico];
+    pub const ALL: [Self; 5] = [
+        Self::Studio,
+        Self::Sage,
+        Self::Graphite,
+        Self::Glacier,
+        Self::Calico,
+    ];
     pub fn name(self) -> &'static str {
         match self {
+            Self::Studio => "Studio",
+            Self::Sage => "Sage",
             Self::Graphite => "Graphite",
             Self::Glacier => "Glacier",
             Self::Calico => "Calico",
         }
     }
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Studio => "White & blue",
+            Self::Sage => "Calm greens",
+            Self::Graphite => "Cool neutrals",
+            Self::Glacier => "Soft teal",
+            Self::Calico => "Warm copper",
+        }
+    }
     fn key(self) -> &'static str {
         match self {
+            Self::Studio => "studio",
+            Self::Sage => "sage",
             Self::Graphite => "graphite",
             Self::Glacier => "glacier",
             Self::Calico => "calico",
@@ -125,13 +146,18 @@ impl Style {
     }
     pub fn from_key(value: &str) -> Self {
         match value {
+            "studio" => Self::Studio,
+            "sage" => Self::Sage,
+            "graphite" => Self::Graphite,
             "glacier" => Self::Glacier,
             "calico" => Self::Calico,
-            _ => Self::Graphite,
+            _ => Self::Studio,
         }
     }
     pub fn radius(self) -> u8 {
         match self {
+            Self::Studio => 12,
+            Self::Sage => 10,
             Self::Graphite => 7,
             Self::Glacier => 11,
             Self::Calico => 5,
@@ -206,9 +232,23 @@ pub(super) enum IconFamily {
     Signing,
     Document,
 }
-/// Muted tints from the approved preview. Labels retain the normal text color.
+/// Decorative icon colors; labels and semantic indicators keep their colors.
 pub(super) fn icon_color(family: IconFamily) -> Color32 {
-    let tint = match (family, is_dark()) {
+    icon_color_for(icon_style(), family)
+}
+pub(super) fn icon_color_for(style: IconStyle, family: IconFamily) -> Color32 {
+    let dark = is_dark() || CHROME.with(Cell::get);
+    if style != IconStyle::Selective {
+        return match (family, dark) {
+            (IconFamily::Editing, false) => rgb(0x0866cf),
+            (IconFamily::Editing, true) => rgb(0x89baff),
+            (IconFamily::Signing, false) => rgb(0x007b60),
+            (IconFamily::Signing, true) => rgb(0x74d5b4),
+            (IconFamily::Document, false) => rgb(0xa65e06),
+            (IconFamily::Document, true) => rgb(0xf2bd6b),
+        };
+    }
+    let tint = match (family, is_dark() || CHROME.with(Cell::get)) {
         (IconFamily::Editing, false) => rgb(0x286393),
         (IconFamily::Editing, true) => rgb(0x91b9df),
         (IconFamily::Signing, false) => rgb(0x247467),
@@ -345,9 +385,90 @@ const CALICO_DARK: Palette = Palette {
     ..DARK
 };
 
+// Studio echoes the clean white workspace and charcoal tab strip of a native
+// document app. The strip gets its own readable dark controls via chrome_scope.
+const STUDIO_LIGHT: Palette = Palette {
+    ink: rgb(0x2b2b30),
+    muted: rgb(0x66666e),
+    accent: rgb(0x0864db),
+    accent_hover: rgb(0x0054c0),
+    accent_soft: rgb(0xeaf3ff),
+    accent_line: rgb(0xb6d4ff),
+    paper: rgb(0xffffff),
+    canvas: rgb(0xe7e7eb),
+    chrome: rgb(0x18181c),
+    toolbar: rgb(0xf5f5f7),
+    surface: rgb(0xffffff),
+    line: rgb(0xe5e5e9),
+    track: rgb(0xededf0),
+    control: rgb(0xf4f4f6),
+    control_hover: rgb(0xe9e9ed),
+    ..LIGHT
+};
+const STUDIO_DARK: Palette = Palette {
+    ink: rgb(0xf1f1f5),
+    muted: rgb(0xaaaab5),
+    accent: rgb(0x94bdff),
+    accent_hover: rgb(0xb4d1ff),
+    accent_soft: rgb(0x293d5a),
+    accent_line: rgb(0x597eaf),
+    paper: rgb(0x202024),
+    canvas: rgb(0x131316),
+    chrome: rgb(0x18181c),
+    toolbar: rgb(0x25252b),
+    surface: rgb(0x2b2b32),
+    line: rgb(0x414149),
+    raised: rgb(0x41414b),
+    track: rgb(0x202025),
+    control: rgb(0x36363f),
+    control_hover: rgb(0x44444f),
+    ..DARK
+};
+const SAGE_LIGHT: Palette = Palette {
+    ink: rgb(0x293c34),
+    muted: rgb(0x5e7065),
+    accent: rgb(0x276b52),
+    accent_hover: rgb(0x1d5742),
+    accent_soft: rgb(0xe2f0e7),
+    accent_line: rgb(0xa0c9af),
+    paper: rgb(0xf7f8f3),
+    canvas: rgb(0xdfe6dd),
+    chrome: rgb(0xe4ece2),
+    toolbar: rgb(0xf3f6ef),
+    surface: rgb(0xfdfff9),
+    line: rgb(0xd5dfd2),
+    raised: rgb(0xfdfff9),
+    track: rgb(0xe5ece1),
+    control: rgb(0xeaf0e5),
+    control_hover: rgb(0xdce7d7),
+    ..LIGHT
+};
+const SAGE_DARK: Palette = Palette {
+    ink: rgb(0xe8f0e7),
+    muted: rgb(0xa7b9aa),
+    accent: rgb(0xa1d6b3),
+    accent_hover: rgb(0xbce5c9),
+    on_accent: rgb(0x1b3025),
+    accent_soft: rgb(0x304c3c),
+    accent_line: rgb(0x648f72),
+    paper: rgb(0x202b25),
+    canvas: rgb(0x141d18),
+    chrome: rgb(0x19231d),
+    toolbar: rgb(0x253129),
+    surface: rgb(0x2c3b30),
+    line: rgb(0x405345),
+    raised: rgb(0x354b3d),
+    track: rgb(0x1d2b22),
+    control: rgb(0x384e3e),
+    control_hover: rgb(0x45614d),
+    ..DARK
+};
+
 thread_local! {
-    static STYLE: Cell<Style> = const { Cell::new(Style::Graphite) };
+    static CHROME: Cell<bool> = const { Cell::new(false) };
+    static STYLE: Cell<Style> = const { Cell::new(Style::Studio) };
     static ICON_STYLE: Cell<IconStyle> = const { Cell::new(IconStyle::Selective) };
+    static TOUCH_TARGET: Cell<f32> = const { Cell::new(0.) };
     static DENSITY: Cell<Density> = const { Cell::new(Density::Compact) };
     static DARK_MODE: Cell<bool> = const { Cell::new(false) };
 }
@@ -373,8 +494,20 @@ pub(super) fn set_icon_style(style: IconStyle) {
 pub(super) fn density() -> Density {
     DENSITY.with(Cell::get)
 }
+pub(super) fn touch_target() -> f32 {
+    TOUCH_TARGET.with(Cell::get)
+}
+pub(super) fn set_touch_target(size: f32) {
+    TOUCH_TARGET.with(|v| v.set(size));
+}
+pub(super) fn handle_hit_radius(compact: f32) -> f32 {
+    compact.max(touch_target() / 2.)
+}
+pub(super) fn handle_radius(compact: f32) -> f32 {
+    compact.max(touch_target() / 6.)
+}
 pub(super) fn comfortable() -> bool {
-    density() == Density::Comfortable
+    density() == Density::Comfortable || touch_target() > 0.
 }
 pub(super) fn set_density(density: Density) {
     DENSITY.with(|value| value.set(density));
@@ -384,6 +517,10 @@ pub(super) fn palette_for(dark: bool) -> &'static Palette {
 }
 pub(super) fn palette_for_style(style: Style, dark: bool) -> &'static Palette {
     match (style, dark) {
+        (Style::Studio, false) => &STUDIO_LIGHT,
+        (Style::Studio, true) => &STUDIO_DARK,
+        (Style::Sage, false) => &SAGE_LIGHT,
+        (Style::Sage, true) => &SAGE_DARK,
         (Style::Graphite, false) => &GRAPHITE_LIGHT,
         (Style::Graphite, true) => &GRAPHITE_DARK,
         (Style::Glacier, false) => &GLACIER_LIGHT,
@@ -393,7 +530,29 @@ pub(super) fn palette_for_style(style: Style, dark: bool) -> &'static Palette {
     }
 }
 fn palette() -> &'static Palette {
-    palette_for(is_dark())
+    palette_for(is_dark() || CHROME.with(Cell::get))
+}
+
+pub(super) fn contrasting_chrome() -> bool {
+    style() == Style::Studio && !is_dark()
+}
+/// Scope custom-painted tab controls as well as egui widgets to the dark strip.
+pub(super) fn with_chrome<R>(body: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CHROME.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(CHROME.with(|c| c.replace(contrasting_chrome())));
+    body()
+}
+pub(super) fn home_card() -> Color32 {
+    if style() == Style::Studio && !is_dark() {
+        rgb(0xf6f6f7)
+    } else {
+        surface()
+    }
 }
 
 macro_rules! tokens {
@@ -441,7 +600,7 @@ fn decode(value: &serde_json::Value) -> (ThemePreference, Style) {
         value
             .get("style")
             .and_then(|t| t.as_str())
-            .unwrap_or("graphite"),
+            .unwrap_or("studio"),
     );
     (preference, style)
 }
@@ -532,6 +691,28 @@ fn save_current(key: &str, value: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn studio_chrome_uses_dark_icon_colors_and_restores_the_workspace() {
+        let previous = (style(), is_dark());
+        set_style(Style::Studio);
+        sync(Theme::Dark);
+        let dark_icon = icon_color(IconFamily::Document);
+        sync(Theme::Light);
+        let light_icon = icon_color(IconFamily::Document);
+        with_chrome(|| {
+            assert_eq!(ink(), STUDIO_DARK.ink);
+            assert_eq!(icon_color(IconFamily::Document), dark_icon);
+        });
+        assert_eq!(ink(), STUDIO_LIGHT.ink);
+        assert_eq!(icon_color(IconFamily::Document), light_icon);
+        set_style(previous.0);
+        sync(if previous.1 {
+            Theme::Dark
+        } else {
+            Theme::Light
+        });
+    }
+
     #[test]
     fn density_defaults_and_roundtrips_preserve_every_other_preference() {
         for value in [
@@ -637,11 +818,11 @@ mod tests {
         );
     }
     #[test]
-    fn old_preferences_default_to_graphite_and_independent_choices_round_trip() {
+    fn missing_preferences_default_to_studio_and_independent_choices_round_trip() {
         let root = tempfile::tempdir().unwrap();
         let initial = serde_json::json!({"theme":"dark", "future_option":42});
         super::super::preferences::save(root.path(), "interface.json", &initial).unwrap();
-        assert_eq!(decode(&initial), (ThemePreference::Dark, Style::Graphite));
+        assert_eq!(decode(&initial), (ThemePreference::Dark, Style::Studio));
         for style in Style::ALL {
             save_field(root.path(), "style", style.key()).unwrap();
             let saved =
@@ -658,7 +839,7 @@ mod tests {
         }
         assert_eq!(
             decode(&serde_json::json!({"style":"future"})),
-            (ThemePreference::System, Style::Graphite)
+            (ThemePreference::System, Style::Studio)
         );
     }
 }

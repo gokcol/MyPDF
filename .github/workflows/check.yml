@@ -20,7 +20,10 @@ jobs:
           python3 -B scripts/test-clean-build-output.py
           python3 -B scripts/test-macos-packaging.py
           python3 -B scripts/test-macos-open-with.py
+          xcrun clang -fobjc-arc -fmodules -Wall -Werror -framework AppKit native/updater/SparkleBridgeTests.m -o /tmp/mypdf-updater-tests
+          /tmp/mypdf-updater-tests
       - run: cargo fmt --all -- --check
+      - run: python scripts/test-release-notes.py
       - run: cargo clippy --locked --all-targets -- -D warnings
       # Every test file runs, so one failure does not hide the others.
       - run: cargo test --locked --no-fail-fast

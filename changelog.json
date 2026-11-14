@@ -1,0 +1,37 @@
+{
+  "unreleased": [
+    "New blank and image-created pages use A4 paper by default.",
+    "Resize individual pages using paper presets, orientation, or custom dimensions without scaling their contents.",
+    "Inserted images fit inside the page while keeping their proportions, and their edge handles remain usable.",
+    "View What's New offline and check for updates through Microsoft Store on Windows or GitHub on Mac.",
+    "A refreshed Home screen puts tools before recent documents. Customize lets you reorder or hide sections and remembers your layout.",
+    "Redesigned Settings with visual previews and two new styles: Studio, the new default, and Sage.",
+    "Draw with finger can be enabled or disabled independently of mouse input. Added long-press page menus, a floating touch toolbar, and icon-color previews in Settings.",
+    "A compact touch icon opens contextual settings for target size, long-press delay, finger-stroke smoothing, gesture hints, and the floating toolbar. Settings offers Automatic, Touch, and Mouse only modes.",
+    "Clicking existing text opens its editor even with the Text tool active. Clicking outside finishes the current edit and keeps changes; a separate click starts the next edit."
+  ],
+  "releases": [
+    {
+      "version": "2.4.2",
+      "changes": [
+        "Fixed Save and autosave rejecting text boxes that look correct on screen.",
+        "Saved text uses the editor's layout and preserves visible overflow without reducing its font size."
+      ]
+    },
+    {
+      "version": "2.4.1",
+      "changes": [
+        "Insert PDF, image, text, Markdown, SVG, DOCX, and RTF files by drag-and-drop or Insert.",
+        "Move, resize, and rotate image layers and add text above them.",
+        "Reset object rotation from the context menu."
+      ]
+    },
+    {
+      "version": "2.3.1",
+      "changes": [
+        "Windows includes offline OCR for English, Turkish, and German.",
+        "Choose pages for OCR and review or copy the recognized text."
+      ]
+    }
+  ]
+}

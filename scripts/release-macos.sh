@@ -175,6 +175,7 @@ PY
 
 # Compile Apple Silicon once and package directly into the unpublished release.
 sh scripts/bundle-macos.sh --target aarch64-apple-darwin --output "$app"
+sh scripts/sign-macos-frameworks.sh "$app" "$identity"
 codesign --force --options runtime --entitlements packaging/entitlements.plist --timestamp --sign "$identity" "$app"
 codesign --verify --strict --verbose=2 "$app"
 
@@ -200,6 +201,7 @@ if [ -n "$profile" ]; then
     spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
 fi
 (cd "$out" && shasum -a 256 "$(basename "$dmg")" >"$(basename "$dmg").sha256")
+sh scripts/macos-update-feed.sh "$dmg" "$out"
 # Archive failures stop before either existing release is renamed or removed.
 if [ -e dist/release ] && [ -e dist/rollback ]; then
     preserve_rollback_data

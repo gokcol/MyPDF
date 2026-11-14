@@ -7,6 +7,7 @@ use egui::{Event as InputEvent, TouchDeviceId, TouchId, TouchPhase, Vec2};
 pub(super) struct Frame {
     /// Suppress page actions through the end/cancel of a navigation gesture.
     pub navigating: bool,
+    pub context_menu: Option<egui::Pos2>,
     /// Disable egui's pointer drag scrolling to avoid applying the pan twice.
     pub tracking: bool,
     pub delta: Vec2,
@@ -21,6 +22,8 @@ struct Contact {
     device: TouchDeviceId,
     id: TouchId,
     origin: egui::Pos2,
+    started: f64,
+    moved: bool,
     pos: egui::Pos2,
 }
 
@@ -29,6 +32,10 @@ struct State {
     document: Option<u64>,
     contacts: Vec<Contact>,
     read: bool,
+    allow_hold: bool,
+    hold_delay: f64,
+    holding: bool,
+    finger_drawing: Option<bool>,
     dragging: bool,
     velocity: Vec2,
     last_motion: f64,
@@ -50,11 +57,13 @@ impl State {
         if self.document != Some(document) {
             *self = Self {
                 document: Some(document),
+                allow_hold: self.allow_hold,
+                hold_delay: self.hold_delay,
                 ..Default::default()
             };
         }
         let mut frame = Frame {
-            navigating: self.dragging,
+            navigating: self.dragging || self.holding,
             tracking: !self.contacts.is_empty(),
             ..Default::default()
         };
@@ -79,6 +88,7 @@ impl State {
                     if self.contacts.is_empty() {
                         self.read = read;
                         self.dragging = false;
+                        self.holding = false;
                     }
                     self.velocity = Vec2::ZERO;
                     if !self
@@ -92,6 +102,8 @@ impl State {
                             device: *device_id,
                             id: *id,
                             origin: *pos,
+                            started: time,
+                            moved: false,
                             pos: *pos,
                         });
                     }
@@ -116,7 +128,8 @@ impl State {
                         if pos.is_finite() && *phase != TouchPhase::Cancel {
                             moved |= contact.pos != *pos;
                             contact.pos = *pos;
-                            if self.read && contact.origin.distance(*pos) > 6. {
+                            contact.moved |= contact.origin.distance(*pos) > 6.;
+                            if self.read && contact.moved {
                                 self.dragging = true;
                             }
                         }
@@ -137,7 +150,25 @@ impl State {
                 _ => {}
             }
         }
-        frame.navigating |= self.dragging || cancelled && frame.tracking;
+        if self.allow_hold
+            && !self.holding
+            && !self.dragging
+            && !cancelled
+            && self.contacts.len() == 1
+            && released.is_empty()
+            && !self.contacts[0].moved
+            && time - self.contacts[0].started
+                >= if self.hold_delay > 0. {
+                    self.hold_delay
+                } else {
+                    0.55
+                }
+        {
+            self.holding = true;
+            self.velocity = Vec2::ZERO;
+            frame.context_menu = Some(self.contacts[0].pos);
+        }
+        frame.navigating |= self.dragging || self.holding || cancelled && frame.tracking;
         frame.contacts = self.contacts.len();
         frame.center = (!self.contacts.is_empty()).then(|| {
             egui::Pos2::ZERO
@@ -147,7 +178,7 @@ impl State {
                     .fold(Vec2::ZERO, |sum, c| sum + c.pos.to_vec2())
                     / self.contacts.len() as f32
         });
-        if self.dragging && !cancelled && !changed_contacts {
+        if self.dragging && !self.holding && !cancelled && !changed_contacts {
             let mut count = 0;
             for contact in &self.contacts {
                 if let Some((_, _, before)) = previous
@@ -179,6 +210,7 @@ impl State {
         }
         if self.contacts.is_empty() {
             self.dragging = false;
+            self.holding = false;
             // Holding still before release is not a flick.
             if frame.tracking && time - self.last_motion > 0.12 {
                 self.velocity = Vec2::ZERO;
@@ -223,7 +255,9 @@ pub(super) fn update(
     }
     // Other views do not call this module, so their release/cancel events
     // cannot update its contacts. Never revive a gesture after such a gap.
+    let finger_drawing = super::touch_tools::draw_with_finger(ctx);
     let reset = interrupt
+        || state.finger_drawing != Some(finger_drawing)
         || state.mode != Some(mode)
         || state.document != Some(document)
         || state.last_frame.is_some_and(|last| frame_nr > last + 1);
@@ -232,14 +266,31 @@ pub(super) fn update(
         state = State::default();
     }
     let (events, time, dt) = ctx.input(|i| (i.events.clone(), i.time, i.stable_dt));
+    state.hold_delay = super::touch_tools::hold_delay(ctx);
+    let finger_navigation = mode == editing::Mode::Draw && !finger_drawing
+        || super::touch_tools::mouse_only(ctx) && mode == editing::Mode::Annotate;
+    state.allow_hold =
+        finger_navigation || matches!(mode, editing::Mode::Read | editing::Mode::Edit);
     let (mut frame, cancelled) = state.update(
         document,
-        mode == editing::Mode::Read,
+        mode == editing::Mode::Read || finger_navigation,
         &events,
         time,
         dt,
         |pos| view.contains(pos) && ctx.layer_id_at(pos) == Some(layer),
     );
+    // Suppress even a stationary touch and its release when finger ink is off.
+    frame.navigating |= finger_navigation && frame.tracking;
+    if state.allow_hold
+        && !state.dragging
+        && !state.holding
+        && state.contacts.len() == 1
+        && !state.contacts[0].moved
+    {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+            (state.hold_delay - (time - state.contacts[0].started)).max(0.01),
+        ));
+    }
     if abandoned_contact {
         frame.navigating = true;
         frame.tracking = true;
@@ -254,6 +305,7 @@ pub(super) fn update(
     }
     frame.apply_motion = true;
     state.mode = Some(mode);
+    state.finger_drawing = Some(finger_drawing);
     state.last_frame = Some(frame_nr);
     state.frame = frame;
     ctx.data_mut(|d| d.insert_temp(state_id(), state));
@@ -268,6 +320,15 @@ pub(super) fn navigating(ctx: &egui::Context, document: u64) -> bool {
                 && state.last_frame == Some(frame_nr)
                 && state.frame.navigating
         })
+    })
+}
+
+pub(super) fn context_press(ctx: &egui::Context, document: u64) -> Option<egui::Pos2> {
+    let frame_nr = ctx.cumulative_frame_nr();
+    ctx.data(|d| {
+        d.get_temp::<State>(state_id())
+            .filter(|s| s.document == Some(document) && s.last_frame == Some(frame_nr))
+            .and_then(|s| s.frame.context_menu)
     })
 }
 
@@ -1007,6 +1068,239 @@ mod tests {
         }
     }
 
+    #[test]
+    fn touch_smoothing_changes_finger_ink_but_preserves_mouse_samples() {
+        let mut drawn = Vec::new();
+        for finger in [false, true] {
+            let (mut app, ctx, mut time) = document_fixture();
+            app.editor.mode = editing::Mode::Draw;
+            app.editor.tool = editing::Tool::Pen;
+            touch_tools::set_finger(&ctx, true);
+            touch_tools::smooth_finger_test(&ctx);
+            document_frame(&mut app, &ctx, &mut time, vec![]);
+            let start = page_origin(&app, &ctx) + vec2(180., 250.);
+            let offsets = [
+                vec2(0., 0.),
+                vec2(40., 30.),
+                vec2(80., -30.),
+                vec2(120., 30.),
+                vec2(160., 0.),
+            ];
+            for (i, offset) in offsets.into_iter().enumerate() {
+                let pos = start + offset;
+                let phase = if i == 0 {
+                    TouchPhase::Start
+                } else if i == 4 {
+                    TouchPhase::End
+                } else {
+                    TouchPhase::Move
+                };
+                let events = if finger {
+                    native_touch(1, phase, pos)
+                } else {
+                    let mut events = vec![InputEvent::PointerMoved(pos)];
+                    if i == 0 || i == 4 {
+                        events.push(pointer(pos, i == 0));
+                    }
+                    events
+                };
+                document_frame(&mut app, &ctx, &mut time, events);
+            }
+            let marks = &app.tabs[0].session.as_ref().unwrap().annotations;
+            assert_eq!(marks.len(), 1);
+            let mark = &marks[0];
+            let mypdf_milestone0::annotations::Kind::Ink { strokes } = &mark.kind else {
+                panic!("Expected ink")
+            };
+            let points: Vec<_> = strokes[0]
+                .iter()
+                .map(|p| {
+                    [
+                        mark.rect[0] + p[0] * (mark.rect[2] - mark.rect[0]),
+                        mark.rect[1] + p[1] * (mark.rect[3] - mark.rect[1]),
+                    ]
+                })
+                .collect();
+            drawn.push(points);
+        }
+        let variation = |points: &[[f32; 2]]| {
+            points
+                .windows(2)
+                .map(|v| (v[1][1] - v[0][1]).abs())
+                .sum::<f32>()
+        };
+        assert!(variation(&drawn[0]) > 150.);
+        assert!(variation(&drawn[1]) < variation(&drawn[0]) * 0.8);
+        for i in [0, drawn[0].len() - 1] {
+            let a = drawn[0][i];
+            let b = if i == 0 {
+                drawn[1][0]
+            } else {
+                *drawn[1].last().unwrap()
+            };
+            assert!((a[0] - b[0]).abs() < 0.01 && (a[1] - b[1]).abs() < 0.01);
+        }
+    }
+    #[test]
+    fn finger_toggle_separates_pan_from_ink_and_keeps_mouse_drawing() {
+        let (mut app, ctx, mut time) = document_fixture();
+        app.editor.mode = editing::Mode::Draw;
+        app.editor.tool = editing::Tool::Pen;
+        document_frame(&mut app, &ctx, &mut time, vec![]);
+        let start = page_origin(&app, &ctx) + vec2(300., 300.);
+        let before = app.tabs[0].document_view.unwrap().1;
+        for (phase, p) in [
+            (TouchPhase::Start, start),
+            (TouchPhase::Move, start - vec2(0., 60.)),
+            (TouchPhase::End, start - vec2(0., 60.)),
+        ] {
+            document_frame(&mut app, &ctx, &mut time, native_touch(1, phase, p));
+        }
+        assert!(app.tabs[0].session.as_ref().unwrap().annotations.is_empty());
+        assert!(app.tabs[0].document_view.unwrap().1.y > before.y);
+        touch_tools::set_finger(&ctx, true);
+        document_frame(&mut app, &ctx, &mut time, vec![]);
+        let start = page_origin(&app, &ctx) + vec2(300., 300.);
+        let before = app.tabs[0].document_view.unwrap().1;
+        for (phase, p) in [
+            (TouchPhase::Start, start),
+            (TouchPhase::Move, start + vec2(60., 10.)),
+            (TouchPhase::End, start + vec2(60., 10.)),
+        ] {
+            document_frame(&mut app, &ctx, &mut time, native_touch(2, phase, p));
+        }
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().annotations.len(), 1);
+        assert_eq!(app.tabs[0].document_view.unwrap().1, before);
+        touch_tools::set_finger(&ctx, false);
+        document_frame(&mut app, &ctx, &mut time, vec![]);
+        let start = page_origin(&app, &ctx) + vec2(300., 350.);
+        document_frame(
+            &mut app,
+            &ctx,
+            &mut time,
+            vec![InputEvent::PointerMoved(start), pointer(start, true)],
+        );
+        document_frame(
+            &mut app,
+            &ctx,
+            &mut time,
+            vec![InputEvent::PointerMoved(start + vec2(60., 10.))],
+        );
+        document_frame(
+            &mut app,
+            &ctx,
+            &mut time,
+            vec![pointer(start + vec2(60., 10.), false)],
+        );
+        assert_eq!(app.tabs[0].session.as_ref().unwrap().annotations.len(), 2);
+    }
+
+    #[test]
+    fn long_press_opens_page_menu_without_ink_and_release_keeps_it_open() {
+        for mode in [
+            editing::Mode::Read,
+            editing::Mode::Draw,
+            editing::Mode::Edit,
+        ] {
+            let (mut app, ctx, mut time) = document_fixture();
+            app.editor.mode = mode;
+            app.editor.tool = editing::Tool::Pen;
+            document_frame(&mut app, &ctx, &mut time, vec![]);
+            let point = page_origin(&app, &ctx) + vec2(350., 300.);
+            document_frame(
+                &mut app,
+                &ctx,
+                &mut time,
+                native_touch(1, TouchPhase::Start, point),
+            );
+            let id = egui::Id::new((app.tabs[0].id, 0_usize, "contextual_page_menu"));
+            assert!(!egui::Popup::is_id_open(&ctx, id));
+            time += 0.6;
+            document_frame(&mut app, &ctx, &mut time, vec![]);
+            assert!(egui::Popup::is_id_open(&ctx, id), "hold must open the menu");
+            document_frame(
+                &mut app,
+                &ctx,
+                &mut time,
+                native_touch(1, TouchPhase::End, point),
+            );
+            assert!(
+                egui::Popup::is_id_open(&ctx, id),
+                "release must not dismiss the menu or choose an action"
+            );
+            assert!(app.tabs[0].session.as_ref().unwrap().annotations.is_empty());
+        }
+    }
+
+    #[test]
+    fn configured_touch_hold_delays_trigger_only_after_the_threshold() {
+        for delay in [0.35, 0.55, 0.85] {
+            let mut state = State {
+                allow_hold: true,
+                hold_delay: delay,
+                ..Default::default()
+            };
+            step(
+                &mut state,
+                1.,
+                vec![touch(1, TouchPhase::Start, pos2(100., 100.))],
+            );
+            assert!(
+                step(&mut state, 1. + delay - 0.02, vec![])
+                    .context_menu
+                    .is_none()
+            );
+            assert!(
+                step(&mut state, 1. + delay + 0.02, vec![])
+                    .context_menu
+                    .is_some()
+            );
+        }
+    }
+    #[test]
+    fn long_press_is_once_only_and_pan_or_pinch_cancels_it() {
+        let mut state = State {
+            allow_hold: true,
+            ..Default::default()
+        };
+        step(
+            &mut state,
+            1.,
+            vec![touch(1, TouchPhase::Start, pos2(100., 100.))],
+        );
+        assert!(step(&mut state, 1.4, vec![]).context_menu.is_none());
+        let held = step(&mut state, 1.6, vec![]);
+        assert!(held.navigating && held.context_menu == Some(pos2(100., 100.)));
+        assert!(step(&mut state, 1.8, vec![]).context_menu.is_none());
+        let end = step(
+            &mut state,
+            1.9,
+            vec![touch(1, TouchPhase::End, pos2(100., 100.))],
+        );
+        assert!(end.navigating && end.delta == Vec2::ZERO);
+        for pinch in [false, true] {
+            let mut state = State {
+                allow_hold: true,
+                ..Default::default()
+            };
+            step(
+                &mut state,
+                1.,
+                vec![touch(1, TouchPhase::Start, pos2(100., 100.))],
+            );
+            step(
+                &mut state,
+                1.1,
+                vec![if pinch {
+                    touch(2, TouchPhase::Start, pos2(200., 100.))
+                } else {
+                    touch(1, TouchPhase::Move, pos2(100., 90.))
+                }],
+            );
+            assert!(step(&mut state, 1.8, vec![]).context_menu.is_none());
+        }
+    }
+
     fn eraser_fixture() -> (
         Viewer,
         egui::Context,
@@ -1030,6 +1324,7 @@ mod tests {
             .commit(vec![ink.clone()])
             .unwrap();
         app.editor.mode = editing::Mode::Draw;
+        touch_tools::set_finger(&ctx, true);
         app.editor.tool = editing::Tool::Eraser;
         document_frame(&mut app, &ctx, &mut time, vec![]);
         (app, ctx, time, ink)

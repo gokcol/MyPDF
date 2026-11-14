@@ -49,7 +49,7 @@ elif name=='cargo':
 elif name=='sips':out(arg('--out'))
 elif name=='iconutil':out(arg('-o'))
 elif name=='codesign':
- if args[-1].endswith('.app') and '--sign' in args:
+ if args[-1].endswith('/MyPDF.app') and '--sign' in args:
   info=plistlib.loads((pathlib.Path(args[-1])/'Contents/Info.plist').read_bytes())
   expected=os.environ['EXPECT_DOCUMENT_HANDLERS']=='yes'
   assert ('CFBundleDocumentTypes' in info)==expected,(info,expected)
@@ -79,8 +79,12 @@ else:raise AssertionError(name)
 def run_case(label,host='aarch64-apple-darwin',failure=None,old=True,rollback=True,bundle=False,debug=False,archive_check=None,review=None,output=None):
  with tempfile.TemporaryDirectory(prefix='mypdf-packaging-test-') as raw:
   d=pathlib.Path(raw).resolve();(d/'scripts').mkdir();(d/'packaging').mkdir();(d/'bin').mkdir()
-  for name in ['bundle-macos.sh','release-macos.sh']:shutil.copyfile(ROOT/'scripts'/name,d/'scripts'/name)
+  for name in ['bundle-macos.sh','release-macos.sh','sign-macos-frameworks.sh']:shutil.copyfile(ROOT/'scripts'/name,d/'scripts'/name)
   shutil.copyfile(ROOT/'packaging/Info.plist',d/'packaging/Info.plist')
+  (d/'sparkle/Sparkle.framework').mkdir(parents=True)
+  (d/'sparkle/LICENSE').write_text('Sparkle fixture license')
+  (d/'scripts/prepare-sparkle.sh').write_text('printf "%s/sparkle\\n" "$PWD"\n')
+  (d/'scripts/macos-update-feed.sh').write_text('test "$FAIL_STAGE" != feed || exit 7\nprintf signed-feed > "$2/appcast.xml"\n')
   stub=d/'bin/stub';stub.write_text(STUB);stub.chmod(0o755)
   for name in ['uname','rustc','cargo','sips','iconutil','codesign','ditto','xcrun','spctl','hdiutil','mv']:(d/'bin'/name).symlink_to('stub')
   for name,text in [('settings','settings-unchanged'),('stamps','stamps-unchanged'),('recovery','recovery-unchanged')]:
@@ -173,7 +177,7 @@ def run_case(label,host='aarch64-apple-darwin',failure=None,old=True,rollback=Tr
   print('PASS',label)
 run_case('ARM64 release: one compile and rollback rotation')
 run_case('Intel release: cross app plus host icon helper',host='x86_64-apple-darwin')
-for fail in ['sign-app','sign-dmg','dmg','notary-dmg','staple-dmg','promote']:run_case('preserve current + rollback after '+fail,failure=fail)
+for fail in ['sign-app','sign-dmg','dmg','notary-dmg','staple-dmg','feed','promote']:run_case('preserve current + rollback after '+fail,failure=fail)
 run_case('first release',old=False,rollback=False)
 run_case('retain existing rollback with no current release',old=False)
 run_case('native bundle',bundle=True)

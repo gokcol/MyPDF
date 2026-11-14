@@ -174,7 +174,9 @@ mod tests {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
             frame(app, ctx, vec![]);
-            if !app.organizer.busy && app.tabs[0].session.is_some() {
+            // Undo starts an asynchronous reload while retaining the session.
+            // Wait until editing is enabled before clicking the next action.
+            if !app.organizer.busy && app.tabs[0].session.as_ref().is_some_and(|s| s.editable) {
                 break;
             }
             assert!(std::time::Instant::now() < until, "{:?}", app.status);

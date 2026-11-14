@@ -259,7 +259,7 @@ mod tests {
             click(&mut app, &ctx, at);
             assert!(app.editor.pending_sign_rect.is_none());
             assert_eq!(app.tabs[0].session.as_ref().unwrap().revision(), 0);
-            let at = bounds(&mut app, &ctx, "Close")[0];
+            let at = bounds(&mut app, &ctx, "Close window")[0];
             click(&mut app, &ctx, at);
             assert!(!app.digital.open);
             let restored = State::at(profile.path().into());
